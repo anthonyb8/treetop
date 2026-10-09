@@ -1,14 +1,18 @@
 //! treetop: an htop-style view of a treehouse worktree pool, for marking trees
 //! and returning or destroying them. Run it from anywhere in a pooled
-//! repository; Enter prints the tree's path on stdout for a shell to cd into.
+//! repository; Enter opens the tree in a tmux window, or outside tmux in a
+//! shell that comes back to treetop when it exits.
 
 mod actions;
 mod app;
 mod pool;
+mod tmux;
 mod ui;
 
-use std::io::{self, Stderr};
+use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::Duration;
@@ -25,32 +29,36 @@ use ratatui::crossterm::terminal::{
 use crate::app::{App, Outcome};
 use crate::pool::Tree;
 
-type Term = Terminal<CrosstermBackend<Stderr>>;
+type Term = Terminal<CrosstermBackend<Stdout>>;
 
 const REFRESH: Duration = Duration::from_secs(10);
 const TICK: Duration = Duration::from_millis(100);
 
 fn enter_screen() -> Result<Term> {
     enable_raw_mode()?;
-    execute!(io::stderr(), EnterAlternateScreen)?;
-    Ok(Terminal::new(CrosstermBackend::new(io::stderr()))?)
+    execute!(io::stdout(), EnterAlternateScreen)?;
+    Ok(Terminal::new(CrosstermBackend::new(io::stdout()))?)
 }
 
 fn leave_screen() -> Result<()> {
     disable_raw_mode()?;
-    execute!(io::stderr(), LeaveAlternateScreen)?;
+    execute!(io::stdout(), LeaveAlternateScreen)?;
     Ok(())
 }
 
 /// Lists the pool REFRESH after each listing finishes, or at once when kicked,
 /// off the UI thread. `treehouse status` scans every process on the machine and
-/// takes seconds of CPU, so a short interval would keep a core busy.
-fn spawn_refresher(dir: PathBuf) -> (Receiver<Result<Vec<Tree>>>, Sender<()>) {
+/// takes seconds of CPU, so a short interval would keep a core busy. Nothing is
+/// listed while `paused` is set, which covers the hours a shell may sit open.
+fn spawn_refresher(
+    dir: PathBuf,
+    paused: Arc<AtomicBool>,
+) -> (Receiver<Result<Vec<Tree>>>, Sender<()>) {
     let (trees_tx, trees_rx) = mpsc::channel();
     let (kick_tx, kick_rx) = mpsc::channel::<()>();
     thread::spawn(move || {
         loop {
-            if trees_tx.send(pool::load(&dir)).is_err() {
+            if !paused.load(Ordering::Relaxed) && trees_tx.send(pool::load(&dir)).is_err() {
                 return;
             }
             if let Err(RecvTimeoutError::Disconnected) = kick_rx.recv_timeout(REFRESH) {
@@ -61,8 +69,9 @@ fn spawn_refresher(dir: PathBuf) -> (Receiver<Result<Vec<Tree>>>, Sender<()>) {
     (trees_rx, kick_tx)
 }
 
-fn run(term: &mut Term, app: &mut App, dir: &Path) -> Result<Option<PathBuf>> {
-    let (trees, kick) = spawn_refresher(dir.to_path_buf());
+fn run(term: &mut Term, app: &mut App, dir: &Path) -> Result<()> {
+    let paused = Arc::new(AtomicBool::new(false));
+    let (trees, kick) = spawn_refresher(dir.to_path_buf(), Arc::clone(&paused));
     loop {
         while let Ok(listing) = trees.try_recv() {
             match listing {
@@ -82,8 +91,18 @@ fn run(term: &mut Term, app: &mut App, dir: &Path) -> Result<Option<PathBuf>> {
         }
         match app.handle_key(key) {
             Outcome::Continue => {}
-            Outcome::Quit => return Ok(None),
-            Outcome::Enter(path) => return Ok(Some(path)),
+            Outcome::Quit => return Ok(()),
+            Outcome::Enter(tree) if tmux::is_inside() => {
+                app.message = Some(tmux::open(&tree).unwrap_or_else(|err| format!("{err:#}")));
+            }
+            Outcome::Enter(tree) => {
+                leave_screen()?;
+                paused.store(true, Ordering::Relaxed);
+                actions::shell(&tree.path);
+                paused.store(false, Ordering::Relaxed);
+                *term = enter_screen()?;
+                let _ = kick.send(());
+            }
             Outcome::Run(pending) => {
                 leave_screen()?;
                 actions::perform(&pending);
@@ -109,8 +128,5 @@ fn main() -> Result<()> {
     let mut term = enter_screen()?;
     let result = run(&mut term, &mut app, &checkout);
     leave_screen()?;
-    if let Some(path) = result? {
-        println!("{}", path.display());
-    }
-    Ok(())
+    result
 }

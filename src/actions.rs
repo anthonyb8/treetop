@@ -1,16 +1,15 @@
-//! Returning and destroying, run with the TUI suspended so treehouse's own
-//! prompts and output reach the terminal. Child stdout goes to stderr: stdout
-//! is reserved for the path printed on Enter, which a shell wrapper captures.
+//! Everything run with the TUI suspended, so treehouse's own prompts and
+//! output, or a shell, have the terminal: entering, returning and destroying.
 
 use std::io::{self, BufRead, Write};
 use std::path::Path;
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus};
 
 use crate::app::{Action, Pending};
 use crate::pool::Tree;
 
 fn run(command: &mut Command) -> io::Result<ExitStatus> {
-    command.stdout(Stdio::from(io::stderr())).status()
+    command.status()
 }
 
 fn report(what: &str, result: io::Result<ExitStatus>) {
@@ -84,6 +83,14 @@ fn destroy_tree(tree: &Tree) {
             .args(INCLUDE)
             .arg("--yes")),
     );
+}
+
+/// Runs the user's shell in the tree. treetop's own cwd stays in the main
+/// checkout, so a later return or destroy of this tree never hits treetop.
+pub fn shell(path: &Path) {
+    let shell = std::env::var_os("SHELL").unwrap_or_else(|| "sh".into());
+    eprintln!("treetop: shell in {}; exit to come back", path.display());
+    report("shell", run(Command::new(shell).current_dir(path)));
 }
 
 pub fn perform(pending: &Pending) {

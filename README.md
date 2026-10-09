@@ -39,7 +39,7 @@ Run `treetop` from anywhere inside a pooled repository.
 | `/` | filter by number, branch or holder; Enter keeps it, Esc clears it |
 | `r` | return the marked trees, or the one under the cursor, to the pool |
 | `D` | destroy them from disk |
-| Enter | quit and print the tree's path |
+| Enter | open the tree: a tmux window inside tmux, else a shell |
 | `q`, Esc | quit |
 
 The columns are what a destroy would lose.
@@ -58,11 +58,10 @@ Both suspend the screen and run in the terminal, so treehouse's own prompts work
 
 The tree treetop was started in is never a target, because returning or destroying it would kill the shell standing in it.
 
-## cd on Enter
+## Entering a tree
 
-A program cannot change its parent shell's directory, so Enter prints the path on stdout and draws the UI on stderr.
-Wrap it to jump in:
+Inside tmux, Enter opens the tree in a new window named for its branch (the part after the last `/`), or `tree N` when it has none, and treetop stays open in its own window.
+When a window of the session already has a pane in that tree, Enter switches to it instead of opening another.
 
-```sh
-tp() { local dir; dir=$(treetop) || return; [[ -n $dir ]] && cd "$dir"; }
-```
+Outside tmux, Enter suspends treetop and opens `$SHELL` in the tree; `exit` comes back.
+The list does not refresh while that shell is open.

@@ -34,8 +34,9 @@ pub struct Pending {
 pub enum Outcome {
     Continue,
     Quit,
-    /// Quit and print this path, for a shell wrapper to cd into.
-    Enter(PathBuf),
+    /// Open this tree: a tmux window inside tmux, else a shell that comes
+    /// back to treetop when it exits.
+    Enter(Tree),
     Run(Pending),
 }
 
@@ -196,7 +197,7 @@ impl App {
             KeyCode::Char('u') => self.marked.clear(),
             KeyCode::Enter => {
                 if let Some(tree) = self.current() {
-                    return Outcome::Enter(tree.path.clone());
+                    return Outcome::Enter(tree.clone());
                 }
             }
             KeyCode::Char('r') => self.ask(Action::Return),
@@ -305,10 +306,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["8"]
         );
-        assert_eq!(
-            press(&mut app, KeyCode::Enter),
-            Outcome::Enter(PathBuf::from("/p/8/app"))
-        );
+        assert!(matches!(press(&mut app, KeyCode::Enter), Outcome::Enter(t) if t.name == "8"));
     }
 
     #[test]
