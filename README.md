@@ -38,7 +38,8 @@ Run `treetop` from anywhere inside a pooled repository.
 | `u` | clear the marks |
 | `/` | filter by number, branch or holder; Enter keeps it, Esc clears it |
 | `r` | return the marked trees, or the one under the cursor, to the pool |
-| `D` | destroy them from disk |
+| `D` | destroy them from disk, after reviewing treehouse's preview of each |
+| `L` | show or hide the log of every action's output; PgUp and PgDn scroll it |
 | Enter | open the tree: a tmux window inside tmux, else a shell |
 | `Ctrl-R` | list the pool again now |
 | `q`, Esc | quit |
@@ -56,10 +57,13 @@ On opening, treetop draws the last listing it saved under `$XDG_CACHE_HOME/treet
 
 ## What the actions run
 
-Both suspend the screen and run in the terminal, so treehouse's own prompts work.
+Both run in the background, one tree at a time, while treetop stays on screen; each row's STATUS shows queued, returning, destroying, returned, destroyed or failed.
+Their output goes to the log (`L`), and a failure also shows its last line in the status line.
 
-- **Return** stops the tree's stack with `harness stack down` when the harness is on PATH, then runs `treehouse return`, which still asks before discarding uncommitted changes.
-- **Destroy** prints `treehouse destroy`'s dry run with every `--include-*` flag, asks again, and only then stops the stack and runs it with `--yes`.
+- **Return** first shows a dialog listing each tree's uncommitted files, unpushed commits and running processes, or "unknown changes" where git cannot read it. On `y` it stops the tree's stack with `harness stack down` when the harness is on PATH, then runs `treehouse return --force`: that dialog replaces treehouse's own prompt before discarding changes.
+- **Destroy** runs `treehouse destroy`'s dry run with every `--include-*` flag in the background and shows it in a dialog per tree. `y` stops the stack and runs it with `--yes`; `n` keeps the tree.
+
+`q` while an action runs waits for it to finish; `Ctrl-C` quits at once and leaves the running command to finish on its own.
 
 The tree treetop was started in is never a target, because returning or destroying it would kill the shell standing in it.
 

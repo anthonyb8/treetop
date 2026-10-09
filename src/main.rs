@@ -6,6 +6,7 @@
 mod actions;
 mod app;
 mod cache;
+mod jobs;
 mod live;
 mod pool;
 mod refresh;
@@ -26,6 +27,7 @@ use ratatui::crossterm::terminal::{
 };
 
 use crate::app::{App, Outcome};
+use crate::jobs::{Kind, Worker};
 use crate::refresh::{Refresher, Update};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -46,20 +48,34 @@ fn leave_screen() -> Result<()> {
 
 fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<()> {
     let refresher = Refresher::spawn(checkout.to_path_buf(), app.trees.clone());
+    let worker = Worker::spawn();
     loop {
         while let Ok(update) = refresher.updates.try_recv() {
             match update {
-                Update::ListingStarted => app.is_listing = true,
-                Update::Listing(listing) => {
+                Update::ListingStarted => app.start_listing(),
+                Update::Listing(Ok(listing)) => app.set_trees(listing),
+                Update::Listing(Err(err)) => {
                     app.is_listing = false;
-                    match listing {
-                        Ok(listing) => app.set_trees(listing),
-                        Err(err) => app.error = Some(format!("{err:#}")),
-                    }
+                    app.error = Some(format!("{err:#}"));
                 }
                 Update::Processes(processes) => app.apply_processes(&processes),
                 Update::Work(work) => app.apply_work(&work),
             }
+        }
+        while let Ok(event) = worker.events.try_recv() {
+            match event {
+                jobs::Event::Started(job) => app.job_started(&job),
+                jobs::Event::Finished { job, is_ok, output } => {
+                    let is_preview = job.kind == Kind::Preview;
+                    app.job_finished(job, is_ok, output);
+                    if !is_preview {
+                        refresher.refresh();
+                    }
+                }
+            }
+        }
+        if app.is_quitting && app.active_jobs() == 0 {
+            return Ok(());
         }
         term.draw(|frame| ui::draw(frame, app))?;
         if !event::poll(TICK)? {
@@ -86,11 +102,10 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<()> {
                 *term = enter_screen()?;
                 refresher.refresh();
             }
-            Outcome::Run(pending) => {
-                leave_screen()?;
-                actions::perform(&pending);
-                *term = enter_screen()?;
-                refresher.refresh();
+            Outcome::Queue(jobs) => {
+                for job in jobs {
+                    worker.push(job);
+                }
             }
         }
     }

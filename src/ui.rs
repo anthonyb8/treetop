@@ -5,12 +5,12 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 
-use crate::app::{Action, App, Pending};
+use crate::app::{App, JobState, Pending, Review};
 use crate::pool::{Tree, Work};
 
-const KEYS: [(&str, &str); 9] = [
+const KEYS: [(&str, &str); 10] = [
     ("Space", "mark"),
     ("u", "unmark"),
     ("/", "filter"),
@@ -18,6 +18,7 @@ const KEYS: [(&str, &str); 9] = [
     ("r", "return"),
     ("D", "destroy"),
     ("j/k", "move"),
+    ("L", "log"),
     ("^R", "refresh"),
     ("q", "quit"),
 ];
@@ -26,7 +27,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let [summary, body, detail, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Fill(1),
-        Constraint::Length(4),
+        if app.is_log_open {
+            Constraint::Fill(1)
+        } else {
+            Constraint::Length(4)
+        },
         Constraint::Length(1),
     ])
     .areas(frame.area());
@@ -39,9 +44,15 @@ pub fn draw(frame: &mut Frame, app: &App) {
     );
     frame.render_widget(summary_line(app), summary);
     draw_table(frame, app, body);
-    frame.render_widget(detail_pane(app), detail);
+    if app.is_log_open {
+        frame.render_widget(log_pane(app, detail.height), detail);
+    } else {
+        frame.render_widget(detail_pane(app), detail);
+    }
     frame.render_widget(footer_line(app), footer);
-    if let Some(pending) = &app.pending {
+    if let Some(review) = app.reviews.front() {
+        draw_review(frame, review, app.reviews.len() - 1);
+    } else if let Some(pending) = &app.pending {
         draw_confirm(frame, pending);
     }
 }
@@ -63,6 +74,13 @@ fn summary_line(app: &App) -> Paragraph<'static> {
         Span::raw(format!("  {} trees  {held} held  ", app.trees.len())),
         Span::styled(format!("{running} running"), Style::new().fg(Color::Yellow)),
         Span::raw(format!("  {} marked", app.marked.len())),
+        match app.active_jobs() {
+            0 => Span::raw(""),
+            n => Span::styled(
+                format!("  {n} action(s) running"),
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+        },
         freshness(app),
         if app.is_listing {
             Span::styled("  refreshing...", Style::new().fg(Color::Cyan))
@@ -107,6 +125,36 @@ fn work_cell(tree: &Tree, count: fn(Work) -> usize, color: Color) -> Cell<'stati
     }
 }
 
+/// The tree's job while one is queued, running, just done or failed, else its
+/// pool status.
+fn status_cell(app: &App, tree: &Tree) -> Cell<'static> {
+    let bold = Modifier::BOLD;
+    let (text, style) = match app.jobs.get(&tree.path) {
+        Some(JobState::Queued(_)) => ("queued".to_string(), Style::new().fg(Color::Cyan)),
+        Some(JobState::Running(kind)) => (
+            format!("{}...", kind.running()),
+            Style::new().fg(Color::Cyan).add_modifier(bold),
+        ),
+        Some(JobState::Done(kind, _)) => (
+            kind.done().to_string(),
+            Style::new().fg(Color::Green).add_modifier(bold),
+        ),
+        Some(JobState::Failed(_)) => (
+            "failed".to_string(),
+            Style::new().fg(Color::Red).add_modifier(bold),
+        ),
+        None => {
+            let color = match tree.status.as_str() {
+                "leased" => Color::Green,
+                "available" => Color::White,
+                _ => Color::Red,
+            };
+            (tree.status.clone(), Style::new().fg(color))
+        }
+    };
+    Cell::from(text).style(style)
+}
+
 fn row(app: &App, tree: &Tree) -> Row<'static> {
     let is_here = app.is_here(tree);
     let mark = if app.marked.contains(&tree.path) {
@@ -119,11 +167,6 @@ fn row(app: &App, tree: &Tree) -> Row<'static> {
     } else {
         Span::raw(" ")
     };
-    let status_color = match tree.status.as_str() {
-        "leased" => Color::Green,
-        "available" => Color::White,
-        _ => Color::Red,
-    };
     let branch = match &tree.branch {
         Some(b) => Cell::from(b.clone()),
         None => Cell::from("(detached)").style(Style::new().fg(Color::White)),
@@ -132,7 +175,7 @@ fn row(app: &App, tree: &Tree) -> Row<'static> {
     Row::new(vec![
         Cell::from(mark),
         Cell::from(tree.name.clone()),
-        Cell::from(tree.status.clone()).style(Style::new().fg(status_color)),
+        status_cell(app, tree),
         branch,
         Cell::from(tree.holder.clone().unwrap_or_default()),
         count_cell(procs, Color::Yellow),
@@ -160,7 +203,7 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
     let widths = [
         Constraint::Length(1),
         Constraint::Length(4),
-        Constraint::Length(10),
+        Constraint::Length(13),
         Constraint::Fill(1),
         Constraint::Length(20),
         Constraint::Length(6),
@@ -258,6 +301,29 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     )
 }
 
+/// What returning a tree throws away, as its confirm line says it.
+fn risk(tree: &Tree) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    match tree.work {
+        None => spans.push(Span::styled(
+            "  unknown changes: git cannot read it",
+            Style::new().fg(Color::Yellow),
+        )),
+        Some(w) if w.changed + w.unpushed > 0 => spans.push(Span::styled(
+            format!("  {} changed, {} unpushed", w.changed, w.unpushed),
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )),
+        Some(_) => spans.push(Span::styled("  clean", Style::new().fg(Color::Green))),
+    }
+    if !tree.processes.is_empty() {
+        spans.push(Span::styled(
+            format!(", {} process(es) running", tree.processes.len()),
+            Style::new().fg(Color::Yellow),
+        ));
+    }
+    spans
+}
+
 fn draw_confirm(frame: &mut Frame, pending: &Pending) {
     let mut lines: Vec<Line> = pending
         .trees
@@ -268,48 +334,105 @@ fn draw_confirm(frame: &mut Frame, pending: &Pending) {
                 t.name,
                 t.branch.as_deref().unwrap_or("(detached)")
             ))];
-            match t.work {
-                Some(w) if w.changed + w.unpushed > 0 => spans.push(Span::styled(
-                    format!("  {} changed, {} unpushed", w.changed, w.unpushed),
-                    Style::new().fg(Color::Red),
-                )),
-                None if t.is_held() => spans.push(Span::styled(
-                    "  git cannot read it",
-                    Style::new().fg(Color::Yellow),
-                )),
-                _ => {}
-            }
+            spans.extend(risk(t));
             Line::from(spans)
         })
         .collect();
     lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        match pending.action {
-            Action::Return => " y returns them to the pool; any other key cancels",
-            Action::Destroy => " y shows treehouse's preview for each, then asks again",
-        },
-        Style::new().fg(Color::White),
+    lines.push(Line::raw(
+        " Uncommitted changes are discarded and running processes stopped.",
     ));
-    let title = format!(
-        " {} {} tree(s)? ",
-        pending.action.verb(),
-        pending.trees.len()
-    );
-    let color = match pending.action {
-        Action::Return => Color::Yellow,
-        Action::Destroy => Color::Red,
-    };
+    lines.push(Line::raw(
+        " y returns them to the pool; any other key cancels.",
+    ));
+    let title = format!(" Return {} tree(s)? ", pending.trees.len());
     let height = u16::try_from(lines.len())
         .unwrap_or(u16::MAX)
         .saturating_add(2);
-    let area = centered(frame.area(), 70, height);
+    let area = centered(frame.area(), 80, height);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::bordered()
                 .title(title)
-                .border_style(Style::new().fg(color)),
+                .border_style(Style::new().fg(Color::Yellow)),
         ),
         area,
     );
+}
+
+/// treehouse's own dry run for one tree, scrollable, with the verdict keys.
+fn draw_review(frame: &mut Frame, review: &Review, remaining: usize) {
+    let full = frame.area();
+    // Sized to the preview plus its borders and a blank line, up to 70% of the
+    // screen; a longer preview scrolls.
+    let lines = u16::try_from(review.preview.lines().count()).unwrap_or(u16::MAX);
+    let height = lines.saturating_add(3).max(6).min(full.height * 7 / 10);
+    let area = centered(full, full.width * 4 / 5, height);
+    let tree = &review.tree;
+    let title = format!(
+        " Destroy tree {} ({})? ",
+        tree.name,
+        tree.branch.as_deref().unwrap_or("detached")
+    );
+    let more = match remaining {
+        0 => String::new(),
+        n => format!("   {n} more to review"),
+    };
+    let keys = format!(" y destroys   n keeps it   j/k scroll{more} ");
+    let preview = if review.preview.trim().is_empty() {
+        "treehouse printed no preview".to_string()
+    } else {
+        review.preview.clone()
+    };
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(preview)
+            .wrap(Wrap { trim: false })
+            .scroll((review.scroll, 0))
+            .block(
+                Block::bordered()
+                    .title(title)
+                    .title_bottom(keys)
+                    .border_style(Style::new().fg(Color::Red)),
+            ),
+        area,
+    );
+}
+
+/// Every finished job's output, newest at the bottom, scrolled up by
+/// `log_scroll` lines.
+fn log_pane(app: &App, height: u16) -> Paragraph<'static> {
+    let mut lines: Vec<Line> = Vec::new();
+    for entry in &app.log {
+        if !lines.is_empty() {
+            lines.push(Line::raw(""));
+        }
+        let (verdict, color) = if entry.is_ok {
+            ("ok", Color::Green)
+        } else {
+            ("failed", Color::Red)
+        };
+        lines.push(Line::styled(
+            format!("{} tree {}: {verdict}", entry.kind.noun(), entry.tree),
+            Style::new().fg(color).add_modifier(Modifier::BOLD),
+        ));
+        lines.extend(entry.output.lines().map(|l| Line::raw(format!("  {l}"))));
+    }
+    if lines.is_empty() {
+        lines.push(Line::raw("no actions yet"));
+    }
+    let shown = usize::from(height.saturating_sub(2));
+    let top = lines
+        .len()
+        .saturating_sub(shown)
+        .saturating_sub(app.log_scroll);
+    Paragraph::new(lines)
+        .scroll((u16::try_from(top).unwrap_or(u16::MAX), 0))
+        .block(
+            Block::bordered()
+                .title(" log ")
+                .title_bottom(" PgUp/PgDn scroll   L closes ")
+                .border_style(Style::new().fg(Color::White)),
+        )
 }

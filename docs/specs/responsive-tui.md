@@ -163,14 +163,14 @@ N/A - not a bug.
 - A background worker that runs actions from a queue, one tree at a time, with captured output.
 - Return: a confirm dialog listing each tree with its changed, unpushed and process counts and saying uncommitted changes are discarded; on `y`, stop the stack when `harness` is on PATH, then `treehouse return <path> --force`.
 - Destroy: the dry run runs in the background and its text shows in a scrollable dialog per tree; `y` runs it with `--yes`, anything else skips that tree.
-- A STATE column on each row: queued, returning, destroying, failed.
+- Each row's STATUS cell shows its job while one is queued, running, just done or failed: queued, returning, destroying, returned, destroyed, failed. A separate column would cost width on every row for a state most rows never have.
 - A log pane, toggled with `L`, holding each command's captured output; a failure also shows in the status line.
 
 **Out:** Enter outside tmux (still a shell); stack controls; running several trees' actions at once.
 
 **Layers:**
 
-- **UI:** the confirm dialog (`src/ui.rs:231`) grows counts and a scrollable preview; a STATE column; a log pane.
+- **UI:** the confirm dialog (`src/ui.rs:231`) grows counts and a scrollable preview; job states in the STATUS cell; a log pane.
 - **Data:** `src/actions.rs` stops writing to the terminal and returns captured output; a job queue and its channel join the main loop.
 - **Schema:** N/A - no database.
 - **Edge / vendors / env:** none.
