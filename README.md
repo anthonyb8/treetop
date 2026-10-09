@@ -7,10 +7,25 @@ treetop only talks to treehouse through its CLI (`treehouse status --json`, `ret
 
 ## Install
 
+On Linux (x86_64 or arm64):
+
 ```sh
-cargo build --release
-cp target/release/treetop ~/.local/bin/
+curl -fsSL https://raw.githubusercontent.com/anthonyb8/treetop/main/install.sh | sh
 ```
+
+It installs the latest release to `~/.local/bin` when that is on PATH, else `/usr/local/bin`, after checking the download against its published SHA-256.
+Set `TREETOP_VERSION=v0.1.0` before `sh` to install a specific release.
+From source: `cargo install --git https://github.com/anthonyb8/treetop`.
+
+## Release
+
+Bump `version` in `Cargo.toml`, then push a matching tag:
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+`.github/workflows/release.yml` refuses a tag that does not match `Cargo.toml`, runs the tests, builds static musl binaries for x86_64 and arm64, and publishes them with checksums as a GitHub release.
 
 ## Use
 
