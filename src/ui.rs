@@ -7,10 +7,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 
-use crate::app::{App, JobState, Pending, Review};
+use crate::app::{App, JobState, Pane, Pending, Review};
+use crate::diff::{self, Tone};
 use crate::pool::{Tree, Work};
 
-const KEYS: [(&str, &str); 10] = [
+const KEYS: [(&str, &str); 11] = [
     ("Space", "mark"),
     ("u", "unmark"),
     ("/", "filter"),
@@ -18,6 +19,7 @@ const KEYS: [(&str, &str); 10] = [
     ("r", "return"),
     ("D", "destroy"),
     ("j/k", "move"),
+    ("Tab", "diff"),
     ("L", "log"),
     ("^R", "refresh"),
     ("q", "quit"),
@@ -27,10 +29,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let [summary, body, detail, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Fill(1),
-        if app.is_log_open {
-            Constraint::Fill(1)
-        } else {
+        if app.pane == Pane::Info {
             Constraint::Length(4)
+        } else {
+            Constraint::Fill(1)
         },
         Constraint::Length(1),
     ])
@@ -44,10 +46,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
     );
     frame.render_widget(summary_line(app), summary);
     draw_table(frame, app, body);
-    if app.is_log_open {
-        frame.render_widget(log_pane(app, detail.height), detail);
-    } else {
-        frame.render_widget(detail_pane(app), detail);
+    match app.pane {
+        Pane::Info => frame.render_widget(detail_pane(app), detail),
+        Pane::Diff => frame.render_widget(diff_pane(app), detail),
+        Pane::Log => frame.render_widget(log_pane(app, detail.height), detail),
     }
     frame.render_widget(footer_line(app), footer);
     if let Some(review) = app.reviews.front() {
@@ -398,6 +400,58 @@ fn draw_review(frame: &mut Frame, review: &Review, remaining: usize) {
             ),
         area,
     );
+}
+
+fn tone_style(tone: Tone) -> Style {
+    match tone {
+        Tone::Heading => Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        Tone::Added => Style::new().fg(Color::Green),
+        Tone::Modified => Style::new().fg(Color::Yellow),
+        Tone::Deleted => Style::new().fg(Color::Red),
+        Tone::Plain => Style::new().fg(Color::White),
+        Tone::Note => Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+    }
+}
+
+/// The tree under the cursor: its uncommitted files, changed lines and
+/// unpushed commits, or why there are none to show.
+fn diff_pane(app: &App) -> Paragraph<'static> {
+    let mut block = Block::bordered()
+        .title_bottom(" Tab closes   PgUp/PgDn scroll ")
+        .border_style(Style::new().fg(Color::White));
+    let Some(tree) = app.current() else {
+        return Paragraph::new("no trees match").block(block);
+    };
+    block = block.title(format!(
+        " diff: tree {} ({}) ",
+        tree.name,
+        tree.branch.as_deref().unwrap_or("detached")
+    ));
+    let note = |text: &str| {
+        vec![Line::styled(
+            text.to_string(),
+            Style::new().fg(Color::Yellow),
+        )]
+    };
+    let lines = if !tree.is_held() {
+        note("An available tree holds no work: treehouse keeps it clean.")
+    } else if tree.work.is_none() {
+        note("git cannot read this tree, so there is no diff to show.")
+    } else {
+        match app.diffs.get(&tree.path) {
+            None => note("reading git..."),
+            Some(loaded) => match &loaded.diff {
+                None => note("git cannot read this tree, so there is no diff to show."),
+                Some(d) => diff::lines(d)
+                    .into_iter()
+                    .map(|l| Line::styled(l.text, tone_style(l.tone)))
+                    .collect(),
+            },
+        }
+    };
+    Paragraph::new(lines)
+        .scroll((app.diff_scroll, 0))
+        .block(block)
 }
 
 /// Every finished job's output, newest at the bottom, scrolled up by

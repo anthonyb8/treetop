@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::diff::Diff;
 use crate::jobs::{Job, Kind};
 use crate::pool::{Process, Tree, Work};
 
@@ -25,6 +26,24 @@ impl JobState {
     pub fn is_active(self) -> bool {
         matches!(self, JobState::Queued(_) | JobState::Running(_))
     }
+}
+
+/// What the pane under the table shows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Pane {
+    #[default]
+    Info,
+    Diff,
+    Log,
+}
+
+/// A tree's diff and the git counts it was asked for at. Once the tree's
+/// counts move on, the diff is stale and is read again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedDiff {
+    /// None when git could not read the tree.
+    pub diff: Option<Diff>,
+    work: Option<Work>,
 }
 
 /// A return waiting on y/n in the confirm dialog.
@@ -83,9 +102,14 @@ pub struct App {
     pub reviews: VecDeque<Review>,
     pub jobs: HashMap<PathBuf, JobState>,
     pub log: Vec<LogEntry>,
-    pub is_log_open: bool,
+    pub pane: Pane,
     /// Lines scrolled up from the newest end of the log.
     pub log_scroll: usize,
+    /// Lines scrolled down from the top of the diff.
+    pub diff_scroll: u16,
+    pub diffs: HashMap<PathBuf, LoadedDiff>,
+    /// Diffs asked for and not yet loaded, with the counts they were asked at.
+    diff_requests: HashMap<PathBuf, Option<Work>>,
     /// `q` was pressed while jobs were running; quit once they finish.
     pub is_quitting: bool,
     pub message: Option<String>,
@@ -245,6 +269,35 @@ impl App {
     fn move_by(&mut self, delta: isize) {
         let last = self.visible().len().saturating_sub(1);
         self.selected = self.selected.saturating_add_signed(delta).min(last);
+        self.diff_scroll = 0;
+    }
+
+    /// The tree whose diff should be read next: the one under the cursor, while
+    /// the diff pane is open, if its diff is missing or older than its counts.
+    /// A tree is asked for once until its answer lands.
+    pub fn wanted_diff(&mut self) -> Option<PathBuf> {
+        if self.pane != Pane::Diff {
+            return None;
+        }
+        let tree = self.current()?;
+        if !tree.is_held() || tree.work.is_none() || self.diff_requests.contains_key(&tree.path) {
+            return None;
+        }
+        if self
+            .diffs
+            .get(&tree.path)
+            .is_some_and(|d| d.work == tree.work)
+        {
+            return None;
+        }
+        let (path, work) = (tree.path.clone(), tree.work);
+        self.diff_requests.insert(path.clone(), work);
+        Some(path)
+    }
+
+    pub fn diff_loaded(&mut self, path: PathBuf, diff: Option<Diff>) {
+        let work = self.diff_requests.remove(&path).flatten();
+        self.diffs.insert(path, LoadedDiff { diff, work });
     }
 
     /// Marked trees, else the one under the cursor, minus any the job cannot
@@ -313,7 +366,10 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return match key.code {
                 KeyCode::Char('c') => Outcome::Quit,
-                KeyCode::Char('r') => Outcome::Refresh,
+                KeyCode::Char('r') => {
+                    self.diffs.clear();
+                    Outcome::Refresh
+                }
                 _ => Outcome::Continue,
             };
         }
@@ -376,7 +432,7 @@ impl App {
             KeyCode::Esc => return self.quit(),
             KeyCode::Down | KeyCode::Char('j') => self.move_by(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_by(-1),
-            KeyCode::Home | KeyCode::Char('g') => self.selected = 0,
+            KeyCode::Home | KeyCode::Char('g') => self.move_by(isize::MIN),
             KeyCode::End | KeyCode::Char('G') => self.move_by(isize::MAX),
             KeyCode::Char('/') => self.is_filtering = true,
             KeyCode::Char(' ') => {
@@ -389,13 +445,31 @@ impl App {
             }
             KeyCode::Char('u') => self.marked.clear(),
             KeyCode::Char('L') => {
-                self.is_log_open = !self.is_log_open;
+                self.pane = if self.pane == Pane::Log {
+                    Pane::Info
+                } else {
+                    Pane::Log
+                };
                 self.log_scroll = 0;
             }
-            KeyCode::PageUp if self.is_log_open => self.log_scroll += 10,
-            KeyCode::PageDown if self.is_log_open => {
-                self.log_scroll = self.log_scroll.saturating_sub(10);
+            KeyCode::Tab => {
+                self.pane = if self.pane == Pane::Diff {
+                    Pane::Info
+                } else {
+                    Pane::Diff
+                };
+                self.diff_scroll = 0;
             }
+            KeyCode::PageUp => match self.pane {
+                Pane::Log => self.log_scroll += 10,
+                Pane::Diff => self.diff_scroll = self.diff_scroll.saturating_sub(10),
+                Pane::Info => {}
+            },
+            KeyCode::PageDown => match self.pane {
+                Pane::Log => self.log_scroll = self.log_scroll.saturating_sub(10),
+                Pane::Diff => self.diff_scroll = self.diff_scroll.saturating_add(10),
+                Pane::Info => {}
+            },
             KeyCode::Enter => {
                 if let Some(tree) = self.current() {
                     return Outcome::Enter(tree.clone());
@@ -629,6 +703,51 @@ mod tests {
             (1, Some(2))
         );
         assert!(!app.is_cached && app.listed_at.is_some());
+    }
+
+    fn with_work(app: &mut App, changed: usize) {
+        let work: HashMap<PathBuf, Option<Work>> = app
+            .trees
+            .iter()
+            .filter(|t| t.is_held())
+            .map(|t| {
+                (
+                    t.path.clone(),
+                    Some(Work {
+                        changed,
+                        unpushed: 0,
+                    }),
+                )
+            })
+            .collect();
+        app.apply_work(&work);
+    }
+
+    #[test]
+    fn the_diff_pane_asks_once_and_again_when_counts_change() {
+        let mut app = app();
+        with_work(&mut app, 1);
+        assert_eq!(app.wanted_diff(), None, "closed pane asks for nothing");
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.wanted_diff(), Some(PathBuf::from("/p/4/app")));
+        assert_eq!(app.wanted_diff(), None, "in flight");
+        app.diff_loaded(PathBuf::from("/p/4/app"), Some(Diff::default()));
+        assert_eq!(app.wanted_diff(), None, "fresh");
+        with_work(&mut app, 2);
+        assert_eq!(app.wanted_diff(), Some(PathBuf::from("/p/4/app")), "stale");
+    }
+
+    #[test]
+    fn the_diff_pane_follows_the_cursor_and_skips_available_trees() {
+        let mut app = app();
+        with_work(&mut app, 0);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.wanted_diff(), None, "tree 7 is available");
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.wanted_diff(), Some(PathBuf::from("/p/8/app")));
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.pane, Pane::Info);
     }
 
     #[test]

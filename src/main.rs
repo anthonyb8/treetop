@@ -6,6 +6,7 @@
 mod actions;
 mod app;
 mod cache;
+mod diff;
 mod jobs;
 mod live;
 mod pool;
@@ -49,6 +50,7 @@ fn leave_screen() -> Result<()> {
 fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<()> {
     let refresher = Refresher::spawn(checkout.to_path_buf(), app.trees.clone());
     let worker = Worker::spawn();
+    let diffs = diff::Loader::spawn();
     loop {
         while let Ok(update) = refresher.updates.try_recv() {
             match update {
@@ -73,6 +75,12 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<()> {
                     }
                 }
             }
+        }
+        while let Ok((path, diff)) = diffs.results.try_recv() {
+            app.diff_loaded(path, diff);
+        }
+        if let Some(path) = app.wanted_diff() {
+            diffs.request(path);
         }
         if app.is_quitting && app.active_jobs() == 0 {
             return Ok(());
