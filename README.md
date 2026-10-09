@@ -45,6 +45,8 @@ Run `treetop` from anywhere inside a pooled repository.
 | `Ctrl-R` | list the pool again now |
 | `q`, Esc | quit |
 
+In a true-colour terminal (`COLORTERM=truecolor`) treetop draws in gruvbox-material (medium), as Neovim does: lualine's sections for the bars and the table header, `CursorLine` for the selected row, `WinSeparator` for borders. Elsewhere it uses the terminal's 16 ANSI colours.
+
 The columns are what a destroy would lose.
 CHANGED counts uncommitted files and UNPUSHED counts commits on no remote; `?` means git could not read a held tree, which deserves a look before it goes.
 PROCS counts processes treehouse found running inside the tree.
@@ -61,7 +63,7 @@ On opening, treetop draws the last listing it saved under `$XDG_CACHE_HOME/treet
 `Tab` opens the tree under the cursor in a full-screen, side-by-side diff, the way a pull request shows it: everything its branch changes against the pool's base (`base_branch` in `treehouse.toml`, else `origin/HEAD`), measured from their merge base, plus uncommitted and untracked files.
 Removed lines sit on the left and the added lines that replace them on the right, row by row, with line numbers on both sides; within a changed line, the words that differ are highlighted.
 Every file runs in one scroll, each under a header with its path and its additions and deletions, and the header of the file you are reading stays pinned to the top.
-Colours come only from the terminal's 16 ANSI colours, as in Claude Code's dark-ansi theme, so the diff follows the terminal's palette.
+Its colours are the diff highlight groups Neovim uses under gruvbox-material (medium): `DiffDelete` and `DiffAdd` behind lines, `LineNr` for numbers, `diffLine` for hunks, `diffFile` for paths.
 
 | Key | Does |
 |---|---|

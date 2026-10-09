@@ -1,9 +1,10 @@
 //! Two clocks, which is how htop stays fast. Processes and git state change by
 //! the second and cost milliseconds to read, so a fast clock reads processes
 //! every FAST and git state every GIT_EVERY ticks: git runs as child processes
-//! and is most of treetop's idle CPU, so it gets half the rate. Pool state changes only when a tree is leased, returned or destroyed,
-//! and `treehouse status` costs seconds of CPU, so the slow clock lists it only
-//! when `git worktree list` changes, when asked, and every SLOW as a backstop.
+//! and is most of treetop's idle CPU, so it gets half the rate. Pool state
+//! changes only when a tree is leased, returned or destroyed, and `treehouse
+//! status` costs seconds of CPU, so the slow clock lists it only when `git
+//! worktree list` changes, when asked, and every SLOW as a backstop.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

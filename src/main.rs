@@ -11,6 +11,7 @@ mod jobs;
 mod live;
 mod pool;
 mod refresh;
+mod theme;
 mod tmux;
 mod ui;
 
