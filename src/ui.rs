@@ -12,29 +12,33 @@ use crate::diff::{Change, FileDiff, Layout as DiffLayout, Row as DiffRow, Side, 
 use crate::pool::{Tree, Work};
 use crate::theme::theme;
 
+/// Most useful first: on a narrow bar the keys at the end are the ones left
+/// out.
 const KEYS: [(&str, &str); 11] = [
-    ("Space", "mark"),
-    ("u", "unmark"),
-    ("/", "filter"),
     ("Enter", "open"),
+    ("Tab", "diff"),
+    ("Space", "mark"),
     ("r", "return"),
     ("D", "destroy"),
-    ("j/k", "move"),
-    ("Tab", "diff"),
+    ("/", "filter"),
     ("L", "log"),
-    ("^R", "refresh"),
     ("q", "quit"),
+    ("^R", "refresh"),
+    ("u", "unmark"),
+    ("j/k", "move"),
 ];
 
+/// Most useful first, as with `KEYS`; Esc stays early so the way out is
+/// never the key a narrow bar drops.
 const DIFF_KEYS: [(&str, &str); 8] = [
     ("j/k", "line"),
     ("Space/b", "page"),
-    ("d/u", "half page"),
     ("n/p", "file"),
+    ("Esc", "back"),
+    ("d/u", "half page"),
     ("h/l", "sideways"),
     ("g/G", "top/end"),
     ("^R", "reload"),
-    ("Esc", "back"),
 ];
 
 fn fg(color: Color) -> Style {
@@ -49,8 +53,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         draw_diff_view(frame, app, view);
         return;
     }
-    let [summary, body, detail, footer] = Layout::vertical([
-        Constraint::Length(1),
+    let [body, detail, footer] = Layout::vertical([
         Constraint::Fill(1),
         if app.pane == Pane::Info {
             Constraint::Length(4)
@@ -61,13 +64,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
     ])
     .areas(frame.area());
 
-    frame.render_widget(summary_line(app), summary);
     draw_table(frame, app, body);
     match app.pane {
         Pane::Info => frame.render_widget(detail_pane(app), detail),
         Pane::Log => frame.render_widget(log_pane(app, detail.height), detail),
     }
-    frame.render_widget(footer_line(app), footer);
+    draw_footer(frame, app, footer);
     if let Some(review) = app.reviews.front() {
         draw_review(frame, review, app.reviews.len() - 1);
     } else if let Some(pending) = &app.pending {
@@ -83,37 +85,39 @@ fn bar(name: &str, spans: Vec<Span<'static>>) -> Paragraph<'static> {
     Paragraph::new(Line::from(line)).style(t.bar)
 }
 
-fn summary_line(app: &App) -> Paragraph<'static> {
+/// The pool at a glance, for the right end of the bottom bar: counts,
+/// actions and how fresh the listing is, closed by the name as a badge, the
+/// way lualine closes its statusline. Zero marks and actions are left out.
+fn summary(app: &App) -> Vec<Span<'static>> {
     let t = theme();
-    if let Some(err) = &app.error {
-        return bar("treetop", vec![Span::styled(err.clone(), fg(t.danger))]);
+    let mut spans = vec![Span::raw("  ")];
+    if app.is_loaded {
+        let held = app.trees.iter().filter(|t| t.is_held()).count();
+        let running = app.trees.iter().filter(|t| !t.processes.is_empty()).count();
+        spans.push(Span::raw(format!(
+            "{} trees  {held} held  ",
+            app.trees.len()
+        )));
+        spans.push(Span::styled(format!("{running} running"), fg(t.warning)));
+        if !app.marked.is_empty() {
+            spans.push(Span::raw(format!("  {} marked", app.marked.len())));
+        }
+        if let n @ 1.. = app.active_jobs() {
+            spans.push(Span::styled(
+                format!("  {n} action(s) running"),
+                fg(t.info).add_modifier(Modifier::BOLD),
+            ));
+        }
+        spans.push(freshness(app));
+        if app.is_listing {
+            spans.push(Span::styled("  refreshing...", fg(t.info)));
+        }
+    } else {
+        spans.push(Span::raw("reading the pool..."));
     }
-    if !app.is_loaded {
-        return bar("treetop", vec![Span::raw("reading the pool...")]);
-    }
-    let held = app.trees.iter().filter(|t| t.is_held()).count();
-    let running = app.trees.iter().filter(|t| !t.processes.is_empty()).count();
-    bar(
-        "treetop",
-        vec![
-            Span::raw(format!("{} trees  {held} held  ", app.trees.len())),
-            Span::styled(format!("{running} running"), fg(t.warning)),
-            Span::raw(format!("  {} marked", app.marked.len())),
-            match app.active_jobs() {
-                0 => Span::raw(""),
-                n => Span::styled(
-                    format!("  {n} action(s) running"),
-                    fg(t.info).add_modifier(Modifier::BOLD),
-                ),
-            },
-            freshness(app),
-            if app.is_listing {
-                Span::styled("  refreshing...", fg(t.info))
-            } else {
-                Span::raw("")
-            },
-        ],
-    )
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(" treetop ", t.badge));
+    spans
 }
 
 /// How old the pool listing is. Processes and git counts are always within a
@@ -287,32 +291,69 @@ fn key_bar(keys: &[(&str, &str)]) -> Vec<Span<'static>> {
         .flat_map(|(k, label)| {
             [
                 Span::styled(format!(" {k} "), t.badge),
-                Span::raw(format!(" {label}  ")),
+                Span::raw(format!(" {label} ")),
             ]
         })
         .collect()
 }
 
-fn footer_line(app: &App) -> Paragraph<'static> {
+/// The keys that fit in `width` columns, dropping whole keys from the end
+/// rather than cutting one in half.
+fn fitting_keys(keys: &[(&str, &str)], width: u16) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut used = 0;
+    for key in keys.chunks(1) {
+        let pair = key_bar(key);
+        let pair_width: usize = pair.iter().map(Span::width).sum();
+        if used + pair_width > usize::from(width) {
+            break;
+        }
+        used += pair_width;
+        spans.extend(pair);
+    }
+    spans
+}
+
+/// What the left of the bottom bar says: the filter being typed, the error or
+/// message there is, else the keys.
+fn footer_left(app: &App, width: u16) -> Line<'static> {
     let t = theme();
     if app.is_filtering {
-        return Paragraph::new(format!(
+        return Line::raw(format!(
             " Filter: {}_   Enter keeps it, Esc clears it",
             app.filter
-        ))
-        .style(t.bar);
+        ));
+    }
+    if let Some(err) = &app.error {
+        return Line::styled(format!(" {err}"), fg(t.danger));
     }
     if let Some(message) = &app.message {
-        return Paragraph::new(Span::styled(format!(" {message}"), fg(t.warning))).style(t.bar);
+        return Line::styled(format!(" {message}"), fg(t.warning));
     }
-    let mut spans = key_bar(&KEYS);
+    let mut spans = fitting_keys(&KEYS, width);
     if !app.filter.is_empty() {
         spans.push(Span::styled(
             format!(" filter: {}", app.filter),
             fg(t.accent),
         ));
     }
-    Paragraph::new(Line::from(spans)).style(t.bar)
+    Line::from(spans)
+}
+
+/// The bottom bar: keys or a message on the left, the summary on the right.
+fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
+    let t = theme();
+    let right = Line::from(summary(app));
+    let right_width = u16::try_from(right.width())
+        .unwrap_or(u16::MAX)
+        .min(area.width);
+    let [left_area, right_area] =
+        Layout::horizontal([Constraint::Fill(1), Constraint::Length(right_width)]).areas(area);
+    frame.render_widget(
+        Paragraph::new(footer_left(app, left_area.width)).style(t.bar),
+        left_area,
+    );
+    frame.render_widget(Paragraph::new(right).style(t.bar), right_area);
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -633,7 +674,7 @@ fn draw_diff_view(frame: &mut Frame, app: &App, view: &DiffView) {
     }
     frame.render_widget(bar("diff", title), top);
     frame.render_widget(
-        Paragraph::new(Line::from(key_bar(&DIFF_KEYS))).style(t.bar),
+        Paragraph::new(Line::from(fitting_keys(&DIFF_KEYS, keys.width))).style(t.bar),
         keys,
     );
 }
