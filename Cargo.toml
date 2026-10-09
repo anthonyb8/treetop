@@ -1,0 +1,11 @@
+[package]
+name = "treetop"
+version = "0.1.0"
+edition = "2024"
+description = "An htop-style view of a treehouse worktree pool, for returning and destroying trees"
+
+[dependencies]
+anyhow = "1.0.104"
+ratatui = "0.30.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"

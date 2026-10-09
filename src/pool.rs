@@ -1,0 +1,204 @@
+//! The pool as treehouse reports it, plus what git says about each held tree.
+//! treetop never reads treehouse's own files: `treehouse status --json` is the
+//! only interface, so a treehouse upgrade cannot leave it reading stale state.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use anyhow::{Context, Result, bail};
+use serde::Deserialize;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Process {
+    pub pid: u32,
+    pub name: String,
+}
+
+/// Uncommitted files and commits on no remote: the work a destroy loses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Work {
+    pub changed: usize,
+    pub unpushed: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tree {
+    pub name: String,
+    pub status: String,
+    pub branch: Option<String>,
+    pub holder: Option<String>,
+    pub path: PathBuf,
+    pub leased_at: Option<String>,
+    pub processes: Vec<Process>,
+    /// None for an available tree, which treehouse keeps clean, and when git fails.
+    pub work: Option<Work>,
+}
+
+impl Tree {
+    /// Somebody holds it, so `treehouse return` has something to release.
+    pub fn is_held(&self) -> bool {
+        self.status != "available"
+    }
+
+    /// `dir` is this tree or inside it, compared by path component.
+    pub fn contains(&self, dir: &Path) -> bool {
+        dir.starts_with(&self.path)
+    }
+}
+
+#[derive(Deserialize)]
+struct RawProcess {
+    pid: u32,
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct RawTree {
+    name: String,
+    status: String,
+    branch: Option<String>,
+    lease_holder: Option<String>,
+    path: PathBuf,
+    leased_at: Option<String>,
+    #[serde(default)]
+    processes: Vec<RawProcess>,
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|v| !v.is_empty())
+}
+
+/// Parses `treehouse status --json`, ordered by pool number the way
+/// `treehouse status` prints it.
+pub fn parse(json: &str) -> Result<Vec<Tree>> {
+    let raw: Vec<RawTree> =
+        serde_json::from_str(json).context("reading treehouse status --json")?;
+    let mut trees: Vec<Tree> = raw
+        .into_iter()
+        .map(|t| Tree {
+            name: t.name,
+            status: t.status,
+            branch: non_empty(t.branch),
+            holder: non_empty(t.lease_holder),
+            path: t.path,
+            leased_at: t.leased_at,
+            processes: t
+                .processes
+                .into_iter()
+                .map(|p| Process {
+                    pid: p.pid,
+                    name: p.name,
+                })
+                .collect(),
+            work: None,
+        })
+        .collect();
+    trees.sort_by(|a, b| {
+        let key = |t: &Tree| (t.name.parse::<u64>().unwrap_or(u64::MAX), t.name.clone());
+        key(a).cmp(&key(b))
+    });
+    Ok(trees)
+}
+
+/// The pool of the repository `dir` belongs to, with git's view of each held tree.
+pub fn load(dir: &Path) -> Result<Vec<Tree>> {
+    let out = Command::new("treehouse")
+        .args(["status", "--json"])
+        .current_dir(dir)
+        .output()
+        .context("running treehouse status")?;
+    if !out.status.success() {
+        bail!(
+            "treehouse status: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let mut trees = parse(&String::from_utf8_lossy(&out.stdout))?;
+    for tree in trees.iter_mut().filter(|t| t.is_held()) {
+        tree.work = work(&tree.path);
+    }
+    Ok(trees)
+}
+
+fn git(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn work(dir: &Path) -> Option<Work> {
+    let changed = git(dir, &["status", "--porcelain"])?.lines().count();
+    let unpushed = git(dir, &["rev-list", "--count", "HEAD", "--not", "--remotes"])?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(Work { changed, unpushed })
+}
+
+/// The main checkout of the repository `dir` is in. treetop runs from there,
+/// because `treehouse return` terminates every process standing in the tree it
+/// returns, and treetop must not be one of them.
+pub fn main_checkout(dir: &Path) -> Result<PathBuf> {
+    let common = git(
+        dir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .context("not inside a git repository")?;
+    let common = PathBuf::from(common.trim());
+    common
+        .parent()
+        .map(Path::to_path_buf)
+        .context("git common dir has no parent")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const STATUS: &str = r#"[
+      {"name":"10","status":"available","branch":"","lease_holder":"","path":"/p/10/app",
+       "leased_at":null,"processes":[],"flavor":"git","detached":true,"lease_id":""},
+      {"name":"4","status":"leased","branch":"feature/end-1-x","lease_holder":"claude:abc",
+       "path":"/p/4/app","leased_at":"2026-09-24T15:23:37-04:00",
+       "processes":[{"pid":42,"name":"node"}],"flavor":null,"detached":null,"lease_id":"l1"}
+    ]"#;
+
+    #[test]
+    fn parses_and_orders_by_pool_number() {
+        let trees = parse(STATUS).unwrap();
+        assert_eq!(
+            trees.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            ["4", "10"]
+        );
+        assert_eq!(trees[0].branch.as_deref(), Some("feature/end-1-x"));
+        assert_eq!(
+            trees[0].processes,
+            [Process {
+                pid: 42,
+                name: "node".into()
+            }]
+        );
+        assert!(trees[0].is_held());
+    }
+
+    #[test]
+    fn empty_branch_and_holder_read_as_none() {
+        let trees = parse(STATUS).unwrap();
+        assert_eq!(trees[1].branch, None);
+        assert_eq!(trees[1].holder, None);
+        assert!(!trees[1].is_held());
+    }
+
+    #[test]
+    fn contains_compares_whole_path_components() {
+        let tree = &parse(STATUS).unwrap()[0];
+        assert!(tree.contains(Path::new("/p/4/app/ui/src")));
+        assert!(!tree.contains(Path::new("/p/40/app")));
+    }
+}
