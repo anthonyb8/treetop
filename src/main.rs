@@ -50,7 +50,7 @@ fn leave_screen() -> Result<()> {
 fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<()> {
     let refresher = Refresher::spawn(checkout.to_path_buf(), app.trees.clone());
     let worker = Worker::spawn();
-    let diffs = diff::Loader::spawn();
+    let diffs = diff::Loader::spawn(diff::base(checkout));
     loop {
         while let Ok(update) = refresher.updates.try_recv() {
             match update {
@@ -85,6 +85,7 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<()> {
         if app.is_quitting && app.active_jobs() == 0 {
             return Ok(());
         }
+        app.screen_height = term.size()?.height;
         term.draw(|frame| ui::draw(frame, app))?;
         if !event::poll(TICK)? {
             continue;

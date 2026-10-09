@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::diff::Diff;
+use crate::diff::Layout;
 use crate::jobs::{Job, Kind};
 use crate::pool::{Process, Tree, Work};
 
@@ -33,16 +33,25 @@ impl JobState {
 pub enum Pane {
     #[default]
     Info,
-    Diff,
     Log,
 }
 
-/// A tree's diff and the git counts it was asked for at. Once the tree's
-/// counts move on, the diff is stale and is read again.
+/// The full-screen diff of one tree, and where it is scrolled to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffView {
+    pub path: PathBuf,
+    /// The first row on screen.
+    pub scroll: usize,
+    /// Columns scrolled sideways, for lines wider than their half.
+    pub hscroll: u16,
+}
+
+/// A tree's diff laid out for the view, or why it could not be read, with the
+/// git counts it was asked for at. Reopening the view after the counts move on
+/// reads it again; while open it holds still, so nothing jumps under a read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedDiff {
-    /// None when git could not read the tree.
-    pub diff: Option<Diff>,
+    pub layout: Result<Layout, String>,
     work: Option<Work>,
 }
 
@@ -105,8 +114,9 @@ pub struct App {
     pub pane: Pane,
     /// Lines scrolled up from the newest end of the log.
     pub log_scroll: usize,
-    /// Lines scrolled down from the top of the diff.
-    pub diff_scroll: u16,
+    pub view: Option<DiffView>,
+    /// The terminal's height, for paging the diff view.
+    pub screen_height: u16,
     pub diffs: HashMap<PathBuf, LoadedDiff>,
     /// Diffs asked for and not yet loaded, with the counts they were asked at.
     diff_requests: HashMap<PathBuf, Option<Work>>,
@@ -269,35 +279,99 @@ impl App {
     fn move_by(&mut self, delta: isize) {
         let last = self.visible().len().saturating_sub(1);
         self.selected = self.selected.saturating_add_signed(delta).min(last);
-        self.diff_scroll = 0;
     }
 
-    /// The tree whose diff should be read next: the one under the cursor, while
-    /// the diff pane is open, if its diff is missing or older than its counts.
-    /// A tree is asked for once until its answer lands.
+    /// The diff the open view needs read, asked for once until it lands.
     pub fn wanted_diff(&mut self) -> Option<PathBuf> {
-        if self.pane != Pane::Diff {
+        let path = self.view.as_ref()?.path.clone();
+        if self.diffs.contains_key(&path) || self.diff_requests.contains_key(&path) {
             return None;
         }
-        let tree = self.current()?;
-        if !tree.is_held() || tree.work.is_none() || self.diff_requests.contains_key(&tree.path) {
-            return None;
-        }
-        if self
-            .diffs
-            .get(&tree.path)
-            .is_some_and(|d| d.work == tree.work)
-        {
-            return None;
-        }
-        let (path, work) = (tree.path.clone(), tree.work);
+        let work = self
+            .trees
+            .iter()
+            .find(|t| t.path == path)
+            .and_then(|t| t.work);
         self.diff_requests.insert(path.clone(), work);
         Some(path)
     }
 
-    pub fn diff_loaded(&mut self, path: PathBuf, diff: Option<Diff>) {
+    pub fn diff_loaded(&mut self, path: PathBuf, layout: Result<Layout, String>) {
         let work = self.diff_requests.remove(&path).flatten();
-        self.diffs.insert(path, LoadedDiff { diff, work });
+        self.diffs.insert(path, LoadedDiff { layout, work });
+    }
+
+    /// Opens the diff of the tree under the cursor, dropping a cached one its
+    /// counts have moved on from.
+    fn open_diff(&mut self) {
+        let Some(tree) = self.current() else { return };
+        if !tree.is_held() {
+            self.message = Some(format!("tree {} is available: nothing to diff", tree.name));
+            return;
+        }
+        let (path, work) = (tree.path.clone(), tree.work);
+        if self.diffs.get(&path).is_some_and(|d| d.work != work) {
+            self.diffs.remove(&path);
+        }
+        self.view = Some(DiffView {
+            path,
+            scroll: 0,
+            hscroll: 0,
+        });
+    }
+
+    fn handle_view_key(&mut self, key: KeyEvent) -> Outcome {
+        let Some(path) = self.view.as_ref().map(|v| v.path.clone()) else {
+            return Outcome::Continue;
+        };
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('c') => return Outcome::Quit,
+                KeyCode::Char('r') => {
+                    self.diffs.remove(&path);
+                }
+                _ => {}
+            }
+            return Outcome::Continue;
+        }
+        if matches!(key.code, KeyCode::Esc | KeyCode::Tab | KeyCode::Char('q')) {
+            self.view = None;
+            return Outcome::Continue;
+        }
+        let (len, starts) = match self.diffs.get(&path).map(|d| &d.layout) {
+            Some(Ok(layout)) => (layout.rows.len(), layout.file_starts.clone()),
+            _ => (0, Vec::new()),
+        };
+        let page = isize::try_from(self.screen_height.saturating_sub(4)).map_or(1, |p| p.max(1));
+        let Some(view) = self.view.as_mut() else {
+            return Outcome::Continue;
+        };
+        let last = len.saturating_sub(1);
+        let by = |delta: isize| view.scroll.saturating_add_signed(delta).min(last);
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => view.scroll = by(1),
+            KeyCode::Up | KeyCode::Char('k') => view.scroll = by(-1),
+            KeyCode::PageDown | KeyCode::Char(' ') => view.scroll = by(page),
+            KeyCode::PageUp | KeyCode::Char('b') => view.scroll = by(-page),
+            KeyCode::Char('d') => view.scroll = by(page / 2),
+            KeyCode::Char('u') => view.scroll = by(-page / 2),
+            KeyCode::Home | KeyCode::Char('g') => view.scroll = 0,
+            KeyCode::End | KeyCode::Char('G') => view.scroll = last,
+            KeyCode::Char('n') => {
+                if let Some(&start) = starts.iter().find(|&&s| s > view.scroll) {
+                    view.scroll = start;
+                }
+            }
+            KeyCode::Char('p') => {
+                if let Some(&start) = starts.iter().rev().find(|&&s| s < view.scroll) {
+                    view.scroll = start;
+                }
+            }
+            KeyCode::Right | KeyCode::Char('l') => view.hscroll = view.hscroll.saturating_add(8),
+            KeyCode::Left | KeyCode::Char('h') => view.hscroll = view.hscroll.saturating_sub(8),
+            _ => {}
+        }
+        Outcome::Continue
     }
 
     /// Marked trees, else the one under the cursor, minus any the job cannot
@@ -363,6 +437,9 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Outcome {
+        if self.view.is_some() {
+            return self.handle_view_key(key);
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return match key.code {
                 KeyCode::Char('c') => Outcome::Quit,
@@ -452,24 +529,11 @@ impl App {
                 };
                 self.log_scroll = 0;
             }
-            KeyCode::Tab => {
-                self.pane = if self.pane == Pane::Diff {
-                    Pane::Info
-                } else {
-                    Pane::Diff
-                };
-                self.diff_scroll = 0;
+            KeyCode::Tab => self.open_diff(),
+            KeyCode::PageUp if self.pane == Pane::Log => self.log_scroll += 10,
+            KeyCode::PageDown if self.pane == Pane::Log => {
+                self.log_scroll = self.log_scroll.saturating_sub(10);
             }
-            KeyCode::PageUp => match self.pane {
-                Pane::Log => self.log_scroll += 10,
-                Pane::Diff => self.diff_scroll = self.diff_scroll.saturating_sub(10),
-                Pane::Info => {}
-            },
-            KeyCode::PageDown => match self.pane {
-                Pane::Log => self.log_scroll = self.log_scroll.saturating_sub(10),
-                Pane::Diff => self.diff_scroll = self.diff_scroll.saturating_add(10),
-                Pane::Info => {}
-            },
             KeyCode::Enter => {
                 if let Some(tree) = self.current() {
                     return Outcome::Enter(tree.clone());
@@ -723,31 +787,72 @@ mod tests {
         app.apply_work(&work);
     }
 
-    #[test]
-    fn the_diff_pane_asks_once_and_again_when_counts_change() {
-        let mut app = app();
-        with_work(&mut app, 1);
-        assert_eq!(app.wanted_diff(), None, "closed pane asks for nothing");
-        press(&mut app, KeyCode::Tab);
-        assert_eq!(app.wanted_diff(), Some(PathBuf::from("/p/4/app")));
-        assert_eq!(app.wanted_diff(), None, "in flight");
-        app.diff_loaded(PathBuf::from("/p/4/app"), Some(Diff::default()));
-        assert_eq!(app.wanted_diff(), None, "fresh");
-        with_work(&mut app, 2);
-        assert_eq!(app.wanted_diff(), Some(PathBuf::from("/p/4/app")), "stale");
+    /// Two files of 7 rows each, one spacer apart: files start at rows 0 and 8.
+    fn two_files() -> Result<Layout, String> {
+        let file =
+            "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n a\n-b\n+c\n d\n e\n f\n";
+        let files = [crate::diff::parse(file), crate::diff::parse(file)].concat();
+        Ok(crate::diff::layout(crate::diff::BranchDiff {
+            base: "origin/main".into(),
+            files,
+        }))
     }
 
     #[test]
-    fn the_diff_pane_follows_the_cursor_and_skips_available_trees() {
+    fn tab_opens_the_diff_of_a_held_tree_and_reads_it_once() {
         let mut app = app();
-        with_work(&mut app, 0);
+        with_work(&mut app, 1);
+        assert_eq!(app.wanted_diff(), None, "no view, nothing to read");
         press(&mut app, KeyCode::Tab);
-        press(&mut app, KeyCode::Down);
-        assert_eq!(app.wanted_diff(), None, "tree 7 is available");
-        press(&mut app, KeyCode::Down);
-        assert_eq!(app.wanted_diff(), Some(PathBuf::from("/p/8/app")));
+        assert_eq!(app.view.as_ref().unwrap().path, PathBuf::from("/p/4/app"));
+        assert_eq!(app.wanted_diff(), Some(PathBuf::from("/p/4/app")));
+        assert_eq!(app.wanted_diff(), None, "in flight");
+        app.diff_loaded(PathBuf::from("/p/4/app"), two_files());
+        assert_eq!(app.wanted_diff(), None, "loaded");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.view.is_none());
+        with_work(&mut app, 2);
         press(&mut app, KeyCode::Tab);
-        assert_eq!(app.pane, Pane::Info);
+        assert_eq!(
+            app.wanted_diff(),
+            Some(PathBuf::from("/p/4/app")),
+            "stale on reopen"
+        );
+    }
+
+    #[test]
+    fn tab_on_an_available_tree_says_there_is_nothing_to_diff() {
+        let mut app = app();
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Tab);
+        assert!(app.view.is_none());
+        assert_eq!(
+            app.message.as_deref(),
+            Some("tree 7 is available: nothing to diff")
+        );
+    }
+
+    #[test]
+    fn the_view_scrolls_jumps_between_files_and_stays_in_bounds() {
+        let mut app = app();
+        app.screen_height = 10;
+        press(&mut app, KeyCode::Tab);
+        app.diff_loaded(PathBuf::from("/p/4/app"), two_files());
+        let scroll = |app: &App| app.view.as_ref().unwrap().scroll;
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(scroll(&app), 8);
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(scroll(&app), 8, "no file after the last");
+        press(&mut app, KeyCode::Char('p'));
+        assert_eq!(scroll(&app), 0);
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(scroll(&app), 6, "a page is the height less the bars");
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(scroll(&app), 14);
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(scroll(&app), 14, "never past the last row");
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.view.is_none(), "q closes the view, not treetop");
     }
 
     #[test]

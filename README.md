@@ -39,7 +39,7 @@ Run `treetop` from anywhere inside a pooled repository.
 | `/` | filter by number, branch or holder; Enter keeps it, Esc clears it |
 | `r` | return the marked trees, or the one under the cursor, to the pool |
 | `D` | destroy them from disk, after reviewing treehouse's preview of each |
-| `Tab` | show or hide the diff of the tree under the cursor; PgUp and PgDn scroll it |
+| `Tab` | open the side-by-side diff of the tree under the cursor |
 | `L` | show or hide the log of every action's output; PgUp and PgDn scroll it |
 | Enter | open the tree: a tmux window inside tmux, else a shell |
 | `Ctrl-R` | list the pool again now |
@@ -56,11 +56,25 @@ The summary line says how old that listing is.
 
 On opening, treetop draws the last listing it saved under `$XDG_CACHE_HOME/treetop` (else `~/.cache/treetop`) at once, in italics and marked "cached listing", until a live one lands.
 
-## The diff pane
+## The diff
 
-`Tab` swaps the pane under the table for the diff of the tree under the cursor: its uncommitted files (`git status --short`, coloured by added, modified and deleted), its changed lines (`git diff --stat HEAD`), and its commits on no remote.
-It is read in the background, follows the cursor, and is read again when the tree's CHANGED or UNPUSHED count moves or on `Ctrl-R`.
-Each section shows at most 300 lines and says how many it left out; Enter opens the tree for anything deeper.
+`Tab` opens the tree under the cursor in a full-screen, side-by-side diff, the way a pull request shows it: everything its branch changes against the pool's base (`base_branch` in `treehouse.toml`, else `origin/HEAD`), measured from their merge base, plus uncommitted and untracked files.
+Removed lines sit on the left and the added lines that replace them on the right, row by row, with line numbers on both sides; within a changed line, the words that differ are highlighted.
+Every file runs in one scroll, each under a header with its path and its additions and deletions.
+
+| Key | Does |
+|---|---|
+| `j` `k` | a line |
+| Space, `b` | a page |
+| `d` `u` | half a page |
+| `n` `p` | the next or previous file |
+| `h` `l` | sideways, for lines wider than their half |
+| `g` `G` | the top or the end |
+| `Ctrl-R` | read the diff again |
+| Esc, `Tab`, `q` | back to the pool |
+
+The diff is read in the background and holds still while it is open; reopening it after the tree's counts have moved reads it again.
+Only the rows on screen are drawn, so a diff of fifty thousand lines scrolls as fast as a short one.
 
 ## What the actions run
 

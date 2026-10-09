@@ -25,7 +25,7 @@ It is for whoever manages a treehouse pool from a terminal, which today is one d
 - Stack controls (`harness stack up` and `down` as user actions): specific to one setup, not to treehouse pools.
   Return and destroy keep stopping a stack when `harness` is on PATH, as they do now.
 - Enter outside tmux keeps opening a shell, because a shell needs the terminal; inside tmux it already stays in the TUI.
-- A line-by-line diff viewer: the diff pane shows files and commits, and Enter opens the tree for anything deeper.
+- A line-by-line diff viewer in issue 3 as first written; see the revision note on issue 3, which brought one in.
 - Changing treehouse itself, including reporting the slow `status` upstream: the split makes it invisible to treetop, so it is left alone.
 
 ## Design
@@ -207,6 +207,8 @@ None.
 ---
 
 # Issue 3: Diff pane
+
+**Revised after release 0.1.4.** A list of files proved too thin to judge a tree by, so issue 3 became a full-screen, side-by-side diff of the branch against its base, like a pull request, plus uncommitted and untracked files, with word-level highlights and one scroll through every file. The README describes it; the text below is the first version.
 
 ## Why
 

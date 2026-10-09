@@ -7,8 +7,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 
-use crate::app::{App, JobState, Pane, Pending, Review};
-use crate::diff::{self, Tone};
+use crate::app::{App, DiffView, JobState, Pane, Pending, Review};
+use crate::diff::{Change, Layout as DiffLayout, Row as DiffRow, Side, ViewRow};
 use crate::pool::{Tree, Work};
 
 const KEYS: [(&str, &str); 11] = [
@@ -26,6 +26,16 @@ const KEYS: [(&str, &str); 11] = [
 ];
 
 pub fn draw(frame: &mut Frame, app: &App) {
+    // White is the base for every cell; widgets below only add accents, so
+    // nothing falls back to a terminal theme's default or dim foreground.
+    frame.render_widget(
+        Block::new().style(Style::new().fg(Color::White)),
+        frame.area(),
+    );
+    if let Some(view) = &app.view {
+        draw_diff_view(frame, app, view);
+        return;
+    }
     let [summary, body, detail, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Fill(1),
@@ -38,17 +48,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
     ])
     .areas(frame.area());
 
-    // White is the base for every cell; widgets below only add accents, so
-    // nothing falls back to a terminal theme's default or dim foreground.
-    frame.render_widget(
-        Block::new().style(Style::new().fg(Color::White)),
-        frame.area(),
-    );
     frame.render_widget(summary_line(app), summary);
     draw_table(frame, app, body);
     match app.pane {
         Pane::Info => frame.render_widget(detail_pane(app), detail),
-        Pane::Diff => frame.render_widget(diff_pane(app), detail),
         Pane::Log => frame.render_widget(log_pane(app, detail.height), detail),
     }
     frame.render_widget(footer_line(app), footer);
@@ -402,56 +405,240 @@ fn draw_review(frame: &mut Frame, review: &Review, remaining: usize) {
     );
 }
 
-fn tone_style(tone: Tone) -> Style {
-    match tone {
-        Tone::Heading => Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        Tone::Added => Style::new().fg(Color::Green),
-        Tone::Modified => Style::new().fg(Color::Yellow),
-        Tone::Deleted => Style::new().fg(Color::Red),
-        Tone::Plain => Style::new().fg(Color::White),
-        Tone::Note => Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+/// Removed lines on the left, added on the right, and the blank a side shows
+/// where the other has more lines: GitHub's split-view colours, dark enough
+/// that white text stays readable on them.
+const REMOVED: Color = Color::Indexed(52);
+const ADDED: Color = Color::Indexed(22);
+/// The chars within a changed line that actually differ from its pair.
+const REMOVED_STRONG: Color = Color::Indexed(88);
+const ADDED_STRONG: Color = Color::Indexed(28);
+const ABSENT: Color = Color::Indexed(236);
+
+const DIFF_KEYS: [(&str, &str); 8] = [
+    ("j/k", "line"),
+    ("Space/b", "page"),
+    ("d/u", "half page"),
+    ("n/p", "file"),
+    ("h/l", "sideways"),
+    ("g/G", "top/end"),
+    ("^R", "reload"),
+    ("Esc", "back"),
+];
+
+fn key_bar(keys: &[(&str, &str)]) -> Line<'static> {
+    let key = Style::new()
+        .fg(Color::White)
+        .bg(Color::Blue)
+        .add_modifier(Modifier::BOLD);
+    Line::from(
+        keys.iter()
+            .flat_map(|(k, label)| {
+                [
+                    Span::styled(format!(" {k} "), key),
+                    Span::raw(format!(" {label}  ")),
+                ]
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// One half of a split row: the line number, then the text scrolled sideways
+/// by `hscroll` columns, with the chars that differ from its pair on `strong`.
+fn side_line(
+    side: Option<&Side>,
+    (change, strong): (Color, Color),
+    number_width: usize,
+    hscroll: u16,
+) -> Paragraph<'static> {
+    let Some(side) = side else {
+        return Paragraph::new("").style(Style::new().bg(ABSENT));
+    };
+    let skip = usize::from(hscroll);
+    let chars: Vec<char> = side.text.chars().skip(skip).collect();
+    let (from, to) = side.emphasis.map_or((0, 0), |(from, to)| {
+        (
+            from.saturating_sub(skip).min(chars.len()),
+            to.saturating_sub(skip).min(chars.len()),
+        )
+    });
+    let piece = |range: std::ops::Range<usize>| chars[range].iter().collect::<String>();
+    let mut spans = vec![Span::styled(
+        format!("{:>number_width$} ", side.number),
+        Style::new().fg(Color::Yellow),
+    )];
+    spans.push(Span::raw(piece(0..from)));
+    spans.push(Span::styled(piece(from..to), Style::new().bg(strong)));
+    spans.push(Span::raw(piece(to..chars.len())));
+    let style = if side.is_change {
+        Style::new().bg(change)
+    } else {
+        Style::new()
+    };
+    Paragraph::new(Line::from(spans)).style(style)
+}
+
+fn change_letter(change: Change) -> (&'static str, Color) {
+    match change {
+        Change::Added => ("A", Color::Green),
+        Change::Deleted => ("D", Color::Red),
+        Change::Modified => ("M", Color::Yellow),
+        Change::Renamed => ("R", Color::Cyan),
     }
 }
 
-/// The tree under the cursor: its uncommitted files, changed lines and
-/// unpushed commits, or why there are none to show.
-fn diff_pane(app: &App) -> Paragraph<'static> {
-    let mut block = Block::bordered()
-        .title_bottom(" Tab closes   PgUp/PgDn scroll ")
-        .border_style(Style::new().fg(Color::White));
-    let Some(tree) = app.current() else {
-        return Paragraph::new("no trees match").block(block);
-    };
-    block = block.title(format!(
-        " diff: tree {} ({}) ",
-        tree.name,
-        tree.branch.as_deref().unwrap_or("detached")
-    ));
-    let note = |text: &str| {
-        vec![Line::styled(
-            text.to_string(),
-            Style::new().fg(Color::Yellow),
-        )]
-    };
-    let lines = if !tree.is_held() {
-        note("An available tree holds no work: treehouse keeps it clean.")
-    } else if tree.work.is_none() {
-        note("git cannot read this tree, so there is no diff to show.")
-    } else {
-        match app.diffs.get(&tree.path) {
-            None => note("reading git..."),
-            Some(loaded) => match &loaded.diff {
-                None => note("git cannot read this tree, so there is no diff to show."),
-                Some(d) => diff::lines(d)
-                    .into_iter()
-                    .map(|l| Line::styled(l.text, tone_style(l.tone)))
-                    .collect(),
+/// The visible slice of the one scroll through every file. Only these rows
+/// are built each frame, so a diff of fifty thousand lines scrolls as fast
+/// as one of fifty.
+fn draw_diff_rows(frame: &mut Frame, layout: &DiffLayout, view: &DiffView, body: Rect) {
+    let diff = &layout.diff;
+    let start = view.scroll.min(layout.rows.len().saturating_sub(1));
+    let visible = &layout.rows[start..(start + usize::from(body.height)).min(layout.rows.len())];
+    let widest = visible
+        .iter()
+        .filter_map(|row| match row {
+            ViewRow::Line(f, r) => match &diff.files[*f].rows[*r] {
+                DiffRow::Pair(l, r) => Some(l.iter().chain(r).map(|s| s.number).max().unwrap_or(0)),
+                DiffRow::Hunk(_) => None,
+            },
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let number_width = widest.to_string().len().max(3);
+    let half = body.width.saturating_sub(1) / 2;
+    for (offset, row) in visible.iter().enumerate() {
+        let y = body.y + u16::try_from(offset).unwrap_or(u16::MAX);
+        let full = Rect::new(body.x, y, body.width, 1);
+        match row {
+            ViewRow::Spacer => {}
+            ViewRow::File(f) => {
+                let file = &diff.files[*f];
+                let (letter, color) = change_letter(file.change);
+                let path = match &file.from {
+                    Some(from) => format!("{from} -> {}", file.path),
+                    None => file.path.clone(),
+                };
+                let bar = Style::new().bg(Color::Blue).add_modifier(Modifier::BOLD);
+                frame.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(format!(" {letter} "), Style::new().fg(color)),
+                        Span::raw(format!(" {path}  ")),
+                        Span::styled(
+                            format!("+{}", file.additions),
+                            Style::new().fg(Color::Green),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(format!("-{}", file.deletions), Style::new().fg(Color::Red)),
+                    ]))
+                    .style(bar),
+                    full,
+                );
+            }
+            ViewRow::Binary(_) => frame.render_widget(
+                Paragraph::new("    binary file: contents not shown")
+                    .style(Style::new().fg(Color::Yellow)),
+                full,
+            ),
+            ViewRow::Line(f, r) => match &diff.files[*f].rows[*r] {
+                DiffRow::Hunk(header) => frame.render_widget(
+                    Paragraph::new(header.clone()).style(Style::new().fg(Color::Cyan)),
+                    full,
+                ),
+                DiffRow::Pair(left, right) => {
+                    let left_area = Rect::new(body.x, y, half, 1);
+                    let right_area =
+                        Rect::new(body.x + half + 1, y, body.width.saturating_sub(half + 1), 1);
+                    frame.render_widget(
+                        side_line(
+                            left.as_ref(),
+                            (REMOVED, REMOVED_STRONG),
+                            number_width,
+                            view.hscroll,
+                        ),
+                        left_area,
+                    );
+                    frame.render_widget(Paragraph::new("│"), Rect::new(body.x + half, y, 1, 1));
+                    frame.render_widget(
+                        side_line(
+                            right.as_ref(),
+                            (ADDED, ADDED_STRONG),
+                            number_width,
+                            view.hscroll,
+                        ),
+                        right_area,
+                    );
+                }
             },
         }
-    };
-    Paragraph::new(lines)
-        .scroll((app.diff_scroll, 0))
-        .block(block)
+    }
+}
+
+/// The full-screen side-by-side diff of one tree against its base.
+fn draw_diff_view(frame: &mut Frame, app: &App, view: &DiffView) {
+    let [top, body, keys] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Fill(1),
+        Constraint::Length(1),
+    ])
+    .areas(frame.area());
+    let tree = app.trees.iter().find(|t| t.path == view.path);
+    let mut title = vec![
+        Span::styled(" diff ", Style::new().add_modifier(Modifier::BOLD)),
+        Span::raw(format!(
+            " tree {}  {}",
+            tree.map_or("?", |t| t.name.as_str()),
+            tree.and_then(|t| t.branch.as_deref())
+                .unwrap_or("(detached)")
+        )),
+    ];
+    match app.diffs.get(&view.path).map(|d| &d.layout) {
+        None => frame.render_widget(Paragraph::new(" reading the diff..."), body),
+        Some(Err(err)) => frame.render_widget(
+            Paragraph::new(format!(" {err}")).style(Style::new().fg(Color::Red)),
+            body,
+        ),
+        Some(Ok(layout)) => {
+            let diff = &layout.diff;
+            let (adds, dels) = diff
+                .files
+                .iter()
+                .fold((0, 0), |(a, d), f| (a + f.additions, d + f.deletions));
+            title.push(Span::raw(format!(
+                "  vs {}   {} files  ",
+                diff.base,
+                diff.files.len()
+            )));
+            title.push(Span::styled(
+                format!("+{adds}"),
+                Style::new().fg(Color::Green),
+            ));
+            title.push(Span::raw(" "));
+            title.push(Span::styled(
+                format!("-{dels}"),
+                Style::new().fg(Color::Red),
+            ));
+            if let Some(index) = layout.file_starts.iter().rposition(|&s| s <= view.scroll) {
+                title.push(Span::raw(format!(
+                    "   file {}/{}: {}",
+                    index + 1,
+                    diff.files.len(),
+                    diff.files[index].path
+                )));
+            }
+            if layout.rows.is_empty() {
+                frame.render_widget(
+                    Paragraph::new(format!(" No changes against {}.", diff.base))
+                        .style(Style::new().fg(Color::Green)),
+                    body,
+                );
+            } else {
+                draw_diff_rows(frame, layout, view, body);
+            }
+        }
+    }
+    frame.render_widget(Paragraph::new(Line::from(title)), top);
+    frame.render_widget(Paragraph::new(key_bar(&DIFF_KEYS)), keys);
 }
 
 /// Every finished job's output, newest at the bottom, scrolled up by
