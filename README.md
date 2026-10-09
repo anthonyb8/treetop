@@ -60,7 +60,8 @@ On opening, treetop draws the last listing it saved under `$XDG_CACHE_HOME/treet
 
 `Tab` opens the tree under the cursor in a full-screen, side-by-side diff, the way a pull request shows it: everything its branch changes against the pool's base (`base_branch` in `treehouse.toml`, else `origin/HEAD`), measured from their merge base, plus uncommitted and untracked files.
 Removed lines sit on the left and the added lines that replace them on the right, row by row, with line numbers on both sides; within a changed line, the words that differ are highlighted.
-Every file runs in one scroll, each under a header with its path and its additions and deletions.
+Every file runs in one scroll, each under a header with its path and its additions and deletions, and the header of the file you are reading stays pinned to the top.
+Colours come only from the terminal's 16 ANSI colours, as in Claude Code's dark-ansi theme, so the diff follows the terminal's palette.
 
 | Key | Does |
 |---|---|

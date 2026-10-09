@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 
 use crate::app::{App, DiffView, JobState, Pane, Pending, Review};
-use crate::diff::{Change, Layout as DiffLayout, Row as DiffRow, Side, ViewRow};
+use crate::diff::{Change, FileDiff, Layout as DiffLayout, Row as DiffRow, Side, ViewRow};
 use crate::pool::{Tree, Work};
 
 const KEYS: [(&str, &str); 11] = [
@@ -405,15 +405,17 @@ fn draw_review(frame: &mut Frame, review: &Review, remaining: usize) {
     );
 }
 
-/// Removed lines on the left, added on the right, and the blank a side shows
-/// where the other has more lines: GitHub's split-view colours, dark enough
-/// that white text stays readable on them.
-const REMOVED: Color = Color::Indexed(52);
-const ADDED: Color = Color::Indexed(22);
+/// Removed lines on the left, added on the right, from the terminal's own 16
+/// ANSI colours, as Claude Code's dark-ansi theme draws diffs, so they follow
+/// whatever palette the terminal runs (gruvbox, say) instead of fixed shades.
+const REMOVED: Color = Color::Red;
+const ADDED: Color = Color::Green;
 /// The chars within a changed line that actually differ from its pair.
-const REMOVED_STRONG: Color = Color::Indexed(88);
-const ADDED_STRONG: Color = Color::Indexed(28);
-const ABSENT: Color = Color::Indexed(236);
+const REMOVED_STRONG: Color = Color::LightRed;
+const ADDED_STRONG: Color = Color::LightGreen;
+/// Text on those backgrounds: the palette's black, which reads on red and
+/// green in dark palettes where white would not.
+const ON_CHANGE: Color = Color::Black;
 
 const DIFF_KEYS: [(&str, &str); 8] = [
     ("j/k", "line"),
@@ -452,7 +454,7 @@ fn side_line(
     hscroll: u16,
 ) -> Paragraph<'static> {
     let Some(side) = side else {
-        return Paragraph::new("").style(Style::new().bg(ABSENT));
+        return Paragraph::new("");
     };
     let skip = usize::from(hscroll);
     let chars: Vec<char> = side.text.chars().skip(skip).collect();
@@ -463,15 +465,23 @@ fn side_line(
         )
     });
     let piece = |range: std::ops::Range<usize>| chars[range].iter().collect::<String>();
+    let number = if side.is_change {
+        Style::new().fg(ON_CHANGE)
+    } else {
+        Style::new().fg(Color::Yellow)
+    };
     let mut spans = vec![Span::styled(
         format!("{:>number_width$} ", side.number),
-        Style::new().fg(Color::Yellow),
+        number,
     )];
     spans.push(Span::raw(piece(0..from)));
-    spans.push(Span::styled(piece(from..to), Style::new().bg(strong)));
+    spans.push(Span::styled(
+        piece(from..to),
+        Style::new().bg(strong).add_modifier(Modifier::BOLD),
+    ));
     spans.push(Span::raw(piece(to..chars.len())));
     let style = if side.is_change {
-        Style::new().bg(change)
+        Style::new().bg(change).fg(ON_CHANGE)
     } else {
         Style::new()
     };
@@ -480,19 +490,62 @@ fn side_line(
 
 fn change_letter(change: Change) -> (&'static str, Color) {
     match change {
-        Change::Added => ("A", Color::Green),
-        Change::Deleted => ("D", Color::Red),
-        Change::Modified => ("M", Color::Yellow),
-        Change::Renamed => ("R", Color::Cyan),
+        Change::Added => ("A", Color::LightGreen),
+        Change::Deleted => ("D", Color::LightRed),
+        Change::Modified => ("M", Color::LightYellow),
+        Change::Renamed => ("R", Color::LightCyan),
     }
+}
+
+/// A file's header bar: its change, path and line counts.
+fn file_header(file: &FileDiff) -> Paragraph<'static> {
+    let (letter, color) = change_letter(file.change);
+    let path = match &file.from {
+        Some(from) => format!("{from} -> {}", file.path),
+        None => file.path.clone(),
+    };
+    Paragraph::new(Line::from(vec![
+        Span::styled(format!(" {letter} "), Style::new().fg(color)),
+        Span::raw(format!(" {path}  ")),
+        Span::styled(
+            format!("+{}", file.additions),
+            Style::new().fg(Color::LightGreen),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!("-{}", file.deletions),
+            Style::new().fg(Color::LightRed),
+        ),
+    ]))
+    .style(
+        Style::new()
+            .fg(Color::White)
+            .bg(Color::Blue)
+            .add_modifier(Modifier::BOLD),
+    )
 }
 
 /// The visible slice of the one scroll through every file. Only these rows
 /// are built each frame, so a diff of fifty thousand lines scrolls as fast
-/// as one of fifty.
+/// as one of fifty. While the top row is inside a file, that file's header
+/// stays pinned above it, so the path is always on screen.
 fn draw_diff_rows(frame: &mut Frame, layout: &DiffLayout, view: &DiffView, body: Rect) {
     let diff = &layout.diff;
     let start = view.scroll.min(layout.rows.len().saturating_sub(1));
+    let pinned = match layout.rows.get(start) {
+        Some(ViewRow::Line(f, _) | ViewRow::Binary(f)) => Some(*f),
+        _ => None,
+    };
+    let body = match pinned {
+        Some(f) if body.height > 1 => {
+            frame.render_widget(
+                file_header(&diff.files[f]),
+                Rect::new(body.x, body.y, body.width, 1),
+            );
+            Rect::new(body.x, body.y + 1, body.width, body.height - 1)
+        }
+        _ => body,
+    };
     let visible = &layout.rows[start..(start + usize::from(body.height)).min(layout.rows.len())];
     let widest = visible
         .iter()
@@ -512,29 +565,7 @@ fn draw_diff_rows(frame: &mut Frame, layout: &DiffLayout, view: &DiffView, body:
         let full = Rect::new(body.x, y, body.width, 1);
         match row {
             ViewRow::Spacer => {}
-            ViewRow::File(f) => {
-                let file = &diff.files[*f];
-                let (letter, color) = change_letter(file.change);
-                let path = match &file.from {
-                    Some(from) => format!("{from} -> {}", file.path),
-                    None => file.path.clone(),
-                };
-                let bar = Style::new().bg(Color::Blue).add_modifier(Modifier::BOLD);
-                frame.render_widget(
-                    Paragraph::new(Line::from(vec![
-                        Span::styled(format!(" {letter} "), Style::new().fg(color)),
-                        Span::raw(format!(" {path}  ")),
-                        Span::styled(
-                            format!("+{}", file.additions),
-                            Style::new().fg(Color::Green),
-                        ),
-                        Span::raw(" "),
-                        Span::styled(format!("-{}", file.deletions), Style::new().fg(Color::Red)),
-                    ]))
-                    .style(bar),
-                    full,
-                );
-            }
+            ViewRow::File(f) => frame.render_widget(file_header(&diff.files[*f]), full),
             ViewRow::Binary(_) => frame.render_widget(
                 Paragraph::new("    binary file: contents not shown")
                     .style(Style::new().fg(Color::Yellow)),
