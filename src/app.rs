@@ -1,12 +1,13 @@
 //! What the screen shows and what each key does, kept free of terminal I/O so
 //! the rules about what may be returned or destroyed are testable.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
+use std::time::Instant;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::pool::Tree;
+use crate::pool::{Process, Tree, Work};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -38,6 +39,8 @@ pub enum Outcome {
     /// back to treetop when it exits.
     Enter(Tree),
     Run(Pending),
+    /// List the pool again now rather than at the next interval.
+    Refresh,
 }
 
 #[derive(Default)]
@@ -46,6 +49,12 @@ pub struct App {
     pub error: Option<String>,
     /// A first listing has arrived; until then an empty table means nothing.
     pub is_loaded: bool,
+    /// The trees on screen come from the cache, not from treehouse yet.
+    pub is_cached: bool,
+    /// A `treehouse status` is running.
+    pub is_listing: bool,
+    /// When the last live listing landed, for the summary line.
+    pub listed_at: Option<Instant>,
     pub filter: String,
     pub is_filtering: bool,
     pub marked: BTreeSet<PathBuf>,
@@ -87,10 +96,48 @@ impl App {
         self.visible().get(self.selected).copied()
     }
 
-    /// Swaps in a fresh listing, keeping the cursor on the same tree and
-    /// dropping marks on trees that have left the pool.
+    /// Swaps in a live listing from treehouse.
     pub fn set_trees(&mut self, trees: Vec<Tree>) {
+        self.replace_trees(trees);
+        self.is_cached = false;
+        self.listed_at = Some(Instant::now());
+    }
+
+    /// Shows the cached listing until a live one lands.
+    pub fn set_cached(&mut self, trees: Vec<Tree>) {
+        self.replace_trees(trees);
+        self.is_cached = true;
+    }
+
+    /// Takes the processes read from /proc, which are fresher than any
+    /// listing. A tree absent from the map has none running.
+    pub fn apply_processes(&mut self, processes: &HashMap<PathBuf, Vec<Process>>) {
+        for tree in &mut self.trees {
+            tree.processes = processes.get(&tree.path).cloned().unwrap_or_default();
+        }
+    }
+
+    /// Takes the git state of the held trees in the map, leaving the rest as
+    /// they were.
+    pub fn apply_work(&mut self, work: &HashMap<PathBuf, Option<Work>>) {
+        for tree in self.trees.iter_mut().filter(|t| t.is_held()) {
+            if let Some(entry) = work.get(&tree.path) {
+                tree.work = *entry;
+            }
+        }
+    }
+
+    /// Keeps the cursor on the same tree, keeps each surviving tree's probed
+    /// processes and git state until the next probe replaces them, and drops
+    /// marks on trees that have left the pool.
+    fn replace_trees(&mut self, mut trees: Vec<Tree>) {
         let cursor = self.current().map(|t| t.path.clone());
+        for tree in &mut trees {
+            if let Some(old) = self.trees.iter().find(|old| old.path == tree.path) {
+                tree.processes = old.processes.clone();
+                tree.work = old.work.filter(|_| tree.is_held());
+            }
+        }
         self.trees = trees;
         self.error = None;
         self.is_loaded = true;
@@ -145,8 +192,12 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Outcome {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            return Outcome::Quit;
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return match key.code {
+                KeyCode::Char('c') => Outcome::Quit,
+                KeyCode::Char('r') => Outcome::Refresh,
+                _ => Outcome::Continue,
+            };
         }
         if let Some(pending) = self.pending.take() {
             return match key.code {
@@ -307,6 +358,49 @@ mod tests {
             ["8"]
         );
         assert!(matches!(press(&mut app, KeyCode::Enter), Outcome::Enter(t) if t.name == "8"));
+    }
+
+    #[test]
+    fn ctrl_r_refreshes_and_never_returns() {
+        let mut app = app();
+        let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert_eq!(app.handle_key(ctrl_r), Outcome::Refresh);
+        assert!(app.pending.is_none());
+    }
+
+    #[test]
+    fn a_new_listing_keeps_probed_state_until_the_next_probe() {
+        let mut app = app();
+        let path = PathBuf::from("/p/8/app");
+        let node = Process {
+            pid: 1,
+            name: "node".into(),
+        };
+        app.apply_processes(&HashMap::from([(path.clone(), vec![node])]));
+        app.apply_work(&HashMap::from([(
+            path,
+            Some(Work {
+                changed: 2,
+                unpushed: 1,
+            }),
+        )]));
+        let listing = app
+            .trees
+            .iter()
+            .cloned()
+            .map(|t| Tree {
+                processes: vec![],
+                work: None,
+                ..t
+            })
+            .collect();
+        app.set_trees(listing);
+        let tree = app.trees.iter().find(|t| t.name == "8").unwrap();
+        assert_eq!(
+            (tree.processes.len(), tree.work.map(|w| w.changed)),
+            (1, Some(2))
+        );
+        assert!(!app.is_cached && app.listed_at.is_some());
     }
 
     #[test]

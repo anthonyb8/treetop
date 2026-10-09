@@ -5,16 +5,15 @@
 
 mod actions;
 mod app;
+mod cache;
+mod live;
 mod pool;
+mod refresh;
 mod tmux;
 mod ui;
 
 use std::io::{self, Stdout};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::thread;
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -27,11 +26,10 @@ use ratatui::crossterm::terminal::{
 };
 
 use crate::app::{App, Outcome};
-use crate::pool::Tree;
+use crate::refresh::{Refresher, Update};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
-const REFRESH: Duration = Duration::from_secs(10);
 const TICK: Duration = Duration::from_millis(100);
 
 fn enter_screen() -> Result<Term> {
@@ -46,37 +44,21 @@ fn leave_screen() -> Result<()> {
     Ok(())
 }
 
-/// Lists the pool REFRESH after each listing finishes, or at once when kicked,
-/// off the UI thread. `treehouse status` scans every process on the machine and
-/// takes seconds of CPU, so a short interval would keep a core busy. Nothing is
-/// listed while `paused` is set, which covers the hours a shell may sit open.
-fn spawn_refresher(
-    dir: PathBuf,
-    paused: Arc<AtomicBool>,
-) -> (Receiver<Result<Vec<Tree>>>, Sender<()>) {
-    let (trees_tx, trees_rx) = mpsc::channel();
-    let (kick_tx, kick_rx) = mpsc::channel::<()>();
-    thread::spawn(move || {
-        loop {
-            if !paused.load(Ordering::Relaxed) && trees_tx.send(pool::load(&dir)).is_err() {
-                return;
-            }
-            if let Err(RecvTimeoutError::Disconnected) = kick_rx.recv_timeout(REFRESH) {
-                return;
-            }
-        }
-    });
-    (trees_rx, kick_tx)
-}
-
-fn run(term: &mut Term, app: &mut App, dir: &Path) -> Result<()> {
-    let paused = Arc::new(AtomicBool::new(false));
-    let (trees, kick) = spawn_refresher(dir.to_path_buf(), Arc::clone(&paused));
+fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<()> {
+    let refresher = Refresher::spawn(checkout.to_path_buf(), app.trees.clone());
     loop {
-        while let Ok(listing) = trees.try_recv() {
-            match listing {
-                Ok(listing) => app.set_trees(listing),
-                Err(err) => app.error = Some(format!("{err:#}")),
+        while let Ok(update) = refresher.updates.try_recv() {
+            match update {
+                Update::ListingStarted => app.is_listing = true,
+                Update::Listing(listing) => {
+                    app.is_listing = false;
+                    match listing {
+                        Ok(listing) => app.set_trees(listing),
+                        Err(err) => app.error = Some(format!("{err:#}")),
+                    }
+                }
+                Update::Processes(processes) => app.apply_processes(&processes),
+                Update::Work(work) => app.apply_work(&work),
             }
         }
         term.draw(|frame| ui::draw(frame, app))?;
@@ -92,22 +74,23 @@ fn run(term: &mut Term, app: &mut App, dir: &Path) -> Result<()> {
         match app.handle_key(key) {
             Outcome::Continue => {}
             Outcome::Quit => return Ok(()),
+            Outcome::Refresh => refresher.refresh(),
             Outcome::Enter(tree) if tmux::is_inside() => {
                 app.message = Some(tmux::open(&tree).unwrap_or_else(|err| format!("{err:#}")));
             }
             Outcome::Enter(tree) => {
                 leave_screen()?;
-                paused.store(true, Ordering::Relaxed);
+                refresher.set_paused(true);
                 actions::shell(&tree.path);
-                paused.store(false, Ordering::Relaxed);
+                refresher.set_paused(false);
                 *term = enter_screen()?;
-                let _ = kick.send(());
+                refresher.refresh();
             }
             Outcome::Run(pending) => {
                 leave_screen()?;
                 actions::perform(&pending);
                 *term = enter_screen()?;
-                let _ = kick.send(());
+                refresher.refresh();
             }
         }
     }
@@ -125,6 +108,9 @@ fn main() -> Result<()> {
     }));
 
     let mut app = App::new(Some(start));
+    if let Some(cached) = cache::read(&checkout) {
+        app.set_cached(cached);
+    }
     let mut term = enter_screen()?;
     let result = run(&mut term, &mut app, &checkout);
     leave_screen()?;

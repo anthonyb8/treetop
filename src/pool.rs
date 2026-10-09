@@ -1,6 +1,7 @@
-//! The pool as treehouse reports it, plus what git says about each held tree.
-//! treetop never reads treehouse's own files: `treehouse status --json` is the
-//! only interface, so a treehouse upgrade cannot leave it reading stale state.
+//! The pool as treehouse reports it. treetop never reads treehouse's own files:
+//! `treehouse status --json` is the only source of pool state, so a treehouse
+//! upgrade cannot leave it reading stale state. Processes and git state, which
+//! change by the second, come from `live` instead.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -100,8 +101,9 @@ pub fn parse(json: &str) -> Result<Vec<Tree>> {
     Ok(trees)
 }
 
-/// The pool of the repository `dir` belongs to, with git's view of each held tree.
-pub fn load(dir: &Path) -> Result<Vec<Tree>> {
+/// The pool of the repository `dir` belongs to, and the raw JSON it was read
+/// from, for the cache.
+pub fn status(dir: &Path) -> Result<(Vec<Tree>, String)> {
     let out = Command::new("treehouse")
         .args(["status", "--json"])
         .current_dir(dir)
@@ -113,15 +115,16 @@ pub fn load(dir: &Path) -> Result<Vec<Tree>> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    let mut trees = parse(&String::from_utf8_lossy(&out.stdout))?;
-    for tree in trees.iter_mut().filter(|t| t.is_held()) {
-        tree.work = work(&tree.path);
-    }
-    Ok(trees)
+    let raw = String::from_utf8_lossy(&out.stdout).into_owned();
+    Ok((parse(&raw)?, raw))
 }
 
-fn git(dir: &Path, args: &[&str]) -> Option<String> {
+/// Runs git in `dir`. `--no-optional-locks` keeps a status check, run every
+/// couple of seconds, from taking the index lock out from under whoever is
+/// working in the tree.
+pub fn git(dir: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new("git")
+        .arg("--no-optional-locks")
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -130,15 +133,6 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-fn work(dir: &Path) -> Option<Work> {
-    let changed = git(dir, &["status", "--porcelain"])?.lines().count();
-    let unpushed = git(dir, &["rev-list", "--count", "HEAD", "--not", "--remotes"])?
-        .trim()
-        .parse()
-        .ok()?;
-    Some(Work { changed, unpushed })
 }
 
 /// The main checkout of the repository `dir` is in. treetop runs from there,

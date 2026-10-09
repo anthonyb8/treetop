@@ -10,14 +10,15 @@ use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState};
 use crate::app::{Action, App, Pending};
 use crate::pool::{Tree, Work};
 
-const KEYS: [(&str, &str); 8] = [
+const KEYS: [(&str, &str); 9] = [
     ("Space", "mark"),
     ("u", "unmark"),
     ("/", "filter"),
-    ("Enter", "cd"),
+    ("Enter", "open"),
     ("r", "return"),
     ("D", "destroy"),
     ("j/k", "move"),
+    ("^R", "refresh"),
     ("q", "quit"),
 ];
 
@@ -62,7 +63,31 @@ fn summary_line(app: &App) -> Paragraph<'static> {
         Span::raw(format!("  {} trees  {held} held  ", app.trees.len())),
         Span::styled(format!("{running} running"), Style::new().fg(Color::Yellow)),
         Span::raw(format!("  {} marked", app.marked.len())),
+        freshness(app),
+        if app.is_listing {
+            Span::styled("  refreshing...", Style::new().fg(Color::Cyan))
+        } else {
+            Span::raw("")
+        },
     ]))
+}
+
+/// How old the pool listing is. Processes and git counts are always within a
+/// couple of seconds; this is about leases, which only treehouse knows.
+fn freshness(app: &App) -> Span<'static> {
+    if app.is_cached {
+        return Span::styled("  cached listing", Style::new().fg(Color::Yellow));
+    }
+    let Some(at) = app.listed_at else {
+        return Span::raw("");
+    };
+    let age = at.elapsed().as_secs();
+    let age = if age < 60 {
+        format!("{age}s")
+    } else {
+        format!("{}m", age / 60)
+    };
+    Span::raw(format!("  listed {age} ago"))
 }
 
 fn count_cell(value: Option<usize>, color: Color) -> Cell<'static> {
@@ -114,6 +139,11 @@ fn row(app: &App, tree: &Tree) -> Row<'static> {
         work_cell(tree, |w| w.changed, Color::Red),
         work_cell(tree, |w| w.unpushed, Color::Magenta),
     ])
+    .style(if app.is_cached {
+        Style::new().add_modifier(Modifier::ITALIC)
+    } else {
+        Style::new()
+    })
 }
 
 fn draw_table(frame: &mut Frame, app: &App, area: Rect) {

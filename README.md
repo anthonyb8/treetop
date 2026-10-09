@@ -40,14 +40,19 @@ Run `treetop` from anywhere inside a pooled repository.
 | `r` | return the marked trees, or the one under the cursor, to the pool |
 | `D` | destroy them from disk |
 | Enter | open the tree: a tmux window inside tmux, else a shell |
+| `Ctrl-R` | list the pool again now |
 | `q`, Esc | quit |
 
 The columns are what a destroy would lose.
 CHANGED counts uncommitted files and UNPUSHED counts commits on no remote; `?` means git could not read a held tree, which deserves a look before it goes.
 PROCS counts processes treehouse found running inside the tree.
 
-The list refreshes every 10 seconds and after every action.
-`treehouse status` scans every process on the machine, so a shorter interval would keep a core busy.
+treetop refreshes on two clocks, the way htop stays fast.
+Processes come straight from `/proc` every 2 seconds and git counts every 4, which together cost under 5% of one core.
+The pool itself comes from `treehouse status`, which takes seconds of CPU, so it is listed only when `git worktree list` changes (a tree leased, returned or destroyed), after every action, on `Ctrl-R`, and every 2 minutes as a backstop.
+The summary line says how old that listing is.
+
+On opening, treetop draws the last listing it saved under `$XDG_CACHE_HOME/treetop` (else `~/.cache/treetop`) at once, in italics and marked "cached listing", until a live one lands.
 
 ## What the actions run
 
