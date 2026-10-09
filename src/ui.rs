@@ -30,6 +30,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
     ])
     .areas(frame.area());
 
+    // White is the base for every cell; widgets below only add accents, so
+    // nothing falls back to a terminal theme's default or dim foreground.
+    frame.render_widget(
+        Block::new().style(Style::new().fg(Color::White)),
+        frame.area(),
+    );
     frame.render_widget(summary_line(app), summary);
     draw_table(frame, app, body);
     frame.render_widget(detail_pane(app), detail);
@@ -46,7 +52,7 @@ fn summary_line(app: &App) -> Paragraph<'static> {
     if !app.is_loaded {
         return Paragraph::new(Line::from(vec![
             Span::styled("treetop", Style::new().add_modifier(Modifier::BOLD)),
-            Span::styled("  reading the pool...", Style::new().fg(Color::DarkGray)),
+            Span::styled("  reading the pool...", Style::new().fg(Color::White)),
         ]));
     }
     let held = app.trees.iter().filter(|t| t.is_held()).count();
@@ -61,9 +67,9 @@ fn summary_line(app: &App) -> Paragraph<'static> {
 
 fn count_cell(value: Option<usize>, color: Color) -> Cell<'static> {
     match value {
-        Some(0) => Cell::from("0").style(Style::new().fg(Color::DarkGray)),
+        Some(0) => Cell::from("0").style(Style::new().fg(Color::White)),
         Some(n) => Cell::from(n.to_string()).style(Style::new().fg(color)),
-        None => Cell::from("-").style(Style::new().fg(Color::DarkGray)),
+        None => Cell::from("-").style(Style::new().fg(Color::White)),
     }
 }
 
@@ -90,12 +96,12 @@ fn row(app: &App, tree: &Tree) -> Row<'static> {
     };
     let status_color = match tree.status.as_str() {
         "leased" => Color::Green,
-        "available" => Color::DarkGray,
+        "available" => Color::White,
         _ => Color::Red,
     };
     let branch = match &tree.branch {
         Some(b) => Cell::from(b.clone()),
-        None => Cell::from("(detached)").style(Style::new().fg(Color::DarkGray)),
+        None => Cell::from("(detached)").style(Style::new().fg(Color::White)),
     };
     let procs = (!tree.processes.is_empty() || tree.is_held()).then_some(tree.processes.len());
     Row::new(vec![
@@ -114,7 +120,12 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
     let header = Row::new([
         "", "#", "STATUS", "BRANCH", "HOLDER", "PROCS", "CHANGED", "UNPUSHED",
     ])
-    .style(Style::new().fg(Color::Black).bg(Color::Green));
+    .style(
+        Style::new()
+            .fg(Color::White)
+            .bg(Color::Blue)
+            .add_modifier(Modifier::BOLD),
+    );
     let rows: Vec<Row> = app.visible().into_iter().map(|t| row(app, t)).collect();
     let widths = [
         Constraint::Length(1),
@@ -134,7 +145,7 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn detail_pane(app: &App) -> Paragraph<'static> {
-    let block = Block::bordered().border_style(Style::new().fg(Color::DarkGray));
+    let block = Block::bordered().border_style(Style::new().fg(Color::White));
     let Some(tree) = app.current() else {
         let text = if app.is_loaded { "no trees match" } else { "" };
         return Paragraph::new(text).block(block);
@@ -160,11 +171,11 @@ fn detail_pane(app: &App) -> Paragraph<'static> {
             ),
             Span::styled(
                 since.map(|s| format!("  leased {s}")).unwrap_or_default(),
-                Style::new().fg(Color::DarkGray),
+                Style::new().fg(Color::White),
             ),
         ]),
         Line::from(vec![
-            Span::styled("processes ", Style::new().fg(Color::DarkGray)),
+            Span::styled("processes ", Style::new().fg(Color::White)),
             Span::raw(procs),
         ]),
     ])
@@ -184,7 +195,10 @@ fn footer_line(app: &App) -> Paragraph<'static> {
             Style::new().fg(Color::Yellow),
         ));
     }
-    let key = Style::new().fg(Color::Black).bg(Color::Cyan);
+    let key = Style::new()
+        .fg(Color::White)
+        .bg(Color::Blue)
+        .add_modifier(Modifier::BOLD);
     let mut spans: Vec<Span> = KEYS
         .iter()
         .flat_map(|(k, label)| {
@@ -244,7 +258,7 @@ fn draw_confirm(frame: &mut Frame, pending: &Pending) {
             Action::Return => " y returns them to the pool; any other key cancels",
             Action::Destroy => " y shows treehouse's preview for each, then asks again",
         },
-        Style::new().fg(Color::DarkGray),
+        Style::new().fg(Color::White),
     ));
     let title = format!(
         " {} {} tree(s)? ",
