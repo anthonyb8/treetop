@@ -1530,6 +1530,7 @@ name = "treetop"
 version = "0.1.8"
 dependencies = [
  "anyhow",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",

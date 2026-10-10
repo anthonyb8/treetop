@@ -1,7 +1,9 @@
 //! Two clocks, which is how htop stays fast. Processes and git state change by
 //! the second and cost milliseconds to read, so a fast clock reads processes
-//! every FAST and git state every GIT_EVERY ticks: git runs as child processes
-//! and is most of treetop's idle CPU, so it gets half the rate. Pool state
+//! and their ports every FAST, and git state and agents every GIT_EVERY ticks:
+//! git runs as child processes and is most of treetop's idle CPU, and agents
+//! move between trees far less often than processes start, so both get half
+//! the rate. Even then git only runs for the trees `watch` says changed. Pool state
 //! changes only when a tree is leased, returned or destroyed, and `treehouse
 //! status` costs seconds of CPU, so the slow clock lists it only when `git
 //! worktree list` changes, when asked, and every SLOW as a backstop.
@@ -16,9 +18,11 @@ use std::time::Duration;
 
 use anyhow::Result;
 
+use crate::agents::{self, Agent};
 use crate::cache;
 use crate::live;
 use crate::pool::{self, Process, Tree, Work};
+use crate::watch::Watcher;
 
 const FAST: Duration = Duration::from_secs(2);
 const SLOW: Duration = Duration::from_secs(120);
@@ -29,6 +33,7 @@ pub enum Update {
     Listing(Result<Vec<Tree>>),
     Processes(HashMap<PathBuf, Vec<Process>>),
     Work(HashMap<PathBuf, Option<Work>>),
+    Agents(HashMap<PathBuf, Vec<Agent>>),
 }
 
 pub struct Refresher {
@@ -117,14 +122,27 @@ fn fast(
 ) {
     let mut seen = None;
     let mut tick: u32 = 0;
+    let mut watcher = Watcher::new();
+    // The latest git counts of every held tree, so a tree that is not read
+    // again keeps its counts and an unpushed-only read keeps its changed count.
+    let mut work: HashMap<PathBuf, Option<Work>> = HashMap::new();
     loop {
         if !paused.load(Ordering::Relaxed) {
             let known = trees.lock().unwrap_or_else(PoisonError::into_inner).clone();
+            // Drained every tick so a burst of writes cannot overflow the queue.
+            watcher.drain();
             if !known.is_empty() {
-                let mut sent = updates.send(Update::Processes(live::processes(&known)));
+                let processes = live::processes(&known);
+                let mut sent = Ok(());
                 if tick.is_multiple_of(GIT_EVERY) {
-                    sent = sent.and_then(|()| updates.send(Update::Work(live::work(&known))));
+                    let agents = agents::find(&known, &processes);
+                    work.extend(live::work(watcher.take(&known, &work)));
+                    work.retain(|path, _| known.iter().any(|t| t.is_held() && t.path == *path));
+                    sent = updates
+                        .send(Update::Work(work.clone()))
+                        .and_then(|()| updates.send(Update::Agents(agents)));
                 }
+                sent = sent.and_then(|()| updates.send(Update::Processes(processes)));
                 if sent.is_err() {
                     return;
                 }

@@ -7,6 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 
+use crate::agents::{Agent, Status};
 use crate::app::{App, DiffView, JobState, Pane, Pending, Review};
 use crate::diff::{Change, FileDiff, Layout as DiffLayout, Row as DiffRow, Side, ViewRow};
 use crate::pool::{Tree, Work};
@@ -14,9 +15,11 @@ use crate::theme::theme;
 
 /// Most useful first: on a narrow bar the keys at the end are the ones left
 /// out.
-const KEYS: [(&str, &str); 11] = [
+const KEYS: [(&str, &str); 13] = [
     ("Enter", "open"),
     ("Tab", "diff"),
+    ("o", "browse"),
+    ("a", "no agent"),
     ("Space", "mark"),
     ("r", "return"),
     ("D", "destroy"),
@@ -56,7 +59,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let [body, detail, footer] = Layout::vertical([
         Constraint::Fill(1),
         if app.pane == Pane::Info {
-            Constraint::Length(4)
+            Constraint::Length(6)
         } else {
             Constraint::Fill(1)
         },
@@ -94,11 +97,28 @@ fn summary(app: &App) -> Vec<Span<'static>> {
     if app.is_loaded {
         let held = app.trees.iter().filter(|t| t.is_held()).count();
         let running = app.trees.iter().filter(|t| !t.processes.is_empty()).count();
+        let serving = app.trees.iter().filter(|t| !t.ports().is_empty()).count();
+        let agents = app.trees.iter().map(|t| t.agents.len()).sum::<usize>();
+        let waiting = app
+            .trees
+            .iter()
+            .flat_map(|t| &t.agents)
+            .filter(|a| a.status == Some(Status::Waiting))
+            .count();
         spans.push(Span::raw(format!(
             "{} trees  {held} held  ",
             app.trees.len()
         )));
         spans.push(Span::styled(format!("{running} running"), fg(t.warning)));
+        spans.push(Span::styled(format!("  {serving} serving"), fg(t.info)));
+        let noun = if agents == 1 { "agent" } else { "agents" };
+        spans.push(Span::raw(format!("  {agents} {noun}")));
+        if waiting > 0 {
+            spans.push(Span::styled(
+                format!("  {waiting} waiting"),
+                fg(t.warning).add_modifier(Modifier::BOLD),
+            ));
+        }
         if !app.marked.is_empty() {
             spans.push(Span::raw(format!("  {} marked", app.marked.len())));
         }
@@ -183,6 +203,48 @@ fn status_cell(app: &App, tree: &Tree) -> Cell<'static> {
     Cell::from(text).style(style)
 }
 
+/// How an agent's status reads: waiting is the one that needs you, so it is
+/// the loud one; a source that cannot tell gets a plain dot.
+fn agent_style(status: Option<Status>) -> (&'static str, Style) {
+    let t = theme();
+    match status {
+        Some(Status::Waiting) => ("●", fg(t.warning).add_modifier(Modifier::BOLD)),
+        Some(Status::Busy) => ("●", fg(t.success)),
+        Some(Status::Idle) => ("○", fg(t.muted)),
+        None => ("·", Style::new()),
+    }
+}
+
+/// The first agent in the tree, and how many more. A held tree with none,
+/// once agents have been read, says so: it is the one to check on.
+fn agent_cell(app: &App, tree: &Tree) -> Cell<'static> {
+    let Some(first) = tree.agents.first() else {
+        return if tree.is_held() && app.is_agents_read {
+            Cell::from("no agent").style(fg(theme().muted))
+        } else {
+            Cell::from("")
+        };
+    };
+    let (glyph, style) = agent_style(first.status);
+    let more = match tree.agents.len() - 1 {
+        0 => String::new(),
+        n => format!(" +{n}"),
+    };
+    Cell::from(format!("{glyph} {}{more}", first.name)).style(style)
+}
+
+/// The lowest port the tree serves and how many more, `-` for none.
+fn ports_cell(tree: &Tree) -> Cell<'static> {
+    let ports = tree.ports();
+    match ports.as_slice() {
+        [] => Cell::from("-").style(fg(theme().muted)),
+        [first] => Cell::from(format!(":{first}")).style(fg(theme().info)),
+        [first, rest @ ..] => {
+            Cell::from(format!(":{first} +{}", rest.len())).style(fg(theme().info))
+        }
+    }
+}
+
 fn row(app: &App, tree: &Tree) -> Row<'static> {
     let t = theme();
     let mark = if app.marked.contains(&tree.path) {
@@ -202,8 +264,10 @@ fn row(app: &App, tree: &Tree) -> Row<'static> {
         Cell::from(tree.name.clone()),
         status_cell(app, tree),
         branch,
+        agent_cell(app, tree),
         Cell::from(tree.holder.clone().unwrap_or_default()),
         count_cell(procs, t.warning),
+        ports_cell(tree),
         work_cell(tree, |w| w.changed, t.danger),
         work_cell(tree, |w| w.unpushed, t.special),
     ])
@@ -217,7 +281,7 @@ fn row(app: &App, tree: &Tree) -> Row<'static> {
 fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
     let t = theme();
     let header = Row::new([
-        "", "#", "STATUS", "BRANCH", "HOLDER", "PROCS", "CHANGED", "UNPUSHED",
+        "", "#", "STATUS", "BRANCH", "AGENT", "HOLDER", "PROCS", "PORTS", "CHANGED", "UNPUSHED",
     ])
     .style(t.header);
     let rows: Vec<Row> = app
@@ -230,8 +294,10 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
         Constraint::Length(4),
         Constraint::Length(13),
         Constraint::Fill(1),
-        Constraint::Length(20),
+        Constraint::Length(22),
+        Constraint::Length(14),
         Constraint::Length(6),
+        Constraint::Length(11),
         Constraint::Length(8),
         Constraint::Length(9),
     ];
@@ -265,6 +331,26 @@ fn detail_pane(app: &App) -> Paragraph<'static> {
             .collect::<Vec<_>>()
             .join(", ")
     };
+    let mut ports: Vec<(u16, &str, u32)> = tree
+        .processes
+        .iter()
+        .flat_map(|p| {
+            p.ports
+                .iter()
+                .map(move |&port| (port, p.name.as_str(), p.pid))
+        })
+        .collect();
+    ports.sort_unstable();
+    ports.dedup_by_key(|(port, _, _)| *port);
+    let ports = if ports.is_empty() {
+        "none".to_string()
+    } else {
+        ports
+            .iter()
+            .map(|(port, name, pid)| format!("localhost:{port} {name} ({pid})"))
+            .collect::<Vec<_>>()
+            .join("   ")
+    };
     Paragraph::new(vec![
         Line::from(vec![
             Span::styled(
@@ -276,12 +362,57 @@ fn detail_pane(app: &App) -> Paragraph<'static> {
                 fg(t.muted),
             ),
         ]),
+        agents_line(app, tree),
+        Line::from(vec![
+            Span::styled("ports     ", fg(t.muted)),
+            Span::raw(ports),
+        ]),
         Line::from(vec![
             Span::styled("processes ", fg(t.muted)),
             Span::raw(procs),
         ]),
     ])
     .block(pane_block())
+}
+
+/// Each agent with its status, where it was seen and its pid.
+fn agents_line(app: &App, tree: &Tree) -> Line<'static> {
+    let t = theme();
+    let mut spans = vec![Span::styled("agents    ", fg(t.muted))];
+    if tree.agents.is_empty() {
+        let text = if app.is_agents_read {
+            "none"
+        } else {
+            "reading..."
+        };
+        spans.push(Span::raw(text));
+        return Line::from(spans);
+    }
+    for (i, agent) in tree.agents.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("   "));
+        }
+        spans.extend(agent_spans(agent));
+    }
+    Line::from(spans)
+}
+
+fn agent_spans(agent: &Agent) -> Vec<Span<'static>> {
+    let (glyph, style) = agent_style(agent.status);
+    let mut about = vec![
+        agent.source.label().to_string(),
+        format!("pid {}", agent.pid),
+    ];
+    if let Some(status) = agent.status {
+        about.insert(0, status.label().to_string());
+    }
+    if agent.is_background {
+        about.push("background".into());
+    }
+    vec![
+        Span::styled(format!("{glyph} {}", agent.name), style),
+        Span::styled(format!(" ({})", about.join(", ")), fg(theme().muted)),
+    ]
 }
 
 /// Keys as badges on a bar, as lualine draws its sections.
@@ -330,13 +461,21 @@ fn footer_left(app: &App, width: u16) -> Line<'static> {
     if let Some(message) = &app.message {
         return Line::styled(format!(" {message}"), fg(t.warning));
     }
-    let mut spans = fitting_keys(&KEYS, width);
+    // What narrows the list is placed first, so the keys give way to it
+    // rather than push it off the bar.
+    let mut narrowing = Vec::new();
+    if app.is_orphans_only {
+        narrowing.push(Span::styled(" no agent only", fg(t.accent)));
+    }
     if !app.filter.is_empty() {
-        spans.push(Span::styled(
+        narrowing.push(Span::styled(
             format!(" filter: {}", app.filter),
             fg(t.accent),
         ));
     }
+    let used = u16::try_from(narrowing.iter().map(Span::width).sum::<usize>()).unwrap_or(width);
+    let mut spans = fitting_keys(&KEYS, width.saturating_sub(used));
+    spans.extend(narrowing);
     Line::from(spans)
 }
 

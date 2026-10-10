@@ -4,7 +4,6 @@
 //! log pane instead of reaching the terminal.
 
 use std::fmt::Write as _;
-use std::io;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -114,26 +113,6 @@ fn capture(command: &mut Command, log: &mut String) -> bool {
     }
 }
 
-/// Stops the tree's stack, as `thr` does, so no dev server outlives the tree.
-/// Without the harness on PATH there is no stack to stop.
-fn stack_down(path: &Path, log: &mut String) {
-    let result = Command::new("harness")
-        .args(["stack", "down"])
-        .current_dir(path)
-        .stdin(Stdio::null())
-        .output();
-    match result {
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => {
-            let _ = writeln!(log, "harness stack down: {err}");
-        }
-        Ok(out) => {
-            log.push_str(&String::from_utf8_lossy(&out.stdout));
-            log.push_str(&String::from_utf8_lossy(&out.stderr));
-        }
-    }
-}
-
 fn treehouse(subcommand: &str, path: &Path) -> Command {
     let mut command = Command::new("treehouse");
     command.arg(subcommand).arg(path);
@@ -142,23 +121,19 @@ fn treehouse(subcommand: &str, path: &Path) -> Command {
 
 /// Runs one job to completion. Return passes `--force` because treetop's own
 /// confirm, which names every tree's uncommitted and unpushed work, has
-/// already replaced treehouse's prompt.
+/// already replaced treehouse's prompt. treehouse stops the processes left in
+/// the tree; anything started outside it, such as a container, is for
+/// whatever started it to stop.
 fn run(job: &Job) -> (bool, String) {
     let path = &job.tree.path;
     let mut log = String::new();
     let is_ok = match job.kind {
-        Kind::Return => {
-            stack_down(path, &mut log);
-            capture(treehouse("return", path).arg("--force"), &mut log)
-        }
+        Kind::Return => capture(treehouse("return", path).arg("--force"), &mut log),
         Kind::Preview => capture(treehouse("destroy", path).args(INCLUDE), &mut log),
-        Kind::Destroy => {
-            stack_down(path, &mut log);
-            capture(
-                treehouse("destroy", path).args(INCLUDE).arg("--yes"),
-                &mut log,
-            )
-        }
+        Kind::Destroy => capture(
+            treehouse("destroy", path).args(INCLUDE).arg("--yes"),
+            &mut log,
+        ),
     };
     (is_ok, log)
 }

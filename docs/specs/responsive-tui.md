@@ -23,7 +23,7 @@ It is for whoever manages a treehouse pool from a terminal, which today is one d
 **Out:**
 
 - Stack controls (`harness stack up` and `down` as user actions): specific to one setup, not to treehouse pools.
-  Return and destroy keep stopping a stack when `harness` is on PATH, as they do now.
+  Return and destroy keep stopping a stack when `harness` is on PATH, as they do now; [Who's in the tree](agents-and-ports.md) issue 1 removes that call.
 - Enter outside tmux keeps opening a shell, because a shell needs the terminal; inside tmux it already stays in the TUI.
 - A line-by-line diff viewer in issue 3 as first written; see the revision note on issue 3, which brought one in.
 - Changing treehouse itself, including reporting the slow `status` upstream: the split makes it invisible to treetop, so it is left alone.

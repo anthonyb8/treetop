@@ -9,10 +9,14 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+use crate::agents::Agent;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Process {
     pub pid: u32,
     pub name: String,
+    /// The TCP ports it listens on, lowest first.
+    pub ports: Vec<u16>,
 }
 
 /// Uncommitted files and commits on no remote: the work a destroy loses.
@@ -31,6 +35,8 @@ pub struct Tree {
     pub path: PathBuf,
     pub leased_at: Option<String>,
     pub processes: Vec<Process>,
+    /// The coding agents working in the tree, the most specific source first.
+    pub agents: Vec<Agent>,
     /// None for an available tree, which treehouse keeps clean, and when git fails.
     pub work: Option<Work>,
 }
@@ -44,6 +50,24 @@ impl Tree {
     /// `dir` is this tree or inside it, compared by path component.
     pub fn contains(&self, dir: &Path) -> bool {
         dir.starts_with(&self.path)
+    }
+
+    /// Every port a process in the tree listens on, lowest first, each once:
+    /// a server on both 127.0.0.1 and ::1 holds two sockets on one port.
+    pub fn ports(&self) -> Vec<u16> {
+        let mut ports: Vec<u16> = self
+            .processes
+            .iter()
+            .flat_map(|p| p.ports.iter().copied())
+            .collect();
+        ports.sort_unstable();
+        ports.dedup();
+        ports
+    }
+
+    /// Held, with no agent working in it: the tree most likely to be forgotten.
+    pub fn is_orphan(&self) -> bool {
+        self.is_held() && self.agents.is_empty()
     }
 }
 
@@ -89,8 +113,10 @@ pub fn parse(json: &str) -> Result<Vec<Tree>> {
                 .map(|p| Process {
                     pid: p.pid,
                     name: p.name,
+                    ports: Vec::new(),
                 })
                 .collect(),
+            agents: Vec::new(),
             work: None,
         })
         .collect();
@@ -135,6 +161,33 @@ pub fn git(dir: &Path, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// The tree's own git directory: `.git` itself in a main checkout, else the
+/// directory a linked worktree's `.git` file names. Read without running git,
+/// because it is asked for every few seconds.
+pub fn git_dir(tree: &Path) -> Option<PathBuf> {
+    let dot_git = tree.join(".git");
+    if dot_git.is_dir() {
+        return Some(dot_git);
+    }
+    let pointer = std::fs::read_to_string(&dot_git).ok()?;
+    let dir = PathBuf::from(pointer.strip_prefix("gitdir:")?.trim());
+    Some(if dir.is_relative() {
+        tree.join(dir)
+    } else {
+        dir
+    })
+}
+
+/// The directory a git dir shares with every worktree of its repository,
+/// which holds the refs: named by its `commondir` file, else the git dir
+/// itself.
+pub fn common_dir(git_dir: &Path) -> PathBuf {
+    match std::fs::read_to_string(git_dir.join("commondir")) {
+        Ok(common) => git_dir.join(common.trim()),
+        Err(_) => git_dir.to_path_buf(),
+    }
+}
+
 /// The main checkout of the repository `dir` is in. treetop runs from there,
 /// because `treehouse return` terminates every process standing in the tree it
 /// returns, and treetop must not be one of them.
@@ -175,7 +228,8 @@ mod tests {
             trees[0].processes,
             [Process {
                 pid: 42,
-                name: "node".into()
+                name: "node".into(),
+                ports: vec![]
             }]
         );
         assert!(trees[0].is_held());
@@ -187,6 +241,18 @@ mod tests {
         assert_eq!(trees[1].branch, None);
         assert_eq!(trees[1].holder, None);
         assert!(!trees[1].is_held());
+    }
+
+    #[test]
+    fn ports_are_listed_once_lowest_first_across_processes() {
+        let mut tree = parse(STATUS).unwrap().remove(0);
+        let process = |pid, ports: &[u16]| Process {
+            pid,
+            name: "node".into(),
+            ports: ports.to_vec(),
+        };
+        tree.processes = vec![process(1, &[5223, 9229]), process(2, &[5223, 3000])];
+        assert_eq!(tree.ports(), [3000, 5223, 9229]);
     }
 
     #[test]

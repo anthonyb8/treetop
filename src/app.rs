@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::agents::Agent;
 use crate::diff::Layout;
 use crate::jobs::{Job, Kind};
 use crate::pool::{Process, Tree, Work};
@@ -88,6 +89,11 @@ pub enum Outcome {
     Queue(Vec<Job>),
     /// List the pool again now rather than at the next interval.
     Refresh,
+    /// Open `http://localhost:<port>`, served from tree `tree`, in the browser.
+    Browse {
+        port: u16,
+        tree: String,
+    },
 }
 
 #[derive(Default)]
@@ -105,6 +111,12 @@ pub struct App {
     pub listed_at: Option<Instant>,
     pub filter: String,
     pub is_filtering: bool,
+    /// Only held trees with no agent are shown, for reviewing what was left
+    /// behind.
+    pub is_orphans_only: bool,
+    /// Agents have been read at least once; until then a tree with none is
+    /// unknown, not orphaned.
+    pub is_agents_read: bool,
     pub marked: BTreeSet<PathBuf>,
     pub selected: usize,
     pub pending: Option<Pending>,
@@ -159,11 +171,13 @@ impl App {
         let needle = self.filter.to_lowercase();
         self.trees
             .iter()
+            .filter(|t| !self.is_orphans_only || t.is_orphan())
             .filter(|t| {
                 needle.is_empty()
                     || [Some(&t.name), t.branch.as_ref(), t.holder.as_ref()]
                         .into_iter()
                         .flatten()
+                        .chain(t.agents.iter().map(|a| &a.name))
                         .any(|field| field.to_lowercase().contains(&needle))
             })
             .collect()
@@ -215,14 +229,24 @@ impl App {
         }
     }
 
+    /// Takes the agents read on the git clock. A tree absent from the map has
+    /// no agent working in it.
+    pub fn apply_agents(&mut self, agents: &HashMap<PathBuf, Vec<Agent>>) {
+        for tree in &mut self.trees {
+            tree.agents = agents.get(&tree.path).cloned().unwrap_or_default();
+        }
+        self.is_agents_read = true;
+    }
+
     /// Keeps the cursor on the same tree, keeps each surviving tree's probed
-    /// processes and git state until the next probe replaces them, and drops
+    /// processes, agents and git state until the next probe replaces them, and drops
     /// marks and settled job states on trees that have left the pool.
     fn replace_trees(&mut self, mut trees: Vec<Tree>) {
         let cursor = self.current().map(|t| t.path.clone());
         for tree in &mut trees {
             if let Some(old) = self.trees.iter().find(|old| old.path == tree.path) {
                 tree.processes = old.processes.clone();
+                tree.agents = old.agents.clone();
                 tree.work = old.work.filter(|_| tree.is_held());
             }
         }
@@ -423,6 +447,23 @@ impl App {
         Outcome::Queue(jobs)
     }
 
+    /// Opens the lowest port the tree under the cursor serves.
+    fn browse(&mut self) -> Outcome {
+        let Some(tree) = self.current() else {
+            return Outcome::Continue;
+        };
+        match tree.ports().first() {
+            Some(&port) => Outcome::Browse {
+                port,
+                tree: tree.name.clone(),
+            },
+            None => {
+                self.message = Some(format!("tree {} serves no port", tree.name));
+                Outcome::Continue
+            }
+        }
+    }
+
     fn quit(&mut self) -> Outcome {
         match self.active_jobs() {
             0 => Outcome::Quit,
@@ -521,6 +562,11 @@ impl App {
                 }
             }
             KeyCode::Char('u') => self.marked.clear(),
+            KeyCode::Char('a') => {
+                self.is_orphans_only = !self.is_orphans_only;
+                self.selected = 0;
+            }
+            KeyCode::Char('o') => return self.browse(),
             KeyCode::Char('L') => {
                 self.pane = if self.pane == Pane::Log {
                     Pane::Info
@@ -743,6 +789,7 @@ mod tests {
         let node = Process {
             pid: 1,
             name: "node".into(),
+            ports: vec![5223],
         };
         app.apply_processes(&HashMap::from([(path.clone(), vec![node])]));
         let work = Work {
@@ -853,6 +900,67 @@ mod tests {
         assert_eq!(scroll(&app), 14, "never past the last row");
         press(&mut app, KeyCode::Char('q'));
         assert!(app.view.is_none(), "q closes the view, not treetop");
+    }
+
+    fn agent(name: &str) -> Agent {
+        Agent {
+            name: name.into(),
+            pid: 1,
+            status: None,
+            source: crate::agents::Source::Process,
+            is_background: false,
+        }
+    }
+
+    #[test]
+    fn filter_matches_agent_names_and_agents_survive_a_listing() {
+        let mut app = app();
+        app.apply_agents(&HashMap::from([(
+            PathBuf::from("/p/4/app"),
+            vec![agent("codex")],
+        )]));
+        app.set_trees(app.trees.clone());
+        press(&mut app, KeyCode::Char('/'));
+        for c in "codex".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let visible: Vec<&str> = app.visible().iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(visible, ["4"]);
+    }
+
+    #[test]
+    fn a_shows_only_held_trees_with_no_agent() {
+        let mut app = app();
+        app.apply_agents(&HashMap::from([(
+            PathBuf::from("/p/4/app"),
+            vec![agent("codex")],
+        )]));
+        press(&mut app, KeyCode::Char('a'));
+        let visible: Vec<&str> = app.visible().iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(visible, ["8"]);
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.visible().len(), 3);
+    }
+
+    #[test]
+    fn o_opens_the_lowest_port_or_says_there_is_none() {
+        let mut app = app();
+        let process = Process {
+            pid: 1,
+            name: "node".into(),
+            ports: vec![5223, 9229],
+        };
+        app.apply_processes(&HashMap::from([(PathBuf::from("/p/4/app"), vec![process])]));
+        assert_eq!(
+            press(&mut app, KeyCode::Char('o')),
+            Outcome::Browse {
+                port: 5223,
+                tree: "4".into()
+            }
+        );
+        press(&mut app, KeyCode::Down);
+        assert_eq!(press(&mut app, KeyCode::Char('o')), Outcome::Continue);
+        assert_eq!(app.message.as_deref(), Some("tree 7 serves no port"));
     }
 
     #[test]

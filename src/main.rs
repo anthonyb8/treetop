@@ -1,9 +1,11 @@
-//! treetop: an htop-style view of a treehouse worktree pool, for marking trees
-//! and returning or destroying them. Run it from anywhere in a pooled
-//! repository; Enter opens the tree in a tmux window, or outside tmux in a
-//! shell that comes back to treetop when it exits.
+//! treetop: an htop-style view of a treehouse worktree pool, for seeing which
+//! agent works in each tree and what it serves, and for marking trees and
+//! returning or destroying them. Run it from anywhere in a pooled repository;
+//! Enter switches to the tree's agent or a window in the tree inside tmux, or
+//! outside tmux opens a shell that comes back to treetop when it exits.
 
 mod actions;
+mod agents;
 mod app;
 mod cache;
 mod diff;
@@ -14,10 +16,11 @@ mod refresh;
 mod theme;
 mod tmux;
 mod ui;
+mod watch;
 
 use std::io::{self, Stdout};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ratatui::Terminal;
@@ -35,6 +38,9 @@ use crate::refresh::{Refresher, Update};
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
 const TICK: Duration = Duration::from_millis(100);
+/// How often the screen is drawn when nothing has changed, for the listing's
+/// age in the summary.
+const REDRAW: Duration = Duration::from_secs(1);
 
 fn enter_screen() -> Result<Term> {
     enable_raw_mode()?;
@@ -52,8 +58,13 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<()> {
     let refresher = Refresher::spawn(checkout.to_path_buf(), app.trees.clone());
     let worker = Worker::spawn();
     let diffs = diff::Loader::spawn(diff::base(checkout));
+    // Drawn only when something changed, or every REDRAW: drawing the whole
+    // table ten times a second is most of what treetop costs while idle.
+    let mut is_stale = true;
+    let mut drawn_at = Instant::now();
     loop {
         while let Ok(update) = refresher.updates.try_recv() {
+            is_stale = true;
             match update {
                 Update::ListingStarted => app.start_listing(),
                 Update::Listing(Ok(listing)) => app.set_trees(listing),
@@ -63,9 +74,11 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<()> {
                 }
                 Update::Processes(processes) => app.apply_processes(&processes),
                 Update::Work(work) => app.apply_work(&work),
+                Update::Agents(agents) => app.apply_agents(&agents),
             }
         }
         while let Ok(event) = worker.events.try_recv() {
+            is_stale = true;
             match event {
                 jobs::Event::Started(job) => app.job_started(&job),
                 jobs::Event::Finished { job, is_ok, output } => {
@@ -78,6 +91,7 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<()> {
             }
         }
         while let Ok((path, diff)) = diffs.results.try_recv() {
+            is_stale = true;
             app.diff_loaded(path, diff);
         }
         if let Some(path) = app.wanted_diff() {
@@ -86,11 +100,17 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<()> {
         if app.is_quitting && app.active_jobs() == 0 {
             return Ok(());
         }
-        app.screen_height = term.size()?.height;
-        term.draw(|frame| ui::draw(frame, app))?;
+        if is_stale || drawn_at.elapsed() >= REDRAW {
+            app.screen_height = term.size()?.height;
+            term.draw(|frame| ui::draw(frame, app))?;
+            is_stale = false;
+            drawn_at = Instant::now();
+        }
         if !event::poll(TICK)? {
             continue;
         }
+        // A key or a resize: either way the screen is drawn again.
+        is_stale = true;
         let Event::Key(key) = event::read()? else {
             continue;
         };
@@ -101,6 +121,10 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<()> {
             Outcome::Continue => {}
             Outcome::Quit => return Ok(()),
             Outcome::Refresh => refresher.refresh(),
+            Outcome::Browse { port, tree } => {
+                app.message =
+                    Some(actions::browse(port, &tree).unwrap_or_else(|err| format!("{err:#}")));
+            }
             Outcome::Enter(tree) if tmux::is_inside() => {
                 app.message = Some(tmux::open(&tree).unwrap_or_else(|err| format!("{err:#}")));
             }
