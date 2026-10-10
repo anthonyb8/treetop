@@ -2,23 +2,27 @@
 //! tree under the cursor, and a key bar. Every colour comes from `theme`.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::buffer::Buffer;
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 
 use crate::agents::{Agent, Status};
 use crate::app::{App, DiffView, JobState, Pane, Pending, Review};
+use crate::chat::Chat;
 use crate::diff::{Change, FileDiff, Layout as DiffLayout, Row as DiffRow, Side, ViewRow};
 use crate::pool::{Tree, Work};
 use crate::theme::theme;
 
 /// Most useful first: on a narrow bar the keys at the end are the ones left
 /// out.
-const KEYS: [(&str, &str); 13] = [
-    ("Enter", "open"),
-    ("Tab", "diff"),
-    ("o", "browse"),
+const KEYS: [(&str, &str); 15] = [
+    ("t", "tree"),
+    ("c", "chat"),
+    ("d", "diff"),
+    ("n", "new agent"),
+    ("o", "open port"),
     ("a", "no agent"),
     ("Space", "mark"),
     ("r", "return"),
@@ -48,7 +52,11 @@ fn fg(color: Color) -> Style {
     Style::new().fg(color)
 }
 
-pub fn draw(frame: &mut Frame, app: &App) {
+pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>) {
+    if let Some(chat) = chat {
+        draw_chat(frame, app, chat);
+        return;
+    }
     // The theme's text colour is the base for every cell; widgets below only
     // add accents, so nothing falls back to a theme's dim default.
     frame.render_widget(Block::new().style(fg(theme().text)), frame.area());
@@ -818,6 +826,104 @@ fn draw_diff_view(frame: &mut Frame, app: &App, view: &DiffView) {
     );
 }
 
+/// An agent's chat over the whole screen, under a bar naming its branch,
+/// tree and agent and the keys out, the way the diff view takes the screen.
+/// The branch comes from the latest listing, so it follows the agent if it
+/// switches branches.
+fn draw_chat(frame: &mut Frame, app: &App, chat: &Chat) {
+    let t = theme();
+    let [top, body] =
+        Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(frame.area());
+    let back = key_bar(&[("^\\", "next chat"), ("^]", "back to treetop")]);
+    let back_width = u16::try_from(back.iter().map(Span::width).sum::<usize>()).unwrap_or(0);
+    let [title, keys] =
+        Layout::horizontal([Constraint::Fill(1), Constraint::Length(back_width)]).areas(top);
+    let branch = app
+        .trees
+        .iter()
+        .find(|tree| tree.name == chat.tree)
+        .and_then(|tree| tree.branch.clone())
+        .unwrap_or_else(|| "(detached)".into());
+    frame.render_widget(
+        bar(
+            "chat",
+            vec![
+                Span::styled(branch, Style::new().add_modifier(Modifier::BOLD)),
+                Span::raw(format!("  tree {}  {}", chat.tree, chat.agent)),
+            ],
+        ),
+        title,
+    );
+    frame.render_widget(Paragraph::new(Line::from(back)).style(t.bar), keys);
+    if !chat.is_ready() {
+        let [_, middle, _] = Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+        ])
+        .areas(body);
+        frame.render_widget(
+            Paragraph::new(format!("opening {}...", chat.agent))
+                .style(fg(t.muted))
+                .centered(),
+            middle,
+        );
+        return;
+    }
+    if let Some(cursor) = draw_screen(chat.screen(), frame.buffer_mut(), body) {
+        frame.set_cursor_position(cursor);
+    }
+}
+
+fn terminal_color(color: vt100::Color) -> Color {
+    match color {
+        vt100::Color::Default => Color::Reset,
+        vt100::Color::Idx(index) => Color::Indexed(index),
+        vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
+}
+
+/// Copies a terminal screen into `area` of the buffer, cell by cell, with
+/// its colours and attributes. Returns where the cursor goes, None when the
+/// program has hidden it or it lies outside the area.
+fn draw_screen(screen: &vt100::Screen, buffer: &mut Buffer, area: Rect) -> Option<Position> {
+    for row in 0..area.height {
+        for col in 0..area.width {
+            let Some(cell) = screen.cell(row, col) else {
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            let mut style = Style::new()
+                .fg(terminal_color(cell.fgcolor()))
+                .bg(terminal_color(cell.bgcolor()));
+            for (is_on, modifier) in [
+                (cell.bold(), Modifier::BOLD),
+                (cell.dim(), Modifier::DIM),
+                (cell.italic(), Modifier::ITALIC),
+                (cell.underline(), Modifier::UNDERLINED),
+                (cell.inverse(), Modifier::REVERSED),
+            ] {
+                if is_on {
+                    style = style.add_modifier(modifier);
+                }
+            }
+            let symbol = if cell.has_contents() {
+                cell.contents()
+            } else {
+                " "
+            };
+            if let Some(target) = buffer.cell_mut((area.x + col, area.y + row)) {
+                target.set_symbol(symbol).set_style(style);
+            }
+        }
+    }
+    let (row, col) = screen.cursor_position();
+    (!screen.hide_cursor() && row < area.height && col < area.width)
+        .then(|| Position::new(area.x + col, area.y + row))
+}
+
 /// Every finished job's output, newest at the bottom, scrolled up by
 /// `log_scroll` lines.
 fn log_pane(app: &App, height: u16) -> Paragraph<'static> {
@@ -853,4 +959,27 @@ fn log_pane(app: &App, height: u16) -> Paragraph<'static> {
                 .title(" log ")
                 .title_bottom(" PgUp/PgDn scroll   L closes "),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copies_a_terminal_screen_with_its_colours_and_cursor() {
+        let mut parser = vt100::Parser::new(3, 10, 0);
+        parser.process(b"hi \x1b[1;31mred\x1b[0m\r\n\x1b[7mrev\x1b[0m");
+        let area = Rect::new(2, 1, 10, 3);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 4));
+        let cursor = draw_screen(parser.screen(), &mut buffer, area);
+        let cell = |x, y| buffer.cell((x, y)).unwrap().clone();
+        assert_eq!(cell(2, 1).symbol(), "h");
+        assert_eq!(cell(5, 1).symbol(), "r");
+        assert_eq!(cell(5, 1).fg, Color::Indexed(1));
+        assert!(cell(5, 1).modifier.contains(Modifier::BOLD));
+        assert!(cell(2, 2).modifier.contains(Modifier::REVERSED));
+        assert_eq!(cursor, Some(Position::new(5, 2)));
+        parser.process(b"\x1b[?25l");
+        assert_eq!(draw_screen(parser.screen(), &mut buffer, area), None);
+    }
 }

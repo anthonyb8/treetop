@@ -4,10 +4,13 @@
 //! pid is alive, so an agent that crashes leaves nothing stale on screen.
 //!
 //! ```json
-//! { "name": "fix-login", "pid": 4242, "status": "waiting" }
+//! { "name": "fix-login", "pid": 4242, "status": "waiting", "attach": ["my-agent", "attach", "fix-login"] }
 //! ```
 //!
-//! `status`, one of `busy`, `idle` or `waiting`, is optional.
+//! `status`, one of `busy`, `idle` or `waiting`, and `attach`, the command
+//! that opens the agent's chat in a terminal, are optional. treetop runs
+//! `attach` only when `c` is pressed on the tree; the git dir is never cloned,
+//! so only someone who can already write to the repository can set it.
 
 use std::fs;
 use std::path::Path;
@@ -23,6 +26,8 @@ struct Holder {
     pid: u32,
     #[serde(default)]
     status: Option<String>,
+    #[serde(default)]
+    attach: Option<Vec<String>>,
 }
 
 fn parse(text: &str) -> Option<Agent> {
@@ -33,6 +38,7 @@ fn parse(text: &str) -> Option<Agent> {
         status: holder.status.as_deref().and_then(Status::parse),
         source: Source::Holder,
         is_background: false,
+        attach: holder.attach.filter(|command| !command.is_empty()),
     })
 }
 
@@ -91,6 +97,20 @@ mod tests {
         assert_eq!(read(&malformed), None);
         let absent = worktree("absent", None);
         assert_eq!(read(&absent), None);
+    }
+
+    #[test]
+    fn reads_an_attach_command_and_treats_an_empty_one_as_none() {
+        let agent = parse(r#"{"name":"a","pid":1,"attach":["my-agent","attach","a"]}"#).unwrap();
+        assert_eq!(
+            agent.attach,
+            Some(vec!["my-agent".into(), "attach".into(), "a".into()])
+        );
+        assert_eq!(
+            parse(r#"{"name":"a","pid":1,"attach":[]}"#).unwrap().attach,
+            None
+        );
+        assert_eq!(parse(r#"{"name":"a","pid":1}"#).unwrap().attach, None);
     }
 
     #[test]

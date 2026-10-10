@@ -39,12 +39,14 @@ Run `treetop` from anywhere inside a pooled repository.
 | `u` | clear the marks |
 | `/` | filter by number, branch, holder or agent; Enter keeps it, Esc clears it |
 | `a` | show only held trees with no agent, or everything again |
-| `o` | open the lowest port the tree serves, `http://localhost:<port>`, in the browser |
+| `o` | open the lowest port the tree serves, `http://localhost:<port>`, in the browser, or copy it to the clipboard where there is no desktop |
 | `r` | return the marked trees, or the one under the cursor, to the pool |
 | `D` | destroy them from disk, after reviewing treehouse's preview of each |
-| `Tab` | open the side-by-side diff of the tree under the cursor |
+| `d` | open the side-by-side diff of the tree under the cursor |
 | `L` | show or hide the log of every action's output; PgUp and PgDn scroll it |
-| Enter | open the tree: its agent's pane or a window inside tmux, else a shell |
+| `t` | go to the tree: its agent's pane or a window inside tmux, else a shell |
+| `c` | open the agent's chat inside treetop; Ctrl+] comes back (see [Agent chats](#agent-chats)) |
+| `n` | start a new agent in the tree, leasing it first if it is available, and open its chat |
 | `Ctrl-R` | list the pool again now |
 | `q`, Esc | quit |
 
@@ -53,6 +55,7 @@ In a true-colour terminal (`COLORTERM=truecolor`) treetop draws in gruvbox-mater
 The columns are what a destroy would lose.
 CHANGED counts uncommitted files and UNPUSHED counts commits on no remote; `?` means git could not read a held tree, which deserves a look before it goes.
 PROCS counts processes running inside the tree, and PORTS the TCP ports they listen on: the lowest, and how many more.
+`o` opens the lowest in the browser on a desktop; on a server reached over SSH it copies the URL to the clipboard of the computer you are typing at, through the terminal (OSC 52; inside tmux, `set-clipboard on`).
 AGENT names the coding agent working in the tree, from the sources under [Agents](#agents); `no agent` on a held tree marks one nobody is working in, which `a` lists on its own.
 
 treetop refreshes on two clocks, the way htop stays fast.
@@ -67,7 +70,7 @@ On opening, treetop draws the last listing it saved under `$XDG_CACHE_HOME/treet
 
 ## The diff
 
-`Tab` opens the tree under the cursor in a full-screen, side-by-side diff, the way a pull request shows it: everything its branch changes against the pool's base (`base_branch` in `treehouse.toml`, else `origin/HEAD`), measured from their merge base, plus uncommitted and untracked files.
+`d` opens the tree under the cursor in a full-screen, side-by-side diff, the way a pull request shows it: everything its branch changes against the pool's base (`base_branch` in `treehouse.toml`, else `origin/HEAD`), measured from their merge base, plus uncommitted and untracked files.
 Removed lines sit on the left and the added lines that replace them on the right, row by row, with line numbers on both sides; within a changed line, the words that differ are highlighted.
 Every file runs in one scroll, each under a header with its path and its additions and deletions, and the header of the file you are reading stays pinned to the top.
 Its colours are the diff highlight groups Neovim uses under gruvbox-material (medium): `DiffDelete` and `DiffAdd` behind lines, `LineNr` for numbers, `diffLine` for hunks, `diffFile` for paths.
@@ -93,10 +96,10 @@ A pid two sources both see counts once, where the more specific source saw it; a
 
 - **`agent.json`**, an open convention any agent or wrapper can follow: a file in the tree's own git directory (`git rev-parse --git-dir`), where `git status` never sees it.
   It counts while its `pid` is alive, so an agent that crashes leaves nothing stale behind.
-  `status`, one of `busy`, `idle` or `waiting`, is optional.
+  `status`, one of `busy`, `idle` or `waiting`, is optional, and so is `attach`, the command that opens the agent's chat in a terminal, which `c` runs.
 
   ```json
-  { "name": "fix-login", "pid": 4242, "status": "waiting" }
+  { "name": "fix-login", "pid": 4242, "status": "waiting", "attach": ["my-agent", "attach", "fix-login"] }
   ```
 
 - **Claude Code**, whose `EnterWorktree` moves a session into a tree without changing its process's working directory.
@@ -120,14 +123,41 @@ Their output goes to the log (`L`), and a failure also shows its last line in th
 
 The tree treetop was started in is never a target, because returning or destroying it would kill the shell standing in it.
 
+## Agent chats
+
+`c` opens the chat of the agent in the tree under the cursor inside treetop, over the whole screen, the way `d` opens the diff.
+**Ctrl+]** always comes back to the list as you left it, whatever the chat is doing, and `c` on another tree opens that one.
+**Ctrl+\\** goes straight to the next agent's chat, down the list as filtered, skipping trees with none and wrapping at the end; the cursor follows, so Ctrl+] lands on the tree you were last in.
+Neither key is a Claude Code default.
+The agent's session keeps running after you leave.
+
+A chat shows "opening" until its first screen has finished drawing, and is drawn a whole frame at a time, so it never flashes half-drawn.
+A chat you leave keeps running in the background with its screen current, so `c` on it again is instant; treetop keeps the 8 most recently left, and ends them when their agent goes away or treetop quits.
+
+treetop runs the chat in a terminal of its own and draws it, so nothing the chat does to its terminal reaches yours, and treetop keeps refreshing behind it.
+Keys and pastes go to the chat; the mouse wheel does not. To scroll, Ctrl+O opens Claude's transcript view, where j/k move a line and Ctrl+u/Ctrl+d half a page; PgUp and PgDn also work where a keyboard has them.
+
+A background Claude Code session (started with `claude --bg`, or backgrounded) opens with `claude attach`, which never starts a second copy.
+Ctrl+Z also leaves it; double Ctrl+C or `←` on an empty prompt opens Claude's own list of sessions inside the chat instead.
+
+An agent with an `attach` command in its `agent.json` opens the same way.
+An agent running in a tmux pane, such as an interactive `claude`, belongs to that pane and cannot be opened elsewhere: inside tmux, `c` switches to its pane, as `t` does.
+
+`n` starts a new agent in the tree under the cursor and opens its chat as soon as it shows up, so its first message is typed there.
+A tree nobody holds is leased first, with `treetop` as the holder, so the pool cannot hand it to anyone else; the agent starts on its detached HEAD and makes its own branch.
+The agent is `claude --bg`, which Claude Code's own agent view lists too, so the same chat opens from either; `TREETOP_NEW_AGENT` names another command.
+Paired with `a`, it puts an agent to work in a tree nobody is working in.
+
 ## Entering a tree
 
-Inside tmux, Enter on a tree with an agent switches to the pane that agent runs in, in whichever session it is, and never opens a new one.
+Enter does nothing, so a stray press never takes you anywhere; `t` goes to the tree.
+
+Inside tmux, `t` on a tree with an agent switches to the pane that agent runs in, in whichever session it is, and never opens a new one.
 The pane is the one whose process is the agent, its parent or its grandparent, so a pane an agent once used and something else uses now is never mistaken for it.
 `prefix` `l` comes back to treetop.
 
-Otherwise Enter opens the tree in a new window named for its branch (the part after the last `/`), or `tree N` when it has none, and treetop stays open in its own window.
-When a window of the session already has a pane in that tree, Enter switches to it instead of opening another.
+Otherwise `t` opens the tree in a new window named for its branch (the part after the last `/`), or `tree N` when it has none, and treetop stays open in its own window.
+When a window of the session already has a pane in that tree, `t` switches to it instead of opening another.
 
-Outside tmux, Enter suspends treetop and opens `$SHELL` in the tree; `exit` comes back.
+Outside tmux, `t` suspends treetop and opens `$SHELL` in the tree; `exit` comes back.
 The list does not refresh while that shell is open.

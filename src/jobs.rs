@@ -13,6 +13,8 @@ use crate::pool::Tree;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
+    /// Starts a new agent in the tree, leasing it first if nobody holds it.
+    Start,
     Return,
     /// `treehouse destroy`'s dry run, shown for review before anything goes.
     Preview,
@@ -23,6 +25,7 @@ impl Kind {
     /// The row's STATUS while the job runs.
     pub fn running(self) -> &'static str {
         match self {
+            Kind::Start => "starting",
             Kind::Return => "returning",
             Kind::Preview => "previewing",
             Kind::Destroy => "destroying",
@@ -32,6 +35,7 @@ impl Kind {
     /// The row's STATUS once the job has succeeded.
     pub fn done(self) -> &'static str {
         match self {
+            Kind::Start => "started",
             Kind::Return => "returned",
             Kind::Preview => "previewed",
             Kind::Destroy => "destroyed",
@@ -40,6 +44,7 @@ impl Kind {
 
     pub fn noun(self) -> &'static str {
         match self {
+            Kind::Start => "agent start",
             Kind::Return => "return",
             Kind::Preview => "destroy preview",
             Kind::Destroy => "destroy",
@@ -113,6 +118,44 @@ fn capture(command: &mut Command, log: &mut String) -> bool {
     }
 }
 
+/// The command `n` runs in a tree to start an agent: `TREETOP_NEW_AGENT`,
+/// split on whitespace, else Claude Code in the background, whose chat `c`
+/// opens and which Claude Code's own agent view lists too.
+fn new_agent() -> Vec<String> {
+    std::env::var("TREETOP_NEW_AGENT")
+        .ok()
+        .map(|command| {
+            command
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .filter(|command| !command.is_empty())
+        .unwrap_or_else(|| vec!["claude".into(), "--bg".into()])
+}
+
+/// Leases the tree when nobody holds it, so the pool cannot hand it to
+/// someone else under the agent, then starts the agent in it.
+fn start(tree: &Tree, log: &mut String) -> bool {
+    if !tree.is_held() {
+        let leased = capture(
+            Command::new("treehouse").args(["lease", &tree.name, "--lease-holder", "treetop"]),
+            log,
+        );
+        if !leased {
+            return false;
+        }
+    }
+    let command = new_agent();
+    let Some((program, args)) = command.split_first() else {
+        return false;
+    };
+    capture(
+        Command::new(program).args(args).current_dir(&tree.path),
+        log,
+    )
+}
+
 fn treehouse(subcommand: &str, path: &Path) -> Command {
     let mut command = Command::new("treehouse");
     command.arg(subcommand).arg(path);
@@ -128,6 +171,7 @@ fn run(job: &Job) -> (bool, String) {
     let path = &job.tree.path;
     let mut log = String::new();
     let is_ok = match job.kind {
+        Kind::Start => start(&job.tree, &mut log),
         Kind::Return => capture(treehouse("return", path).arg("--force"), &mut log),
         Kind::Preview => capture(treehouse("destroy", path).args(INCLUDE), &mut log),
         Kind::Destroy => capture(

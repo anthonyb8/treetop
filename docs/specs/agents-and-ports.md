@@ -30,7 +30,7 @@ It is for whoever runs several agents over a treehouse pool from a terminal, wit
 - Ports of containers started from a tree (a database in Docker): `docker-proxy` runs as root outside the tree, so nothing ties its sockets to one.
 - A treetop config file: the one knob, extra agent names, is an environment variable.
 - Starting or stopping dev servers.
-- Attaching to a background agent session that has no tmux pane; see Open decisions.
+- Attaching to a background agent session that has no tmux pane; issue 4 adds it, after the first three shipped.
 
 ## Design
 
@@ -82,6 +82,7 @@ It goes.
 | 1 | Ports and a richer detail pane | a PORTS column, ports in a taller detail pane, `o` to open one, and no harness call | None |
 | 2 | Agent detection | an AGENT column fed by the process scan, the holder file and Claude Code | 1 |
 | 3 | Jump to the agent, and orphans | Enter lands in the agent's pane; trees with no agent stand out | 2 |
+| 4 | Agent chat in place | `c` opens a background agent's chat inside treetop and Ctrl+] always comes back | 2 |
 
 Issue 2 depends on 1 because both widen `Process` and the detail pane; 3 needs 2's agents to know where to jump.
 
@@ -102,7 +103,7 @@ The harness loses treetop's `harness stack down` in issue 1; anyone relying on i
 
 ## Open decisions
 
-- **Attaching to a background Claude session.** A session with no tmux pane (`kind: bg`) has no pane to jump to, and resuming it in a new window could start a second copy of a running session. Until the right attach is known, Enter on such a tree falls back to the tree's window. Decide before issue 3 ships, or leave the fallback in place.
+- **Attaching to a background Claude session.** Settled by issue 4: `claude attach <id>` opens a running background session without starting a second copy.
 
 ---
 
@@ -304,6 +305,73 @@ N/A - not a bug.
 ## Open decisions
 
 None beyond the project's, on background sessions.
+
+## Links
+
+**Project:** Who's in the tree. **Blocked by:** Issue 2. **Blocks:** None.
+
+---
+
+# Issue 4: Agent chat in place
+
+## Why
+
+Every agent working in the pool runs as a background Claude Code session, with no tmux pane, so issue 3's Enter can only open a window in its tree.
+Checking on an agent means leaving treetop, finding the session and attaching by hand, then finding treetop again for the next one.
+
+## Outcome
+
+`c` opens the agent's chat inside treetop, over the whole screen the way `Tab` opens the diff; Ctrl+] always comes back to the list exactly as left, and `c` on the next tree opens that chat.
+
+## Repro
+
+N/A - not a bug.
+
+## Scope
+
+**In:**
+
+- An attach command on each agent: `claude attach <first 8 characters of the session id>` for a background Claude Code session, the short id `claude --bg` prints; an optional `attach` array in `agent.json`; none for the process scan.
+- `c`: opens the first attach command in the tree; inside tmux, an agent with a pane and no attach command is switched to, as Enter does; otherwise the status line says why nothing opened.
+- The chat runs in a pseudo-terminal treetop owns, parsed by `vt100` and drawn in treetop's frame under a bar naming the agent and the key back.
+- treetop reads every key first and keeps Ctrl+] to leave; the rest, and pastes, go to the chat.
+
+Handing the real terminal to `claude attach` was tried first and failed in a real setup (tmux with `mouse on`): Claude's own ways out are unreliable from inside a dialog, and the terminal modes it switches on were not all switched off again, so treetop came back unusable.
+Owning the terminal removes both: Ctrl+] cannot be swallowed by the chat, and the chat's modes only ever reach the parser.
+
+**Out:** forwarding the mouse (PgUp and PgDn scroll instead); attaching to interactive sessions, which Claude Code does not offer; keeping a chat alive in the background after leaving it.
+
+**Layers:**
+
+- **UI:** the `c` key, the chat view and its bar, status messages.
+- **Data:** `Agent.attach`; `src/chat.rs` owns the pseudo-terminal, the parser and key encoding.
+- **Schema:** N/A - no database.
+- **Edge / vendors / env:** `claude` on PATH for Claude Code sessions; the `vt100` crate.
+- **Tests:** key encoding for each key family and application cursor mode; Ctrl+] recognised however crossterm reports it; a parsed screen drawn with its colours, attributes and cursor; `c` choosing a chat, a pane or a message; the attach command from background and interactive session fixtures; `attach` read from `agent.json`.
+- **Risk:** the attach id is the session id's prefix, which Claude Code documents only as the id `--bg` prints; a format change shows as the chat exiting at once.
+
+**Roles:** N/A - single-user CLI.
+
+## Acceptance
+
+- [ ] On a tree with a background Claude Code session, `c` shows that session's chat inside treetop, and typing reaches it.
+- [ ] Ctrl+] returns to treetop at once, from the prompt and from inside a Claude menu, with cursor, filter and marks unchanged.
+- [ ] Ctrl+Z, which ends the attach client, also returns.
+- [ ] Afterwards treetop's keys work and the terminal has no mouse or paste mode left on.
+- [ ] Resizing while the chat is open redraws it at the new size.
+- [ ] The session keeps running after leaving, and no `claude attach` process is left behind.
+- [ ] `c` on a tree with no agent says so and stays in treetop.
+
+## Approach
+
+- `src/chat.rs` opens the terminal with `openpty`, starts the command in its own session with the terminal as its controlling terminal, reads its output on a thread, and on leaving ends its process group and reaps it off the UI thread.
+- `src/main.rs` routes every event to the open chat, Ctrl+] excepted, polls at 16 ms while one is open, and enables bracketed paste only then.
+- `src/ui.rs` `draw_screen` copies the parsed cells into the frame.
+- Measured in tmux with the user's config: Ctrl+] leaves from inside Claude's command menu; the pane's mouse and paste flags read 0 afterwards; idle CPU with no chat open is unchanged.
+
+## Open decisions
+
+None.
 
 ## Links
 

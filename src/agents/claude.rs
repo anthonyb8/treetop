@@ -8,6 +8,10 @@
 //!   name, status, kind (`interactive` or `bg`) and process start time.
 //! - `<config>/projects/<dir>/<sessionId>.jsonl`: the transcript. Every entry
 //!   carries the session's `cwd`, which after `EnterWorktree` is the tree.
+//!
+//! A background session opens in a terminal with `claude attach <id>`, where
+//! the id is the short one `claude --bg` prints: the session id's first eight
+//! characters.
 
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
@@ -61,12 +65,21 @@ fn agent(session: &Session, start: Option<u64>) -> Option<Agent> {
     if recorded.is_some_and(|recorded| recorded != start) {
         return None;
     }
+    let is_background = session.kind.as_deref() == Some("bg");
+    // An interactive session belongs to the terminal it runs in; only a
+    // background one can be attached from another.
+    let attach = session
+        .session_id
+        .get(..8)
+        .filter(|_| is_background)
+        .map(|id| vec!["claude".to_string(), "attach".to_string(), id.to_string()]);
     Some(Agent {
         name: session.name.clone().unwrap_or_else(|| "claude".into()),
         pid: session.pid,
         status: session.status.as_deref().and_then(Status::parse),
         source: Source::Claude,
-        is_background: session.kind.as_deref() == Some("bg"),
+        is_background,
+        attach,
     })
 }
 
@@ -131,7 +144,12 @@ pub fn find() -> Vec<Sighting> {
         .filter_map(|path| {
             let session: Session = serde_json::from_str(&fs::read_to_string(path).ok()?).ok()?;
             let agent = agent(&session, live::stat(session.pid).map(|s| s.start))?;
-            let cwd = last_cwd(&tail(&transcript(&projects, &session.session_id)?)?)?;
+            // A session that has had no message yet has no transcript; until
+            // it does, it works where its process runs.
+            let cwd = transcript(&projects, &session.session_id)
+                .and_then(|path| tail(&path))
+                .and_then(|tail| last_cwd(&tail))
+                .or_else(|| fs::read_link(format!("/proc/{}/cwd", session.pid)).ok())?;
             Some((cwd, agent))
         })
         .collect()
@@ -157,6 +175,20 @@ mod tests {
         assert_eq!(agent.name, "trading-card-check");
         assert_eq!(agent.status, Some(Status::Waiting));
         assert!(agent.is_background);
+        assert_eq!(
+            agent.attach,
+            Some(vec!["claude".into(), "attach".into(), "e6b79280".into()])
+        );
+    }
+
+    #[test]
+    fn an_interactive_session_has_no_attach_command() {
+        let interactive: Session =
+            serde_json::from_str(&SESSION.replace(r#""kind":"bg""#, r#""kind":"interactive""#))
+                .unwrap();
+        let agent = agent(&interactive, Some(163482243)).unwrap();
+        assert!(!agent.is_background);
+        assert_eq!(agent.attach, None);
     }
 
     #[test]

@@ -74,6 +74,9 @@ pub struct Agent {
     pub source: Source,
     /// Runs with no terminal of its own, so there is no pane to switch to.
     pub is_background: bool,
+    /// The command that opens its chat in a terminal, which `c` runs inside
+    /// treetop; None when the agent offers none.
+    pub attach: Option<Vec<String>>,
 }
 
 /// An agent and the directory it works in, before it is placed in a tree.
@@ -125,6 +128,7 @@ mod tests {
             status: None,
             source,
             is_background: false,
+            attach: None,
         }
     }
 

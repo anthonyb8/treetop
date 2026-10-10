@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -94,6 +94,13 @@ pub enum Outcome {
         port: u16,
         tree: String,
     },
+    /// Open `command`, agent `agent`'s chat in tree `tree`, inside treetop
+    /// until Ctrl+] or until it exits.
+    Chat {
+        command: Vec<String>,
+        agent: String,
+        tree: String,
+    },
 }
 
 #[derive(Default)]
@@ -138,6 +145,23 @@ pub struct App {
     /// The tree treetop was started in. Returning or destroying it would kill
     /// the shell standing in it, so it is never a target.
     pub here: Option<PathBuf>,
+    /// treetop runs inside tmux, so an agent in a pane can be switched to.
+    pub is_in_tmux: bool,
+    /// An agent `n` started, whose chat opens once it shows up.
+    awaiting_chat: Option<Awaiting>,
+}
+
+/// How long a started agent may take to show up before treetop stops
+/// waiting to open its chat.
+const AWAIT_CHAT: Duration = Duration::from_secs(30);
+
+/// A tree an agent was just started in, and the agents already there, so
+/// the new one is the one whose chat opens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Awaiting {
+    path: PathBuf,
+    known: Vec<u32>,
+    since: Instant,
 }
 
 /// The last line worth showing from a command's output, for the status line.
@@ -281,6 +305,24 @@ impl App {
                 job.tree.name,
                 last_line(&output)
             ));
+        } else if job.kind == Kind::Start {
+            self.jobs
+                .insert(path.clone(), JobState::Done(job.kind, Instant::now()));
+            let known = self
+                .trees
+                .iter()
+                .find(|t| t.path == path)
+                .map(|t| t.agents.iter().map(|a| a.pid).collect())
+                .unwrap_or_default();
+            self.message = Some(format!(
+                "agent started in tree {}; its chat opens when it shows up",
+                job.tree.name
+            ));
+            self.awaiting_chat = Some(Awaiting {
+                path,
+                known,
+                since: Instant::now(),
+            });
         } else if job.kind == Kind::Preview {
             self.jobs.remove(&path);
             self.reviews.push_back(Review {
@@ -447,6 +489,102 @@ impl App {
         Outcome::Queue(jobs)
     }
 
+    /// Opens the chat of the first agent in the tree under the cursor that
+    /// offers one. An agent in a tmux pane cannot be attached from here, so
+    /// inside tmux `c` switches to its pane instead, as Enter does.
+    fn chat(&mut self) -> Outcome {
+        let Some(tree) = self.current() else {
+            return Outcome::Continue;
+        };
+        if let Some((agent, command)) = tree
+            .agents
+            .iter()
+            .find_map(|a| Some((a, a.attach.clone()?)))
+        {
+            return Outcome::Chat {
+                command,
+                agent: agent.name.clone(),
+                tree: tree.name.clone(),
+            };
+        }
+        if self.is_in_tmux && tree.agents.iter().any(|a| !a.is_background) {
+            return Outcome::Enter(tree.clone());
+        }
+        self.message = Some(match tree.agents.first() {
+            None => format!("tree {} has no agent to open", tree.name),
+            Some(agent) => format!("{} has no chat to open in place", agent.name),
+        });
+        Outcome::Continue
+    }
+
+    /// The chat of an agent `n` started, once it has shown up in its tree
+    /// with a chat to open. Gives up after AWAIT_CHAT, saying so.
+    pub fn ready_chat(&mut self) -> Option<Outcome> {
+        let awaiting = self.awaiting_chat.as_ref()?;
+        let tree = self.trees.iter().find(|t| t.path == awaiting.path)?;
+        let started = tree
+            .agents
+            .iter()
+            .filter(|a| !awaiting.known.contains(&a.pid))
+            .find_map(|a| Some((a.name.clone(), a.attach.clone()?)));
+        if let Some((agent, command)) = started {
+            let tree = tree.name.clone();
+            self.awaiting_chat = None;
+            return Some(Outcome::Chat {
+                command,
+                agent,
+                tree,
+            });
+        }
+        if awaiting.since.elapsed() >= AWAIT_CHAT {
+            self.message = Some(format!(
+                "the agent started in tree {} has not shown up; c opens it once it does",
+                tree.name
+            ));
+            self.awaiting_chat = None;
+        }
+        None
+    }
+
+    /// The chat of the next tree down the list, as filtered, that has one,
+    /// after tree `from`, wrapping past the end. The cursor moves to that
+    /// tree, so leaving the chat lands on it. None when no other tree has a
+    /// chat to open.
+    pub fn next_chat(&mut self, from: &str) -> Option<Outcome> {
+        let visible = self.visible();
+        let start = visible.iter().position(|t| t.name == from)?;
+        let (index, agent, command, tree) = (1..visible.len())
+            .map(|step| (start + step) % visible.len())
+            .find_map(|index| {
+                let tree = visible[index];
+                let agent = tree.agents.iter().find(|a| a.attach.is_some())?;
+                Some((
+                    index,
+                    agent.name.clone(),
+                    agent.attach.clone()?,
+                    tree.name.clone(),
+                ))
+            })?;
+        self.selected = index;
+        Some(Outcome::Chat {
+            command,
+            agent,
+            tree,
+        })
+    }
+
+    /// Starts an agent in the tree under the cursor.
+    fn new_agent(&mut self) -> Outcome {
+        let Some(tree) = self.current().cloned() else {
+            return Outcome::Continue;
+        };
+        if self.jobs.get(&tree.path).is_some_and(|s| s.is_active()) {
+            self.message = Some(format!("tree {} already has an action queued", tree.name));
+            return Outcome::Continue;
+        }
+        self.queue(Kind::Start, vec![tree])
+    }
+
     /// Opens the lowest port the tree under the cursor serves.
     fn browse(&mut self) -> Outcome {
         let Some(tree) = self.current() else {
@@ -567,6 +705,8 @@ impl App {
                 self.selected = 0;
             }
             KeyCode::Char('o') => return self.browse(),
+            KeyCode::Char('c') => return self.chat(),
+            KeyCode::Char('n') => return self.new_agent(),
             KeyCode::Char('L') => {
                 self.pane = if self.pane == Pane::Log {
                     Pane::Info
@@ -575,12 +715,12 @@ impl App {
                 };
                 self.log_scroll = 0;
             }
-            KeyCode::Tab => self.open_diff(),
+            KeyCode::Char('d') => self.open_diff(),
             KeyCode::PageUp if self.pane == Pane::Log => self.log_scroll += 10,
             KeyCode::PageDown if self.pane == Pane::Log => {
                 self.log_scroll = self.log_scroll.saturating_sub(10);
             }
-            KeyCode::Enter => {
+            KeyCode::Char('t') => {
                 if let Some(tree) = self.current() {
                     return Outcome::Enter(tree.clone());
                 }
@@ -771,7 +911,7 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         let visible: Vec<&str> = app.visible().iter().map(|t| t.name.as_str()).collect();
         assert_eq!(visible, ["8"]);
-        assert!(matches!(press(&mut app, KeyCode::Enter), Outcome::Enter(t) if t.name == "8"));
+        assert!(matches!(press(&mut app, KeyCode::Char('t')), Outcome::Enter(t) if t.name == "8"));
     }
 
     #[test]
@@ -846,11 +986,11 @@ mod tests {
     }
 
     #[test]
-    fn tab_opens_the_diff_of_a_held_tree_and_reads_it_once() {
+    fn d_opens_the_diff_of_a_held_tree_and_reads_it_once() {
         let mut app = app();
         with_work(&mut app, 1);
         assert_eq!(app.wanted_diff(), None, "no view, nothing to read");
-        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('d'));
         assert_eq!(app.view.as_ref().unwrap().path, PathBuf::from("/p/4/app"));
         assert_eq!(app.wanted_diff(), Some(PathBuf::from("/p/4/app")));
         assert_eq!(app.wanted_diff(), None, "in flight");
@@ -859,7 +999,7 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         assert!(app.view.is_none());
         with_work(&mut app, 2);
-        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('d'));
         assert_eq!(
             app.wanted_diff(),
             Some(PathBuf::from("/p/4/app")),
@@ -868,10 +1008,10 @@ mod tests {
     }
 
     #[test]
-    fn tab_on_an_available_tree_says_there_is_nothing_to_diff() {
+    fn d_on_an_available_tree_says_there_is_nothing_to_diff() {
         let mut app = app();
         press(&mut app, KeyCode::Down);
-        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('d'));
         assert!(app.view.is_none());
         assert_eq!(
             app.message.as_deref(),
@@ -883,7 +1023,7 @@ mod tests {
     fn the_view_scrolls_jumps_between_files_and_stays_in_bounds() {
         let mut app = app();
         app.screen_height = 10;
-        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('d'));
         app.diff_loaded(PathBuf::from("/p/4/app"), two_files());
         let scroll = |app: &App| app.view.as_ref().unwrap().scroll;
         press(&mut app, KeyCode::Char('n'));
@@ -909,7 +1049,41 @@ mod tests {
             status: None,
             source: crate::agents::Source::Process,
             is_background: false,
+            attach: None,
         }
+    }
+
+    #[test]
+    fn c_opens_an_attachable_chat_else_the_pane_inside_tmux_else_says_why() {
+        let mut app = app();
+        let attachable = Agent {
+            is_background: true,
+            attach: Some(vec!["claude".into(), "attach".into(), "e6b79280".into()]),
+            ..agent("fix-login")
+        };
+        app.apply_agents(&HashMap::from([
+            (PathBuf::from("/p/4/app"), vec![agent("codex"), attachable]),
+            (PathBuf::from("/p/8/app"), vec![agent("codex")]),
+        ]));
+        assert_eq!(
+            press(&mut app, KeyCode::Char('c')),
+            Outcome::Chat {
+                command: vec!["claude".into(), "attach".into(), "e6b79280".into()],
+                agent: "fix-login".into(),
+                tree: "4".into()
+            }
+        );
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(press(&mut app, KeyCode::Char('c')), Outcome::Continue);
+        assert_eq!(app.message.as_deref(), Some("tree 7 has no agent to open"));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(press(&mut app, KeyCode::Char('c')), Outcome::Continue);
+        assert_eq!(
+            app.message.as_deref(),
+            Some("codex has no chat to open in place")
+        );
+        app.is_in_tmux = true;
+        assert!(matches!(press(&mut app, KeyCode::Char('c')), Outcome::Enter(t) if t.name == "8"));
     }
 
     #[test]
@@ -961,6 +1135,83 @@ mod tests {
         press(&mut app, KeyCode::Down);
         assert_eq!(press(&mut app, KeyCode::Char('o')), Outcome::Continue);
         assert_eq!(app.message.as_deref(), Some("tree 7 serves no port"));
+    }
+
+    #[test]
+    fn enter_does_nothing_and_t_goes_to_the_tree() {
+        let mut app = app();
+        assert_eq!(press(&mut app, KeyCode::Enter), Outcome::Continue);
+        assert!(matches!(press(&mut app, KeyCode::Char('t')), Outcome::Enter(t) if t.name == "4"));
+    }
+
+    #[test]
+    fn n_starts_an_agent_and_its_chat_opens_once_it_shows_up() {
+        let mut app = app();
+        app.apply_agents(&HashMap::from([(
+            PathBuf::from("/p/4/app"),
+            vec![agent("old")],
+        )]));
+        let job = queued(press(&mut app, KeyCode::Char('n'))).remove(0);
+        assert_eq!((job.kind, job.tree.name.as_str()), (Kind::Start, "4"));
+        app.job_finished(job, true, "claude attach 1234abcd".into());
+        assert_eq!(app.ready_chat(), None, "not shown up yet");
+        let started = Agent {
+            pid: 99,
+            is_background: true,
+            attach: Some(vec!["claude".into(), "attach".into(), "1234abcd".into()]),
+            ..agent("new-session")
+        };
+        let old_attachable = Agent {
+            attach: Some(vec!["claude".into(), "attach".into(), "old".into()]),
+            ..agent("old")
+        };
+        app.apply_agents(&HashMap::from([(
+            PathBuf::from("/p/4/app"),
+            vec![old_attachable, started],
+        )]));
+        assert_eq!(
+            app.ready_chat(),
+            Some(Outcome::Chat {
+                command: vec!["claude".into(), "attach".into(), "1234abcd".into()],
+                agent: "new-session".into(),
+                tree: "4".into()
+            })
+        );
+        assert_eq!(app.ready_chat(), None, "opened once");
+    }
+
+    fn attachable(name: &str) -> Agent {
+        Agent {
+            is_background: true,
+            attach: Some(vec!["claude".into(), "attach".into(), name.into()]),
+            ..agent(name)
+        }
+    }
+
+    #[test]
+    fn next_chat_goes_down_the_list_skipping_trees_without_one_and_wraps() {
+        let mut app = app();
+        app.apply_agents(&HashMap::from([
+            (PathBuf::from("/p/4/app"), vec![attachable("a")]),
+            (PathBuf::from("/p/7/app"), vec![agent("pane-only")]),
+            (PathBuf::from("/p/8/app"), vec![attachable("b")]),
+        ]));
+        let chat_in = |outcome: Option<Outcome>| match outcome {
+            Some(Outcome::Chat { agent, tree, .. }) => (agent, tree),
+            other => panic!("expected a chat, got {other:?}"),
+        };
+        assert_eq!(chat_in(app.next_chat("4")), ("b".into(), "8".into()));
+        assert_eq!(app.current().unwrap().name, "8", "the cursor follows");
+        assert_eq!(
+            chat_in(app.next_chat("8")),
+            ("a".into(), "4".into()),
+            "wraps"
+        );
+        app.apply_agents(&HashMap::from([(
+            PathBuf::from("/p/4/app"),
+            vec![attachable("a")],
+        )]));
+        assert_eq!(app.next_chat("4"), None, "no other tree has a chat");
     }
 
     #[test]
