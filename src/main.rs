@@ -27,7 +27,8 @@ use anyhow::Result;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -54,9 +55,17 @@ fn enter_screen() -> Result<Term> {
     Ok(Terminal::new(CrosstermBackend::new(io::stdout()))?)
 }
 
+/// Gives the terminal back as treetop found it. The modes a chat switches
+/// on are switched off here too, so leaving with a chat open, or on a
+/// panic, never leaves the mouse captured.
 fn leave_screen() -> Result<()> {
     disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen)?;
+    execute!(
+        io::stdout(),
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
     Ok(())
 }
 
@@ -77,16 +86,19 @@ fn open_chat(
         agent,
         tree,
     ) {
-        Ok(()) => execute!(io::stdout(), EnableBracketedPaste)?,
+        // The mouse is captured only while a chat is open, so the wheel
+        // scrolls it; on the list, the terminal keeps the mouse to itself.
+        Ok(()) => execute!(io::stdout(), EnableBracketedPaste, EnableMouseCapture)?,
         Err(err) => app.message = Some(format!("{err:#}")),
     }
     Ok(())
 }
 
-/// Switches the paste mode a chat needs off again once none is on screen.
+/// Switches the paste and mouse modes a chat needs off again once none is
+/// on screen.
 fn chat_closed(app: &mut App, agent: &str, tree: &str) -> Result<()> {
     app.message = Some(format!("back from {agent} in tree {tree}"));
-    execute!(io::stdout(), DisableBracketedPaste)?;
+    execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture)?;
     Ok(())
 }
 
@@ -199,6 +211,8 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<()> {
                     }
                 }
                 Event::Paste(text) => open.paste(&text),
+                // The chat starts on row 1, below treetop's bar.
+                Event::Mouse(mouse) => open.send_mouse(mouse, 1),
                 _ => {}
             }
             continue;

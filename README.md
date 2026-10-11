@@ -135,7 +135,9 @@ A chat shows "opening" until its first screen has finished drawing, and is drawn
 A chat you leave keeps running in the background with its screen current, so `c` on it again is instant; treetop keeps the 8 most recently left, and ends them when their agent goes away or treetop quits.
 
 treetop runs the chat in a terminal of its own and draws it, so nothing the chat does to its terminal reaches yours, and treetop keeps refreshing behind it.
-Keys and pastes go to the chat; the mouse wheel does not. To scroll, Ctrl+O opens Claude's transcript view, where j/k move a line and Ctrl+u/Ctrl+d half a page; PgUp and PgDn also work where a keyboard has them.
+Keys, pastes and the mouse go to the chat: the wheel scrolls back through it, three lines a step, and clicks work as they do in Claude itself.
+treetop takes the mouse only while a chat is open; on the list, the terminal and tmux keep it.
+From the keyboard, Ctrl+O opens Claude's transcript view, where j/k move a line and Ctrl+u/Ctrl+d half a page; PgUp and PgDn also work where a keyboard has them.
 
 A background Claude Code session (started with `claude --bg`, or backgrounded) opens with `claude attach`, which never starts a second copy.
 Ctrl+Z also leaves it; double Ctrl+C or `←` on an empty prompt opens Claude's own list of sessions inside the chat instead.

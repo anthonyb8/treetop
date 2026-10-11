@@ -17,7 +17,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
 /// Lines of scrollback kept; the chat draws its own history, so none.
 const SCROLLBACK: usize = 0;
@@ -234,6 +237,22 @@ impl Chat {
         self.write(&bytes);
     }
 
+    /// Passes a mouse event on, in the mode and encoding the chat asked for.
+    /// `top` is the screen row the chat starts on, below treetop's bar.
+    pub fn send_mouse(&mut self, event: MouseEvent, top: u16) {
+        let screen = self.screen();
+        let bytes = encode_mouse(
+            event,
+            top,
+            screen.mouse_protocol_mode(),
+            screen.mouse_protocol_encoding(),
+            screen.application_cursor(),
+        );
+        if let Some(bytes) = bytes {
+            self.write(&bytes);
+        }
+    }
+
     /// Pastes `text`, wrapped in bracketed-paste markers when the chat asked
     /// for them, so it arrives as one paste rather than as typed keys.
     pub fn paste(&mut self, text: &str) {
@@ -365,6 +384,96 @@ impl Chats {
             chat.resize(rows, cols);
         }
     }
+}
+
+/// Lines a wheel step scrolls. Claude Code moves one line per wheel event,
+/// so each step is passed on this many times, as terminals scroll their own
+/// scrollback; a chat that has not asked for the mouse gets as many arrows.
+const WHEEL_LINES: usize = 3;
+
+/// The bytes a terminal sends for a mouse event, when the chat's `mode`
+/// asks for that kind of event, in its `encoding`. Rows are shifted by
+/// `top`, the row the chat starts on; events on treetop's bar are dropped.
+/// A chat that has not asked for the mouse gets the wheel as arrow keys,
+/// which scroll most programs, the way terminals do on an alternate screen.
+fn encode_mouse(
+    event: MouseEvent,
+    top: u16,
+    mode: MouseProtocolMode,
+    encoding: MouseProtocolEncoding,
+    application_cursor: bool,
+) -> Option<Vec<u8>> {
+    let row = event.row.checked_sub(top)?;
+    if mode == MouseProtocolMode::None {
+        let arrow = match event.kind {
+            MouseEventKind::ScrollUp => KeyCode::Up,
+            MouseEventKind::ScrollDown => KeyCode::Down,
+            _ => return None,
+        };
+        let bytes = encode(KeyEvent::new(arrow, KeyModifiers::NONE), application_cursor);
+        return Some(bytes.repeat(WHEEL_LINES));
+    }
+    let button_code = |button: MouseButton| match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    };
+    let reports_release = mode != MouseProtocolMode::Press;
+    let reports_drag = matches!(
+        mode,
+        MouseProtocolMode::ButtonMotion | MouseProtocolMode::AnyMotion
+    );
+    let (code, is_release) = match event.kind {
+        MouseEventKind::ScrollUp => (64, false),
+        MouseEventKind::ScrollDown => (65, false),
+        MouseEventKind::ScrollLeft => (66, false),
+        MouseEventKind::ScrollRight => (67, false),
+        MouseEventKind::Down(button) => (button_code(button), false),
+        MouseEventKind::Up(button) if reports_release => (button_code(button), true),
+        MouseEventKind::Drag(button) if reports_drag => (button_code(button) + 32, false),
+        MouseEventKind::Moved if mode == MouseProtocolMode::AnyMotion => (35, false),
+        _ => return None,
+    };
+    let modifiers = u16::from(event.modifiers.contains(KeyModifiers::SHIFT)) * 4
+        + u16::from(event.modifiers.contains(KeyModifiers::ALT)) * 8
+        + u16::from(event.modifiers.contains(KeyModifiers::CONTROL)) * 16;
+    let (code, col, row) = (code + modifiers, event.column + 1, row + 1);
+    let is_wheel = matches!(
+        event.kind,
+        MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight
+    );
+    let bytes = match encoding {
+        MouseProtocolEncoding::Sgr => {
+            let end = if is_release { 'm' } else { 'M' };
+            format!("\x1b[<{code};{col};{row}{end}").into_bytes()
+        }
+        // The older encodings have no release code of their own: a release
+        // is button 3. Each value is offset by 32; the default encoding
+        // writes it as one byte, so it cannot pass 223, and UTF-8 as a
+        // character.
+        legacy => {
+            let code = if is_release { 3 + modifiers } else { code };
+            let mut bytes = b"\x1b[M".to_vec();
+            for value in [code, col, row] {
+                let value = value.saturating_add(32);
+                if legacy == MouseProtocolEncoding::Utf8 {
+                    let c = char::from_u32(u32::from(value)).unwrap_or(' ');
+                    bytes.extend(c.to_string().as_bytes());
+                } else {
+                    bytes.push(u8::try_from(value).unwrap_or(255));
+                }
+            }
+            bytes
+        }
+    };
+    Some(if is_wheel {
+        bytes.repeat(WHEEL_LINES)
+    } else {
+        bytes
+    })
 }
 
 /// Ctrl+\\, which goes to the next agent's chat. Without the terminal's
@@ -515,6 +624,113 @@ mod tests {
         assert_eq!(sync_state(b"\x1b[?2026hdraw\x1b[?2026l"), Some(false));
         assert_eq!(sync_state(b"\x1b[?2026l\x1b[?2026hnext"), Some(true));
         assert_eq!(sync_state(b"plain output"), None);
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn sgr(event: MouseEvent, mode: MouseProtocolMode) -> Option<Vec<u8>> {
+        encode_mouse(event, 1, mode, MouseProtocolEncoding::Sgr, false)
+    }
+
+    #[test]
+    fn passes_the_wheel_and_clicks_in_sgr_below_the_bar() {
+        let any = MouseProtocolMode::AnyMotion;
+        assert_eq!(
+            sgr(mouse(MouseEventKind::ScrollUp, 9, 5), any).unwrap(),
+            b"\x1b[<64;10;5M".repeat(WHEEL_LINES),
+            "a wheel step scrolls WHEEL_LINES lines"
+        );
+        assert_eq!(
+            sgr(mouse(MouseEventKind::ScrollDown, 0, 1), any).unwrap(),
+            b"\x1b[<65;1;1M".repeat(WHEEL_LINES)
+        );
+        assert_eq!(
+            sgr(mouse(MouseEventKind::Down(MouseButton::Left), 2, 3), any).unwrap(),
+            b"\x1b[<0;3;3M"
+        );
+        assert_eq!(
+            sgr(mouse(MouseEventKind::Up(MouseButton::Left), 2, 3), any).unwrap(),
+            b"\x1b[<0;3;3m"
+        );
+        assert_eq!(
+            sgr(mouse(MouseEventKind::ScrollUp, 2, 0), any),
+            None,
+            "on the bar"
+        );
+    }
+
+    #[test]
+    fn reports_only_what_the_mode_asks_for() {
+        let press = MouseProtocolMode::Press;
+        let release = MouseProtocolMode::PressRelease;
+        let drag = mouse(MouseEventKind::Drag(MouseButton::Left), 1, 2);
+        let up = mouse(MouseEventKind::Up(MouseButton::Left), 1, 2);
+        let moved = mouse(MouseEventKind::Moved, 1, 2);
+        assert_eq!(sgr(up, press), None);
+        assert!(sgr(up, release).is_some());
+        assert_eq!(sgr(drag, release), None);
+        assert_eq!(
+            sgr(drag, MouseProtocolMode::ButtonMotion).unwrap(),
+            b"\x1b[<32;2;2M"
+        );
+        assert_eq!(sgr(moved, MouseProtocolMode::ButtonMotion), None);
+        assert_eq!(
+            sgr(moved, MouseProtocolMode::AnyMotion).unwrap(),
+            b"\x1b[<35;2;2M"
+        );
+        assert!(sgr(mouse(MouseEventKind::ScrollUp, 1, 2), press).is_some());
+    }
+
+    #[test]
+    fn encodes_modifiers_and_the_legacy_encodings() {
+        let shifted = MouseEvent {
+            modifiers: KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+            ..mouse(MouseEventKind::Down(MouseButton::Right), 4, 6)
+        };
+        assert_eq!(
+            sgr(shifted, MouseProtocolMode::PressRelease).unwrap(),
+            b"\x1b[<22;5;6M"
+        );
+        let legacy = |kind, encoding| {
+            encode_mouse(
+                mouse(kind, 4, 6),
+                1,
+                MouseProtocolMode::PressRelease,
+                encoding,
+                false,
+            )
+        };
+        let default = MouseProtocolEncoding::Default;
+        assert_eq!(
+            legacy(MouseEventKind::Down(MouseButton::Left), default).unwrap(),
+            [0x1b, b'[', b'M', 32, 37, 38]
+        );
+        assert_eq!(
+            legacy(MouseEventKind::Up(MouseButton::Left), default).unwrap(),
+            [0x1b, b'[', b'M', 35, 37, 38]
+        );
+    }
+
+    #[test]
+    fn a_chat_without_the_mouse_gets_the_wheel_as_arrows() {
+        let none = MouseProtocolMode::None;
+        let up = mouse(MouseEventKind::ScrollUp, 1, 4);
+        assert_eq!(sgr(up, none).unwrap(), b"\x1b[A\x1b[A\x1b[A");
+        assert_eq!(
+            encode_mouse(up, 1, none, MouseProtocolEncoding::Sgr, true).unwrap(),
+            b"\x1bOA\x1bOA\x1bOA"
+        );
+        assert_eq!(
+            sgr(mouse(MouseEventKind::Down(MouseButton::Left), 1, 4), none),
+            None
+        );
     }
 
     #[test]
