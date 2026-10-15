@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
@@ -45,6 +45,113 @@ pub fn report_state(report: &Report, trees: &[Tree]) -> State {
     } else {
         report.state
     }
+}
+
+/// Which list fills the screen.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Screen {
+    #[default]
+    Trees,
+    /// What the agents have reported, the ones that need you first.
+    Inbox,
+}
+
+/// One report in the inbox, with the tree it works in and its agent while
+/// it runs.
+#[derive(Debug, Clone, Copy)]
+pub struct Item<'a> {
+    pub report: &'a Report,
+    pub tree: Option<&'a Tree>,
+    pub agent: Option<&'a Agent>,
+    pub is_read: bool,
+    /// The state the inbox goes by; see `report_state`.
+    pub state: State,
+}
+
+impl<'a> Item<'a> {
+    fn new(report: &'a Report, trees: &'a [Tree], is_read: bool) -> Self {
+        Item {
+            report,
+            tree: report.dir.as_deref().and_then(|d| pool::holding(trees, d)),
+            agent: trees
+                .iter()
+                .flat_map(|t| &t.agents)
+                .find(|a| a.job.as_deref() == Some(report.job.as_str())),
+            is_read,
+            state: report_state(report, trees),
+        }
+    }
+
+    /// Waiting at a prompt in its chat, which only its chat can answer: a
+    /// line typed in would land in the dialog, not reach it as a message.
+    pub fn is_at_prompt(&self) -> bool {
+        self.state != self.report.state
+    }
+
+    /// What it has to say, as the inbox shows it.
+    pub fn text(&self) -> &str {
+        if self.is_at_prompt() {
+            "waiting at a prompt in its chat: Enter opens it"
+        } else {
+            &self.report.text
+        }
+    }
+
+    /// Where it works, as the inbox says it: the tree's number, `main`, or
+    /// the directory's name when it is in neither.
+    pub fn place(&self) -> String {
+        match (self.tree, &self.report.dir) {
+            (Some(tree), _) => tree.name.clone(),
+            (None, Some(dir)) => dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| dir.display().to_string()),
+            (None, None) => "-".into(),
+        }
+    }
+
+    /// The command that opens its chat: its agent's while it runs, else
+    /// `claude attach <job>`, which reopens a stopped one too.
+    fn attach(&self) -> Vec<String> {
+        self.agent
+            .and_then(|a| a.attach.clone())
+            .unwrap_or_else(|| vec!["claude".into(), "attach".into(), self.report.job.clone()])
+    }
+
+    fn recipient(&self) -> Recipient {
+        Recipient {
+            agent: self.report.name.clone(),
+            tree: self.place(),
+            command: self.attach(),
+        }
+    }
+
+    /// Where it sorts: what needs you, then what is new, then what moves.
+    fn rank(&self) -> u8 {
+        match (self.state, self.is_read) {
+            (State::Blocked, false) => 0,
+            (State::Done | State::Stopped, false) => 1,
+            (State::Working, _) => 2,
+            (State::Blocked, true) => 3,
+            (State::Done | State::Stopped, true) => 4,
+        }
+    }
+}
+
+/// A workspace the picker offers: a repository treetop has been opened in,
+/// with its held trees from its last listing, None when it has none cached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Choice {
+    pub checkout: PathBuf,
+    pub name: String,
+    pub held: Option<usize>,
+}
+
+/// The workspace picker `w` opens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Picker {
+    pub choices: Vec<Choice>,
+    pub selected: usize,
 }
 
 /// What the pane under the table shows.
@@ -107,6 +214,10 @@ pub enum Outcome {
     Queue(Vec<Job>),
     /// List the pool again now rather than at the next interval.
     Refresh,
+    /// Read the workspaces and open the picker on them.
+    Workspaces,
+    /// Show the pool of the repository checked out here instead.
+    Switch(PathBuf),
     /// Open `http://localhost:<port>`, served from tree `tree`, in the browser.
     Browse {
         port: u16,
@@ -179,9 +290,20 @@ pub struct App {
     /// A chat on its way: its popup stands in from the moment the box is
     /// sent until the chat itself opens in the same frame.
     pub opening: Option<Opening>,
-    /// Every background agent's latest report, for the bell and for finding
-    /// a stopped coordinator.
+    pub screen: Screen,
+    /// The main checkout of the pool on screen, the workspace.
+    pub checkout: PathBuf,
+    /// The workspace picker, while it is open.
+    pub picker: Option<Picker>,
+    /// Every background agent's latest report, for the inbox, the bell and
+    /// finding a stopped coordinator.
     pub reports: Vec<Report>,
+    /// The job under the inbox cursor. The cursor follows the job rather
+    /// than a row, since the inbox re-sorts whenever an agent's state moves.
+    inbox_job: Option<String>,
+    /// Reports marked read, by job, at the write they were read at: a newer
+    /// write makes one unread again.
+    read: HashMap<String, SystemTime>,
     /// Each job's state at the last read, so a change can be announced;
     /// None until the first read, which announces nothing.
     last_states: Option<HashMap<String, State>>,
@@ -688,58 +810,119 @@ impl App {
     }
 
     /// Takes the latest reports. Returns what to announce: each job that has
-    /// come to need you or finished since the last read, what needs you
-    /// first.
+    /// come to need you or finished since the last read, the coordinator
+    /// included, in inbox order.
     pub fn apply_reports(&mut self, reports: Vec<Report>) -> Vec<String> {
+        self.read
+            .retain(|job, _| reports.iter().any(|r| &r.job == job));
         self.reports = reports;
-        let mut reports: Vec<(&Report, State)> = self
-            .reports
+        let items = self.items();
+        let states: HashMap<String, State> = items
             .iter()
-            .map(|r| (r, report_state(r, &self.trees)))
+            .map(|i| (i.report.job.clone(), i.state))
             .collect();
-        reports.sort_by_key(|(r, state)| (*state != State::Blocked, std::cmp::Reverse(r.updated)));
-        let news = match &self.last_states {
+        let news: Vec<String> = match &self.last_states {
             None => Vec::new(),
-            Some(last) => reports
+            Some(last) => items
                 .iter()
-                .filter(|(report, state)| {
-                    let was = last.get(&report.job).copied();
-                    match state {
+                .filter(|item| {
+                    let was = last.get(&item.report.job).copied();
+                    match item.state {
                         State::Blocked => was != Some(State::Blocked),
                         State::Done => was.is_some_and(|w| w != State::Done),
                         State::Working | State::Stopped => false,
                     }
                 })
-                .map(|(report, state)| {
-                    let text = if *state != report.state {
-                        "waiting at a prompt in its chat"
-                    } else {
-                        &report.text
-                    };
-                    format!("{} {}: {text}", report.name, state.label())
+                .map(|item| {
+                    format!(
+                        "{} {}: {}",
+                        item.report.name,
+                        item.state.label(),
+                        item.text()
+                    )
                 })
                 .collect(),
         };
-        self.last_states = Some(
-            reports
-                .iter()
-                .map(|(r, state)| (r.job.clone(), *state))
-                .collect(),
-        );
+        self.last_states = Some(states);
         news
     }
 
-    /// Reports waiting on you, for the summary.
-    pub fn needing_you(&self) -> usize {
-        self.reports
+    /// Every report in inbox order: what needs you, then what is new, then
+    /// what is still moving, then what has been read, newest first within
+    /// each.
+    fn items(&self) -> Vec<Item<'_>> {
+        let mut items: Vec<Item> = self
+            .reports
             .iter()
-            .filter(|r| report_state(r, &self.trees) == State::Blocked)
+            .map(|report| {
+                let is_read = self.read.get(&report.job) == Some(&report.updated);
+                Item::new(report, &self.trees, is_read)
+            })
+            .collect();
+        items.sort_by(|a, b| {
+            a.rank()
+                .cmp(&b.rank())
+                .then(b.report.updated.cmp(&a.report.updated))
+                .then(a.report.job.cmp(&b.report.job))
+        });
+        items
+    }
+
+    /// The inbox: every report but the coordinator's, which is talked to
+    /// through `n` rather than answered from here.
+    pub fn inbox(&self) -> Vec<Item<'_>> {
+        let mut items = self.items();
+        items.retain(|i| i.report.name != coordinator::NAME);
+        items
+    }
+
+    pub fn current_item(&self) -> Option<Item<'_>> {
+        self.inbox().get(self.inbox_selected()).copied()
+    }
+
+    /// The inbox row under the cursor: its job's row, else the first when
+    /// that job has left the inbox.
+    pub fn inbox_selected(&self) -> usize {
+        let job = self.inbox_job.as_deref();
+        self.inbox()
+            .iter()
+            .position(|i| Some(i.report.job.as_str()) == job)
+            .unwrap_or(0)
+    }
+
+    fn select_inbox(&mut self, index: usize) {
+        let items = self.inbox();
+        let index = index.min(items.len().saturating_sub(1));
+        self.inbox_job = items.get(index).map(|i| i.report.job.clone());
+    }
+
+    /// Reports waiting on you and not yet read, for the summary.
+    pub fn needing_you(&self) -> usize {
+        self.inbox()
+            .iter()
+            .filter(|i| i.state == State::Blocked && !i.is_read)
             .count()
     }
 
+    fn mark_read(&mut self, job: &str) {
+        if let Some(report) = self.reports.iter().find(|r| r.job == job) {
+            self.read.insert(report.job.clone(), report.updated);
+        }
+    }
+
+    /// The tree the cursor stands on in either list, for the compose box's
+    /// "this tree" target.
+    fn cursor_tree(&self) -> Option<&Tree> {
+        match self.screen {
+            Screen::Trees => self.current(),
+            Screen::Inbox => self.current_item().and_then(|i| i.tree),
+        }
+    }
+
     /// The coordinator to talk to: the running one, else the latest stopped
-    /// one, which `claude attach` starts again with its conversation kept.
-    /// None when there is neither, and a new one has to be started.
+    /// one in this pool, which `claude attach` starts again with its
+    /// conversation kept. None when there is neither, and a new one has to be
+    /// started. Another repository's coordinator is never taken.
     pub fn coordinator(&self) -> Option<Recipient> {
         let running = self.trees.iter().find_map(|tree| {
             let agent = tree.agents.iter().find(|a| a.name == coordinator::NAME)?;
@@ -754,6 +937,11 @@ impl App {
                 .reports
                 .iter()
                 .filter(|r| r.name == coordinator::NAME)
+                .filter(|r| {
+                    r.dir
+                        .as_deref()
+                        .is_some_and(|dir| pool::holding(&self.trees, dir).is_some())
+                })
                 .max_by_key(|r| r.updated)?;
             Some(Recipient {
                 agent: report.name.clone(),
@@ -768,7 +956,7 @@ impl App {
     /// wants its own; then the tree under the cursor; then in place.
     fn open_dispatch(&mut self) {
         let mut targets = vec![Target::Coordinator, Target::NewTree];
-        if let Some(tree) = self.current().filter(|t| !t.is_main) {
+        if let Some(tree) = self.cursor_tree().filter(|t| !t.is_main) {
             targets.push(Target::Tree(tree.clone()));
         }
         if let Some(main) = self.trees.iter().find(|t| t.is_main) {
@@ -815,6 +1003,88 @@ impl App {
             self.message = Some(format!("{skipped} agent(s) left out: no chat to type into"));
         }
         self.prompt = Some(Prompt::message(to));
+    }
+
+    /// Opens the compose box to answer the report under the inbox cursor.
+    fn open_reply(&mut self) {
+        let Some(item) = self.current_item() else {
+            return;
+        };
+        let (job, to) = (item.report.job.clone(), item.recipient());
+        self.mark_read(&job);
+        self.prompt = Some(Prompt::message(vec![to]));
+    }
+
+    /// Opens the chat of the report under the inbox cursor.
+    fn open_item_chat(&mut self) -> Outcome {
+        let Some(item) = self.current_item() else {
+            return Outcome::Continue;
+        };
+        let (job, to) = (item.report.job.clone(), item.recipient());
+        self.mark_read(&job);
+        Outcome::Chat {
+            command: to.command,
+            agent: to.agent,
+            tree: to.tree,
+        }
+    }
+
+    fn handle_inbox_key(&mut self, key: KeyEvent) -> Outcome {
+        let at = self.inbox_selected();
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => return self.quit(),
+            KeyCode::Tab => self.screen = Screen::Trees,
+            KeyCode::Down | KeyCode::Char('j') => self.select_inbox(at + 1),
+            KeyCode::Up | KeyCode::Char('k') => self.select_inbox(at.saturating_sub(1)),
+            KeyCode::Home | KeyCode::Char('g') => self.select_inbox(0),
+            KeyCode::End | KeyCode::Char('G') => self.select_inbox(usize::MAX),
+            KeyCode::Enter | KeyCode::Char('m') => {
+                if self.current_item().is_some_and(|i| i.is_at_prompt()) {
+                    return self.open_item_chat();
+                }
+                self.open_reply();
+            }
+            KeyCode::Char('n') => self.open_dispatch(),
+            KeyCode::Char('x') => {
+                if let Some(item) = self.current_item() {
+                    let job = item.report.job.clone();
+                    if item.is_read {
+                        self.read.remove(&job);
+                    } else {
+                        self.mark_read(&job);
+                    }
+                }
+            }
+            KeyCode::Char('c') => return self.open_item_chat(),
+            KeyCode::Char('t') => match self.current_item().and_then(|i| i.tree) {
+                Some(tree) => return Outcome::Enter(tree.clone()),
+                None => self.message = Some("it works outside the pool".into()),
+            },
+            KeyCode::Char('r') => match self.current_item().and_then(|i| i.tree).cloned() {
+                Some(tree) => {
+                    let is_settled = self
+                        .current_item()
+                        .is_some_and(|i| i.report.state.is_settled());
+                    self.marked.clear();
+                    let path = tree.path.clone();
+                    self.selected = self
+                        .visible()
+                        .iter()
+                        .position(|t| t.path == path)
+                        .unwrap_or(self.selected);
+                    let trees = self.targets(Kind::Return);
+                    if !trees.is_empty() {
+                        if !is_settled {
+                            self.message = Some("its agent is still working".into());
+                        }
+                        self.pending = Some(Pending { trees });
+                    }
+                }
+                None => self.message = Some("it works outside the pool".into()),
+            },
+            _ => {}
+        }
+        Outcome::Continue
     }
 
     pub fn paste(&mut self, text: &str) {
@@ -935,6 +1205,54 @@ impl App {
         Outcome::Queue(vec![job])
     }
 
+    /// Opens the picker on `choices`, the cursor on the most recent workspace
+    /// other than this one, so `w` then Enter goes back and forth between two.
+    pub fn open_picker(&mut self, choices: Vec<Choice>) {
+        if choices.iter().all(|c| c.checkout == self.checkout) {
+            self.message = Some(
+                "no other workspace yet: run treetop once in another pooled repository".into(),
+            );
+            return;
+        }
+        let selected = choices
+            .iter()
+            .position(|c| c.checkout != self.checkout)
+            .unwrap_or(0);
+        self.picker = Some(Picker { choices, selected });
+    }
+
+    fn handle_picker_key(&mut self, key: KeyEvent) -> Outcome {
+        let Some(picker) = self.picker.as_mut() else {
+            return Outcome::Continue;
+        };
+        let last = picker.choices.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => picker.selected = (picker.selected + 1).min(last),
+            KeyCode::Up | KeyCode::Char('k') => picker.selected = picker.selected.saturating_sub(1),
+            KeyCode::Enter => {
+                let chosen = picker
+                    .choices
+                    .get(picker.selected)
+                    .map(|c| c.checkout.clone());
+                self.picker = None;
+                match chosen {
+                    Some(path) if path == self.checkout => {}
+                    Some(_) if self.active_jobs() > 0 => {
+                        self.message = Some(format!(
+                            "{} action(s) still running here; switch once they finish",
+                            self.active_jobs()
+                        ));
+                    }
+                    Some(path) => return Outcome::Switch(path),
+                    None => {}
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('q' | 'w') => self.picker = None,
+            _ => {}
+        }
+        Outcome::Continue
+    }
+
     /// Opens the lowest port the tree under the cursor serves.
     fn browse(&mut self) -> Outcome {
         let Some(tree) = self.current() else {
@@ -971,6 +1289,9 @@ impl App {
         }
         if self.prompt.is_some() {
             return self.handle_prompt_key(key);
+        }
+        if self.picker.is_some() {
+            return self.handle_picker_key(key);
         }
         if let Some(opening) = self.opening.clone() {
             let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -1049,7 +1370,14 @@ impl App {
         if !self.is_quitting {
             self.message = None;
         }
+        if key.code == KeyCode::Char('w') {
+            return Outcome::Workspaces;
+        }
+        if self.screen == Screen::Inbox {
+            return self.handle_inbox_key(key);
+        }
         match key.code {
+            KeyCode::Tab => self.screen = Screen::Inbox,
             KeyCode::Char('m') => self.open_message(),
             KeyCode::Char('q') => return self.quit(),
             KeyCode::Esc if !self.filter.is_empty() => {
@@ -1120,7 +1448,6 @@ mod tests {
     use super::*;
     use crate::pool::parse;
     use ratatui::crossterm::event::KeyEvent;
-    use std::time::SystemTime;
 
     fn app() -> App {
         let trees = parse(
@@ -1748,7 +2075,185 @@ mod tests {
             text: format!("{job} says"),
             dir: Some(PathBuf::from(dir)),
             updated: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000 - age),
+            steps: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_inbox_puts_what_needs_you_first_then_news_then_work_then_what_is_read() {
+        let mut app = app();
+        app.apply_reports(vec![
+            report("work", State::Working, "/p/8/app", 1),
+            report("old-done", State::Done, "/p/4/app", 50),
+            report("new-done", State::Done, "/home/me/app", 5),
+            report("ask", State::Blocked, "/p/8/app/ui", 40),
+        ]);
+        let order = |app: &App| -> Vec<String> {
+            app.inbox().iter().map(|i| i.report.job.clone()).collect()
+        };
+        assert_eq!(order(&app), ["ask", "new-done", "old-done", "work"]);
+        let ask = app.inbox()[0];
+        assert_eq!(ask.place(), "8", "joined to the tree it works in");
+        assert_eq!(
+            app.inbox()[1].place(),
+            "app",
+            "outside the pool: its directory"
+        );
+        assert_eq!(app.needing_you(), 1);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(
+            order(&app),
+            ["new-done", "old-done", "work", "ask"],
+            "read sinks"
+        );
+        assert_eq!(app.needing_you(), 0);
+    }
+
+    #[test]
+    fn enter_in_the_inbox_replies_through_the_reports_agent_else_by_its_job() {
+        let mut app = app();
+        app.apply_reports(vec![report("e6b79280", State::Blocked, "/p/4/app", 1)]);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Enter);
+        type_in(&mut app, "after deploy");
+        match press(&mut app, KeyCode::Enter) {
+            Outcome::Send { to, text } => {
+                assert_eq!(text, "after deploy");
+                assert_eq!(to[0].command, ["claude", "attach", "e6b79280"]);
+                assert_eq!(to[0].tree, "4");
+            }
+            other => panic!("expected a send, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_inbox_cursor_stays_on_its_job_when_an_agent_starts_waiting() {
+        let mut app = app();
+        app.apply_reports(vec![
+            report("ping", State::Done, "/p/4/app", 1),
+            report("ask", State::Working, "/p/8/app", 2),
+        ]);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.current_item().unwrap().report.job, "ask");
+        let waiting = Agent {
+            status: Some(Status::Waiting),
+            job: Some("ask".into()),
+            ..attachable("ask")
+        };
+        app.apply_agents(&HashMap::from([(PathBuf::from("/p/8/app"), vec![waiting])]));
+        assert_eq!(app.inbox()[0].report.job, "ask", "it moved to the top");
+        assert_eq!(
+            app.current_item().unwrap().report.job,
+            "ask",
+            "the cursor went with it"
+        );
+    }
+
+    #[test]
+    fn the_coordinator_is_left_out_of_the_inbox_but_still_rings_the_bell() {
+        let mut app = app_with_main();
+        let coordinator = |state| Report {
+            name: coordinator::NAME.into(),
+            ..report("c0", state, "/repo", 1)
+        };
+        app.apply_reports(vec![coordinator(State::Working)]);
+        let news = app.apply_reports(vec![coordinator(State::Done)]);
+        assert_eq!(news, [format!("{} done: c0 says", coordinator::NAME)]);
+        assert!(app.inbox().is_empty());
+    }
+
+    fn choice(path: &str, held: Option<usize>) -> Choice {
+        Choice {
+            checkout: PathBuf::from(path),
+            name: crate::workspaces::name(std::path::Path::new(path)),
+            held,
+        }
+    }
+
+    #[test]
+    fn w_opens_the_picker_on_the_last_other_workspace_and_enter_switches() {
+        let mut app = app_with_main();
+        app.checkout = PathBuf::from("/repo");
+        assert_eq!(press(&mut app, KeyCode::Char('w')), Outcome::Workspaces);
+        app.open_picker(vec![
+            choice("/repo", Some(2)),
+            choice("/home/me/harness", Some(1)),
+            choice("/home/me/lander", None),
+        ]);
+        assert_eq!(app.picker.as_ref().unwrap().selected, 1, "the other one");
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.picker.as_ref().unwrap().selected, 2, "stops at the end");
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Outcome::Switch(PathBuf::from("/home/me/lander"))
+        );
+        assert!(app.picker.is_none());
+    }
+
+    #[test]
+    fn the_picker_closes_on_esc_stays_put_on_this_workspace_and_says_when_alone() {
+        let mut app = app_with_main();
+        app.checkout = PathBuf::from("/repo");
+        app.open_picker(vec![choice("/repo", Some(2))]);
+        assert!(app.picker.is_none());
+        assert!(
+            app.message
+                .as_deref()
+                .unwrap()
+                .contains("no other workspace")
+        );
+        app.open_picker(vec![
+            choice("/repo", None),
+            choice("/home/me/harness", None),
+        ]);
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Outcome::Continue,
+            "already here"
+        );
+        app.open_picker(vec![
+            choice("/repo", None),
+            choice("/home/me/harness", None),
+        ]);
+        assert_eq!(press(&mut app, KeyCode::Esc), Outcome::Continue);
+        assert!(
+            app.picker.is_none() && !app.is_quitting,
+            "Esc closes, never quits"
+        );
+    }
+
+    #[test]
+    fn a_switch_waits_for_running_actions() {
+        let mut app = app_with_main();
+        app.checkout = PathBuf::from("/repo");
+        press(&mut app, KeyCode::End);
+        press(&mut app, KeyCode::Char('r'));
+        press(&mut app, KeyCode::Char('y'));
+        app.open_picker(vec![
+            choice("/repo", None),
+            choice("/home/me/harness", None),
+        ]);
+        assert_eq!(press(&mut app, KeyCode::Enter), Outcome::Continue);
+        assert!(
+            app.message
+                .as_deref()
+                .unwrap()
+                .contains("still running here")
+        );
+    }
+
+    #[test]
+    fn another_repositorys_stopped_coordinator_is_never_taken() {
+        let mut app = app_with_main();
+        app.apply_reports(vec![Report {
+            name: coordinator::NAME.into(),
+            ..report("elsewhere", State::Stopped, "/home/me/harness", 1)
+        }]);
+        assert_eq!(app.coordinator(), None);
     }
 
     #[test]
@@ -1768,9 +2273,14 @@ mod tests {
         let news = app.apply_reports(vec![report]);
         assert_eq!(
             news,
-            ["job cde62519 needs you: waiting at a prompt in its chat"]
+            ["job cde62519 needs you: waiting at a prompt in its chat: Enter opens it"]
         );
         assert_eq!(app.needing_you(), 1);
+        press(&mut app, KeyCode::Tab);
+        assert!(matches!(
+            press(&mut app, KeyCode::Enter),
+            Outcome::Chat { tree, .. } if tree == "8"
+        ));
     }
 
     #[test]

@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 
 use crate::pool::{self, Tree};
 
-/// `$XDG_CACHE_HOME/treetop`, else `~/.cache/treetop`.
-fn dir() -> Option<PathBuf> {
+/// `$XDG_CACHE_HOME/treetop`, else `~/.cache/treetop`, which also keeps the
+/// list of workspaces.
+pub fn dir() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)

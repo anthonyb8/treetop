@@ -340,6 +340,7 @@ mod tests {
             text: format!("{name} says"),
             dir: Some(PathBuf::from(dir)),
             updated: SystemTime::UNIX_EPOCH,
+            steps: Vec::new(),
         }
     }
 

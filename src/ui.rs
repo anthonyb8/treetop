@@ -11,19 +11,22 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 
 use crate::agents::{Agent, Status};
-use crate::app::{App, DiffView, JobState, Opening, Pane, Pending, Review};
+use crate::app::{App, DiffView, Item, JobState, Opening, Pane, Pending, Picker, Review, Screen};
 use crate::chat::Chat;
 use crate::coordinator;
 use crate::diff::{Change, FileDiff, Layout as DiffLayout, Row as DiffRow, Side, ViewRow};
 use crate::dispatch::{Prompt, Purpose, Target};
 use crate::pool::{Tree, Work};
 use crate::popup;
+use crate::reports::{self, State};
 use crate::theme::theme;
 
 /// Most useful first: on a narrow bar the keys at the end are the ones left
 /// out.
-const KEYS: [(&str, &str); 16] = [
+const KEYS: [(&str, &str); 18] = [
+    ("Tab", "inbox"),
     ("n", "ask/dispatch"),
+    ("w", "workspace"),
     ("m", "message"),
     ("t", "tree"),
     ("c", "chat"),
@@ -39,6 +42,20 @@ const KEYS: [(&str, &str); 16] = [
     ("^R", "refresh"),
     ("u", "unmark"),
     ("j/k", "move"),
+];
+
+/// The inbox's keys, most useful first, as with `KEYS`.
+const INBOX_KEYS: [(&str, &str); 10] = [
+    ("Enter", "reply"),
+    ("c", "chat"),
+    ("x", "read"),
+    ("n", "ask/dispatch"),
+    ("Tab", "trees"),
+    ("t", "tree"),
+    ("r", "return tree"),
+    ("w", "workspace"),
+    ("j/k", "move"),
+    ("q", "quit"),
 ];
 
 /// Most useful first, as with `KEYS`; Esc stays early so the way out is
@@ -62,22 +79,34 @@ pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>) {
     // The theme's text colour is the base for every cell; widgets below only
     // add accents, so nothing falls back to a theme's dim default.
     frame.render_widget(Block::new().style(fg(theme().text)), frame.area());
+    let is_inbox = app.screen == Screen::Inbox;
     let [body, detail, footer] = Layout::vertical([
         Constraint::Fill(1),
-        match app.pane {
-            Pane::Info => Constraint::Length(6),
-            Pane::Log => Constraint::Fill(1),
+        match (is_inbox, app.pane) {
+            (true, _) => Constraint::Length(13),
+            (false, Pane::Info) => Constraint::Length(6),
+            (false, Pane::Log) => Constraint::Fill(1),
         },
         Constraint::Length(1),
     ])
     .areas(frame.area());
-    draw_table(frame, app, body);
-    match app.pane {
-        Pane::Info => frame.render_widget(detail_pane(app), detail),
-        Pane::Log => frame.render_widget(log_pane(app, detail.height), detail),
+    if is_inbox {
+        draw_inbox(frame, app, body);
+        draw_report(frame, app, detail);
+    } else {
+        draw_table(frame, app, body);
+        match app.pane {
+            Pane::Info => frame.render_widget(detail_pane(app), detail),
+            Pane::Log => frame.render_widget(log_pane(app, detail.height), detail),
+        }
     }
     draw_footer(frame, app, footer);
-    if chat.is_some() || app.view.is_some() || app.prompt.is_some() || app.opening.is_some() {
+    if chat.is_some()
+        || app.view.is_some()
+        || app.prompt.is_some()
+        || app.opening.is_some()
+        || app.picker.is_some()
+    {
         let area = frame.area();
         frame
             .buffer_mut()
@@ -91,6 +120,8 @@ pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>) {
         draw_diff_view(frame, app, view);
     } else if let Some(prompt) = &app.prompt {
         draw_prompt(frame, prompt);
+    } else if let Some(picker) = &app.picker {
+        draw_picker(frame, app, picker);
     } else if let Some(review) = app.reviews.front() {
         draw_review(frame, review, app.reviews.len() - 1);
     } else if let Some(pending) = &app.pending {
@@ -101,7 +132,10 @@ pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>) {
 /// The pool at a glance, for the right end of the bottom bar: counts,
 /// actions and how fresh the listing is, closed by the name as a badge, the
 /// way lualine closes its statusline. Zero marks and actions are left out.
-fn summary(app: &App) -> Vec<Span<'static>> {
+///
+/// `is_compact` keeps only what needs you, what you marked and what is
+/// running, for a bar too narrow to show the keys beside the full summary.
+fn summary(app: &App, is_compact: bool) -> Vec<Span<'static>> {
     let t = theme();
     let mut spans = vec![Span::raw("  ")];
     if app.is_loaded {
@@ -116,11 +150,13 @@ fn summary(app: &App) -> Vec<Span<'static>> {
             .flat_map(|t| &t.agents)
             .filter(|a| a.status == Some(Status::Waiting))
             .count();
-        spans.push(Span::raw(format!("{trees} trees  {held} held  ")));
-        spans.push(Span::styled(format!("{running} running"), fg(t.warning)));
-        spans.push(Span::styled(format!("  {serving} serving"), fg(t.info)));
-        let noun = if agents == 1 { "agent" } else { "agents" };
-        spans.push(Span::raw(format!("  {agents} {noun}")));
+        spans.push(Span::raw(format!("{trees} trees  {held} held")));
+        if !is_compact {
+            spans.push(Span::styled(format!("  {running} running"), fg(t.warning)));
+            spans.push(Span::styled(format!("  {serving} serving"), fg(t.info)));
+            let noun = if agents == 1 { "agent" } else { "agents" };
+            spans.push(Span::raw(format!("  {agents} {noun}")));
+        }
         if waiting > 0 {
             spans.push(Span::styled(
                 format!("  {waiting} waiting"),
@@ -142,15 +178,21 @@ fn summary(app: &App) -> Vec<Span<'static>> {
                 fg(t.info).add_modifier(Modifier::BOLD),
             ));
         }
-        spans.push(freshness(app));
-        if app.is_listing {
-            spans.push(Span::styled("  refreshing...", fg(t.info)));
+        if !is_compact {
+            spans.push(freshness(app));
+            if app.is_listing {
+                spans.push(Span::styled("  refreshing...", fg(t.info)));
+            }
         }
     } else {
         spans.push(Span::raw("reading the pool..."));
     }
     spans.push(Span::raw(" "));
-    spans.push(Span::styled(" treetop ", t.badge));
+    let badge = match crate::workspaces::name(&app.checkout) {
+        name if name.is_empty() => " treetop ".to_string(),
+        name => format!(" treetop · {name} "),
+    };
+    spans.push(Span::styled(badge, t.badge));
     spans
 }
 
@@ -489,7 +531,11 @@ fn footer_left(app: &App, width: u16) -> Line<'static> {
         ));
     }
     let used = u16::try_from(narrowing.iter().map(Span::width).sum::<usize>()).unwrap_or(width);
-    let mut spans = fitting_keys(&KEYS, width.saturating_sub(used));
+    let keys: &[(&str, &str)] = match app.screen {
+        Screen::Trees => &KEYS,
+        Screen::Inbox => &INBOX_KEYS,
+    };
+    let mut spans = fitting_keys(keys, width.saturating_sub(used));
     spans.extend(narrowing);
     Line::from(spans)
 }
@@ -497,7 +543,15 @@ fn footer_left(app: &App, width: u16) -> Line<'static> {
 /// The bottom bar: keys or a message on the left, the summary on the right.
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let t = theme();
-    let right = Line::from(summary(app));
+    // The keys keep at least KEY_ROOM columns; a full summary that would
+    // squeeze them gives way to the compact one.
+    const KEY_ROOM: u16 = 40;
+    let full = Line::from(summary(app, false));
+    let right = if full.width() > usize::from(area.width.saturating_sub(KEY_ROOM)) {
+        Line::from(summary(app, true))
+    } else {
+        full
+    };
     let right_width = u16::try_from(right.width())
         .unwrap_or(u16::MAX)
         .min(area.width);
@@ -508,6 +562,221 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         left_area,
     );
     frame.render_widget(Paragraph::new(right).style(t.bar), right_area);
+}
+
+/// Rows `lines` take wrapped at `width`, near enough to size a pane by:
+/// wrapping breaks at words, so it can take a row more than this says.
+fn wrapped_height(lines: &[Line], width: u16) -> usize {
+    let width = usize::from(width.max(1));
+    lines
+        .iter()
+        .map(|line| line.width().div_ceil(width).max(1))
+        .sum()
+}
+
+/// How a report's state reads: what needs you is the loud one, what is new
+/// stands out, and what has been read steps back.
+fn report_style(item: &Item) -> (&'static str, Style) {
+    let t = theme();
+    let style = match item.state {
+        State::Blocked => fg(t.warning).add_modifier(Modifier::BOLD),
+        State::Done => fg(t.success),
+        State::Working => fg(t.info),
+        State::Stopped => fg(t.muted),
+    };
+    let glyph = match item.state {
+        State::Blocked => "●",
+        State::Done => "✓",
+        State::Working => "·",
+        State::Stopped => "■",
+    };
+    if item.is_read {
+        (glyph, fg(t.muted))
+    } else {
+        (glyph, style)
+    }
+}
+
+/// The inbox: one row per agent's latest report, what needs you first.
+fn draw_inbox(frame: &mut Frame, app: &App, area: Rect) {
+    let t = theme();
+    let items = app.inbox();
+    let header = Row::new(["", "WHERE", "AGENT", "STATE", "REPORT", "AGE"]).style(t.header);
+    let rows: Vec<Row> = items
+        .iter()
+        .map(|item| {
+            let (glyph, style) = report_style(item);
+            let text_style = if item.is_read {
+                fg(t.muted)
+            } else {
+                Style::new()
+            };
+            let first_line = item.text().lines().next().unwrap_or("").to_string();
+            Row::new(vec![
+                Cell::from(glyph).style(style),
+                Cell::from(item.place()),
+                Cell::from(item.report.name.clone()).style(text_style),
+                Cell::from(item.state.label()).style(style),
+                Cell::from(first_line).style(text_style),
+                Cell::from(reports::age(item.report.updated)).style(fg(t.muted)),
+            ])
+        })
+        .collect();
+    if rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(" No reports yet. n dispatches an agent; what it reports lands here.")
+                .style(fg(t.muted)),
+            area,
+        );
+        return;
+    }
+    // The report is what the inbox is for, so the agent's name gives way to
+    // it on a narrow screen.
+    let widths = [
+        Constraint::Length(1),
+        Constraint::Length(5),
+        Constraint::Length((area.width / 5).clamp(12, 28)),
+        Constraint::Length(9),
+        Constraint::Fill(1),
+        Constraint::Length(4),
+    ];
+    let table = Table::new(rows, widths)
+        .header(header)
+        .row_highlight_style(t.cursor);
+    let mut state = TableState::default().with_selected(Some(app.inbox_selected()));
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
+/// The report under the cursor in full: where it works, what it says, and
+/// its latest steps.
+fn draw_report(frame: &mut Frame, app: &App, area: Rect) {
+    let t = theme();
+    let Some(item) = app.current_item() else {
+        frame.render_widget(Paragraph::new("").block(pane_block()), area);
+        return;
+    };
+    let block = pane_block().title(format!(" {} ", item.report.name));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let mut place = vec![Span::styled(
+        match item.tree {
+            Some(tree) if tree.is_main => "main checkout".to_string(),
+            Some(tree) => format!("tree {}", tree.name),
+            None => "outside the pool".to_string(),
+        },
+        Style::new().add_modifier(Modifier::BOLD),
+    )];
+    if let Some(tree) = item.tree {
+        place.push(Span::raw(format!(
+            "  {}",
+            tree.branch.as_deref().unwrap_or("(detached)")
+        )));
+        if let Some(work) = tree.work {
+            place.push(Span::styled(
+                format!("  {} changed", work.changed),
+                fg(if work.changed > 0 { t.danger } else { t.muted }),
+            ));
+            place.push(Span::styled(
+                format!("  {} unpushed", work.unpushed),
+                fg(if work.unpushed > 0 {
+                    t.special
+                } else {
+                    t.muted
+                }),
+            ));
+        }
+        if let Some(port) = tree.ports().first() {
+            place.push(Span::styled(format!("  :{port}"), fg(t.info)));
+        }
+    }
+    if let Some(dir) = &item.report.dir {
+        place.push(Span::styled(format!("  {}", dir.display()), fg(t.muted)));
+    }
+    let live = match item.agent {
+        Some(agent) => format!("running, pid {}", agent.pid),
+        None => "not running; c or a reply starts it again".into(),
+    };
+    place.push(Span::styled(
+        format!("  job {} · {live}", item.report.job),
+        fg(t.muted),
+    ));
+    let (glyph, style) = report_style(&item);
+    let mut said = vec![Line::from(place)];
+    for (i, text) in item.text().lines().enumerate() {
+        let lead = if i == 0 {
+            Span::styled(format!("{glyph} {} ", item.state.label()), style)
+        } else {
+            Span::raw("  ")
+        };
+        said.push(Line::from(vec![lead, Span::raw(text.to_string())]));
+    }
+    let said_height = u16::try_from(wrapped_height(&said, inner.width) + 1)
+        .unwrap_or(u16::MAX)
+        .min(inner.height.saturating_sub(3).max(2));
+    let said = Paragraph::new(said).wrap(Wrap { trim: false });
+    let [said_area, steps_area] =
+        Layout::vertical([Constraint::Length(said_height), Constraint::Fill(1)]).areas(inner);
+    frame.render_widget(said, said_area);
+    let shown = usize::from(steps_area.height.saturating_sub(1));
+    let steps = &item.report.steps[item.report.steps.len().saturating_sub(shown)..];
+    let mut lines = vec![Line::styled("steps", fg(t.muted))];
+    lines.extend(steps.iter().map(|step| {
+        let at = step.at.map_or_else(|| "--:--".into(), reports::clock);
+        let state = step.state.map_or("", State::label);
+        Line::from(vec![
+            Span::styled(format!("{at} "), fg(t.muted)),
+            Span::styled(format!("{state:<9} "), fg(t.muted)),
+            Span::raw(step.detail.replace('\n', " ")),
+        ])
+    }));
+    frame.render_widget(Paragraph::new(lines), steps_area);
+}
+
+/// The workspace picker: every repository treetop has been opened in, this
+/// one marked, with how many trees each holds.
+fn draw_picker(frame: &mut Frame, app: &App, picker: &Picker) {
+    let t = theme();
+    let screen = frame.area();
+    let width = screen.width.saturating_sub(4).min(96);
+    let height = u16::try_from(picker.choices.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2);
+    let area = popup::centered(screen, width, height);
+    let keys = [("j/k", "move"), ("Enter", "switch"), ("Esc", "close")];
+    let block = popup_block(Line::styled(
+        " Workspaces ",
+        fg(t.title).add_modifier(Modifier::BOLD),
+    ))
+    .title_bottom(Line::from(fitting_keys(&keys, width.saturating_sub(2))));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let rows: Vec<Row> = picker
+        .choices
+        .iter()
+        .map(|choice| {
+            let is_here = choice.checkout == app.checkout;
+            let held = match choice.held {
+                Some(n) => format!("{n} held"),
+                None => "not listed yet".into(),
+            };
+            Row::new(vec![
+                Cell::from(if is_here { "●" } else { " " }).style(fg(t.accent)),
+                Cell::from(choice.name.clone()).style(Style::new().add_modifier(Modifier::BOLD)),
+                Cell::from(held).style(fg(t.info)),
+                Cell::from(choice.checkout.display().to_string()).style(fg(t.muted)),
+            ])
+        })
+        .collect();
+    let widths = [
+        Constraint::Length(1),
+        Constraint::Length(20),
+        Constraint::Length(14),
+        Constraint::Fill(1),
+    ];
+    let table = Table::new(rows, widths).row_highlight_style(t.cursor);
+    let mut state = TableState::default().with_selected(Some(picker.selected));
+    frame.render_stateful_widget(table, inner, &mut state);
 }
 
 /// A popup's frame over the dimmed table: a border in the accent colour and
