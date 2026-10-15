@@ -388,6 +388,10 @@ fn show(term: &mut Term, start: PathBuf, mut checkout: PathBuf) -> Result<()> {
 fn main() -> Result<()> {
     let start = std::env::current_dir()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(answer) = cli::answer_anywhere(&args) {
+        println!("{answer}");
+        return Ok(());
+    }
     let checkout = checkout_for(&start, args.is_empty())?;
     std::env::set_current_dir(&checkout)?;
     if !args.is_empty() {

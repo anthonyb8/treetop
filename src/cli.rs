@@ -40,6 +40,18 @@ const SEND_GRACE: Duration = Duration::from_secs(1);
 /// The size of the terminal a message is typed into, unseen.
 const SEND_SIZE: (u16, u16) = (40, 120);
 
+/// Answers `--help` and `--version`, which need no repository, so they
+/// work from any directory. None for every other command.
+pub fn answer_anywhere(args: &[String]) -> Option<String> {
+    match args {
+        [flag] if flag == "-h" || flag == "--help" || flag == "help" => Some(USAGE.into()),
+        [flag] if flag == "-V" || flag == "--version" => {
+            Some(format!("treetop {}", env!("CARGO_PKG_VERSION")))
+        }
+        _ => None,
+    }
+}
+
 /// Runs the command `args` names, from the main checkout `checkout`.
 pub fn run(args: &[String], checkout: &Path) -> Result<()> {
     match args {
@@ -49,14 +61,6 @@ pub fn run(args: &[String], checkout: &Path) -> Result<()> {
         }
         [command, place, task @ ..] if command == "dispatch" && !task.is_empty() => {
             dispatch(checkout, place, &task.join(" "))
-        }
-        [flag] if flag == "-h" || flag == "--help" || flag == "help" => {
-            println!("{USAGE}");
-            Ok(())
-        }
-        [flag] if flag == "-V" || flag == "--version" => {
-            println!("treetop {}", env!("CARGO_PKG_VERSION"));
-            Ok(())
         }
         _ => bail!("{USAGE}"),
     }
