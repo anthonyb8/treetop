@@ -1,25 +1,32 @@
 //! treetop: an htop-style view of a treehouse worktree pool, for seeing which
-//! agent works in each tree and what it serves, and for marking trees and
-//! returning or destroying them. Run it from anywhere in a pooled repository;
-//! Enter switches to the tree's agent or a window in the tree inside tmux, or
-//! outside tmux opens a shell that comes back to treetop when it exits.
+//! agent works in each tree and what it serves, talking to them and to the
+//! coordinator that oversees them, and marking trees and returning or
+//! destroying them. Run it from anywhere in a pooled repository. Chats and
+//! diffs open in popups over the pool; `t` goes to the tree itself, a tmux
+//! pane or window inside tmux, else a shell that comes back to treetop when
+//! it exits. With arguments, it runs one of the commands in `cli` instead.
 
 mod actions;
 mod agents;
 mod app;
 mod cache;
 mod chat;
+mod cli;
+mod coordinator;
 mod diff;
+mod dispatch;
 mod jobs;
 mod live;
 mod pool;
+mod popup;
 mod refresh;
+mod reports;
 mod theme;
 mod tmux;
 mod ui;
 mod watch;
 
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -34,6 +41,7 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use ratatui::layout::Rect;
 
 use crate::app::{App, Outcome};
 use crate::chat::Chats;
@@ -49,9 +57,11 @@ const CHAT_TICK: Duration = Duration::from_millis(16);
 /// age in the summary.
 const REDRAW: Duration = Duration::from_secs(1);
 
+/// Bracketed paste stays on throughout, so a paste into the box arrives as
+/// one piece rather than as keys, where its first line break would send it.
 fn enter_screen() -> Result<Term> {
     enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen)?;
+    execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
     Ok(Terminal::new(CrosstermBackend::new(io::stdout()))?)
 }
 
@@ -69,7 +79,13 @@ fn leave_screen() -> Result<()> {
     Ok(())
 }
 
-/// Opens an agent's chat over treetop's screen, or says why it could not.
+/// The size of the terminal a chat runs in: the inside of its popup.
+fn chat_size(term: &Term) -> Result<(u16, u16)> {
+    let size = term.size()?;
+    Ok(popup::terminal_size(size.height, size.width))
+}
+
+/// Opens an agent's chat in a popup over treetop, or says why it could not.
 fn open_chat(
     term: &Term,
     app: &mut App,
@@ -78,27 +94,40 @@ fn open_chat(
     agent: String,
     tree: String,
 ) -> Result<()> {
-    let size = term.size()?;
-    match chats.show(
-        command,
-        size.height.saturating_sub(1),
-        size.width,
-        agent,
-        tree,
-    ) {
+    let (rows, cols) = chat_size(term)?;
+    match chats.show(command, rows, cols, agent, tree) {
         // The mouse is captured only while a chat is open, so the wheel
         // scrolls it; on the list, the terminal keeps the mouse to itself.
-        Ok(()) => execute!(io::stdout(), EnableBracketedPaste, EnableMouseCapture)?,
+        Ok(()) => execute!(io::stdout(), EnableMouseCapture)?,
         Err(err) => app.message = Some(format!("{err:#}")),
     }
     Ok(())
 }
 
-/// Switches the paste and mouse modes a chat needs off again once none is
-/// on screen.
+/// Gives the mouse back to the terminal once no chat is on screen.
 fn chat_closed(app: &mut App, agent: &str, tree: &str) -> Result<()> {
     app.message = Some(format!("back from {agent} in tree {tree}"));
-    execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture)?;
+    execute!(io::stdout(), DisableMouseCapture)?;
+    Ok(())
+}
+
+/// Rings the terminal bell and, inside tmux, shows the most pressing piece of
+/// news in the status line, so an agent that needs you is heard from any
+/// window. News comes what needs you first.
+fn announce(news: &[String]) -> Result<()> {
+    let mut out = io::stdout();
+    out.write_all(b"\x07")?;
+    out.flush()?;
+    if let Some(first) = news.first()
+        && tmux::is_inside()
+    {
+        let more = match news.len() - 1 {
+            0 => String::new(),
+            n => format!(" (+{n} more)"),
+        };
+        let line: String = first.chars().take(160).collect();
+        tmux::notify(&format!("treetop: {line}{more}"));
+    }
     Ok(())
 }
 
@@ -123,6 +152,12 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<()> {
                 }
                 Update::Processes(processes) => app.apply_processes(&processes),
                 Update::Work(work) => app.apply_work(&work),
+                Update::Reports(reports) => {
+                    let news = app.apply_reports(reports);
+                    if !news.is_empty() {
+                        announce(&news)?;
+                    }
+                }
                 Update::Agents(agents) => {
                     app.apply_agents(&agents);
                     let live: Vec<&Vec<String>> = agents
@@ -169,6 +204,19 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<()> {
         }
         let pumped = chats.pump();
         is_stale |= pumped.is_stale;
+        if let Some((agent, tree)) = pumped.delivered.last() {
+            app.message = Some(match pumped.delivered.len() {
+                1 => format!("sent to {agent} in {tree}"),
+                n => format!("sent to {n} agents"),
+            });
+            is_stale = true;
+        }
+        if let Some((agent, tree)) = pumped.undelivered.first() {
+            app.message = Some(format!(
+                "could not reach {agent} in {tree}: its chat closed before the message went in"
+            ));
+            is_stale = true;
+        }
         if let Some((agent, tree)) = pumped.ended {
             chat_closed(app, &agent, &tree)?;
             is_stale = true;
@@ -186,7 +234,8 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<()> {
         is_stale = true;
         let event = event::read()?;
         if let Event::Resize(cols, rows) = event {
-            chats.resize(rows.saturating_sub(1), cols);
+            let (rows, cols) = popup::terminal_size(rows, cols);
+            chats.resize(rows, cols);
         }
         if let Some(open) = chats.open_mut() {
             match event {
@@ -211,10 +260,17 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<()> {
                     }
                 }
                 Event::Paste(text) => open.paste(&text),
-                // The chat starts on row 1, below treetop's bar.
-                Event::Mouse(mouse) => open.send_mouse(mouse, 1),
+                Event::Mouse(mouse) => {
+                    let size = term.size()?;
+                    let screen = Rect::new(0, 0, size.width, size.height);
+                    open.send_mouse(mouse, popup::inner(screen));
+                }
                 _ => {}
             }
+            continue;
+        }
+        if let Event::Paste(text) = &event {
+            app.paste(text);
             continue;
         }
         let Event::Key(key) = event else {
@@ -247,6 +303,21 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<()> {
                 *term = enter_screen()?;
                 refresher.refresh();
             }
+            Outcome::Send { to, text } => {
+                let size = chat_size(term)?;
+                for recipient in to {
+                    let agent = recipient.agent.clone();
+                    if let Err(err) = chats.deliver(
+                        &recipient.command,
+                        &text,
+                        size,
+                        recipient.agent,
+                        recipient.tree,
+                    ) {
+                        app.message = Some(format!("could not reach {agent}: {err:#}"));
+                    }
+                }
+            }
             Outcome::Queue(jobs) => {
                 for job in jobs {
                     worker.push(job);
@@ -260,6 +331,10 @@ fn main() -> Result<()> {
     let start = std::env::current_dir()?;
     let checkout = pool::main_checkout(&start)?;
     std::env::set_current_dir(&checkout)?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if !args.is_empty() {
+        return cli::run(&args, &checkout);
+    }
 
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -269,7 +344,8 @@ fn main() -> Result<()> {
 
     let mut app = App::new(Some(start));
     app.is_in_tmux = tmux::is_inside();
-    if let Some(cached) = cache::read(&checkout) {
+    if let Some(mut cached) = cache::read(&checkout) {
+        cached.insert(0, pool::main_tree(&checkout));
         app.set_cached(cached);
     }
     let mut term = enter_screen()?;

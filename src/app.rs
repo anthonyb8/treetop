@@ -6,11 +6,15 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::layout::Rect;
 
-use crate::agents::Agent;
+use crate::agents::{Agent, Status};
+use crate::coordinator;
 use crate::diff::Layout;
-use crate::jobs::{Job, Kind};
-use crate::pool::{Process, Tree, Work};
+use crate::dispatch::{Edit, Prompt, Purpose, Recipient, Target};
+use crate::jobs::{Job, Kind, Launch};
+use crate::pool::{self, Process, Tree, Work};
+use crate::reports::{Report, State};
 
 /// Where a tree's latest job stands, shown in its STATUS cell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +33,20 @@ impl JobState {
     }
 }
 
+/// The state a report goes by: its own, except that an agent sitting at a
+/// question dialog or permission prompt needs you, though its report still
+/// says working.
+pub fn report_state(report: &Report, trees: &[Tree]) -> State {
+    let is_waiting = trees.iter().flat_map(|t| &t.agents).any(|a| {
+        a.job.as_deref() == Some(report.job.as_str()) && a.status == Some(Status::Waiting)
+    });
+    if report.state == State::Working && is_waiting {
+        State::Blocked
+    } else {
+        report.state
+    }
+}
+
 /// What the pane under the table shows.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Pane {
@@ -37,7 +55,7 @@ pub enum Pane {
     Log,
 }
 
-/// The full-screen diff of one tree, and where it is scrolled to.
+/// The diff of one tree in its popup, and where it is scrolled to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffView {
     pub path: PathBuf,
@@ -94,12 +112,17 @@ pub enum Outcome {
         port: u16,
         tree: String,
     },
-    /// Open `command`, agent `agent`'s chat in tree `tree`, inside treetop
-    /// until Ctrl+] or until it exits.
+    /// Open `command`, agent `agent`'s chat in tree `tree`, in a popup over
+    /// treetop until Ctrl+Q or until it exits.
     Chat {
         command: Vec<String>,
         agent: String,
         tree: String,
+    },
+    /// Type `text` into each agent's chat and submit it.
+    Send {
+        to: Vec<Recipient>,
+        text: String,
     },
 }
 
@@ -134,7 +157,7 @@ pub struct App {
     /// Lines scrolled up from the newest end of the log.
     pub log_scroll: usize,
     pub view: Option<DiffView>,
-    /// The terminal's height, for paging the diff view.
+    /// The terminal's height, for paging the diff popup.
     pub screen_height: u16,
     pub diffs: HashMap<PathBuf, LoadedDiff>,
     /// Diffs asked for and not yet loaded, with the counts they were asked at.
@@ -149,11 +172,49 @@ pub struct App {
     pub is_in_tmux: bool,
     /// An agent `n` started, whose chat opens once it shows up.
     awaiting_chat: Option<Awaiting>,
+    /// The chat of an agent just started, ready to open: `claude --bg`
+    /// prints the id `claude attach` takes, so there is no waiting for the
+    /// agent to be seen in its tree.
+    started_chat: Option<Outcome>,
+    /// A chat on its way: its popup stands in from the moment the box is
+    /// sent until the chat itself opens in the same frame.
+    pub opening: Option<Opening>,
+    /// Every background agent's latest report, for the bell and for finding
+    /// a stopped coordinator.
+    pub reports: Vec<Report>,
+    /// Each job's state at the last read, so a change can be announced;
+    /// None until the first read, which announces nothing.
+    last_states: Option<HashMap<String, State>>,
+    /// The compose box being typed in, if it is open.
+    pub prompt: Option<Prompt>,
+    /// Stand-ins handed out for trees not leased yet.
+    new_trees: usize,
 }
 
 /// How long a started agent may take to show up before treetop stops
 /// waiting to open its chat.
 const AWAIT_CHAT: Duration = Duration::from_secs(30);
+
+/// The chat a popup is standing in for while its agent starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Opening {
+    pub agent: String,
+    /// The tree's name, `new` until a new tree is leased.
+    pub tree: String,
+}
+
+/// The id `claude --bg` prints for `claude attach`, from the line it
+/// suggests running: `claude attach cbcfd8c8    open in this terminal`.
+fn attach_id(output: &str) -> Option<&str> {
+    output.lines().find_map(|line| {
+        let id = line
+            .split("claude attach ")
+            .nth(1)?
+            .split_whitespace()
+            .next()?;
+        id.chars().all(|c| c.is_ascii_alphanumeric()).then_some(id)
+    })
+}
 
 /// A tree an agent was just started in, and the agents already there, so
 /// the new one is the one whose chat opens.
@@ -290,14 +351,27 @@ impl App {
 
     pub fn job_started(&mut self, job: &Job) {
         self.jobs
-            .insert(job.tree.path.clone(), JobState::Running(job.kind));
+            .insert(job.key.clone(), JobState::Running(job.kind));
     }
 
     /// Records a finished job. A successful preview becomes a review; a failure
     /// stays on its row and its last line goes to the status line.
     pub fn job_finished(&mut self, job: Job, is_ok: bool, output: String) {
+        // A dispatch to a new tree ran under a stand-in until it had one.
         let path = job.tree.path.clone();
+        if job.key != path {
+            self.jobs.remove(&job.key);
+        }
+        let task = job
+            .launch
+            .as_ref()
+            .map(|l| l.task.trim())
+            .filter(|t| !t.is_empty());
+        let is_coordinator = job.launch.as_ref().is_some_and(|l| l.is_coordinator);
         if !is_ok {
+            if job.kind == Kind::Start {
+                self.opening = None;
+            }
             self.jobs.insert(path, JobState::Failed(job.kind));
             self.message = Some(format!(
                 "{} of tree {} failed: {}  (L shows the log)",
@@ -305,24 +379,51 @@ impl App {
                 job.tree.name,
                 last_line(&output)
             ));
+        } else if job.kind == Kind::Start && task.is_some() {
+            self.jobs
+                .insert(path.clone(), JobState::Done(job.kind, Instant::now()));
+            self.message = Some(if is_coordinator {
+                "the coordinator started on your message; n, Enter opens its chat".to_string()
+            } else if job.tree.is_main {
+                "dispatched to the main checkout; c opens its chat".to_string()
+            } else {
+                format!("dispatched to tree {}; c opens its chat", job.tree.name)
+            });
         } else if job.kind == Kind::Start {
             self.jobs
                 .insert(path.clone(), JobState::Done(job.kind, Instant::now()));
+            // Its chat opens only while its popup still stands in for it; Esc
+            // on the popup means it is opened later, with `c`.
             let known = self
                 .trees
                 .iter()
                 .find(|t| t.path == path)
                 .map(|t| t.agents.iter().map(|a| a.pid).collect())
                 .unwrap_or_default();
-            self.message = Some(format!(
-                "agent started in tree {}; its chat opens when it shows up",
-                job.tree.name
-            ));
-            self.awaiting_chat = Some(Awaiting {
-                path,
-                known,
-                since: Instant::now(),
-            });
+            match (self.opening.as_mut(), attach_id(&output)) {
+                (None, _) => {
+                    self.message = Some(if is_coordinator {
+                        "the coordinator started; c on main opens its chat".to_string()
+                    } else {
+                        format!("agent started in tree {}; c opens its chat", job.tree.name)
+                    });
+                }
+                (Some(opening), Some(id)) => {
+                    self.started_chat = Some(Outcome::Chat {
+                        command: vec!["claude".into(), "attach".into(), id.to_string()],
+                        agent: opening.agent.clone(),
+                        tree: job.tree.name.clone(),
+                    });
+                }
+                (Some(opening), None) => {
+                    opening.tree = job.tree.name.clone();
+                    self.awaiting_chat = Some(Awaiting {
+                        path,
+                        known,
+                        since: Instant::now(),
+                    });
+                }
+            }
         } else if job.kind == Kind::Preview {
             self.jobs.remove(&path);
             self.reviews.push_back(Review {
@@ -408,7 +509,10 @@ impl App {
             Some(Ok(layout)) => (layout.rows.len(), layout.file_starts.clone()),
             _ => (0, Vec::new()),
         };
-        let page = isize::try_from(self.screen_height.saturating_sub(4)).map_or(1, |p| p.max(1));
+        // The popup's height, less the file header pinned at its top and the
+        // key bar at its bottom.
+        let body = crate::popup::inner(Rect::new(0, 0, 80, self.screen_height)).height;
+        let page = isize::try_from(body.saturating_sub(2)).map_or(1, |p| p.max(1));
         let Some(view) = self.view.as_mut() else {
             return Outcome::Continue;
         };
@@ -461,6 +565,8 @@ impl App {
                         "tree {} is where you started treetop; cd out first",
                         t.name
                     ))
+                } else if t.is_main {
+                    Some("the main checkout is never returned or destroyed".to_string())
                 } else if self.jobs.get(&t.path).is_some_and(|s| s.is_active()) {
                     Some(format!("tree {} already has an action queued", t.name))
                 } else if kind == Kind::Return && !t.is_held() {
@@ -483,7 +589,7 @@ impl App {
             .into_iter()
             .map(|tree| {
                 self.jobs.insert(tree.path.clone(), JobState::Queued(kind));
-                Job { kind, tree }
+                Job::new(kind, tree)
             })
             .collect();
         Outcome::Queue(jobs)
@@ -517,9 +623,15 @@ impl App {
         Outcome::Continue
     }
 
-    /// The chat of an agent `n` started, once it has shown up in its tree
-    /// with a chat to open. Gives up after AWAIT_CHAT, saying so.
+    /// The chat of an agent `n` started: at once when its start printed the
+    /// id to attach to, else once it has shown up in its tree with a chat to
+    /// open. Gives up after AWAIT_CHAT, saying so.
     pub fn ready_chat(&mut self) -> Option<Outcome> {
+        if let Some(chat) = self.started_chat.take() {
+            self.opening = None;
+            self.awaiting_chat = None;
+            return Some(chat);
+        }
         let awaiting = self.awaiting_chat.as_ref()?;
         let tree = self.trees.iter().find(|t| t.path == awaiting.path)?;
         let started = tree
@@ -530,6 +642,7 @@ impl App {
         if let Some((agent, command)) = started {
             let tree = tree.name.clone();
             self.awaiting_chat = None;
+            self.opening = None;
             return Some(Outcome::Chat {
                 command,
                 agent,
@@ -542,6 +655,7 @@ impl App {
                 tree.name
             ));
             self.awaiting_chat = None;
+            self.opening = None;
         }
         None
     }
@@ -573,16 +687,252 @@ impl App {
         })
     }
 
-    /// Starts an agent in the tree under the cursor.
-    fn new_agent(&mut self) -> Outcome {
-        let Some(tree) = self.current().cloned() else {
+    /// Takes the latest reports. Returns what to announce: each job that has
+    /// come to need you or finished since the last read, what needs you
+    /// first.
+    pub fn apply_reports(&mut self, reports: Vec<Report>) -> Vec<String> {
+        self.reports = reports;
+        let mut reports: Vec<(&Report, State)> = self
+            .reports
+            .iter()
+            .map(|r| (r, report_state(r, &self.trees)))
+            .collect();
+        reports.sort_by_key(|(r, state)| (*state != State::Blocked, std::cmp::Reverse(r.updated)));
+        let news = match &self.last_states {
+            None => Vec::new(),
+            Some(last) => reports
+                .iter()
+                .filter(|(report, state)| {
+                    let was = last.get(&report.job).copied();
+                    match state {
+                        State::Blocked => was != Some(State::Blocked),
+                        State::Done => was.is_some_and(|w| w != State::Done),
+                        State::Working | State::Stopped => false,
+                    }
+                })
+                .map(|(report, state)| {
+                    let text = if *state != report.state {
+                        "waiting at a prompt in its chat"
+                    } else {
+                        &report.text
+                    };
+                    format!("{} {}: {text}", report.name, state.label())
+                })
+                .collect(),
+        };
+        self.last_states = Some(
+            reports
+                .iter()
+                .map(|(r, state)| (r.job.clone(), *state))
+                .collect(),
+        );
+        news
+    }
+
+    /// Reports waiting on you, for the summary.
+    pub fn needing_you(&self) -> usize {
+        self.reports
+            .iter()
+            .filter(|r| report_state(r, &self.trees) == State::Blocked)
+            .count()
+    }
+
+    /// The coordinator to talk to: the running one, else the latest stopped
+    /// one, which `claude attach` starts again with its conversation kept.
+    /// None when there is neither, and a new one has to be started.
+    pub fn coordinator(&self) -> Option<Recipient> {
+        let running = self.trees.iter().find_map(|tree| {
+            let agent = tree.agents.iter().find(|a| a.name == coordinator::NAME)?;
+            Some(Recipient {
+                agent: agent.name.clone(),
+                tree: tree.name.clone(),
+                command: agent.attach.clone()?,
+            })
+        });
+        running.or_else(|| {
+            let report = self
+                .reports
+                .iter()
+                .filter(|r| r.name == coordinator::NAME)
+                .max_by_key(|r| r.updated)?;
+            Some(Recipient {
+                agent: report.name.clone(),
+                tree: "main".into(),
+                command: vec!["claude".into(), "attach".into(), report.job.clone()],
+            })
+        })
+    }
+
+    /// Opens the compose box. The coordinator comes first, since it is who
+    /// you talk to about the agents; then a new tree, since most new work
+    /// wants its own; then the tree under the cursor; then in place.
+    fn open_dispatch(&mut self) {
+        let mut targets = vec![Target::Coordinator, Target::NewTree];
+        if let Some(tree) = self.current().filter(|t| !t.is_main) {
+            targets.push(Target::Tree(tree.clone()));
+        }
+        if let Some(main) = self.trees.iter().find(|t| t.is_main) {
+            targets.push(Target::InPlace(main.clone()));
+        }
+        self.prompt = Some(Prompt::dispatch(targets));
+    }
+
+    /// Opens the compose box to write to the agents in the marked trees, else in the
+    /// tree under the cursor. Agents with no chat to type into are left out,
+    /// and the status line says how many.
+    fn open_message(&mut self) {
+        let trees: Vec<&Tree> = if self.marked.is_empty() {
+            self.current().into_iter().collect()
+        } else {
+            self.trees
+                .iter()
+                .filter(|t| self.marked.contains(&t.path))
+                .collect()
+        };
+        let agents: Vec<(&Tree, &Agent)> = trees
+            .iter()
+            .flat_map(|t| t.agents.iter().map(move |a| (*t, a)))
+            .collect();
+        let to: Vec<Recipient> = agents
+            .iter()
+            .filter_map(|(tree, agent)| {
+                Some(Recipient {
+                    agent: agent.name.clone(),
+                    tree: tree.name.clone(),
+                    command: agent.attach.clone()?,
+                })
+            })
+            .collect();
+        let skipped = agents.len() - to.len();
+        if to.is_empty() {
+            self.message = Some(match skipped {
+                0 => "no agent there to write to".to_string(),
+                n => format!("{n} agent(s) there, none with a chat to type into"),
+            });
+            return;
+        }
+        if skipped > 0 {
+            self.message = Some(format!("{skipped} agent(s) left out: no chat to type into"));
+        }
+        self.prompt = Some(Prompt::message(to));
+    }
+
+    pub fn paste(&mut self, text: &str) {
+        if let Some(prompt) = &mut self.prompt {
+            prompt.paste(text);
+        }
+    }
+
+    fn handle_prompt_key(&mut self, key: KeyEvent) -> Outcome {
+        let Some(prompt) = &mut self.prompt else {
             return Outcome::Continue;
         };
+        match prompt.edit(key) {
+            Edit::Continue => Outcome::Continue,
+            Edit::Cancel => {
+                self.prompt = None;
+                Outcome::Continue
+            }
+            Edit::Submit => match self.prompt.take() {
+                Some(prompt) => self.submit(prompt),
+                None => Outcome::Continue,
+            },
+        }
+    }
+
+    fn submit(&mut self, prompt: Prompt) -> Outcome {
+        let text = prompt.text.trim().to_string();
+        match prompt.purpose {
+            Purpose::Message { to } => {
+                if text.is_empty() {
+                    self.message = Some("nothing to send".into());
+                    return Outcome::Continue;
+                }
+                self.message = Some(format!("sending to {} agent(s)...", to.len()));
+                Outcome::Send { to, text }
+            }
+            Purpose::Dispatch { mut targets, at } => {
+                if at >= targets.len() {
+                    return Outcome::Continue;
+                }
+                match targets.swap_remove(at) {
+                    Target::Coordinator => self.converse(text),
+                    target => self.dispatch(target, text),
+                }
+            }
+        }
+    }
+
+    /// Talks to the coordinator the way `m` talks to an agent: `text` goes
+    /// to it behind the screen and treetop stays on the list. With no text,
+    /// its chat opens instead, which is where its answers are read. With no
+    /// coordinator, one starts in the main checkout with `text` as its
+    /// first prompt.
+    fn converse(&mut self, text: String) -> Outcome {
+        if let Some(to) = self.coordinator() {
+            if text.trim().is_empty() {
+                return Outcome::Chat {
+                    command: to.command,
+                    agent: to.agent,
+                    tree: to.tree,
+                };
+            }
+            self.message = Some("sending to the coordinator...".into());
+            return Outcome::Send { to: vec![to], text };
+        }
+        let Some(main) = self.trees.iter().find(|t| t.is_main).cloned() else {
+            self.message = Some("the main checkout is not listed yet".into());
+            return Outcome::Continue;
+        };
+        self.start(
+            main,
+            Launch {
+                task: text,
+                name: Some(coordinator::NAME.into()),
+                is_new_tree: false,
+                is_coordinator: true,
+            },
+        )
+    }
+
+    /// Queues a Start for `task` at `target`. An empty task starts the agent
+    /// idle and opens its chat, as `n` always has.
+    fn dispatch(&mut self, target: Target, task: String) -> Outcome {
+        let launch = Launch::agent(task, target == Target::NewTree);
+        let tree = match target {
+            Target::Coordinator => return self.converse(launch.task),
+            Target::Tree(tree) | Target::InPlace(tree) => tree,
+            Target::NewTree => {
+                self.new_trees += 1;
+                pool::stand_in(PathBuf::from(format!("(new tree {})", self.new_trees)))
+            }
+        };
+        if launch.is_new_tree {
+            self.message = Some("leasing a new tree for the agent...".into());
+        }
+        self.start(tree, launch)
+    }
+
+    /// Queues a Start of `launch` in `tree`, unless the tree is busy with
+    /// another action.
+    fn start(&mut self, tree: Tree, launch: Launch) -> Outcome {
         if self.jobs.get(&tree.path).is_some_and(|s| s.is_active()) {
             self.message = Some(format!("tree {} already has an action queued", tree.name));
             return Outcome::Continue;
         }
-        self.queue(Kind::Start, vec![tree])
+        if launch.task.trim().is_empty() {
+            self.opening = Some(Opening {
+                agent: launch.name.clone().unwrap_or_else(|| "new agent".into()),
+                tree: tree.name.clone(),
+            });
+        }
+        let job = Job {
+            launch: Some(launch),
+            ..Job::new(Kind::Start, tree)
+        };
+        self.jobs
+            .insert(job.key.clone(), JobState::Queued(Kind::Start));
+        Outcome::Queue(vec![job])
     }
 
     /// Opens the lowest port the tree under the cursor serves.
@@ -618,6 +968,26 @@ impl App {
     pub fn handle_key(&mut self, key: KeyEvent) -> Outcome {
         if self.view.is_some() {
             return self.handle_view_key(key);
+        }
+        if self.prompt.is_some() {
+            return self.handle_prompt_key(key);
+        }
+        if let Some(opening) = self.opening.clone() {
+            let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            if is_ctrl && key.code == KeyCode::Char('c') {
+                return Outcome::Quit;
+            }
+            let is_back = key.code == KeyCode::Esc || crate::chat::is_exit(key);
+            if is_back {
+                self.message = Some(format!(
+                    "{} keeps starting; c opens its chat once it is up",
+                    opening.agent
+                ));
+                self.opening = None;
+                self.awaiting_chat = None;
+                self.started_chat = None;
+            }
+            return Outcome::Continue;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return match key.code {
@@ -680,6 +1050,7 @@ impl App {
             self.message = None;
         }
         match key.code {
+            KeyCode::Char('m') => self.open_message(),
             KeyCode::Char('q') => return self.quit(),
             KeyCode::Esc if !self.filter.is_empty() => {
                 self.filter.clear();
@@ -706,7 +1077,7 @@ impl App {
             }
             KeyCode::Char('o') => return self.browse(),
             KeyCode::Char('c') => return self.chat(),
-            KeyCode::Char('n') => return self.new_agent(),
+            KeyCode::Char('n') => self.open_dispatch(),
             KeyCode::Char('L') => {
                 self.pane = if self.pane == Pane::Log {
                     Pane::Info
@@ -749,6 +1120,7 @@ mod tests {
     use super::*;
     use crate::pool::parse;
     use ratatui::crossterm::event::KeyEvent;
+    use std::time::SystemTime;
 
     fn app() -> App {
         let trees = parse(
@@ -1033,7 +1405,11 @@ mod tests {
         press(&mut app, KeyCode::Char('p'));
         assert_eq!(scroll(&app), 0);
         press(&mut app, KeyCode::Char(' '));
-        assert_eq!(scroll(&app), 6, "a page is the height less the bars");
+        assert_eq!(
+            scroll(&app),
+            4,
+            "a page is the popup's inside less the pinned header and the key bar"
+        );
         press(&mut app, KeyCode::Char('G'));
         assert_eq!(scroll(&app), 14);
         press(&mut app, KeyCode::Char('j'));
@@ -1050,6 +1426,7 @@ mod tests {
             source: crate::agents::Source::Process,
             is_background: false,
             attach: None,
+            job: None,
         }
     }
 
@@ -1144,16 +1521,35 @@ mod tests {
         assert!(matches!(press(&mut app, KeyCode::Char('t')), Outcome::Enter(t) if t.name == "4"));
     }
 
+    fn type_in(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
     #[test]
-    fn n_starts_an_agent_and_its_chat_opens_once_it_shows_up() {
+    fn n_to_the_tree_under_the_cursor_with_no_task_starts_it_idle_and_opens_its_chat() {
         let mut app = app();
         app.apply_agents(&HashMap::from([(
             PathBuf::from("/p/4/app"),
             vec![agent("old")],
         )]));
-        let job = queued(press(&mut app, KeyCode::Char('n'))).remove(0);
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(
+            app.prompt.as_ref().unwrap().target().unwrap().label(),
+            "tree 4"
+        );
+        let job = queued(press(&mut app, KeyCode::Enter)).remove(0);
         assert_eq!((job.kind, job.tree.name.as_str()), (Kind::Start, "4"));
-        app.job_finished(job, true, "claude attach 1234abcd".into());
+        assert_eq!(job.launch.as_ref().unwrap().task, "");
+        assert_eq!(
+            app.opening.as_ref().unwrap().tree,
+            "4",
+            "its popup stands in"
+        );
+        app.job_finished(job, true, "printed no id".into());
         assert_eq!(app.ready_chat(), None, "not shown up yet");
         let started = Agent {
             pid: 99,
@@ -1178,6 +1574,318 @@ mod tests {
             })
         );
         assert_eq!(app.ready_chat(), None, "opened once");
+        assert!(app.opening.is_none());
+    }
+
+    /// What `claude --bg` prints.
+    const BACKGROUNDED: &str = "backgrounded · cbcfd8c8 · treetop-coordinator (working)
+  claude agents             list sessions
+  claude attach cbcfd8c8    open in this terminal
+  claude stop cbcfd8c8      stop this session
+";
+
+    #[test]
+    fn a_started_chat_opens_from_the_id_claude_prints_without_waiting_to_see_it() {
+        assert_eq!(attach_id(BACKGROUNDED), Some("cbcfd8c8"));
+        assert_eq!(attach_id("started"), None);
+        let mut app = app_with_main();
+        press(&mut app, KeyCode::Char('n'));
+        let job = queued(press(&mut app, KeyCode::Enter)).remove(0);
+        assert_eq!(app.opening.as_ref().unwrap().agent, coordinator::NAME);
+        app.job_finished(job, true, BACKGROUNDED.into());
+        assert_eq!(
+            app.ready_chat(),
+            Some(Outcome::Chat {
+                command: vec!["claude".into(), "attach".into(), "cbcfd8c8".into()],
+                agent: coordinator::NAME.into(),
+                tree: "main".into()
+            })
+        );
+        assert!(app.opening.is_none() && app.ready_chat().is_none());
+    }
+
+    #[test]
+    fn esc_on_a_chat_on_its_way_stops_waiting_and_a_failed_start_ends_it() {
+        let mut app = app_with_main();
+        press(&mut app, KeyCode::Char('n'));
+        let job = queued(press(&mut app, KeyCode::Enter)).remove(0);
+        assert!(app.opening.is_some());
+        assert_eq!(
+            press(&mut app, KeyCode::Char('q')),
+            Outcome::Continue,
+            "keys wait"
+        );
+        press(&mut app, KeyCode::Esc);
+        assert!(app.opening.is_none());
+        app.job_finished(job, true, BACKGROUNDED.into());
+        assert_eq!(app.ready_chat(), None, "dismissed, it opens only with c");
+        assert!(
+            app.message
+                .as_deref()
+                .unwrap()
+                .contains("c on main opens its chat")
+        );
+        press(&mut app, KeyCode::Char('n'));
+        let job = queued(press(&mut app, KeyCode::Enter)).remove(0);
+        app.job_finished(job, false, "claude: not found".into());
+        assert!(app.opening.is_none());
+    }
+
+    /// The fixture's pool with the main checkout above it, as listings come.
+    fn app_with_main() -> App {
+        let mut app = app();
+        let mut trees = app.trees.clone();
+        trees.insert(0, crate::pool::main_tree(std::path::Path::new("/repo")));
+        app.set_trees(trees);
+        app
+    }
+
+    #[test]
+    fn a_task_dispatched_in_place_starts_in_the_main_checkout_and_opens_no_chat() {
+        let mut app = app_with_main();
+        press(&mut app, KeyCode::Char('n'));
+        type_in(&mut app, "say hi");
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(
+            app.prompt.as_ref().unwrap().target().unwrap().label(),
+            "in place"
+        );
+        let job = queued(press(&mut app, KeyCode::Enter)).remove(0);
+        assert!(job.tree.is_main);
+        let launch = job.launch.clone().unwrap();
+        assert_eq!(
+            (launch.task.as_str(), launch.is_new_tree),
+            ("say hi", false)
+        );
+        assert_eq!(launch.name.as_deref(), Some("say hi"));
+        app.job_finished(job, true, String::new());
+        assert_eq!(app.ready_chat(), None);
+        assert!(app.message.unwrap().contains("the main checkout"));
+    }
+
+    #[test]
+    fn a_new_tree_dispatch_runs_under_a_stand_in_until_its_tree_is_leased() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('n'));
+        type_in(&mut app, "fix login");
+        press(&mut app, KeyCode::Tab);
+        let mut job = queued(press(&mut app, KeyCode::Enter)).remove(0);
+        assert!(job.launch.as_ref().unwrap().is_new_tree);
+        assert_eq!(job.key, PathBuf::from("(new tree 1)"));
+        assert_eq!(app.active_jobs(), 1);
+        job.tree.path = PathBuf::from("/p/12/app");
+        job.tree.name = "12".into();
+        app.job_finished(job, true, String::new());
+        assert_eq!(app.active_jobs(), 0, "the stand-in is cleared");
+        assert!(app.message.unwrap().contains("tree 12"));
+    }
+
+    #[test]
+    fn esc_closes_the_bar_and_queues_nothing() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('n'));
+        type_in(&mut app, "q");
+        assert_eq!(press(&mut app, KeyCode::Esc), Outcome::Continue);
+        assert!(app.prompt.is_none() && app.active_jobs() == 0);
+        assert!(!app.is_quitting, "q went into the bar, not to quit");
+    }
+
+    #[test]
+    fn m_writes_to_the_marked_trees_agents_and_leaves_out_those_with_no_chat() {
+        let mut app = app();
+        app.apply_agents(&HashMap::from([
+            (
+                PathBuf::from("/p/4/app"),
+                vec![attachable("a"), agent("pane-only")],
+            ),
+            (PathBuf::from("/p/8/app"), vec![attachable("b")]),
+        ]));
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Char(' '));
+        }
+        press(&mut app, KeyCode::Char('m'));
+        assert_eq!(
+            app.message.as_deref(),
+            Some("1 agent(s) left out: no chat to type into")
+        );
+        type_in(&mut app, "rebase on development");
+        match press(&mut app, KeyCode::Enter) {
+            Outcome::Send { to, text } => {
+                assert_eq!(text, "rebase on development");
+                let names: Vec<(&str, &str)> = to
+                    .iter()
+                    .map(|r| (r.agent.as_str(), r.tree.as_str()))
+                    .collect();
+                assert_eq!(names, [("a", "4"), ("b", "8")]);
+            }
+            other => panic!("expected a send, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_main_checkout_is_never_returned_or_destroyed() {
+        let mut app = app_with_main();
+        press(&mut app, KeyCode::Home);
+        assert_eq!(app.current().unwrap().name, "main");
+        press(&mut app, KeyCode::Char('r'));
+        assert!(app.pending.is_none());
+        assert_eq!(
+            app.message.as_deref(),
+            Some("the main checkout is never returned or destroyed")
+        );
+        press(&mut app, KeyCode::Char('a'));
+        assert!(
+            app.visible().iter().all(|t| !t.is_main),
+            "an agentless main is no orphan"
+        );
+    }
+
+    fn report(job: &str, state: State, dir: &str, age: u64) -> Report {
+        Report {
+            job: job.into(),
+            name: format!("job {job}"),
+            state,
+            text: format!("{job} says"),
+            dir: Some(PathBuf::from(dir)),
+            updated: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000 - age),
+        }
+    }
+
+    #[test]
+    fn an_agent_waiting_at_a_prompt_needs_you_though_its_report_says_working() {
+        let mut app = app();
+        let report = report("cde62519", State::Working, "/p/8/app", 1);
+        app.apply_reports(vec![report.clone()]);
+        let at_prompt = Agent {
+            status: Some(Status::Waiting),
+            job: Some("cde62519".into()),
+            ..attachable("cde62519")
+        };
+        app.apply_agents(&HashMap::from([(
+            PathBuf::from("/p/8/app"),
+            vec![at_prompt],
+        )]));
+        let news = app.apply_reports(vec![report]);
+        assert_eq!(
+            news,
+            ["job cde62519 needs you: waiting at a prompt in its chat"]
+        );
+        assert_eq!(app.needing_you(), 1);
+    }
+
+    #[test]
+    fn news_puts_what_needs_you_first() {
+        let mut app = app();
+        app.apply_reports(vec![
+            report("done", State::Working, "/p/4/app", 1),
+            report("ask", State::Working, "/p/8/app", 2),
+        ]);
+        let news = app.apply_reports(vec![
+            report("done", State::Done, "/p/4/app", 1),
+            report("ask", State::Blocked, "/p/8/app", 2),
+        ]);
+        assert_eq!(
+            news,
+            ["job ask needs you: ask says", "job done done: done says"]
+        );
+    }
+
+    #[test]
+    fn n_talks_to_the_coordinator_first_and_starts_it_in_the_main_checkout() {
+        let mut app = app_with_main();
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(
+            app.prompt.as_ref().unwrap().target(),
+            Some(&Target::Coordinator)
+        );
+        type_in(&mut app, "what needs me?");
+        let job = queued(press(&mut app, KeyCode::Enter)).remove(0);
+        assert!(job.tree.is_main);
+        let launch = job.launch.clone().unwrap();
+        assert!(launch.is_coordinator);
+        assert_eq!(launch.task, "what needs me?");
+        assert_eq!(launch.name.as_deref(), Some(coordinator::NAME));
+        assert!(app.opening.is_none(), "given a message, nothing opens");
+        app.job_finished(
+            job,
+            true,
+            "  claude attach c00rd1na    open in this terminal".into(),
+        );
+        assert_eq!(
+            app.ready_chat(),
+            None,
+            "treetop stays on the list, as m does"
+        );
+        assert!(
+            app.message
+                .as_deref()
+                .unwrap()
+                .contains("started on your message")
+        );
+    }
+
+    #[test]
+    fn a_running_coordinator_is_talked_to_rather_than_started_again() {
+        let mut app = app_with_main();
+        app.apply_agents(&HashMap::from([(
+            PathBuf::from("/repo"),
+            vec![attachable(coordinator::NAME)],
+        )]));
+        press(&mut app, KeyCode::Char('n'));
+        type_in(&mut app, "status?");
+        match press(&mut app, KeyCode::Enter) {
+            Outcome::Send { to, text } => {
+                assert_eq!(text, "status?");
+                assert_eq!(to[0].command, ["claude", "attach", coordinator::NAME]);
+                assert_eq!(to[0].tree, "main");
+            }
+            other => panic!("expected the message sent as m sends, got {other:?}"),
+        }
+        assert!(app.opening.is_none(), "no chat opens");
+        press(&mut app, KeyCode::Char('n'));
+        assert!(
+            matches!(press(&mut app, KeyCode::Enter), Outcome::Chat { agent, .. } if agent == coordinator::NAME),
+            "nothing typed opens its chat"
+        );
+    }
+
+    #[test]
+    fn a_stopped_coordinator_is_attached_again_by_its_latest_job() {
+        let mut app = app_with_main();
+        let stopped = |job: &str, age| Report {
+            name: coordinator::NAME.into(),
+            ..report(job, State::Stopped, "/repo", age)
+        };
+        app.apply_reports(vec![stopped("old", 50), stopped("latest", 5)]);
+        press(&mut app, KeyCode::Char('n'));
+        assert!(matches!(
+            press(&mut app, KeyCode::Enter),
+            Outcome::Chat { command, .. } if command == ["claude", "attach", "latest"]
+        ));
+    }
+
+    #[test]
+    fn news_is_announced_once_and_never_on_the_first_read() {
+        let mut app = app();
+        assert!(
+            app.apply_reports(vec![report("a", State::Blocked, "/p/4/app", 1)])
+                .is_empty()
+        );
+        let reports = vec![
+            report("a", State::Blocked, "/p/4/app", 1),
+            report("b", State::Working, "/p/8/app", 1),
+        ];
+        assert!(
+            app.apply_reports(reports).is_empty(),
+            "still blocked is no news"
+        );
+        let news = app.apply_reports(vec![
+            report("a", State::Working, "/p/4/app", 1),
+            report("b", State::Done, "/p/8/app", 1),
+        ]);
+        assert_eq!(news, ["job b done: b says"]);
+        let news = app.apply_reports(vec![report("a", State::Blocked, "/p/4/app", 1)]);
+        assert_eq!(news, ["job a needs you: a says"]);
     }
 
     fn attachable(name: &str) -> Agent {

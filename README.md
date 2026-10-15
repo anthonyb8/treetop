@@ -2,9 +2,10 @@
 
 An htop-style view of a [treehouse](https://github.com/kunchenguid/treehouse) worktree pool.
 See which coding agent works in each tree, whether it is waiting on you and what the tree serves, and jump to the agent in one key.
+Ask a coordinator agent about every other agent at once, or send an agent a task in a fresh tree, a tree you pick or the main checkout.
 Mark trees, then return them to the pool or destroy them, with git's view of each tree on screen so nothing unpushed goes by accident.
 
-treetop only talks to treehouse through its CLI (`treehouse status --json`, `return`, `destroy`), so a treehouse upgrade keeps working without a fork.
+treetop only talks to treehouse through its CLI (`treehouse status --json`, `get --lease`, `lease`, `return`, `destroy`), so a treehouse upgrade keeps working without a fork.
 
 ## Install
 
@@ -42,11 +43,12 @@ Run `treetop` from anywhere inside a pooled repository.
 | `o` | open the lowest port the tree serves, `http://localhost:<port>`, in the browser, or copy it to the clipboard where there is no desktop |
 | `r` | return the marked trees, or the one under the cursor, to the pool |
 | `D` | destroy them from disk, after reviewing treehouse's preview of each |
-| `d` | open the side-by-side diff of the tree under the cursor |
+| `d` | open the side-by-side diff of the tree under the cursor in a popup |
 | `L` | show or hide the log of every action's output; PgUp and PgDn scroll it |
 | `t` | go to the tree: its agent's pane or a window inside tmux, else a shell |
-| `c` | open the agent's chat inside treetop; Ctrl+] comes back (see [Agent chats](#agent-chats)) |
-| `n` | start a new agent in the tree, leasing it first if it is available, and open its chat |
+| `c` | open the agent's chat in a popup over treetop; Ctrl+Q comes back (see [Agent chats](#agent-chats)) |
+| `n` | open the compose box: ask the coordinator, or Tab to start a new agent in a new tree, the tree under the cursor or in place (see [The coordinator and dispatch](#the-coordinator-and-dispatch)) |
+| `m` | write a message to the agents in the marked trees, or the tree under the cursor |
 | `Ctrl-R` | list the pool again now |
 | `q`, Esc | quit |
 
@@ -57,6 +59,7 @@ CHANGED counts uncommitted files and UNPUSHED counts commits on no remote; `?` m
 PROCS counts processes running inside the tree, and PORTS the TCP ports they listen on: the lowest, and how many more.
 `o` opens the lowest in the browser on a desktop; on a server reached over SSH it copies the URL to the clipboard of the computer you are typing at, through the terminal (OSC 52; inside tmux, `set-clipboard on`).
 AGENT names the coding agent working in the tree, from the sources under [Agents](#agents); `no agent` on a held tree marks one nobody is working in, which `a` lists on its own.
+The first row, `main`, is the repository's main checkout, so agents working in place show too; it is never returned or destroyed, and the summary's tree counts leave it out.
 
 treetop refreshes on two clocks, the way htop stays fast.
 Processes and their ports come straight from `/proc` every 2 seconds, and agents every 4.
@@ -70,7 +73,7 @@ On opening, treetop draws the last listing it saved under `$XDG_CACHE_HOME/treet
 
 ## The diff
 
-`d` opens the tree under the cursor in a full-screen, side-by-side diff, the way a pull request shows it: everything its branch changes against the pool's base (`base_branch` in `treehouse.toml`, else `origin/HEAD`), measured from their merge base, plus uncommitted and untracked files.
+`d` opens the tree under the cursor in a side-by-side diff, in a popup over the pool, the way a pull request shows it: everything its branch changes against the pool's base (`base_branch` in `treehouse.toml`, else `origin/HEAD`), measured from their merge base, plus uncommitted and untracked files.
 Removed lines sit on the left and the added lines that replace them on the right, row by row, with line numbers on both sides; within a changed line, the words that differ are highlighted.
 Every file runs in one scroll, each under a header with its path and its additions and deletions, and the header of the file you are reading stays pinned to the top.
 Its colours are the diff highlight groups Neovim uses under gruvbox-material (medium): `DiffDelete` and `DiffAdd` behind lines, `LineNr` for numbers, `diffLine` for hunks, `diffFile` for paths.
@@ -121,13 +124,15 @@ Their output goes to the log (`L`), and a failure also shows its last line in th
 
 `q` while an action runs waits for it to finish; `Ctrl-C` quits at once and leaves the running command to finish on its own.
 
-The tree treetop was started in is never a target, because returning or destroying it would kill the shell standing in it.
+The tree treetop was started in is never a target, because returning or destroying it would kill the shell standing in it, and neither is the main checkout.
 
 ## Agent chats
 
-`c` opens the chat of the agent in the tree under the cursor inside treetop, over the whole screen, the way `d` opens the diff.
-**Ctrl+]** always comes back to the list as you left it, whatever the chat is doing, and `c` on another tree opens that one.
-**Ctrl+\\** goes straight to the next agent's chat, down the list as filtered, skipping trees with none and wrapping at the end; the cursor follows, so Ctrl+] lands on the tree you were last in.
+`c` opens the chat of the agent in the tree under the cursor in a popup over treetop, the way `d` opens the diff.
+The pool stays on screen, dimmed, round the popup's border, so a chat never passes for a Claude Code session of your own; the popup's title names the tree, branch and agent, and its bottom edge the keys out.
+The chat's terminal is the size of the inside of the popup, and follows it when the terminal is resized.
+**Ctrl+Q** always comes back to the list as you left it, whatever the chat is doing, and `c` on another tree opens that one.
+**Ctrl+\\** goes straight to the next agent's chat, down the list as filtered, skipping trees with none and wrapping at the end; the cursor follows, so Ctrl+Q lands on the tree you were last in.
 Neither key is a Claude Code default.
 The agent's session keeps running after you leave.
 
@@ -145,10 +150,61 @@ Ctrl+Z also leaves it; double Ctrl+C or `←` on an empty prompt opens Claude's 
 An agent with an `attach` command in its `agent.json` opens the same way.
 An agent running in a tmux pane, such as an interactive `claude`, belongs to that pane and cannot be opened elsewhere: inside tmux, `c` switches to its pane, as `t` does.
 
-`n` starts a new agent in the tree under the cursor and opens its chat as soon as it shows up, so its first message is typed there.
-A tree nobody holds is leased first, with `treetop` as the holder, so the pool cannot hand it to anyone else; the agent starts on its detached HEAD and makes its own branch.
-The agent is `claude --bg`, which Claude Code's own agent view lists too, so the same chat opens from either; `TREETOP_NEW_AGENT` names another command.
-Paired with `a`, it puts an agent to work in a tree nobody is working in.
+## The coordinator and dispatch
+
+treetop is where agents are sent out, and the coordinator is who you ask about them.
+
+`n` opens the compose box in the middle of the screen, with whom the text goes to along its top; Tab and Shift+Tab change it:
+
+- **coordinator**, the default: one Claude Code session in the main checkout that oversees every other agent (see below). A message goes to it as `m` sends one; nothing typed opens its chat.
+- **new tree**: a new agent in a fresh tree from the pool, leased with `treehouse get --lease` when the job runs, so two quick dispatches never share one.
+- **tree N**: a new agent in the tree under the cursor, leased first if nobody holds it.
+- **in place**: a new agent in the main checkout, for a quick job that needs no tree of its own.
+
+Enter sends it, Alt+Enter breaks the line, Esc cancels, Ctrl+U clears the text and Ctrl+W a word; a paste keeps its line breaks.
+The text wraps and the box grows with it.
+
+### The coordinator
+
+The coordinator is `claude --bg --name treetop-coordinator`, started in the main checkout the first time you send it something, with a system prompt that makes it the pool's overseer rather than a coder.
+A message to it is sent the way `m` sends one: typed into its chat behind the screen, while you stay on the list, and the status line says when it is in.
+Enter with nothing typed opens its chat in the same popup as `c`, which is where its answers are read.
+If none is running, one starts with your message as its first prompt; with nothing typed, it starts idle and its chat opens.
+treetop finds it again by its name: while it runs, and for a day after it stops, through `claude attach`, which starts it again with its conversation kept.
+After that a new one starts.
+
+It sees and steers the other agents through three treetop commands, which it may run without asking:
+
+| Command | Does |
+|---|---|
+| `treetop status` | prints JSON: each held tree's branch, uncommitted and unpushed counts and ports, its agents and their state, and each background agent's latest report (the question it is waiting on, its answer once done, else what it is doing now); idle trees are only counted |
+| `treetop send <tree\|agent> <message>` | types the message into the chat of every agent in that tree (a number or `main`), or of the agent of that name, and submits it |
+| `treetop dispatch <new\|main\|N> <task>` | starts a new agent on the task in a fresh tree, the main checkout or tree N |
+
+They work from any shell too.
+Each prints only what it is asked for, so a question costs the coordinator one small read rather than a crawl through every transcript.
+It is told to run `treetop status` before answering anything about the agents, to lead with what is waiting on you, and to say what it will send or dispatch and wait for a yes unless you have told it to go ahead.
+
+### New agents
+
+Every tree is leased with `treetop` as the holder, and the agent starts on its detached HEAD and makes its own branch.
+The agent is `claude --bg --name <the task's first words> <task>`, which Claude Code's own agent view lists too; `TREETOP_NEW_AGENT` names another command, which gets the task as its last argument.
+An empty task starts the agent idle and opens its chat as soon as it shows up, so its first message is typed there; paired with `a`, that puts an agent to work in a tree nobody is working in.
+
+### Messages
+
+`m` opens the compose box to write to the agents in the marked trees, or the tree under the cursor.
+treetop types it into each agent's chat, the same `claude attach` that `c` opens, behind the screen if the chat is not open: it waits for the chat to draw, pastes the text, and presses Enter.
+An agent mid-turn queues it, as Claude Code queues anything typed while it works.
+Agents with no chat to type into, such as an interactive session or a bare process, are left out, and the status line says how many.
+
+### Hearing back
+
+treetop reads every background agent's latest report from Claude Code's job files under `~/.claude/jobs`.
+When an agent comes to need you, or finishes, treetop rings the terminal bell, and inside tmux shows it in the status line for five seconds, so it is heard from any window.
+An agent sitting at a question dialog or permission prompt needs you too, though its report still says working.
+The summary counts the reports that need you; the coordinator reads the reports themselves.
+These job files are internal to Claude Code, like its session files, so a release that changes them silences the bell and blanks the reports until treetop catches up.
 
 ## Entering a tree
 

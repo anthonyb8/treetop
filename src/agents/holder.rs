@@ -39,6 +39,7 @@ fn parse(text: &str) -> Option<Agent> {
         source: Source::Holder,
         is_background: false,
         attach: holder.attach.filter(|command| !command.is_empty()),
+        job: None,
     })
 }
 

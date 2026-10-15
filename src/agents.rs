@@ -15,10 +15,12 @@ mod claude;
 mod holder;
 mod procs;
 
+pub use claude::config_dir;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::pool::{Process, Tree};
+use crate::pool::{self, Process, Tree};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -77,6 +79,9 @@ pub struct Agent {
     /// The command that opens its chat in a terminal, which `c` runs inside
     /// treetop; None when the agent offers none.
     pub attach: Option<Vec<String>>,
+    /// The background job Claude Code keeps its reports under, which joins
+    /// the agent to its entry in the inbox.
+    pub job: Option<String>,
 }
 
 /// An agent and the directory it works in, before it is placed in a tree.
@@ -106,7 +111,7 @@ fn place(trees: &[Tree], sightings: Vec<Sighting>) -> HashMap<PathBuf, Vec<Agent
     let mut seen = HashSet::new();
     let mut by_tree: HashMap<PathBuf, Vec<Agent>> = HashMap::new();
     for (dir, agent) in sightings {
-        let Some(tree) = trees.iter().find(|t| t.contains(&dir)) else {
+        let Some(tree) = pool::holding(trees, &dir) else {
             continue;
         };
         if seen.insert(agent.pid) {
@@ -129,6 +134,7 @@ mod tests {
             source,
             is_background: false,
             attach: None,
+            job: None,
         }
     }
 
