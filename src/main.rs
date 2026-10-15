@@ -25,9 +25,10 @@ mod theme;
 mod tmux;
 mod ui;
 mod watch;
+mod workspaces;
 
 use std::io::{self, Stdout, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -43,7 +44,7 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::layout::Rect;
 
-use crate::app::{App, Outcome};
+use crate::app::{App, Choice, Outcome};
 use crate::chat::Chats;
 use crate::jobs::{Kind, Worker};
 use crate::refresh::{Refresher, Update};
@@ -113,7 +114,7 @@ fn chat_closed(app: &mut App, agent: &str, tree: &str) -> Result<()> {
 
 /// Rings the terminal bell and, inside tmux, shows the most pressing piece of
 /// news in the status line, so an agent that needs you is heard from any
-/// window. News comes what needs you first.
+/// window. News comes in inbox order, what needs you first.
 fn announce(news: &[String]) -> Result<()> {
     let mut out = io::stdout();
     out.write_all(b"\x07")?;
@@ -123,7 +124,7 @@ fn announce(news: &[String]) -> Result<()> {
     {
         let more = match news.len() - 1 {
             0 => String::new(),
-            n => format!(" (+{n} more)"),
+            n => format!(" (+{n} more in the inbox)"),
         };
         let line: String = first.chars().take(160).collect();
         tmux::notify(&format!("treetop: {line}{more}"));
@@ -131,7 +132,27 @@ fn announce(news: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<()> {
+/// Why `run` stopped showing a pool.
+enum Exit {
+    Quit,
+    /// Show the pool of the repository checked out here instead.
+    Switch(PathBuf),
+}
+
+/// Every workspace, with how many trees each held at its last listing.
+fn choices() -> Vec<Choice> {
+    workspaces::list()
+        .into_iter()
+        .map(|workspace| Choice {
+            held: cache::read(&workspace.checkout)
+                .map(|trees| trees.iter().filter(|t| t.is_held()).count()),
+            name: workspace.name(),
+            checkout: workspace.checkout,
+        })
+        .collect()
+}
+
+fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
     let refresher = Refresher::spawn(checkout.to_path_buf(), app.trees.clone());
     let worker = Worker::spawn();
     let diffs = diff::Loader::spawn(diff::base(checkout));
@@ -190,7 +211,7 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<()> {
             diffs.request(path);
         }
         if app.is_quitting && app.active_jobs() == 0 {
-            return Ok(());
+            return Ok(Exit::Quit);
         }
         if !chats.is_open()
             && let Some(Outcome::Chat {
@@ -281,7 +302,9 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<()> {
         }
         match app.handle_key(key) {
             Outcome::Continue => {}
-            Outcome::Quit => return Ok(()),
+            Outcome::Quit => return Ok(Exit::Quit),
+            Outcome::Workspaces => app.open_picker(choices()),
+            Outcome::Switch(path) => return Ok(Exit::Switch(path)),
             Outcome::Refresh => refresher.refresh(),
             Outcome::Chat {
                 command,
@@ -327,11 +350,46 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<()> {
     }
 }
 
+/// The repository to open: the one `start` is in, else, for the screen, the
+/// workspace opened most recently, so treetop opens from anywhere.
+fn checkout_for(start: &Path, is_screen: bool) -> Result<PathBuf> {
+    match pool::main_checkout(start) {
+        Ok(checkout) => Ok(checkout),
+        Err(err) => match workspaces::list().into_iter().next() {
+            Some(last) if is_screen => Ok(last.checkout),
+            _ => Err(err),
+        },
+    }
+}
+
+/// Shows the pool of `checkout`, and of each workspace `w` switches to,
+/// until treetop quits. Each switch starts the pool's clocks, worker and
+/// chats afresh; ending the old pool's chat clients leaves its agents
+/// running.
+fn show(term: &mut Term, start: PathBuf, mut checkout: PathBuf) -> Result<()> {
+    let mut here = Some(start);
+    loop {
+        std::env::set_current_dir(&checkout)?;
+        workspaces::record(&checkout);
+        let mut app = App::new(here.take());
+        app.is_in_tmux = tmux::is_inside();
+        app.checkout = checkout.clone();
+        if let Some(mut cached) = cache::read(&checkout) {
+            cached.insert(0, pool::main_tree(&checkout));
+            app.set_cached(cached);
+        }
+        match run(term, &mut app, &checkout)? {
+            Exit::Quit => return Ok(()),
+            Exit::Switch(next) => checkout = next,
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let start = std::env::current_dir()?;
-    let checkout = pool::main_checkout(&start)?;
-    std::env::set_current_dir(&checkout)?;
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let checkout = checkout_for(&start, args.is_empty())?;
+    std::env::set_current_dir(&checkout)?;
     if !args.is_empty() {
         return cli::run(&args, &checkout);
     }
@@ -342,14 +400,8 @@ fn main() -> Result<()> {
         default_hook(info);
     }));
 
-    let mut app = App::new(Some(start));
-    app.is_in_tmux = tmux::is_inside();
-    if let Some(mut cached) = cache::read(&checkout) {
-        cached.insert(0, pool::main_tree(&checkout));
-        app.set_cached(cached);
-    }
     let mut term = enter_screen()?;
-    let result = run(&mut term, &mut app, &checkout);
+    let result = show(&mut term, start, checkout);
     leave_screen()?;
     result
 }

@@ -1,6 +1,6 @@
 # Who's in the tree
 
-A project in six issues: what each tree is serving, which agent is working in it, one key to land in that agent's chat, sending agents work and hearing back from them, and a coordinator to talk to about all of them.
+A project in seven issues: what each tree is serving, which agent is working in it, one key to land in that agent's chat, sending agents work and hearing back from them, a coordinator to talk to about all of them, and moving between repositories' pools.
 Each issue is one PR into `main` and ships on its own as a tagged release.
 
 ## Goal
@@ -503,6 +503,63 @@ N/A - not a bug.
 
 - Measured in tmux at 160 by 48 on the user's pool: a chat's terminal reported 138 by 38, the popup's inside; `m` and `treetop send 21` each reached a stand-in agent in tree 21 (and the Claude session working there); `treetop send` took about 3.4 seconds, most of it waiting for the chat to draw; `treetop status` printed the live pool.
 - The coordinator's flags were checked with `claude -p` and the same arguments: the prompt took and the task after `--name` arrived as its first message. Starting it with `--bg` from the box has not been run yet.
+
+## Open decisions
+
+None.
+
+# Issue 7: Workspaces, and the inbox back
+
+## Why
+
+treetop showed one repository's pool, the one it was started in, so working across several pooled repositories meant a treetop per repository or quitting and starting again elsewhere.
+Removing the inbox in Issue 6 took away the quickest read of what each agent last said; the coordinator answers questions about the agents, but does not replace a list to scan.
+
+## Outcome
+
+`w` switches one treetop between the pools of every repository it has been opened in, and `Tab` brings back the inbox as it was before Issue 6, with replies through the compose box and chats in the popup.
+
+## Repro
+
+N/A - not a bug.
+
+## Scope
+
+**In:**
+
+- The inbox, its report pane, read marks and keys restored as they were; replies open the compose box, `c` opens the chat in the popup, and the coordinator's own reports are left out of it while still ringing the bell.
+- A workspace list in `$XDG_CACHE_HOME/treetop/workspaces.json`, added to on every start, dropping checkouts that no longer exist.
+- A `w` picker popup with each workspace's held trees from its cached listing; Enter switches by restarting the pool's clocks, worker and chats on the new checkout.
+- The workspace's name on the summary badge, and a compact summary when the bar is too narrow for the keys beside the full one.
+- A stopped coordinator taken up again only in its own pool.
+- Run outside any pool, the screen opens the last workspace.
+
+**Out:**
+
+- Scanning `~/.treehouse` for pools: treetop reads treehouse only through its CLI.
+- An inbox per workspace: reports carry where an agent works, not which repository's pool it belongs to by any field the inbox could filter on without guessing, and one inbox for everything is what a glance is for.
+
+**Layers:**
+
+- **UI:** the inbox table and report pane, the picker popup, `Tab`, `w`, the badge, the compact summary.
+- **Data:** `src/workspaces.rs` (the list), `Report.steps` and the timeline in `src/reports.rs`, `Screen`, `Item`, `Picker` and `Outcome::Switch` in `src/app.rs`, the `show` loop in `src/main.rs`.
+- **Schema:** N/A - no database.
+- **Edge / vendors / env:** `XDG_CACHE_HOME` for the list.
+- **Tests:** the restored inbox tests; the coordinator out of the inbox but announced; another repository's coordinator never taken; the list's order, round trip, missing checkouts and corrupt file; the picker's starting row, bounds, Esc, staying put on this workspace, the message when there is no other, and a switch refused while actions run.
+- **Risk:** the job files stay internal and undocumented.
+
+**Roles:** N/A - single-user CLI.
+
+## Acceptance
+
+- [ ] `Tab` shows the inbox with what needs you first, and Enter on a row opens the compose box addressed to that agent.
+- [ ] After opening treetop once in a second pooled repository, `w` lists both and Enter switches the table, the main row and the badge to it; `w` and Enter switch back.
+- [ ] At 80 columns the bottom bar keeps its keys and the badge.
+
+## Approach
+
+- Measured in tmux at 160 by 48 and 80 by 30 with a temporary `XDG_CACHE_HOME`: the inbox listed the pool's live reports, a reply box opened addressed to the row's agent and closed on Esc, and `w` switched app to linear-tui and back.
+- The 80-column check found the full summary pushing every key and the badge off the bar; the compact summary keeps 40 columns for the keys.
 
 ## Open decisions
 
