@@ -2,11 +2,12 @@
 //! owns, its output parsed into a screen treetop draws in its own frame, so
 //! the real terminal is never handed over: whatever modes the chat switches
 //! on (mouse tracking, extended keys, bracketed paste) land in the parser,
-//! and treetop sees every key first, keeping Ctrl+] to leave.
+//! and treetop sees every key first, keeping Ctrl+Q to leave.
 //!
-//! A chat left with Ctrl+] keeps running in the background, its screen kept
+//! A chat left with Ctrl+Q keeps running in the background, its screen kept
 //! current, so opening it again is instant.
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -20,6 +21,7 @@ use anyhow::{Context, Result, bail};
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use ratatui::layout::{Position, Rect};
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
 /// Lines of scrollback kept; the chat draws its own history, so none.
@@ -44,6 +46,21 @@ const SYNC_END: &[u8] = b"\x1b[?2026l";
 /// Chats kept running after they are left, the most recently left kept.
 const KEPT: usize = 8;
 
+/// How long a chat opened to deliver a message is given after its first draw
+/// before the message is typed: Claude Code draws its input box before it
+/// takes keys, and typing sooner loses them.
+const TYPE_AFTER: Duration = Duration::from_millis(1500);
+
+/// How long after the text is pasted Enter follows, so the chat reads the
+/// paste as a paste and the Enter as sending it.
+const SUBMIT_AFTER: Duration = Duration::from_millis(300);
+
+/// A line waiting to be typed into a chat.
+struct Outgoing {
+    text: String,
+    pasted_at: Option<Instant>,
+}
+
 pub struct Chat {
     pub agent: String,
     pub tree: String,
@@ -61,6 +78,10 @@ pub struct Chat {
     is_ready: bool,
     /// When the synchronized update in progress began, if one is.
     sync_since: Option<Instant>,
+    /// When its first draw was shown, which starts TYPE_AFTER.
+    ready_at: Option<Instant>,
+    /// Lines to type and send once it takes keys, oldest first.
+    outbox: VecDeque<Outgoing>,
 }
 
 /// Where the last synchronized-output marker in `bytes` leaves the chat:
@@ -173,6 +194,8 @@ impl Chat {
             last_output: None,
             is_ready: false,
             sync_since: None,
+            ready_at: None,
+            outbox: VecDeque::new(),
         })
     }
 
@@ -206,6 +229,9 @@ impl Chat {
                 .last_output
                 .is_some_and(|at| at.elapsed() >= SETTLE && self.sync_since.is_none());
             self.is_ready = has_settled || self.opened_at.elapsed() >= REVEAL;
+            if self.is_ready {
+                self.ready_at = Some(Instant::now());
+            }
             return self.is_ready;
         }
         let is_mid_update = self.sync_since.is_some_and(|at| at.elapsed() < SYNC_WAIT);
@@ -238,12 +264,12 @@ impl Chat {
     }
 
     /// Passes a mouse event on, in the mode and encoding the chat asked for.
-    /// `top` is the screen row the chat starts on, below treetop's bar.
-    pub fn send_mouse(&mut self, event: MouseEvent, top: u16) {
+    /// `area` is where the chat is drawn on screen, inside its popup.
+    pub fn send_mouse(&mut self, event: MouseEvent, area: Rect) {
         let screen = self.screen();
         let bytes = encode_mouse(
             event,
-            top,
+            area,
             screen.mouse_protocol_mode(),
             screen.mouse_protocol_encoding(),
             screen.application_cursor(),
@@ -261,6 +287,32 @@ impl Chat {
         } else {
             self.write(text.as_bytes());
         }
+    }
+
+    /// Types the waiting lines in, one at a time: the text as a paste, then
+    /// Enter once SUBMIT_AFTER has passed. Returns how many were sent.
+    fn flush(&mut self) -> usize {
+        if self.ready_at.is_none_or(|at| at.elapsed() < TYPE_AFTER) {
+            return 0;
+        }
+        let mut sent = 0;
+        while let Some(next) = self.outbox.front_mut() {
+            match next.pasted_at {
+                None => {
+                    next.pasted_at = Some(Instant::now());
+                    let text = next.text.clone();
+                    self.paste(&text);
+                    return sent;
+                }
+                Some(at) if at.elapsed() >= SUBMIT_AFTER => {
+                    self.write(b"\r");
+                    self.outbox.pop_front();
+                    sent += 1;
+                }
+                Some(_) => return sent,
+            }
+        }
+        sent
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
@@ -293,13 +345,17 @@ pub struct Pumped {
     pub is_stale: bool,
     /// The open chat's program exited, which closes it: its agent and tree.
     pub ended: Option<(String, String)>,
+    /// Agent and tree of each message typed in and sent.
+    pub delivered: Vec<(String, String)>,
+    /// Agent and tree of each chat that ended with messages still unsent.
+    pub undelivered: Vec<(String, String)>,
 }
 
 /// The chat on screen, if one is, and the ones left running behind it.
 #[derive(Default)]
 pub struct Chats {
     open: Option<Chat>,
-    /// Left with Ctrl+], oldest first.
+    /// Left with Ctrl+Q, oldest first.
     background: Vec<Chat>,
 }
 
@@ -346,36 +402,100 @@ impl Chats {
         if let Some(chat) = self.open.take() {
             self.background.push(chat);
         }
+        self.trim();
+    }
+
+    /// Ends the oldest background chats beyond KEPT, never one still holding
+    /// a message to send.
+    fn trim(&mut self) {
         while self.background.len() > KEPT {
-            self.background.remove(0);
+            match self.background.iter().position(|c| c.outbox.is_empty()) {
+                Some(index) => drop(self.background.remove(index)),
+                None => break,
+            }
         }
     }
 
-    /// Pumps every chat. A background chat whose program exited is dropped;
-    /// the open one closes and is reported.
+    /// Queues `text` to be typed into the chat running `command` and sent:
+    /// the one on screen or left running if there is one, else a new one
+    /// opened behind treetop for it.
+    pub fn deliver(
+        &mut self,
+        command: &[String],
+        text: &str,
+        (rows, cols): (u16, u16),
+        agent: String,
+        tree: String,
+    ) -> Result<()> {
+        let outgoing = Outgoing {
+            text: text.to_string(),
+            pasted_at: None,
+        };
+        let running = self
+            .open
+            .iter_mut()
+            .chain(&mut self.background)
+            .find(|c| c.command == command);
+        match running {
+            Some(chat) => chat.outbox.push_back(outgoing),
+            None => {
+                let mut chat = Chat::open(command, rows, cols, agent, tree)?;
+                chat.outbox.push_back(outgoing);
+                self.background.push(chat);
+                self.trim();
+            }
+        }
+        Ok(())
+    }
+
+    /// Pumps every chat and types in what is waiting. A background chat whose
+    /// program exited is dropped; the open one closes and is reported.
     pub fn pump(&mut self) -> Pumped {
+        let mut delivered = Vec::new();
+        let mut undelivered = Vec::new();
         for chat in &mut self.background {
             chat.pump();
+            let sent = chat.flush();
+            delivered.extend((0..sent).map(|_| (chat.agent.clone(), chat.tree.clone())));
         }
-        self.background.retain(|c| !c.is_ended());
+        self.background.retain(|c| {
+            if c.is_ended() && !c.outbox.is_empty() {
+                undelivered.push((c.agent.clone(), c.tree.clone()));
+            }
+            !c.is_ended()
+        });
         let Some(open) = &mut self.open else {
             return Pumped {
                 is_stale: false,
                 ended: None,
+                delivered,
+                undelivered,
             };
         };
         let is_stale = open.pump();
+        let sent = open.flush();
+        delivered.extend((0..sent).map(|_| (open.agent.clone(), open.tree.clone())));
+        if open.is_ended() && !open.outbox.is_empty() {
+            undelivered.push((open.agent.clone(), open.tree.clone()));
+        }
         let ended = open
             .is_ended()
             .then(|| self.open.take())
             .flatten()
             .map(|chat| (chat.agent.clone(), chat.tree.clone()));
-        Pumped { is_stale, ended }
+        Pumped {
+            is_stale,
+            ended,
+            delivered,
+            undelivered,
+        }
     }
 
-    /// Ends the background chats whose agent is gone.
+    /// Ends the background chats whose agent is gone, except one still
+    /// delivering a message: attaching to a stopped agent starts it again.
     pub fn retain(&mut self, is_live: impl Fn(&[String]) -> bool) {
-        self.background.retain(|c| is_live(&c.command));
+        self.background
+            .retain(|c| !c.outbox.is_empty() || is_live(&c.command));
     }
 
     /// Resizes every chat, so one opened later is already the right size.
@@ -393,17 +513,21 @@ const WHEEL_LINES: usize = 3;
 
 /// The bytes a terminal sends for a mouse event, when the chat's `mode`
 /// asks for that kind of event, in its `encoding`. Rows are shifted by
-/// `top`, the row the chat starts on; events on treetop's bar are dropped.
+/// the corner of `area`, where the chat is drawn; events outside it, on the
+/// popup's frame or the table round it, are dropped.
 /// A chat that has not asked for the mouse gets the wheel as arrow keys,
 /// which scroll most programs, the way terminals do on an alternate screen.
 fn encode_mouse(
     event: MouseEvent,
-    top: u16,
+    area: Rect,
     mode: MouseProtocolMode,
     encoding: MouseProtocolEncoding,
     application_cursor: bool,
 ) -> Option<Vec<u8>> {
-    let row = event.row.checked_sub(top)?;
+    if !area.contains(Position::new(event.column, event.row)) {
+        return None;
+    }
+    let (col, row) = (event.column - area.x, event.row - area.y);
     if mode == MouseProtocolMode::None {
         let arrow = match event.kind {
             MouseEventKind::ScrollUp => KeyCode::Up,
@@ -437,7 +561,7 @@ fn encode_mouse(
     let modifiers = u16::from(event.modifiers.contains(KeyModifiers::SHIFT)) * 4
         + u16::from(event.modifiers.contains(KeyModifiers::ALT)) * 8
         + u16::from(event.modifiers.contains(KeyModifiers::CONTROL)) * 16;
-    let (code, col, row) = (code + modifiers, event.column + 1, row + 1);
+    let (code, col, row) = (code + modifiers, col + 1, row + 1);
     let is_wheel = matches!(
         event.kind,
         MouseEventKind::ScrollUp
@@ -482,10 +606,11 @@ pub fn is_next(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('\\' | '4'))
 }
 
-/// Ctrl+], which leaves the chat. Without the terminal's extended key modes,
-/// crossterm reports the byte Ctrl+] sends (0x1d) as Ctrl+5.
+/// Ctrl+Q, which leaves the chat. Claude Code binds no Ctrl+Q, and in raw
+/// mode it is no flow control, so the chat never needs it; Ctrl+], which
+/// Claude Code uses, passes through.
 pub fn is_exit(key: KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char(']' | '5'))
+    key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('q' | 'Q'))
 }
 
 /// The bytes a terminal sends for `key`, in the xterm encoding a program
@@ -635,8 +760,30 @@ mod tests {
         }
     }
 
+    /// A chat drawn from column 0, row 1 of the screen.
+    const BELOW_A_BAR: Rect = Rect::new(0, 1, 80, 24);
+
     fn sgr(event: MouseEvent, mode: MouseProtocolMode) -> Option<Vec<u8>> {
-        encode_mouse(event, 1, mode, MouseProtocolEncoding::Sgr, false)
+        encode_mouse(event, BELOW_A_BAR, mode, MouseProtocolEncoding::Sgr, false)
+    }
+
+    #[test]
+    fn a_popup_shifts_clicks_by_its_corner_and_drops_those_outside_it() {
+        let popup = Rect::new(10, 4, 20, 5);
+        let click = |column, row| {
+            encode_mouse(
+                mouse(MouseEventKind::Down(MouseButton::Left), column, row),
+                popup,
+                MouseProtocolMode::PressRelease,
+                MouseProtocolEncoding::Sgr,
+                false,
+            )
+        };
+        assert_eq!(click(10, 4).unwrap(), b"\x1b[<0;1;1M");
+        assert_eq!(click(29, 8).unwrap(), b"\x1b[<0;20;5M");
+        assert_eq!(click(9, 4), None, "left of it");
+        assert_eq!(click(30, 8), None, "right of it");
+        assert_eq!(click(12, 9), None, "below it");
     }
 
     #[test]
@@ -701,7 +848,7 @@ mod tests {
         let legacy = |kind, encoding| {
             encode_mouse(
                 mouse(kind, 4, 6),
-                1,
+                BELOW_A_BAR,
                 MouseProtocolMode::PressRelease,
                 encoding,
                 false,
@@ -724,7 +871,7 @@ mod tests {
         let up = mouse(MouseEventKind::ScrollUp, 1, 4);
         assert_eq!(sgr(up, none).unwrap(), b"\x1b[A\x1b[A\x1b[A");
         assert_eq!(
-            encode_mouse(up, 1, none, MouseProtocolEncoding::Sgr, true).unwrap(),
+            encode_mouse(up, BELOW_A_BAR, none, MouseProtocolEncoding::Sgr, true).unwrap(),
             b"\x1bOA\x1bOA\x1bOA"
         );
         assert_eq!(
@@ -741,10 +888,10 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_right_bracket_leaves_however_it_is_reported() {
-        assert!(is_exit(key(KeyCode::Char(']'), KeyModifiers::CONTROL)));
-        assert!(is_exit(key(KeyCode::Char('5'), KeyModifiers::CONTROL)));
-        assert!(!is_exit(key(KeyCode::Char(']'), KeyModifiers::NONE)));
-        assert!(!is_exit(key(KeyCode::Char('z'), KeyModifiers::CONTROL)));
+    fn ctrl_q_leaves_and_ctrl_right_bracket_goes_to_the_chat() {
+        assert!(is_exit(key(KeyCode::Char('q'), KeyModifiers::CONTROL)));
+        assert!(!is_exit(key(KeyCode::Char('q'), KeyModifiers::NONE)));
+        assert!(!is_exit(key(KeyCode::Char(']'), KeyModifiers::CONTROL)));
+        assert!(!is_exit(key(KeyCode::Char('5'), KeyModifiers::CONTROL)));
     }
 }

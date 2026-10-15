@@ -123,6 +123,12 @@ fn tmux(args: &[&str]) -> Result<String> {
 /// Switches to the pane of the agent working in the tree, else to a window of
 /// this session already in the tree, else opens one there. Returns what
 /// happened, for the status line.
+/// Shows `text` in the status line of every client, the way tmux reports a
+/// bell in another window, so news reaches you in whatever window you are.
+pub fn notify(text: &str) {
+    let _ = tmux(&["display-message", "-d", "5000", text]);
+}
+
 pub fn open(tree: &Tree) -> Result<String> {
     if let Some(switched) = open_agent(tree)? {
         return Ok(switched);

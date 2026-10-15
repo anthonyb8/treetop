@@ -43,10 +43,12 @@ struct Session {
     /// is accepted too, in case that changes.
     #[serde(default)]
     proc_start: Option<Value>,
+    #[serde(default)]
+    job_id: Option<String>,
 }
 
 /// `CLAUDE_CONFIG_DIR`, else `~/.claude`.
-fn config_dir() -> Option<PathBuf> {
+pub fn config_dir() -> Option<PathBuf> {
     std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".claude")))
@@ -80,6 +82,7 @@ fn agent(session: &Session, start: Option<u64>) -> Option<Agent> {
         source: Source::Claude,
         is_background,
         attach,
+        job: session.job_id.clone(),
     })
 }
 

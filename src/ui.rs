@@ -1,5 +1,7 @@
-//! Drawing, htop style: a summary line, the pool table, a detail pane for the
-//! tree under the cursor, and a key bar. Every colour comes from `theme`.
+//! Drawing, htop style: the pool table, a detail pane for the tree under the
+//! cursor, and a key bar with the summary. A chat, a diff or the compose box
+//! floats over them in a popup, with the table dimmed round it, so treetop
+//! never leaves the screen. Every colour comes from `theme`.
 
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -9,19 +11,23 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 
 use crate::agents::{Agent, Status};
-use crate::app::{App, DiffView, JobState, Pane, Pending, Review};
+use crate::app::{App, DiffView, JobState, Opening, Pane, Pending, Review};
 use crate::chat::Chat;
+use crate::coordinator;
 use crate::diff::{Change, FileDiff, Layout as DiffLayout, Row as DiffRow, Side, ViewRow};
+use crate::dispatch::{Prompt, Purpose, Target};
 use crate::pool::{Tree, Work};
+use crate::popup;
 use crate::theme::theme;
 
 /// Most useful first: on a narrow bar the keys at the end are the ones left
 /// out.
-const KEYS: [(&str, &str); 15] = [
+const KEYS: [(&str, &str); 16] = [
+    ("n", "ask/dispatch"),
+    ("m", "message"),
     ("t", "tree"),
     ("c", "chat"),
     ("d", "diff"),
-    ("n", "new agent"),
     ("o", "open port"),
     ("a", "no agent"),
     ("Space", "mark"),
@@ -53,47 +59,43 @@ fn fg(color: Color) -> Style {
 }
 
 pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>) {
-    if let Some(chat) = chat {
-        draw_chat(frame, app, chat);
-        return;
-    }
     // The theme's text colour is the base for every cell; widgets below only
     // add accents, so nothing falls back to a theme's dim default.
     frame.render_widget(Block::new().style(fg(theme().text)), frame.area());
-    if let Some(view) = &app.view {
-        draw_diff_view(frame, app, view);
-        return;
-    }
     let [body, detail, footer] = Layout::vertical([
         Constraint::Fill(1),
-        if app.pane == Pane::Info {
-            Constraint::Length(6)
-        } else {
-            Constraint::Fill(1)
+        match app.pane {
+            Pane::Info => Constraint::Length(6),
+            Pane::Log => Constraint::Fill(1),
         },
         Constraint::Length(1),
     ])
     .areas(frame.area());
-
     draw_table(frame, app, body);
     match app.pane {
         Pane::Info => frame.render_widget(detail_pane(app), detail),
         Pane::Log => frame.render_widget(log_pane(app, detail.height), detail),
     }
     draw_footer(frame, app, footer);
-    if let Some(review) = app.reviews.front() {
+    if chat.is_some() || app.view.is_some() || app.prompt.is_some() || app.opening.is_some() {
+        let area = frame.area();
+        frame
+            .buffer_mut()
+            .set_style(area, Style::new().add_modifier(Modifier::DIM));
+    }
+    if let Some(chat) = chat {
+        draw_chat(frame, app, chat);
+    } else if let Some(opening) = &app.opening {
+        draw_opening(frame, app, opening);
+    } else if let Some(view) = &app.view {
+        draw_diff_view(frame, app, view);
+    } else if let Some(prompt) = &app.prompt {
+        draw_prompt(frame, prompt);
+    } else if let Some(review) = app.reviews.front() {
         draw_review(frame, review, app.reviews.len() - 1);
     } else if let Some(pending) = &app.pending {
         draw_confirm(frame, pending);
     }
-}
-
-/// A bar across the screen: the name as a badge, then `spans`.
-fn bar(name: &str, spans: Vec<Span<'static>>) -> Paragraph<'static> {
-    let t = theme();
-    let mut line = vec![Span::styled(format!(" {name} "), t.badge), Span::raw(" ")];
-    line.extend(spans);
-    Paragraph::new(Line::from(line)).style(t.bar)
 }
 
 /// The pool at a glance, for the right end of the bottom bar: counts,
@@ -103,7 +105,8 @@ fn summary(app: &App) -> Vec<Span<'static>> {
     let t = theme();
     let mut spans = vec![Span::raw("  ")];
     if app.is_loaded {
-        let held = app.trees.iter().filter(|t| t.is_held()).count();
+        let pool = app.trees.iter().filter(|t| !t.is_main);
+        let (trees, held) = (pool.clone().count(), pool.filter(|t| t.is_held()).count());
         let running = app.trees.iter().filter(|t| !t.processes.is_empty()).count();
         let serving = app.trees.iter().filter(|t| !t.ports().is_empty()).count();
         let agents = app.trees.iter().map(|t| t.agents.len()).sum::<usize>();
@@ -113,10 +116,7 @@ fn summary(app: &App) -> Vec<Span<'static>> {
             .flat_map(|t| &t.agents)
             .filter(|a| a.status == Some(Status::Waiting))
             .count();
-        spans.push(Span::raw(format!(
-            "{} trees  {held} held  ",
-            app.trees.len()
-        )));
+        spans.push(Span::raw(format!("{trees} trees  {held} held  ")));
         spans.push(Span::styled(format!("{running} running"), fg(t.warning)));
         spans.push(Span::styled(format!("  {serving} serving"), fg(t.info)));
         let noun = if agents == 1 { "agent" } else { "agents" };
@@ -125,6 +125,12 @@ fn summary(app: &App) -> Vec<Span<'static>> {
             spans.push(Span::styled(
                 format!("  {waiting} waiting"),
                 fg(t.warning).add_modifier(Modifier::BOLD),
+            ));
+        }
+        if let n @ 1.. = app.needing_you() {
+            spans.push(Span::styled(
+                format!("  {n} need you"),
+                fg(t.danger).add_modifier(Modifier::BOLD),
             ));
         }
         if !app.marked.is_empty() {
@@ -203,6 +209,7 @@ fn status_cell(app: &App, tree: &Tree) -> Cell<'static> {
             let color = match tree.status.as_str() {
                 "leased" => t.success,
                 "available" => t.muted,
+                "checkout" => t.info,
                 _ => t.danger,
             };
             (tree.status.clone(), fg(color))
@@ -503,15 +510,138 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(right).style(t.bar), right_area);
 }
 
-fn centered(area: Rect, width: u16, height: u16) -> Rect {
-    let width = width.min(area.width);
-    let height = height.min(area.height);
-    Rect::new(
-        area.x + (area.width - width) / 2,
-        area.y + (area.height - height) / 2,
-        width,
-        height,
-    )
+/// A popup's frame over the dimmed table: a border in the accent colour and
+/// its title. Callers put the keys where they read best.
+fn popup_block(title: Line<'static>) -> Block<'static> {
+    Block::bordered()
+        .title(title)
+        .border_style(fg(theme().accent))
+        .style(fg(theme().text))
+}
+
+/// `text` broken into rows of `width` characters, at its own line breaks
+/// and wherever a line runs past the width, so the cursor's place is known.
+fn wrap_chars(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    for line in text.split('\n') {
+        let chars: Vec<char> = line.chars().collect();
+        if chars.is_empty() {
+            rows.push(String::new());
+        }
+        rows.extend(chars.chunks(width).map(|chunk| chunk.iter().collect()));
+    }
+    if rows.last().is_some_and(|row| row.chars().count() == width) {
+        rows.push(String::new());
+    }
+    rows
+}
+
+/// Rows the compose box gives its text, growing with it.
+const COMPOSE_ROWS: (u16, u16) = (7, 16);
+
+/// The compose box in the middle of the screen: who the text goes to, the
+/// text, wrapped and growing as it is typed, and the keys.
+fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
+    let t = theme();
+    let screen = frame.area();
+    let width = screen.width.saturating_sub(4).min(116);
+    let text_width = usize::from(width.saturating_sub(4));
+    let rows = wrap_chars(&prompt.text, text_width);
+    let text_height = u16::try_from(rows.len())
+        .unwrap_or(u16::MAX)
+        .clamp(COMPOSE_ROWS.0, COMPOSE_ROWS.1);
+    let targets = match &prompt.purpose {
+        Purpose::Dispatch { targets, at } => Some((targets, *at)),
+        Purpose::Message { .. } => None,
+    };
+    // Borders, the targets and a blank line under them when there are any.
+    let chrome = if targets.is_some() { 4 } else { 2 };
+    let area = popup::centered(screen, width, text_height + chrome);
+    let (title, placeholder) = match (prompt.target(), &prompt.purpose) {
+        (Some(Target::Coordinator), _) => (
+            " Ask the coordinator ".to_string(),
+            "ask about the agents or give it work; send nothing to just open its chat",
+        ),
+        (Some(_), _) => (
+            " New agent ".to_string(),
+            "the task, or nothing to start it idle and open its chat",
+        ),
+        (None, Purpose::Message { to }) => (
+            match to.as_slice() {
+                [one] => format!(" Message {} in {} ", one.agent, one.tree),
+                many => format!(" Message {} agents ", many.len()),
+            },
+            "what to tell it",
+        ),
+        (None, Purpose::Dispatch { .. }) => (" New agent ".to_string(), ""),
+    };
+    let mut keys = vec![
+        ("Enter", "send"),
+        ("Alt+Enter", "new line"),
+        ("Esc", "cancel"),
+    ];
+    if targets.is_some() {
+        keys.insert(0, ("Tab", "to"));
+    }
+    let block = popup_block(Line::styled(
+        title,
+        fg(t.title).add_modifier(Modifier::BOLD),
+    ))
+    .title_bottom(Line::from(fitting_keys(&keys, width.saturating_sub(2))));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let inner = Rect::new(
+        inner.x + 1,
+        inner.y,
+        inner.width.saturating_sub(2),
+        inner.height,
+    );
+    let mut text_area = inner;
+    if let Some((targets, at)) = targets {
+        let mut spans = vec![Span::styled("to ", fg(t.muted))];
+        for (i, target) in targets.iter().enumerate() {
+            let label = format!(" {} ", target.label());
+            spans.push(if i == at {
+                Span::styled(label, t.badge)
+            } else {
+                Span::styled(label, fg(t.muted))
+            });
+            spans.push(Span::raw(" "));
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+        text_area = Rect::new(
+            inner.x,
+            inner.y + 2,
+            inner.width,
+            inner.height.saturating_sub(2),
+        );
+    }
+    if prompt.text.is_empty() {
+        frame.render_widget(
+            Paragraph::new(placeholder)
+                .wrap(Wrap { trim: false })
+                .style(fg(t.muted).add_modifier(Modifier::ITALIC)),
+            text_area,
+        );
+        frame.set_cursor_position(Position::new(text_area.x, text_area.y));
+        return;
+    }
+    // The end of a long text stays in view, since that is where it is typed.
+    let shown = usize::from(text_area.height);
+    let first = rows.len().saturating_sub(shown);
+    let lines: Vec<Line> = rows[first..].iter().map(|r| Line::raw(r.clone())).collect();
+    frame.render_widget(Paragraph::new(lines), text_area);
+    let last = rows.last().map_or(0, |row| row.chars().count());
+    let cursor_row = u16::try_from(rows.len() - 1 - first).unwrap_or(0);
+    frame.set_cursor_position(Position::new(
+        text_area.x + u16::try_from(last).unwrap_or(0),
+        text_area.y + cursor_row,
+    ));
 }
 
 /// A dialog's frame: a border in `color` and its title in the theme's title
@@ -574,7 +704,7 @@ fn draw_confirm(frame: &mut Frame, pending: &Pending) {
     let height = u16::try_from(lines.len())
         .unwrap_or(u16::MAX)
         .saturating_add(2);
-    let area = centered(frame.area(), 80, height);
+    let area = popup::centered(frame.area(), 80, height);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines).block(dialog(title, theme().warning)),
@@ -589,7 +719,7 @@ fn draw_review(frame: &mut Frame, review: &Review, remaining: usize) {
     // screen; a longer preview scrolls.
     let lines = u16::try_from(review.preview.lines().count()).unwrap_or(u16::MAX);
     let height = lines.saturating_add(3).max(6).min(full.height * 7 / 10);
-    let area = centered(full, full.width * 4 / 5, height);
+    let area = popup::centered(full, full.width * 4 / 5, height);
     let tree = &review.tree;
     let title = format!(
         " Destroy tree {} ({})? ",
@@ -765,114 +895,150 @@ fn draw_diff_rows(frame: &mut Frame, layout: &DiffLayout, view: &DiffView, body:
     }
 }
 
-/// The full-screen side-by-side diff of one tree against its base.
+/// The side-by-side diff of one tree against its base, in a popup.
 fn draw_diff_view(frame: &mut Frame, app: &App, view: &DiffView) {
     let t = theme();
-    let [top, body, keys] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Fill(1),
-        Constraint::Length(1),
-    ])
-    .areas(frame.area());
+    let area = popup::area(frame.area());
+    // The keys sit in a bar on the popup's last row, drawn like a file header.
+    let [body, key_row] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)])
+        .areas(popup::inner(frame.area()));
     let tree = app.trees.iter().find(|tree| tree.path == view.path);
-    let mut title = vec![Span::raw(format!(
-        "tree {}  {}",
-        tree.map_or("?", |tree| tree.name.as_str()),
-        tree.and_then(|tree| tree.branch.as_deref())
-            .unwrap_or("(detached)")
-    ))];
-    match app.diffs.get(&view.path).map(|d| &d.layout) {
+    let mut title = vec![
+        Span::styled(" diff ", t.badge),
+        Span::styled(
+            format!(
+                " tree {}  {}",
+                tree.map_or("?", |tree| tree.name.as_str()),
+                tree.and_then(|tree| tree.branch.as_deref())
+                    .unwrap_or("(detached)")
+            ),
+            Style::new().add_modifier(Modifier::BOLD),
+        ),
+    ];
+    frame.render_widget(Clear, area);
+    let loaded = app.diffs.get(&view.path).map(|d| &d.layout);
+    if let Some(Ok(layout)) = loaded {
+        let diff = &layout.diff;
+        let (adds, dels) = diff
+            .files
+            .iter()
+            .fold((0, 0), |(a, d), f| (a + f.additions, d + f.deletions));
+        title.push(Span::raw(format!(
+            "  vs {}   {} files  ",
+            diff.base,
+            diff.files.len()
+        )));
+        title.push(Span::styled(format!("+{adds}"), fg(t.success)));
+        title.push(Span::raw(" "));
+        title.push(Span::styled(format!("-{dels} "), fg(t.danger)));
+        if let Some(index) = layout.file_starts.iter().rposition(|&s| s <= view.scroll) {
+            // The file's path is in the header pinned under the title.
+            title.push(Span::raw(format!(
+                "  file {}/{} ",
+                index + 1,
+                diff.files.len()
+            )));
+        }
+    }
+    frame.render_widget(popup_block(Line::from(title)), area);
+    frame.render_widget(
+        Paragraph::new(Line::from(fitting_keys(&DIFF_KEYS, key_row.width))).style(t.diff.header),
+        key_row,
+    );
+    match loaded {
         None => frame.render_widget(Paragraph::new(" reading the diff..."), body),
         Some(Err(err)) => {
             frame.render_widget(Paragraph::new(format!(" {err}")).style(fg(t.danger)), body)
         }
-        Some(Ok(layout)) => {
-            let diff = &layout.diff;
-            let (adds, dels) = diff
-                .files
-                .iter()
-                .fold((0, 0), |(a, d), f| (a + f.additions, d + f.deletions));
-            title.push(Span::raw(format!(
-                "  vs {}   {} files  ",
-                diff.base,
-                diff.files.len()
-            )));
-            title.push(Span::styled(format!("+{adds}"), fg(t.success)));
-            title.push(Span::raw(" "));
-            title.push(Span::styled(format!("-{dels}"), fg(t.danger)));
-            if let Some(index) = layout.file_starts.iter().rposition(|&s| s <= view.scroll) {
-                title.push(Span::raw(format!(
-                    "   file {}/{}: {}",
-                    index + 1,
-                    diff.files.len(),
-                    diff.files[index].path
-                )));
-            }
-            if layout.rows.is_empty() {
-                frame.render_widget(
-                    Paragraph::new(format!(" No changes against {}.", diff.base))
-                        .style(fg(t.success)),
-                    body,
-                );
-            } else {
-                draw_diff_rows(frame, layout, view, body);
-            }
-        }
+        Some(Ok(layout)) if layout.rows.is_empty() => frame.render_widget(
+            Paragraph::new(format!(" No changes against {}.", layout.diff.base))
+                .style(fg(t.success)),
+            body,
+        ),
+        Some(Ok(layout)) => draw_diff_rows(frame, layout, view, body),
     }
-    frame.render_widget(bar("diff", title), top);
-    frame.render_widget(
-        Paragraph::new(Line::from(fitting_keys(&DIFF_KEYS, keys.width))).style(t.bar),
-        keys,
-    );
 }
 
-/// An agent's chat over the whole screen, under a bar naming its branch,
-/// tree and agent and the keys out, the way the diff view takes the screen.
-/// The branch comes from the latest listing, so it follows the agent if it
-/// switches branches.
+/// An agent's chat in a popup over treetop, under a title naming its branch,
+/// tree and agent, with the keys out at the right of the same line. The branch comes from
+/// the latest listing, so it follows the agent if it switches branches.
 fn draw_chat(frame: &mut Frame, app: &App, chat: &Chat) {
-    let t = theme();
-    let [top, body] =
-        Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(frame.area());
-    let back = key_bar(&[("^\\", "next chat"), ("^]", "back to treetop")]);
-    let back_width = u16::try_from(back.iter().map(Span::width).sum::<usize>()).unwrap_or(0);
-    let [title, keys] =
-        Layout::horizontal([Constraint::Fill(1), Constraint::Length(back_width)]).areas(top);
-    let branch = app
-        .trees
-        .iter()
-        .find(|tree| tree.name == chat.tree)
-        .and_then(|tree| tree.branch.clone())
-        .unwrap_or_else(|| "(detached)".into());
-    frame.render_widget(
-        bar(
-            "chat",
-            vec![
-                Span::styled(branch, Style::new().add_modifier(Modifier::BOLD)),
-                Span::raw(format!("  tree {}  {}", chat.tree, chat.agent)),
-            ],
-        ),
-        title,
-    );
-    frame.render_widget(Paragraph::new(Line::from(back)).style(t.bar), keys);
+    let body = chat_frame(frame, app, &chat.agent, &chat.tree);
     if !chat.is_ready() {
-        let [_, middle, _] = Layout::vertical([
-            Constraint::Fill(1),
-            Constraint::Length(1),
-            Constraint::Fill(1),
-        ])
-        .areas(body);
-        frame.render_widget(
-            Paragraph::new(format!("opening {}...", chat.agent))
-                .style(fg(t.muted))
-                .centered(),
-            middle,
-        );
+        draw_note(frame, body, &opening_note(&chat.agent));
         return;
     }
     if let Some(cursor) = draw_screen(chat.screen(), frame.buffer_mut(), body) {
         frame.set_cursor_position(cursor);
     }
+}
+
+/// The popup a chat on its way stands in with: the frame the chat opens in,
+/// so the hand-over from the compose box to the chat never leaves the popup.
+fn draw_opening(frame: &mut Frame, app: &App, opening: &Opening) {
+    let body = chat_frame(frame, app, &opening.agent, &opening.tree);
+    let note = if opening.tree == "new" {
+        "leasing a tree for the agent...".to_string()
+    } else {
+        opening_note(&opening.agent)
+    };
+    draw_note(frame, body, &note);
+}
+
+fn opening_note(agent: &str) -> String {
+    if agent == coordinator::NAME {
+        "opening the coordinator...".into()
+    } else {
+        format!("opening {agent}...")
+    }
+}
+
+/// A chat's popup: its frame and title, cleared, with the keys out at the
+/// right of the title. Returns where the chat's screen goes.
+fn chat_frame(frame: &mut Frame, app: &App, agent: &str, tree: &str) -> Rect {
+    let t = theme();
+    let area = popup::area(frame.area());
+    let title = if agent == coordinator::NAME {
+        vec![Span::styled(" coordinator ", t.badge)]
+    } else {
+        let branch = app
+            .trees
+            .iter()
+            .find(|candidate| candidate.name == tree)
+            .and_then(|candidate| candidate.branch.clone())
+            .unwrap_or_else(|| "(detached)".into());
+        vec![
+            Span::styled(" chat ", t.badge),
+            Span::styled(
+                format!(" {branch}"),
+                Style::new().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!("  tree {tree}  {agent} ")),
+        ]
+    };
+    let keys = Line::from(key_bar(&[("^Q", "back to treetop"), ("^\\", "next chat")]));
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        popup_block(Line::from(title)).title_top(keys.right_aligned()),
+        area,
+    );
+    popup::inner(frame.area())
+}
+
+/// One muted line in the middle of `area`.
+fn draw_note(frame: &mut Frame, area: Rect, note: &str) {
+    let [_, middle, _] = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+    frame.render_widget(
+        Paragraph::new(note.to_string())
+            .style(fg(theme().muted))
+            .centered(),
+        middle,
+    );
 }
 
 fn terminal_color(color: vt100::Color) -> Color {
@@ -897,7 +1063,8 @@ fn draw_screen(screen: &vt100::Screen, buffer: &mut Buffer, area: Rect) -> Optio
             }
             let mut style = Style::new()
                 .fg(terminal_color(cell.fgcolor()))
-                .bg(terminal_color(cell.bgcolor()));
+                .bg(terminal_color(cell.bgcolor()))
+                .remove_modifier(Modifier::all());
             for (is_on, modifier) in [
                 (cell.bold(), Modifier::BOLD),
                 (cell.dim(), Modifier::DIM),

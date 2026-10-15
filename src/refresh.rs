@@ -22,6 +22,7 @@ use crate::agents::{self, Agent};
 use crate::cache;
 use crate::live;
 use crate::pool::{self, Process, Tree, Work};
+use crate::reports::{self, Report};
 use crate::watch::Watcher;
 
 const FAST: Duration = Duration::from_secs(2);
@@ -34,6 +35,8 @@ pub enum Update {
     Processes(HashMap<PathBuf, Vec<Process>>),
     Work(HashMap<PathBuf, Option<Work>>),
     Agents(HashMap<PathBuf, Vec<Agent>>),
+    /// Every background agent's latest report, read with the agents.
+    Reports(Vec<Report>),
 }
 
 pub struct Refresher {
@@ -96,8 +99,9 @@ fn slow(
             if updates.send(Update::ListingStarted).is_err() {
                 return;
             }
-            let listing = pool::status(checkout).map(|(listing, raw)| {
+            let listing = pool::status(checkout).map(|(mut listing, raw)| {
                 cache::write(checkout, &raw);
+                listing.insert(0, pool::main_tree(checkout));
                 listing.clone_into(&mut trees.lock().unwrap_or_else(PoisonError::into_inner));
                 listing
             });
@@ -123,6 +127,7 @@ fn fast(
     let mut seen = None;
     let mut tick: u32 = 0;
     let mut watcher = Watcher::new();
+    let mut reports = reports::Reader::default();
     // The latest git counts of every held tree, so a tree that is not read
     // again keeps its counts and an unpushed-only read keeps its changed count.
     let mut work: HashMap<PathBuf, Option<Work>> = HashMap::new();
@@ -140,7 +145,8 @@ fn fast(
                     work.retain(|path, _| known.iter().any(|t| t.is_held() && t.path == *path));
                     sent = updates
                         .send(Update::Work(work.clone()))
-                        .and_then(|()| updates.send(Update::Agents(agents)));
+                        .and_then(|()| updates.send(Update::Agents(agents)))
+                        .and_then(|()| updates.send(Update::Reports(reports.read())));
                 }
                 sent = sent.and_then(|()| updates.send(Update::Processes(processes)));
                 if sent.is_err() {

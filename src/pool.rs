@@ -39,6 +39,9 @@ pub struct Tree {
     pub agents: Vec<Agent>,
     /// None for an available tree, which treehouse keeps clean, and when git fails.
     pub work: Option<Work>,
+    /// The repository's main checkout, listed above the pool so agents working
+    /// in place are seen too. It is never returned or destroyed.
+    pub is_main: bool,
 }
 
 impl Tree {
@@ -67,7 +70,57 @@ impl Tree {
 
     /// Held, with no agent working in it: the tree most likely to be forgotten.
     pub fn is_orphan(&self) -> bool {
-        self.is_held() && self.agents.is_empty()
+        self.is_held() && !self.is_main && self.agents.is_empty()
+    }
+}
+
+/// The tree `dir` is in. A tree can sit inside another, as a worktree under
+/// the main checkout does, so the deepest one that contains it wins.
+pub fn holding<'a>(trees: &'a [Tree], dir: &Path) -> Option<&'a Tree> {
+    trees
+        .iter()
+        .filter(|t| t.contains(dir))
+        .max_by_key(|t| t.path.components().count())
+}
+
+/// The main checkout as a row: the branch comes from its `HEAD` file, read
+/// rather than asked of git, since it is read with every listing.
+pub fn main_tree(checkout: &Path) -> Tree {
+    let branch = git_dir(checkout)
+        .and_then(|dir| std::fs::read_to_string(dir.join("HEAD")).ok())
+        .and_then(|head| {
+            head.trim()
+                .strip_prefix("ref: refs/heads/")
+                .map(str::to_string)
+        });
+    Tree {
+        name: "main".into(),
+        status: "checkout".into(),
+        branch,
+        holder: None,
+        path: checkout.to_path_buf(),
+        leased_at: None,
+        processes: Vec::new(),
+        agents: Vec::new(),
+        work: None,
+        is_main: true,
+    }
+}
+
+/// A row for a tree not leased yet, under `path`, a stand-in its Start job
+/// replaces with the tree the pool hands out.
+pub fn stand_in(path: PathBuf) -> Tree {
+    Tree {
+        name: "new".into(),
+        status: "available".into(),
+        branch: None,
+        holder: None,
+        path,
+        leased_at: None,
+        processes: Vec::new(),
+        agents: Vec::new(),
+        work: None,
+        is_main: false,
     }
 }
 
@@ -118,6 +171,7 @@ pub fn parse(json: &str) -> Result<Vec<Tree>> {
                 .collect(),
             agents: Vec::new(),
             work: None,
+            is_main: false,
         })
         .collect();
     trees.sort_by(|a, b| {
@@ -253,6 +307,18 @@ mod tests {
         };
         tree.processes = vec![process(1, &[5223, 9229]), process(2, &[5223, 3000])];
         assert_eq!(tree.ports(), [3000, 5223, 9229]);
+    }
+
+    #[test]
+    fn the_deepest_tree_holds_a_dir_inside_two() {
+        let mut trees = parse(STATUS).unwrap();
+        trees.push(main_tree(Path::new("/p/4")));
+        assert_eq!(holding(&trees, Path::new("/p/4/app/ui")).unwrap().name, "4");
+        assert_eq!(
+            holding(&trees, Path::new("/p/4/docs")).unwrap().name,
+            "main"
+        );
+        assert!(holding(&trees, Path::new("/elsewhere")).is_none());
     }
 
     #[test]

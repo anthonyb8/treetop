@@ -1,6 +1,6 @@
 # Who's in the tree
 
-A project in three issues: what each tree is serving, which agent is working in it, and one key to land in that agent's chat.
+A project in six issues: what each tree is serving, which agent is working in it, one key to land in that agent's chat, sending agents work and hearing back from them, and a coordinator to talk to about all of them.
 Each issue is one PR into `main` and ships on its own as a tagged release.
 
 ## Goal
@@ -26,7 +26,7 @@ It is for whoever runs several agents over a treehouse pool from a terminal, wit
 **Out:**
 
 - Changing treehouse, or asking it to record agents.
-- Messaging or controlling agents, such as asking one to release its tree: an agent leaves a tree through its own command, and treetop's part is making what is left behind obvious.
+- Controlling agents, such as stopping one or asking it to release its tree: an agent leaves a tree through its own command, and treetop's part is making what is left behind obvious. Sending agents tasks and messages is issue 5.
 - Ports of containers started from a tree (a database in Docker): `docker-proxy` runs as root outside the tree, so nothing ties its sockets to one.
 - A treetop config file: the one knob, extra agent names, is an environment variable.
 - Starting or stopping dev servers.
@@ -376,3 +376,134 @@ None.
 ## Links
 
 **Project:** Who's in the tree. **Blocked by:** Issue 2. **Blocks:** None.
+
+# Issue 5: Dispatch and the inbox
+
+## Why
+
+treetop shows who is in each tree and opens their chats, but it only reaches out: starting an agent gives it no task, writing to one means opening its chat, and nothing an agent says comes back unless you go and look.
+Managing several agents needs the loop closed: send work out to the right place, and hear back when an agent finishes, gets stuck or needs a decision.
+Agents working in place in the main checkout are invisible, since it is not a pool tree.
+
+## Outcome
+
+`n` sends an agent a task in a fresh tree, the tree under the cursor or the main checkout; `m` writes a line to one agent or every marked one; and `Tab` opens an inbox of what each background agent has reported, what needs you first, answered from there, with a bell when something new needs you.
+
+## Repro
+
+N/A - not a bug.
+
+## Scope
+
+**In:**
+
+- A dispatch bar: the task, a target cycled with Tab (new tree, tree under the cursor, in place), Enter to send. A new tree is leased with `treehouse get --lease --lease-holder treetop` when the job runs. The agent is `claude --bg --name <first words> <task>`; `TREETOP_NEW_AGENT` gets the task as its last argument. An empty task keeps today's `n`: an idle agent whose chat opens.
+- A `main` row for the main checkout, above the pool, read from its `HEAD`; never returned or destroyed, never an orphan, left out of the summary's tree counts. A directory inside two trees belongs to the deeper one.
+- `m`: a line typed into each agent's `attach` command in a pseudo-terminal treetop owns, opened behind the screen when its chat is not open, pasted once the chat has drawn and then submitted with Enter.
+- An inbox from `~/.claude/jobs/<id>/state.json` and `timeline.jsonl`: state, the question (`needs`) or answer (`output.result`) else the `detail`, where it works (`worktreePath`, else `cwd`), and the latest steps. Joined to its live agent through the session file's `jobId`.
+- An agent whose session is `waiting` while its job says working is at a dialog or permission prompt: it needs you, and Enter opens its chat instead of the reply bar.
+- A bell, and inside tmux a five-second `display-message`, when a job comes to need you or finishes; never on the first read.
+
+**Out:**
+
+- Stopping, killing or removing agents.
+- Moving a running agent to another tree: a Claude Code session is stored per project directory, so resuming it elsewhere does not find it.
+- Claude Code's private session-to-session messaging socket (`messagingSocketPath`): its protocol is undocumented. Messages go through `claude attach`, as a person would type them.
+- A lead agent that dispatches and answers workers on your behalf; the inbox is what it would read.
+- Model, effort and permission pickers on the bar.
+
+**Layers:**
+
+- **UI:** the bar in the bottom row, the inbox table and report pane, the `main` row, the need-you count, `Tab`, `n`, `m`, `x`.
+- **Data:** `src/dispatch.rs` (the bar and targets), `src/reports.rs` (job files, read again only when they change), `Job.launch` and `Job.key` in `src/jobs.rs`, delivery in `src/chat.rs`, `Agent.job`.
+- **Schema:** N/A - no database.
+- **Edge / vendors / env:** `treehouse get --lease`; `claude` on PATH; tmux for the status-line notice.
+- **Tests:** target cycling and line editing; session names from a task; the agent command with and without a task and with `TREETOP_NEW_AGENT`; dispatch to each target, including the stand-in a new tree runs under until it is leased; `m` leaving out agents with no chat; the main row refused by return and the orphan filter; inbox order, read marks and the job-to-tree join; replies addressed by job; an agent at a prompt needing you; news announced once; the cursor staying on its job when the inbox re-sorts; job files read from fixtures.
+- **Risk:** the job files are internal and undocumented, like the session files; a change empties the inbox rather than failing. Typing into a chat that has not finished loading loses keys, so delivery waits 1.5 s after the first draw.
+
+**Roles:** N/A - single-user CLI.
+
+## Acceptance
+
+- [ ] `n`, a task and Enter starts a named background agent in a fresh tree leased by `treetop`; Tab sends it to the tree under the cursor or the main checkout instead.
+- [ ] Its report reaches the inbox within about 4 seconds of the agent writing it, with the tree it works in.
+- [ ] Enter on a report, a line and Enter reach that agent, and its answer comes back to the inbox.
+- [ ] `m` with marked trees writes the same line to each of their agents.
+- [ ] An agent at a question dialog shows as needing you, the bell rings once, and Enter opens its chat at the dialog.
+- [ ] Agents working in the main checkout show on the `main` row, which `r` and `D` refuse.
+- [ ] At 80 columns the bar and the inbox keep the text readable.
+
+## Approach
+
+- Bracketed paste is on for the whole session, not only while a chat is open, so a paste into the bar arrives whole rather than sent by its first line break.
+- The inbox cursor follows a job, not a row: an agent changing state re-sorts the list, and a row index would leave the cursor on a different report.
+- Measured in tmux on the user's pool: an in-place dispatch reported back in about 20 seconds; a reply from the inbox reached the agent and its answer came back; a dispatch to a new tree leased and provisioned tree 11; an agent at a question dialog showed as needing you and Enter opened it at the dialog.
+
+## Open decisions
+
+None.
+
+## Links
+
+**Project:** Who's in the tree. **Blocked by:** Issue 4. **Blocks:** None.
+
+# Issue 6: Popups and the coordinator
+
+## Why
+
+Opening a chat over the whole screen made it look like a Claude Code session of your own, so it was easy to forget treetop was underneath and start working in an agent's chat as if it were yours.
+The inbox repeated what Claude Code's own agent view shows, one report at a time, which is not coordination: answering "what needs me?" meant reading every row.
+The bottom-row bar was too small for writing an agent anything longer than a line.
+
+## Outcome
+
+Chats and diffs open in a popup over the dimmed pool; `n` opens a compose box in the middle of the screen whose first target is a coordinator, a Claude Code session that reads every agent's state through `treetop status` and acts through `treetop send` and `treetop dispatch`; the inbox is gone.
+
+## Repro
+
+N/A - not a bug.
+
+## Scope
+
+**In:**
+
+- A popup for the chat and the diff, with a margin of the pool showing round it, dimmed. The chat's terminal is the popup's inside; mouse events outside it are dropped and those inside are shifted by its corner.
+- A compose box: the targets along its top (coordinator, new tree, tree under the cursor, in place), wrapped text that grows the box, Alt+Enter for a line break. `m` uses the same box.
+- The coordinator: `claude --bg --name treetop-coordinator`, started in the main checkout on first use with a system prompt and `--allowedTools` for its three commands. Found again by name among running agents, else among job reports, through `claude attach <job>`.
+- `treetop status`, `treetop send <tree|agent> <message>`, `treetop dispatch <new|main|N> <task>`.
+- The inbox tab, its report pane and read marks removed; the job reports stay for the bell, the need-you count and `treetop status`.
+
+**Out:**
+
+- `t` stays a jump to the tree's pane or window.
+- An MCP server for the coordinator: a server treetop would have to keep running, for the same three actions a shell command gives.
+- Claude Code's session-to-session messaging, for the reason Issue 5 gives.
+
+**Layers:**
+
+- **UI:** the chat, diff and compose popups in `src/ui.rs`, their geometry in `src/popup.rs`, the `n` targets.
+- **Data:** `src/coordinator.rs` (its name, prompt and command), `src/cli.rs` (the three commands), `Launch.is_coordinator` in `src/jobs.rs`, `Outcome::Converse` in `src/app.rs`.
+- **Schema:** N/A - no database.
+- **Edge / vendors / env:** `claude` on PATH with `--bg`, `--allowedTools`, `--append-system-prompt` and `--name`.
+- **Tests:** popup geometry on large and tiny screens; mouse events shifted by the popup and dropped outside it; the coordinator as the first target, started in the main checkout with its chat opened, talked to when running, attached again when stopped; its command and prompt; `status` JSON listing held trees, counting idle ones and leaving the coordinator out; `send` finding a tree, an agent by name or a stopped agent, never the coordinator; Alt+Enter; news ordered what needs you first.
+- **Risk:** the job and session files stay internal and undocumented. `send` types into every agent with a chat in the tree it names, so a tree shared by two agents gets the message twice over.
+
+**Roles:** N/A - single-user CLI.
+
+## Acceptance
+
+- [ ] `c` opens a chat in a popup with the pool dimmed round it, sized to the popup, and Ctrl+Q comes back; Ctrl+], which Claude Code uses to open an artifact, reaches the chat.
+- [ ] `d` opens the diff in the same popup, and its paging fits the popup.
+- [ ] `n`, a question and Enter starts the coordinator in the main checkout on that question, and treetop stays on the list; a second message goes to the same coordinator the way `m` sends one, and `n` with nothing typed opens its chat.
+- [ ] The coordinator answers "what needs me?" from `treetop status` without asking permission to run it.
+- [ ] `n`, Tab and a task still dispatches to a new tree, the tree under the cursor or in place.
+- [ ] At 80 columns the compose box keeps the targets and keys readable.
+
+## Approach
+
+- Measured in tmux at 160 by 48 on the user's pool: a chat's terminal reported 138 by 38, the popup's inside; `m` and `treetop send 21` each reached a stand-in agent in tree 21 (and the Claude session working there); `treetop send` took about 3.4 seconds, most of it waiting for the chat to draw; `treetop status` printed the live pool.
+- The coordinator's flags were checked with `claude -p` and the same arguments: the prompt took and the task after `--name` arrived as its first message. Starting it with `--bg` from the box has not been run yet.
+
+## Open decisions
+
+None.

@@ -31,7 +31,7 @@ fn running() -> Vec<(PathBuf, u32)> {
 fn assign(trees: &[Tree], running: &[(PathBuf, u32)]) -> HashMap<PathBuf, Vec<u32>> {
     let mut by_tree: HashMap<PathBuf, Vec<u32>> = HashMap::new();
     for (cwd, pid) in running {
-        if let Some(tree) = trees.iter().find(|t| t.contains(cwd)) {
+        if let Some(tree) = pool::holding(trees, cwd) {
             by_tree.entry(tree.path.clone()).or_default().push(*pid);
         }
     }
