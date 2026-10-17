@@ -94,6 +94,9 @@ pub struct Agent {
     /// The background job Claude Code keeps its reports under, which joins
     /// the agent to its entry in the inbox.
     pub job: Option<String>,
+    /// The agent plugin that reported it, which `send` and `stop` go
+    /// through; None for one seen another way.
+    pub plugin: Option<String>,
 }
 
 /// An agent and the directory it works in, before it is placed in a tree.
@@ -104,7 +107,7 @@ fn is_alive(pid: u32) -> bool {
 }
 
 /// An agent plugin's sighting as an agent, where it works.
-fn from_plugin(seen: Seen) -> Sighting {
+fn from_plugin(plugin: &str, seen: Seen) -> Sighting {
     let status = if seen.live {
         seen.status.as_deref().and_then(Status::parse)
     } else {
@@ -118,6 +121,7 @@ fn from_plugin(seen: Seen) -> Sighting {
         is_background: seen.background,
         attach: seen.attach.filter(|command| !command.is_empty()),
         job: seen.id,
+        plugin: Some(plugin.to_string()),
     };
     (seen.dir, agent)
 }
@@ -132,10 +136,12 @@ fn from_plugins(dirs: &[PathBuf]) -> Vec<Sighting> {
     }
     plugin::of_kind(Kind::Agent)
         .iter()
-        .filter_map(|plugin| plugin.call("find", json!({ "dirs": dirs })).ok())
-        .filter_map(|result| serde_json::from_value::<Found>(result).ok())
-        .flat_map(|found| found.agents)
-        .map(from_plugin)
+        .filter_map(|plugin| {
+            let result = plugin.call("find", json!({ "dirs": dirs })).ok()?;
+            let found: Found = serde_json::from_value(result).ok()?;
+            Some((plugin.name().to_string(), found.agents))
+        })
+        .flat_map(|(name, agents)| agents.into_iter().map(move |seen| from_plugin(&name, seen)))
         .collect()
 }
 
@@ -201,6 +207,7 @@ mod tests {
             is_background: false,
             attach: None,
             job: None,
+            plugin: None,
         }
     }
 
@@ -253,18 +260,21 @@ mod tests {
         )
         .unwrap();
         let cold = |name: &str, job: &str| {
-            from_plugin(Seen {
-                id: Some(job.into()),
-                name: name.into(),
-                // Both last worked in tree 4; tree 4 has since been handed
-                // to a new agent, recorded in its sidecar.
-                dir: PathBuf::from("/p/4/app"),
-                live: false,
-                pid: Some(5),
-                status: Some("busy".into()),
-                background: true,
-                attach: None,
-            })
+            from_plugin(
+                "claude",
+                Seen {
+                    id: Some(job.into()),
+                    name: name.into(),
+                    // Both last worked in tree 4; tree 4 has since been handed
+                    // to a new agent, recorded in its sidecar.
+                    dir: PathBuf::from("/p/4/app"),
+                    live: false,
+                    pid: Some(5),
+                    status: Some("busy".into()),
+                    background: true,
+                    attach: None,
+                },
+            )
         };
         let sidecars = HashMap::from([(
             PathBuf::from("/p/9/app"),

@@ -366,6 +366,13 @@ pub fn op(op: &str, args: &Value) -> Result<Value, Error> {
             "name": "claude",
             "kind": "agent",
             "ops": ["start", "find", "attach", "send", "stop"],
+            // The prompt box sits between two rules; a permission or
+            // question dialog takes its place and numbers its choices.
+            "screen": {
+                "input": "❯",
+                "rule": "─",
+                "dialogs": ["Do you want to", "❯ 1."],
+            },
         })),
         "find" => Ok(json!({ "agents": find() })),
         "start" => start(args),

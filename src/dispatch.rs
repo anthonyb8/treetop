@@ -40,6 +40,44 @@ pub struct Recipient {
     pub agent: String,
     pub tree: String,
     pub command: Vec<String>,
+    /// The agent plugin that reaches it, and its id there.
+    pub plugin: Option<String>,
+    pub job: Option<String>,
+    /// Not running: a message starts it again through its plugin rather
+    /// than being typed into its chat.
+    pub is_cold: bool,
+}
+
+impl Recipient {
+    /// `agent` in tree `tree`, if it has a chat to type into or a plugin to
+    /// send through.
+    pub fn of(agent: &crate::agents::Agent, tree: &str) -> Option<Self> {
+        let is_cold = agent.status == Some(crate::agents::Status::Cold);
+        if is_cold && (agent.plugin.is_none() || agent.job.is_none()) {
+            return None;
+        }
+        Some(Recipient {
+            agent: agent.name.clone(),
+            tree: tree.to_string(),
+            command: agent.attach.clone()?,
+            plugin: agent.plugin.clone(),
+            job: agent.job.clone(),
+            is_cold,
+        })
+    }
+
+    /// The Claude Code background job `job`, named `agent`, from its report:
+    /// cold unless `is_running`.
+    pub fn of_job(agent: &str, tree: String, job: &str, is_running: bool) -> Self {
+        Recipient {
+            agent: agent.to_string(),
+            tree,
+            command: vec!["claude".into(), "attach".into(), job.to_string()],
+            plugin: Some("claude".into()),
+            job: Some(job.to_string()),
+            is_cold: !is_running,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

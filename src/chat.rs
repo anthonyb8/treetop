@@ -24,6 +24,8 @@ use ratatui::crossterm::event::{
 use ratatui::layout::{Position, Rect};
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
+use crate::plugin::Screen;
+
 /// Lines of scrollback kept; the chat draws its own history, so none.
 const SCROLLBACK: usize = 0;
 
@@ -46,19 +48,83 @@ const SYNC_END: &[u8] = b"\x1b[?2026l";
 /// Chats kept running after they are left, the most recently left kept.
 const KEPT: usize = 8;
 
-/// How long a chat opened to deliver a message is given after its first draw
-/// before the message is typed: Claude Code draws its input box before it
-/// takes keys, and typing sooner loses them.
+/// For a chat whose screen treetop cannot read, how long after its first
+/// draw a message is typed: Claude Code draws its input box before it takes
+/// keys, and typing sooner loses them.
 const TYPE_AFTER: Duration = Duration::from_millis(1500);
 
 /// How long after the text is pasted Enter follows, so the chat reads the
 /// paste as a paste and the Enter as sending it.
 const SUBMIT_AFTER: Duration = Duration::from_millis(300);
 
+/// How long a chat gets to show an empty input box before a message to it
+/// fails.
+const INPUT_LIMIT: Duration = Duration::from_secs(20);
+
+/// How long a paste gets to show in the input box, and an Enter to empty
+/// it again, before the message fails.
+const LAND_LIMIT: Duration = Duration::from_secs(5);
+
+/// Where a message waiting to be typed into a chat stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    /// Not typed yet, since the time it was queued.
+    Waiting(Instant),
+    /// Pasted at this time; Enter follows once the paste shows.
+    Pasted(Instant),
+    /// Enter pressed at this time; sent once the input box empties.
+    Submitted(Instant),
+}
+
 /// A line waiting to be typed into a chat.
 struct Outgoing {
     text: String,
-    pasted_at: Option<Instant>,
+    stage: Stage,
+}
+
+/// What a chat's screen says about typing a message into it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Input {
+    /// The input box is there and empty.
+    Empty,
+    /// The input box holds this text.
+    Holding(String),
+    /// A dialog has the keys, so a message would answer it.
+    Dialog,
+    /// No input box yet.
+    Missing,
+}
+
+/// The chat's input box as `hints` describe it, read from `text`, the
+/// screen's rows.
+pub fn input(text: &str, hints: &Screen) -> Input {
+    let lines: Vec<&str> = text.lines().collect();
+    let is_rule = |line: &str| line.trim_start().starts_with(&hints.rule);
+    let opening = (1..lines.len())
+        .rev()
+        .find(|&at| lines[at].trim_start().starts_with(&hints.input) && is_rule(lines[at - 1]));
+    let closing = opening.and_then(|at| (at + 1..lines.len()).find(|&end| is_rule(lines[end])));
+    let (Some(at), Some(end)) = (opening, closing) else {
+        let is_dialog = hints
+            .dialogs
+            .iter()
+            .any(|marker| text.contains(marker.as_str()));
+        return if is_dialog {
+            Input::Dialog
+        } else {
+            Input::Missing
+        };
+    };
+    let first = lines[at].trim_start()[hints.input.len()..].trim();
+    let held: Vec<&str> = std::iter::once(first)
+        .chain(lines[at + 1..end].iter().map(|line| line.trim()))
+        .filter(|line| !line.is_empty())
+        .collect();
+    if held.is_empty() {
+        Input::Empty
+    } else {
+        Input::Holding(held.join(" "))
+    }
 }
 
 pub struct Chat {
@@ -82,6 +148,8 @@ pub struct Chat {
     ready_at: Option<Instant>,
     /// Lines to type and send once it takes keys, oldest first.
     outbox: VecDeque<Outgoing>,
+    /// How its screen shows it takes a message; None types on a timer.
+    hints: Option<Screen>,
 }
 
 /// Where the last synchronized-output marker in `bytes` leaves the chat:
@@ -196,6 +264,7 @@ impl Chat {
             sync_since: None,
             ready_at: None,
             outbox: VecDeque::new(),
+            hints: None,
         })
     }
 
@@ -289,27 +358,103 @@ impl Chat {
         }
     }
 
-    /// Types the waiting lines in, one at a time: the text as a paste, then
-    /// Enter once SUBMIT_AFTER has passed. Returns how many were sent.
-    fn flush(&mut self) -> usize {
+    /// Types the waiting lines in, one at a time. With hints, each waits for
+    /// an empty input box, is pasted, gets Enter once the paste shows, and
+    /// counts as sent once the box empties again; a dialog or a draft in the
+    /// box fails it rather than typing into either. With none, the text is
+    /// pasted TYPE_AFTER after the first draw and Enter follows SUBMIT_AFTER
+    /// later. Returns how many were sent, and why each that failed did.
+    fn flush(&mut self) -> (usize, Vec<String>) {
+        let (mut sent, mut failed) = (0, Vec::new());
+        let Some(hints) = self.hints.clone() else {
+            return (self.flush_blind(), failed);
+        };
+        while let Some(next) = self.outbox.front() {
+            let state = input(&self.screen().contents(), &hints);
+            let (stage, text) = (next.stage, next.text.clone());
+            let fail = match (stage, state) {
+                (Stage::Waiting(_), Input::Empty) if self.is_ready => {
+                    self.paste(&text);
+                    self.set_stage(Stage::Pasted(Instant::now()));
+                    return (sent, failed);
+                }
+                (Stage::Waiting(_), Input::Holding(_)) => {
+                    Some("its input box already holds a draft; open its chat")
+                }
+                (Stage::Waiting(_), Input::Dialog) => {
+                    Some("a dialog is open in its chat; answer it there")
+                }
+                (Stage::Waiting(since), _) if since.elapsed() >= INPUT_LIMIT => {
+                    Some("its input box never showed")
+                }
+                (Stage::Pasted(_), Input::Holding(_)) => {
+                    self.write(b"\r");
+                    self.set_stage(Stage::Submitted(Instant::now()));
+                    return (sent, failed);
+                }
+                (Stage::Pasted(at), _) if at.elapsed() >= LAND_LIMIT => {
+                    Some("the paste never showed in its input box")
+                }
+                (Stage::Submitted(_), Input::Empty) => {
+                    self.outbox.pop_front();
+                    sent += 1;
+                    continue;
+                }
+                (Stage::Submitted(at), _) if at.elapsed() >= LAND_LIMIT => {
+                    Some("Enter did not send it; it may still be in the input box")
+                }
+                _ => return (sent, failed),
+            };
+            if let Some(why) = fail {
+                self.outbox.pop_front();
+                failed.push(why.to_string());
+            }
+        }
+        (sent, failed)
+    }
+
+    /// `flush`, adding who each message went to, or failed to reach and
+    /// why, to the lists.
+    fn flush_into(
+        &mut self,
+        delivered: &mut Vec<(String, String)>,
+        failed: &mut Vec<(String, String, String)>,
+    ) {
+        let (sent, reasons) = self.flush();
+        delivered.extend((0..sent).map(|_| (self.agent.clone(), self.tree.clone())));
+        failed.extend(
+            reasons
+                .into_iter()
+                .map(|why| (self.agent.clone(), self.tree.clone(), why)),
+        );
+    }
+
+    fn set_stage(&mut self, stage: Stage) {
+        if let Some(next) = self.outbox.front_mut() {
+            next.stage = stage;
+        }
+    }
+
+    /// `flush` for a chat whose screen treetop cannot read.
+    fn flush_blind(&mut self) -> usize {
         if self.ready_at.is_none_or(|at| at.elapsed() < TYPE_AFTER) {
             return 0;
         }
         let mut sent = 0;
         while let Some(next) = self.outbox.front_mut() {
-            match next.pasted_at {
-                None => {
-                    next.pasted_at = Some(Instant::now());
+            match next.stage {
+                Stage::Waiting(_) => {
+                    next.stage = Stage::Pasted(Instant::now());
                     let text = next.text.clone();
                     self.paste(&text);
                     return sent;
                 }
-                Some(at) if at.elapsed() >= SUBMIT_AFTER => {
+                Stage::Pasted(at) | Stage::Submitted(at) if at.elapsed() >= SUBMIT_AFTER => {
                     self.write(b"\r");
                     self.outbox.pop_front();
                     sent += 1;
                 }
-                Some(_) => return sent,
+                Stage::Pasted(_) | Stage::Submitted(_) => return sent,
             }
         }
         sent
@@ -347,8 +492,8 @@ pub struct Pumped {
     pub ended: Option<(String, String)>,
     /// Agent and tree of each message typed in and sent.
     pub delivered: Vec<(String, String)>,
-    /// Agent and tree of each chat that ended with messages still unsent.
-    pub undelivered: Vec<(String, String)>,
+    /// Agent, tree and why, of each message that could not be sent.
+    pub failed: Vec<(String, String, String)>,
 }
 
 /// The chat on screen, if one is, and the ones left running behind it.
@@ -418,18 +563,19 @@ impl Chats {
 
     /// Queues `text` to be typed into the chat running `command` and sent:
     /// the one on screen or left running if there is one, else a new one
-    /// opened behind treetop for it.
+    /// opened behind treetop for it. `hints` say how its screen shows that
+    /// it takes a message.
     pub fn deliver(
         &mut self,
         command: &[String],
         text: &str,
         (rows, cols): (u16, u16),
-        agent: String,
-        tree: String,
+        (agent, tree): (String, String),
+        hints: Option<Screen>,
     ) -> Result<()> {
         let outgoing = Outgoing {
             text: text.to_string(),
-            pasted_at: None,
+            stage: Stage::Waiting(Instant::now()),
         };
         let running = self
             .open
@@ -437,9 +583,13 @@ impl Chats {
             .chain(&mut self.background)
             .find(|c| c.command == command);
         match running {
-            Some(chat) => chat.outbox.push_back(outgoing),
+            Some(chat) => {
+                chat.hints = chat.hints.take().or(hints);
+                chat.outbox.push_back(outgoing);
+            }
             None => {
                 let mut chat = Chat::open(command, rows, cols, agent, tree)?;
+                chat.hints = hints;
                 chat.outbox.push_back(outgoing);
                 self.background.push(chat);
                 self.trim();
@@ -452,15 +602,21 @@ impl Chats {
     /// program exited is dropped; the open one closes and is reported.
     pub fn pump(&mut self) -> Pumped {
         let mut delivered = Vec::new();
-        let mut undelivered = Vec::new();
+        let mut failed = Vec::new();
         for chat in &mut self.background {
             chat.pump();
-            let sent = chat.flush();
-            delivered.extend((0..sent).map(|_| (chat.agent.clone(), chat.tree.clone())));
+            chat.flush_into(&mut delivered, &mut failed);
         }
+        let ended = |chat: &Chat| {
+            (
+                chat.agent.clone(),
+                chat.tree.clone(),
+                "its chat ended".into(),
+            )
+        };
         self.background.retain(|c| {
             if c.is_ended() && !c.outbox.is_empty() {
-                undelivered.push((c.agent.clone(), c.tree.clone()));
+                failed.push(ended(c));
             }
             !c.is_ended()
         });
@@ -469,14 +625,13 @@ impl Chats {
                 is_stale: false,
                 ended: None,
                 delivered,
-                undelivered,
+                failed,
             };
         };
         let is_stale = open.pump();
-        let sent = open.flush();
-        delivered.extend((0..sent).map(|_| (open.agent.clone(), open.tree.clone())));
+        open.flush_into(&mut delivered, &mut failed);
         if open.is_ended() && !open.outbox.is_empty() {
-            undelivered.push((open.agent.clone(), open.tree.clone()));
+            failed.push(ended(open));
         }
         let ended = open
             .is_ended()
@@ -487,7 +642,7 @@ impl Chats {
             is_stale,
             ended,
             delivered,
-            undelivered,
+            failed,
         }
     }
 
@@ -682,6 +837,59 @@ pub fn encode(key: KeyEvent, application_cursor: bool) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Claude Code's own hints, as its plugin gives them.
+    fn claude() -> Screen {
+        Screen {
+            input: "❯".into(),
+            rule: "─".into(),
+            dialogs: vec!["Do you want to".into(), "❯ 1.".into()],
+        }
+    }
+
+    /// The bottom of an idle Claude Code chat, as `claude attach` draws it,
+    /// with `input` in its box.
+    fn idle(input: &str) -> String {
+        format!(
+            "❯ dfd\n● \"dfd\" looks like a stray keypress.\n✻ Worked for 4s\n\
+             ─────────────────────────────── dfd ─\n❯ {input}\n\
+             ──────────────────────────────────────\n  [anthony@ treetop]\n  ⏵⏵ auto mode on"
+        )
+    }
+
+    #[test]
+    fn reads_an_empty_input_box_and_one_holding_a_draft() {
+        assert_eq!(input(&idle(""), &claude()), Input::Empty);
+        assert_eq!(
+            input(&idle("commit it"), &claude()),
+            Input::Holding("commit it".into()),
+            "a draft left in the box, which a message must not be added to"
+        );
+    }
+
+    #[test]
+    fn a_line_quoted_above_the_box_is_not_the_input() {
+        // The transcript's own `❯ dfd` has no rule above it.
+        let only_transcript = "❯ dfd\n● answer\n";
+        assert_eq!(input(only_transcript, &claude()), Input::Missing);
+    }
+
+    #[test]
+    fn a_dialog_in_place_of_the_box_is_a_dialog() {
+        let dialog = "● Bash(rm -rf node_modules)\n\
+             ──────────────────────\n Bash command\n   rm -rf node_modules\n\
+             Do you want to proceed?\n ❯ 1. Yes\n   2. No, and tell Claude what to do differently (esc)\n";
+        assert_eq!(input(dialog, &claude()), Input::Dialog);
+    }
+
+    #[test]
+    fn a_long_draft_spans_the_lines_of_the_box() {
+        let screen = "──────── x ─\n❯ first line\n  second line\n────────────\n";
+        assert_eq!(
+            input(screen, &claude()),
+            Input::Holding("first line second line".into())
+        );
+    }
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)

@@ -161,6 +161,9 @@ An agent plugin answers these ops:
 | `find` | `dirs` | `agents`: each with `id`, `name`, `dir`, `live`, and optionally `pid`, `status` (`busy`, `idle` or `waiting`), `background` and `attach` |
 | `attach` | `id` | `argv`, the command that opens its chat in a terminal |
 | `send` | `id`, `text` | `delivered`, for an agent that is not running |
+
+`describe` may also give `screen`, which tells treetop how to type a message into a running agent's chat: the input box is a line starting with `input` between two lines starting with `rule`, and a screen with no input box but one of `dialogs` on it is waiting on an answer.
+Claude Code's is `{"input": "❯", "rule": "─", "dialogs": ["Do you want to", "❯ 1."]}`; without one, treetop types on a timer.
 | `stop` | `id` | nothing |
 
 Claude Code's plugin is built in, and `treetop plugin claude` serves it on stdin and stdout like any other; a plugin of your own named `claude` replaces it.
@@ -260,8 +263,11 @@ Up to four actions run at once, each on its own tree, so a slow one never holds 
 ### Messages
 
 `m` opens the compose box to write to the agents in the marked trees, or the tree under the cursor.
-treetop types it into each agent's chat, the same `claude attach` that `c` opens, behind the screen if the chat is not open: it waits for the chat to draw, pastes the text, and presses Enter.
+A running agent gets it typed into its chat, the same `claude attach` that `c` opens, behind the screen if the chat is not open.
+treetop reads the chat's screen as it goes, by the patterns the agent's plugin gives: it waits for an empty input box, pastes the text, presses Enter once the paste shows, and counts it sent once the box empties again.
+A dialog on screen, or a draft already in the box, stops it rather than typing into either, and the status line says which; so does a box that never shows, or a paste or Enter that does not land within a few seconds.
 An agent mid-turn queues it, as Claude Code queues anything typed while it works.
+A cold agent gets it through its plugin instead, which for Claude Code is `claude --bg --resume`: the session starts again with the message as its next turn, under the same job.
 Agents with no chat to type into, such as an interactive session or a bare process, are left out, and the status line says how many.
 
 ### The inbox

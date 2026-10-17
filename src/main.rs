@@ -239,10 +239,8 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             });
             is_stale = true;
         }
-        if let Some((agent, tree)) = pumped.undelivered.first() {
-            app.message = Some(format!(
-                "could not reach {agent} in {tree}: its chat closed before the message went in"
-            ));
+        if let Some((agent, tree, why)) = pumped.failed.first() {
+            app.message = Some(format!("not sent to {agent} in {tree}: {why}"));
             is_stale = true;
         }
         if let Some((agent, tree)) = pumped.ended {
@@ -336,13 +334,18 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             Outcome::Send { to, text } => {
                 let size = chat_size(term)?;
                 for recipient in to {
+                    if let Some(job) = app.send_cold(&recipient, &text) {
+                        worker.push(job);
+                        continue;
+                    }
                     let agent = recipient.agent.clone();
+                    let hints = recipient.plugin.as_deref().and_then(plugin::screen_of);
                     if let Err(err) = chats.deliver(
                         &recipient.command,
                         &text,
                         size,
-                        recipient.agent,
-                        recipient.tree,
+                        (recipient.agent, recipient.tree),
+                        hints,
                     ) {
                         app.message = Some(format!("could not reach {agent}: {err:#}"));
                     }

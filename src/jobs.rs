@@ -19,7 +19,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::agents::{Source, Status, claude};
+use crate::agents::{Status, claude};
 use crate::branch;
 use crate::child::{self, End};
 use crate::config::{self, Hooks};
@@ -55,6 +55,8 @@ pub enum Kind {
     /// Gives the tree's branch the job's `rename`, or names one on a
     /// detached HEAD.
     Rename,
+    /// Sends the job's `message` to a cold agent through its plugin.
+    Send,
 }
 
 impl Kind {
@@ -66,6 +68,7 @@ impl Kind {
             Kind::Preview => "previewing",
             Kind::Destroy => "destroying",
             Kind::Rename => "renaming",
+            Kind::Send => "sending",
         }
     }
 
@@ -77,6 +80,7 @@ impl Kind {
             Kind::Preview => "previewed",
             Kind::Destroy => "destroyed",
             Kind::Rename => "renamed",
+            Kind::Send => "sent",
         }
     }
 
@@ -87,6 +91,7 @@ impl Kind {
             Kind::Preview => "destroy preview",
             Kind::Destroy => "destroy",
             Kind::Rename => "branch rename",
+            Kind::Send => "message",
         }
     }
 }
@@ -122,6 +127,15 @@ impl Launch {
     }
 }
 
+/// A message for an agent that is not running, which its plugin delivers by
+/// starting it again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Message {
+    pub plugin: String,
+    pub id: String,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
     pub kind: Kind,
@@ -132,6 +146,8 @@ pub struct Job {
     pub launch: Option<Launch>,
     /// The branch name a Rename gives the tree.
     pub rename: Option<String>,
+    /// What a Send sends, and to whom.
+    pub message: Option<Message>,
     /// The command that opens the chat of the agent a Start started, once it
     /// has.
     pub attach: Option<Vec<String>>,
@@ -145,6 +161,7 @@ impl Job {
             tree,
             launch: None,
             rename: None,
+            message: None,
             attach: None,
         }
     }
@@ -622,23 +639,28 @@ fn run_hook(name: &str, command: &[String], tree: &Path, log: &mut String) {
     }
 }
 
-/// Stops every background agent a plugin reports running in the tree, since
-/// treehouse stops only processes standing in it, and a session that moved
-/// in with `EnterWorktree` stands elsewhere. Each plugin is asked in turn
-/// until one stops it.
+/// Stops every background agent a plugin reports running in the tree,
+/// through that plugin, since treehouse stops only processes standing in it,
+/// and a session that moved in with `EnterWorktree` stands elsewhere.
 fn stop_agents(tree: &Tree, log: &mut String) {
-    let running = tree.agents.iter().filter(|a| {
-        a.source == Source::Plugin && a.is_background && a.status != Some(Status::Cold)
-    });
-    let plugins = plugin::of_kind(PluginKind::Agent);
+    let running = tree
+        .agents
+        .iter()
+        .filter(|a| a.is_background && a.status != Some(Status::Cold));
     for agent in running {
-        let Some(id) = &agent.job else { continue };
-        let stopped = plugins
-            .iter()
-            .find(|plugin| plugin.call("stop", json!({ "id": id })).is_ok());
+        let (Some(name), Some(id)) = (&agent.plugin, &agent.job) else {
+            continue;
+        };
+        let stopped = plugin::named(PluginKind::Agent, name)
+            .ok_or_else(|| format!("no agent plugin {name}"))
+            .and_then(|plugin| {
+                plugin
+                    .call("stop", json!({ "id": id }))
+                    .map_err(|err| err.to_string())
+            });
         let _ = match stopped {
-            Some(plugin) => writeln!(log, "{} stopped {} ({id})", plugin.name(), agent.name),
-            None => writeln!(log, "could not stop {} ({id})", agent.name),
+            Ok(_) => writeln!(log, "{name} stopped {} ({id})", agent.name),
+            Err(why) => writeln!(log, "could not stop {} ({id}): {why}", agent.name),
         };
     }
 }
@@ -673,6 +695,16 @@ fn delete_if_merged(tree: &Path, branch: &str, log: &mut String) {
     } else if capture(git(tree).args(["branch", "-D", branch]), GIT_LIMIT, log) {
         let _ = writeln!(log, "deleted branch {branch}, merged into {base_ref}");
     }
+}
+
+/// Sends `message` through its agent's plugin.
+pub fn send_cold(message: &Message) -> Result<(), String> {
+    let plugin = plugin::named(PluginKind::Agent, &message.plugin)
+        .ok_or_else(|| format!("no agent plugin {}", message.plugin))?;
+    plugin
+        .call("send", json!({ "id": message.id, "text": message.text }))
+        .map(|_| ())
+        .map_err(|err| err.to_string())
 }
 
 /// Stops the tree's agents, runs the `on_return` hook, returns the tree,
@@ -713,6 +745,16 @@ pub fn run(job: &mut Job) -> (bool, String) {
             let to = job.rename.clone().unwrap_or_default();
             rename(&job.tree.path, &to, &mut log)
         }
+        Kind::Send => match &job.message {
+            Some(message) => match send_cold(message) {
+                Ok(()) => true,
+                Err(why) => {
+                    let _ = writeln!(log, "{why}");
+                    false
+                }
+            },
+            None => false,
+        },
         Kind::Return => give_back(&job.tree, &mut log),
         Kind::Preview => capture(
             treehouse("destroy", &job.tree.path).args(INCLUDE),

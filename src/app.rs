@@ -12,7 +12,7 @@ use crate::agents::{Agent, Status};
 use crate::coordinator;
 use crate::diff::Layout;
 use crate::dispatch::{Edit, Prompt, Purpose, Recipient, Target};
-use crate::jobs::{Job, Kind, Launch};
+use crate::jobs::{Job, Kind, Launch, Message};
 use crate::pool::{self, Process, Tree, Work};
 use crate::reports::{Report, State};
 use crate::sidecar::Sidecar;
@@ -120,10 +120,15 @@ impl<'a> Item<'a> {
     }
 
     fn recipient(&self) -> Recipient {
+        let is_running = self.agent.is_some_and(|a| a.pid.is_some());
         Recipient {
-            agent: self.report.name.clone(),
-            tree: self.place(),
             command: self.attach(),
+            ..Recipient::of_job(
+                &self.report.name,
+                self.place(),
+                &self.report.job,
+                is_running,
+            )
         }
     }
 
@@ -578,6 +583,31 @@ impl App {
         });
     }
 
+    /// A message to `to` as a job for its plugin, when it is not running: its
+    /// plugin starts it again with the message, rather than a chat being
+    /// opened to type it in. None for an agent that is running.
+    pub fn send_cold(&mut self, to: &Recipient, text: &str) -> Option<Job> {
+        let (true, Some(plugin), Some(id)) = (to.is_cold, &to.plugin, &to.job) else {
+            return None;
+        };
+        let tree = self
+            .trees
+            .iter()
+            .find(|t| t.name == to.tree)
+            .cloned()
+            .unwrap_or_else(|| pool::stand_in(PathBuf::from(format!("(job {id})"))));
+        self.jobs
+            .insert(tree.path.clone(), JobState::Queued(Kind::Send));
+        Some(Job {
+            message: Some(Message {
+                plugin: plugin.clone(),
+                id: id.clone(),
+                text: text.to_string(),
+            }),
+            ..Job::new(Kind::Send, tree)
+        })
+    }
+
     /// Shows the tree at `path` back in the pool at once, as the next listing
     /// will, rather than leaving it held until that lands.
     fn returned(&mut self, path: &PathBuf) {
@@ -953,11 +983,7 @@ impl App {
     pub fn coordinator(&self) -> Option<Recipient> {
         let running = self.trees.iter().find_map(|tree| {
             let agent = tree.agents.iter().find(|a| a.name == coordinator::NAME)?;
-            Some(Recipient {
-                agent: agent.name.clone(),
-                tree: tree.name.clone(),
-                command: agent.attach.clone()?,
-            })
+            Recipient::of(agent, &tree.name)
         });
         running.or_else(|| {
             let report = self
@@ -970,11 +996,12 @@ impl App {
                         .is_some_and(|dir| pool::holding(&self.trees, dir).is_some())
                 })
                 .max_by_key(|r| r.updated)?;
-            Some(Recipient {
-                agent: report.name.clone(),
-                tree: "main".into(),
-                command: vec!["claude".into(), "attach".into(), report.job.clone()],
-            })
+            Some(Recipient::of_job(
+                &report.name,
+                "main".into(),
+                &report.job,
+                false,
+            ))
         })
     }
 
@@ -1030,13 +1057,7 @@ impl App {
             .collect();
         let to: Vec<Recipient> = agents
             .iter()
-            .filter_map(|(tree, agent)| {
-                Some(Recipient {
-                    agent: agent.name.clone(),
-                    tree: tree.name.clone(),
-                    command: agent.attach.clone()?,
-                })
-            })
+            .filter_map(|(tree, agent)| Recipient::of(agent, &tree.name))
             .collect();
         let skipped = agents.len() - to.len();
         if to.is_empty() {
@@ -1837,6 +1858,7 @@ mod tests {
             is_background: false,
             attach: None,
             job: None,
+            plugin: None,
         }
     }
 
@@ -2513,6 +2535,49 @@ mod tests {
             attach: Some(vec!["claude".into(), "attach".into(), name.into()]),
             ..agent(name)
         }
+    }
+
+    #[test]
+    fn a_message_to_a_cold_agent_goes_through_its_plugin_not_its_chat() {
+        let mut app = app();
+        let cold = Agent {
+            status: Some(Status::Cold),
+            pid: None,
+            job: Some("42494f41".into()),
+            plugin: Some("claude".into()),
+            ..attachable("idle one")
+        };
+        app.apply_agents(&HashMap::from([(PathBuf::from("/p/4/app"), vec![cold])]));
+        press(&mut app, KeyCode::Char('m'));
+        type_in(&mut app, "carry on");
+        let Outcome::Send { to, text } = press(&mut app, KeyCode::Enter) else {
+            panic!("expected a send");
+        };
+        assert!(to[0].is_cold);
+        let job = app.send_cold(&to[0], &text).unwrap();
+        assert_eq!(job.kind, Kind::Send);
+        assert_eq!(job.tree.name, "4");
+        assert_eq!(
+            job.message,
+            Some(Message {
+                plugin: "claude".into(),
+                id: "42494f41".into(),
+                text: "carry on".into(),
+            })
+        );
+        assert_eq!(
+            app.jobs[&PathBuf::from("/p/4/app")],
+            JobState::Queued(Kind::Send)
+        );
+        let live = Recipient {
+            is_cold: false,
+            ..to[0].clone()
+        };
+        assert_eq!(
+            app.send_cold(&live, &text),
+            None,
+            "a running one is typed to"
+        );
     }
 
     #[test]

@@ -62,6 +62,22 @@ pub struct Description {
     /// The ops it answers besides `describe`.
     #[serde(default)]
     pub ops: Vec<String>,
+    /// For an agent plugin, how its chat's screen shows that it takes a
+    /// message, so one is typed in only when it can land.
+    #[serde(default)]
+    pub screen: Option<Screen>,
+}
+
+/// What an agent's chat looks like on screen, for typing a message into it.
+/// The input box is a line starting with `input` between two lines starting
+/// with `rule`; a screen with no input box and one of `dialogs` on it is
+/// waiting on an answer that a message would land in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Screen {
+    pub input: String,
+    pub rule: String,
+    #[serde(default)]
+    pub dialogs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -302,6 +318,18 @@ impl Plugin {
             Plugin::External { path, .. } => call(path, op, args, timeout(op)),
         }
     }
+
+    /// What it says it is.
+    pub fn description(&self) -> Result<Description, Error> {
+        match self {
+            Plugin::Builtin(name) => {
+                let result = builtin::handle(name, "describe", &json!({}))?;
+                serde_json::from_value(result)
+                    .map_err(|err| Error::new(Code::Failed, format!("invalid description: {err}")))
+            }
+            Plugin::External { path, .. } => described(path),
+        }
+    }
 }
 
 /// What each plugin file said it is, with the file's modification time, so
@@ -349,6 +377,11 @@ pub fn of_kind(kind: Kind) -> Vec<Plugin> {
         }
     }
     plugins
+}
+
+/// How the chats of agent plugin `name`'s agents show they take a message.
+pub fn screen_of(name: &str) -> Option<Screen> {
+    named(Kind::Agent, name)?.description().ok()?.screen
 }
 
 /// The plugin of `kind` named `name`, whoever provides it.

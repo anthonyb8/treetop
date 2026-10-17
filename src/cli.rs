@@ -247,13 +247,7 @@ fn recipients(trees: &[Tree], reports: &[Report], target: &str) -> Vec<Recipient
         tree.agents
             .iter()
             .filter(|a| a.name != coordinator::NAME && is_named(&a.name))
-            .filter_map(|a| {
-                Some(Recipient {
-                    agent: a.name.clone(),
-                    tree: tree.name.clone(),
-                    command: a.attach.clone()?,
-                })
-            })
+            .filter_map(|a| Recipient::of(a, &tree.name))
             .collect()
     };
     if let Some(tree) = trees.iter().find(|t| t.name == target) {
@@ -270,11 +264,18 @@ fn recipients(trees: &[Tree], reports: &[Report], target: &str) -> Vec<Recipient
         .iter()
         .filter(|r| r.name != coordinator::NAME && r.name.eq_ignore_ascii_case(target))
         .max_by_key(|r| r.updated)
-        .map(|r| Recipient {
-            agent: r.name.clone(),
-            tree: reports::tree_of(r, trees)
-                .map_or_else(|| "outside the pool".into(), |t| t.name.clone()),
-            command: vec!["claude".into(), "attach".into(), r.job.clone()],
+        .map(|r| {
+            let tree = reports::tree_of(r, trees);
+            let is_running = trees
+                .iter()
+                .flat_map(|t| &t.agents)
+                .any(|a| a.job.as_deref() == Some(r.job.as_str()) && a.pid.is_some());
+            Recipient::of_job(
+                &r.name,
+                tree.map_or_else(|| "outside the pool".into(), |t| t.name.clone()),
+                &r.job,
+                is_running,
+            )
         })
         .into_iter()
         .collect()
@@ -289,26 +290,44 @@ fn send(checkout: &Path, target: &str, message: &str) -> Result<()> {
         bail!("no agent with a chat to type into at {target}; `treetop status` lists them");
     }
     let mut chats = Chats::default();
+    let (mut delivered, mut failed) = (0, Vec::new());
+    let mut typed = 0;
     for recipient in &to {
-        chats.deliver(
-            &recipient.command,
-            message,
-            SEND_SIZE,
-            recipient.agent.clone(),
-            recipient.tree.clone(),
-        )?;
+        let (agent, tree) = (recipient.agent.clone(), recipient.tree.clone());
+        if let (true, Some(plugin), Some(id)) =
+            (recipient.is_cold, &recipient.plugin, &recipient.job)
+        {
+            let message = jobs::Message {
+                plugin: plugin.clone(),
+                id: id.clone(),
+                text: message.to_string(),
+            };
+            match jobs::send_cold(&message) {
+                Ok(()) => {
+                    println!("sent to {agent} in tree {tree}, starting it again");
+                    delivered += 1;
+                }
+                Err(why) => failed.push((agent, tree, why)),
+            }
+            continue;
+        }
+        let hints = recipient.plugin.as_deref().and_then(plugin::screen_of);
+        chats.deliver(&recipient.command, message, SEND_SIZE, (agent, tree), hints)?;
+        typed += 1;
     }
     let started = Instant::now();
-    let (mut delivered, mut failed) = (0, Vec::new());
-    while delivered + failed.len() < to.len() && started.elapsed() < SEND_TIMEOUT {
+    let (mut typed_in, mut typed_failed) = (0, 0);
+    while typed_in + typed_failed < typed && started.elapsed() < SEND_TIMEOUT {
         let pumped = chats.pump();
         for (agent, tree) in pumped.delivered {
             println!("sent to {agent} in tree {tree}");
-            delivered += 1;
+            typed_in += 1;
         }
-        failed.extend(pumped.undelivered);
+        typed_failed += pumped.failed.len();
+        failed.extend(pumped.failed);
         thread::sleep(Duration::from_millis(20));
     }
+    delivered += typed_in;
     // The Enter has been written; give the session a moment to take it
     // before the chat clients are ended.
     let grace = Instant::now();
@@ -316,8 +335,8 @@ fn send(checkout: &Path, target: &str, message: &str) -> Result<()> {
         chats.pump();
         thread::sleep(Duration::from_millis(20));
     }
-    for (agent, tree) in &failed {
-        eprintln!("could not reach {agent} in tree {tree}: its chat closed first");
+    for (agent, tree, why) in &failed {
+        eprintln!("not sent to {agent} in tree {tree}: {why}");
     }
     if delivered < to.len() {
         bail!("sent to {delivered} of {} agent(s)", to.len());
@@ -372,6 +391,7 @@ mod tests {
             is_background: true,
             attach: Some(vec!["claude".into(), "attach".into(), job.into()]),
             job: Some(job.into()),
+            plugin: None,
         }
     }
 
