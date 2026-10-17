@@ -164,7 +164,9 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
     let refresher = Refresher::spawn(checkout.to_path_buf(), app.trees.clone());
     let worker = Worker::spawn();
     let diffs = diff::Loader::spawn(diff::base(checkout));
-    let tickets = tickets::Loader::spawn(checkout.to_path_buf());
+    // The Issues screen, made the first time it is shown.
+    let mut issues: Option<issues::Screen> = None;
+    let mut was_issues = false;
     // Drawn only when something changed, or every REDRAW: drawing the whole
     // table ten times a second is most of what treetop costs while idle.
     let mut is_stale = true;
@@ -220,14 +222,25 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
         if let Some(path) = app.wanted_diff() {
             diffs.request(path);
         }
-        while let Ok(loaded) = tickets.results.try_recv() {
-            is_stale = true;
-            app.tickets_loaded(loaded);
+        if app.is_issues {
+            match issues.as_mut() {
+                None => match tickets::backends(checkout) {
+                    Ok((backends, at)) => issues = Some(issues::Screen::new(backends, at)),
+                    Err(err) => {
+                        app.is_issues = false;
+                        app.message = Some(err);
+                    }
+                },
+                Some(screen) if !was_issues => screen.open(),
+                Some(_) => {}
+            }
+            if let Some(screen) = issues.as_mut()
+                && screen.poll()
+            {
+                is_stale = true;
+            }
         }
-        if let Some(filters) = app.wanted_tickets() {
-            is_stale = true;
-            tickets.request(filters);
-        }
+        was_issues = app.is_issues;
         if app.is_quitting && app.active_jobs() == 0 {
             return Ok(Exit::Quit);
         }
@@ -260,7 +273,7 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
         }
         if is_stale || drawn_at.elapsed() >= REDRAW {
             app.screen_height = term.size()?.height;
-            term.draw(|frame| ui::draw(frame, app, chats.open()))?;
+            term.draw(|frame| ui::draw(frame, app, chats.open(), issues.as_ref()))?;
             is_stale = false;
             drawn_at = Instant::now();
         }
@@ -316,7 +329,26 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
         if key.kind != KeyEventKind::Press {
             continue;
         }
-        match app.handle_key(key) {
+        let on_issues = issues
+            .as_mut()
+            .filter(|_| app.is_issues && app.prompt.is_none());
+        let outcome = match on_issues {
+            Some(screen) => match screen.handle_key(key) {
+                issues::Action::None => Outcome::Continue,
+                issues::Action::Back => {
+                    app.is_issues = false;
+                    Outcome::Continue
+                }
+                issues::Action::Quit => app.quit(),
+                issues::Action::Pick(issue) => app.pick(issue.id),
+                issues::Action::Open(url) => {
+                    screen.say(actions::open_url(&url).unwrap_or_else(|err| format!("{err:#}")));
+                    Outcome::Continue
+                }
+            },
+            None => app.handle_key(key),
+        };
+        match outcome {
             Outcome::Continue => {}
             Outcome::Quit => return Ok(Exit::Quit),
             Outcome::Workspaces => app.open_picker(choices()),
@@ -383,11 +415,12 @@ fn checkout_for(start: &Path, is_screen: bool) -> Result<PathBuf> {
 }
 
 /// Shows the pool of `checkout`, and of each workspace `w` switches to,
-/// until treetop quits. Each switch starts the pool's clocks, worker and
-/// chats afresh; ending the old pool's chat clients leaves its agents
-/// running.
-fn show(term: &mut Term, start: PathBuf, mut checkout: PathBuf) -> Result<()> {
+/// until treetop quits, opening on the Issues screen when `is_issues`. Each
+/// switch starts the pool's clocks, worker and chats afresh; ending the old
+/// pool's chat clients leaves its agents running.
+fn show(term: &mut Term, start: PathBuf, mut checkout: PathBuf, is_issues: bool) -> Result<()> {
     let mut here = Some(start);
+    let mut is_issues = is_issues;
     loop {
         std::env::set_current_dir(&checkout)?;
         workspaces::record(&checkout);
@@ -395,6 +428,7 @@ fn show(term: &mut Term, start: PathBuf, mut checkout: PathBuf) -> Result<()> {
         app.is_in_tmux = tmux::is_inside();
         app.checkout = checkout.clone();
         app.user = branch::user();
+        app.is_issues = std::mem::take(&mut is_issues);
         if let Some(mut cached) = cache::read(&checkout) {
             cached.insert(0, pool::main_tree(&checkout));
             app.set_cached(cached);
@@ -418,9 +452,11 @@ fn main() -> Result<()> {
     {
         return builtin::serve(name);
     }
-    let checkout = checkout_for(&start, args.is_empty())?;
+    // `treetop issues` opens the screen on the Issues screen.
+    let is_issues = args == ["issues"];
+    let checkout = checkout_for(&start, args.is_empty() || is_issues)?;
     std::env::set_current_dir(&checkout)?;
-    if !args.is_empty() {
+    if !args.is_empty() && !is_issues {
         return cli::run(&args, &checkout);
     }
 
@@ -431,7 +467,7 @@ fn main() -> Result<()> {
     }));
 
     let mut term = enter_screen()?;
-    let result = show(&mut term, start, checkout);
+    let result = show(&mut term, start, checkout, is_issues);
     leave_screen()?;
     result
 }

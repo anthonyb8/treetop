@@ -28,6 +28,7 @@ use crate::watch::Check;
 
 const USAGE: &str = "usage:
   treetop                          open the pool view
+  treetop issues                   open it on the Issues screen
   treetop status                   every tree, agent and report, as JSON
   treetop send <tree|agent> <msg>  type a message into an agent's chat and send it
   treetop dispatch <new|main|N> <task>

@@ -16,7 +16,6 @@ use crate::jobs::{Job, Kind, Launch, Message};
 use crate::pool::{self, Process, Tree, Work};
 use crate::reports::{Report, State};
 use crate::sidecar::Sidecar;
-use crate::tickets::{self, Filters, Loaded, Ticket};
 
 /// Where a tree's latest job stands, shown in its STATUS cell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,59 +95,6 @@ impl<'a> Item<'a> {
             State::Done | State::Stopped => 1,
             State::Working => 2,
         }
-    }
-}
-
-/// The tickets screen, which `Tab` switches to: the repository's ticket
-/// source's tickets, as the filter line narrows them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TicketsView {
-    /// The ticket source's name, once a list has come.
-    pub source: Option<String>,
-    pub tickets: Vec<Ticket>,
-    pub selected: usize,
-    pub filters: Filters,
-    pub is_loading: bool,
-    pub error: Option<String>,
-    /// The filter line, while it is being edited.
-    pub editing: Option<String>,
-    /// Filters to load, until the main loop hands them to the loader.
-    request: Option<Filters>,
-}
-
-impl Default for TicketsView {
-    /// Your own open tickets, which are the ones you pick up.
-    fn default() -> Self {
-        TicketsView {
-            source: None,
-            tickets: Vec::new(),
-            selected: 0,
-            filters: Filters {
-                mine: true,
-                ..Filters::default()
-            },
-            is_loading: false,
-            error: None,
-            editing: None,
-            request: None,
-        }
-    }
-}
-
-impl TicketsView {
-    pub fn current(&self) -> Option<&Ticket> {
-        self.tickets.get(self.selected)
-    }
-
-    fn load(&mut self) {
-        self.is_loading = true;
-        self.error = None;
-        self.request = Some(self.filters.clone());
-    }
-
-    fn move_by(&mut self, delta: isize) {
-        let last = self.tickets.len().saturating_sub(1);
-        self.selected = self.selected.saturating_add_signed(delta).min(last);
     }
 }
 
@@ -258,9 +204,9 @@ pub struct App {
     pub is_filtering: bool,
     /// The `?` overlay of every key is open.
     pub is_help: bool,
-    /// The tickets screen is shown in place of the trees.
-    pub is_tickets: bool,
-    pub tickets: TicketsView,
+    /// The Issues screen is shown in place of the trees; the program
+    /// around the app owns it and gives it the keys.
+    pub is_issues: bool,
     /// Agents have been read at least once; until then a tree with none is
     /// unknown, not orphaned.
     pub is_agents_read: bool,
@@ -1245,89 +1191,6 @@ impl App {
         Outcome::Continue
     }
 
-    /// The filters the tickets screen wants loaded, taken once.
-    pub fn wanted_tickets(&mut self) -> Option<Filters> {
-        self.tickets.request.take()
-    }
-
-    /// Takes a list of tickets, if it is for the filters on screen; one for
-    /// filters since changed is stale. The cursor stays on its ticket.
-    pub fn tickets_loaded(&mut self, loaded: Loaded) {
-        let view = &mut self.tickets;
-        if loaded.filters != view.filters {
-            return;
-        }
-        view.is_loading = false;
-        match loaded.result {
-            Ok((source, tickets)) => {
-                let cursor = view.current().map(|t| t.id.clone());
-                view.source = Some(source);
-                view.tickets = tickets;
-                view.selected = cursor
-                    .and_then(|id| view.tickets.iter().position(|t| t.id == id))
-                    .unwrap_or(0);
-                view.error = None;
-            }
-            Err(err) => {
-                view.tickets.clear();
-                view.error = Some(err);
-            }
-        }
-    }
-
-    /// Shows the tickets screen, listing them afresh.
-    fn open_tickets(&mut self) {
-        self.is_tickets = true;
-        self.tickets.load();
-    }
-
-    fn handle_tickets_key(&mut self, key: KeyEvent) -> Outcome {
-        let view = &mut self.tickets;
-        if let Some(line) = &mut view.editing {
-            match key.code {
-                KeyCode::Enter => {
-                    view.filters = tickets::parse(line);
-                    view.editing = None;
-                    view.selected = 0;
-                    view.load();
-                }
-                KeyCode::Esc => view.editing = None,
-                KeyCode::Backspace => {
-                    line.pop();
-                }
-                KeyCode::Char(c) => line.push(c),
-                _ => {}
-            }
-            return Outcome::Continue;
-        }
-        match key.code {
-            KeyCode::Tab | KeyCode::Esc => self.is_tickets = false,
-            KeyCode::Char('q') => return self.quit(),
-            KeyCode::Char('?') => self.is_help = true,
-            KeyCode::Char('w') => return Outcome::Workspaces,
-            KeyCode::Down | KeyCode::Char('j') => view.move_by(1),
-            KeyCode::Up | KeyCode::Char('k') => view.move_by(-1),
-            KeyCode::Home | KeyCode::Char('g') => view.move_by(isize::MIN),
-            KeyCode::End | KeyCode::Char('G') => view.move_by(isize::MAX),
-            KeyCode::Char('/') => {
-                let mut line = tickets::line(&view.filters);
-                if !line.is_empty() {
-                    line.push(' ');
-                }
-                view.editing = Some(line);
-            }
-            KeyCode::Char('m') => {
-                view.filters.mine = !view.filters.mine;
-                view.selected = 0;
-                view.load();
-            }
-            KeyCode::Char('r') => view.load(),
-            KeyCode::Enter => return self.pick_current(),
-            _ => {}
-        }
-        Outcome::Continue
-    }
-
     /// The tree a ticket has been picked up in, by its sidecar.
     fn tree_of_ticket(&self, id: &str) -> Option<&Tree> {
         self.trees.iter().find(|t| {
@@ -1338,14 +1201,11 @@ impl App {
         })
     }
 
-    /// Picks up the ticket under the tickets cursor: a new agent on it in a
-    /// fresh tree, back on the trees. A ticket already in a tree is not
+    /// Picks up issue `id`, from the Issues screen: a new agent on it in a
+    /// fresh tree, back on the trees. An issue already in a tree is not
     /// picked up twice; the cursor goes to its tree instead.
-    fn pick_current(&mut self) -> Outcome {
-        let Some(id) = self.tickets.current().map(|t| t.id.clone()) else {
-            return Outcome::Continue;
-        };
-        self.is_tickets = false;
+    pub fn pick(&mut self, id: String) -> Outcome {
+        self.is_issues = false;
         if let Some(path) = self.tree_of_ticket(&id).map(|t| t.path.clone()) {
             self.filter.clear();
             self.reselect(Some(path));
@@ -1377,7 +1237,8 @@ impl App {
         }
     }
 
-    fn quit(&mut self) -> Outcome {
+    /// Quits, or waits for running actions to finish first.
+    pub fn quit(&mut self) -> Outcome {
         match self.active_jobs() {
             0 => Outcome::Quit,
             n => {
@@ -1470,9 +1331,6 @@ impl App {
                 _ => Outcome::Continue,
             };
         }
-        if self.is_tickets {
-            return self.handle_tickets_key(key);
-        }
         if self.is_filtering {
             match key.code {
                 KeyCode::Enter => self.is_filtering = false,
@@ -1497,7 +1355,7 @@ impl App {
         }
         match key.code {
             KeyCode::Enter => return self.open_agent(),
-            KeyCode::Tab => self.open_tickets(),
+            KeyCode::Tab => self.is_issues = true,
             KeyCode::Char('m') => self.open_message(),
             KeyCode::Char('q') => return self.quit(),
             KeyCode::Char('?') => self.is_help = true,
@@ -1737,82 +1595,20 @@ mod tests {
         );
     }
 
-    fn ticket(id: &str) -> Ticket {
-        Ticket {
-            id: id.into(),
-            title: format!("{id} title"),
-            ..Ticket::default()
-        }
-    }
-
     #[test]
-    fn tab_lists_your_tickets_and_a_stale_list_is_dropped() {
+    fn tab_shows_the_issues_screen() {
         let mut app = app();
         press(&mut app, KeyCode::Tab);
-        assert!(app.is_tickets && app.tickets.is_loading);
-        let mine = app.wanted_tickets().unwrap();
-        assert!(mine.mine, "your own tickets first");
-        assert_eq!(app.wanted_tickets(), None, "asked once");
-        press(&mut app, KeyCode::Char('m'));
-        let everyone = app.wanted_tickets().unwrap();
-        assert!(!everyone.mine);
-        app.tickets_loaded(Loaded {
-            filters: mine,
-            result: Ok(("work".into(), vec![ticket("END-1")])),
-        });
-        assert!(app.tickets.tickets.is_empty(), "for filters since changed");
-        app.tickets_loaded(Loaded {
-            filters: everyone,
-            result: Ok(("work".into(), vec![ticket("END-1"), ticket("END-2")])),
-        });
-        assert!(!app.tickets.is_loading);
-        assert_eq!(app.tickets.source.as_deref(), Some("work"));
-        press(&mut app, KeyCode::Char('j'));
-        assert_eq!(app.tickets.current().unwrap().id, "END-2");
-        press(&mut app, KeyCode::Tab);
-        assert!(!app.is_tickets, "Tab goes back to the trees");
+        assert!(app.is_issues);
     }
 
     #[test]
-    fn the_filter_line_starts_from_the_filters_and_enter_applies_it() {
-        let mut app = app();
-        press(&mut app, KeyCode::Tab);
-        app.wanted_tickets();
-        press(&mut app, KeyCode::Char('/'));
-        assert_eq!(app.tickets.editing.as_deref(), Some("mine "));
-        type_in(&mut app, "label:Bug login");
-        press(&mut app, KeyCode::Enter);
-        let filters = app.wanted_tickets().unwrap();
-        assert_eq!(
-            (
-                filters.mine,
-                filters.label.as_deref(),
-                filters.query.as_deref()
-            ),
-            (true, Some("Bug"), Some("login"))
-        );
-        app.tickets_loaded(Loaded {
-            filters,
-            result: Err("work: auth: LINEAR_API_KEY_WORK is not set".into()),
-        });
-        assert_eq!(
-            app.tickets.error.as_deref(),
-            Some("work: auth: LINEAR_API_KEY_WORK is not set")
-        );
-    }
-
-    #[test]
-    fn enter_on_a_ticket_picks_it_up_in_a_new_tree_once() {
+    fn picking_an_issue_starts_it_in_a_new_tree_once() {
         let mut app = app();
         app.checkout = PathBuf::from("/repo");
-        press(&mut app, KeyCode::Tab);
-        let filters = app.wanted_tickets().unwrap();
-        app.tickets_loaded(Loaded {
-            filters,
-            result: Ok(("work".into(), vec![ticket("END-812"), ticket("END-799")])),
-        });
-        let job = queued(press(&mut app, KeyCode::Enter)).remove(0);
-        assert!(!app.is_tickets, "back on the trees");
+        app.is_issues = true;
+        let job = queued(app.pick("END-812".into())).remove(0);
+        assert!(!app.is_issues, "back on the trees");
         let launch = job.launch.unwrap();
         assert!(launch.is_new_tree);
         assert_eq!(
@@ -1826,10 +1622,7 @@ mod tests {
         let mut sidecar = *app.trees[2].sidecar.clone().unwrap();
         sidecar.ticket = Some("END-799".into());
         app.apply_sidecars(HashMap::from([(PathBuf::from("/p/8/app"), sidecar)]));
-        press(&mut app, KeyCode::Tab);
-        app.wanted_tickets();
-        press(&mut app, KeyCode::Char('j'));
-        assert_eq!(press(&mut app, KeyCode::Enter), Outcome::Continue);
+        assert_eq!(app.pick("end-799".into()), Outcome::Continue);
         assert_eq!(
             app.current().unwrap().name,
             "8",
@@ -1838,7 +1631,7 @@ mod tests {
         assert!(
             app.message
                 .unwrap()
-                .starts_with("END-799 is already in this tree")
+                .starts_with("end-799 is already in this tree")
         );
     }
 

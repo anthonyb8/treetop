@@ -3,14 +3,14 @@
 //! system names for it, and marking it started. The plugin does the talking;
 //! this resolves which plugin and which settings, and reads its replies.
 
-use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread;
+use std::path::Path;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-pub use issues::{Filters, line, parse};
+use issues::Backend;
+pub use issues::Filters;
 
 use crate::config;
 use crate::plugin::{self, Kind, Plugin};
@@ -112,42 +112,84 @@ pub fn prompt(template: Option<&str>, ticket: &Ticket) -> String {
     out
 }
 
-/// Tickets read for a filter, or why they could not be.
-pub struct Loaded {
-    pub filters: Filters,
-    /// The source's name and its tickets.
-    pub result: Result<(String, Vec<Ticket>), String>,
+/// A ticket plugin other than Linear's on the Issues screen: it lists and
+/// reads through the plugin contract, and its edits say they cannot.
+struct ReadOnly(Source);
+
+/// A ticket as the Issues screen shows an issue.
+fn issue(ticket: Ticket) -> linear::Issue {
+    linear::Issue {
+        uuid: ticket.id.clone(),
+        id: ticket.id,
+        title: ticket.title,
+        state: ticket.state,
+        labels: ticket.labels,
+        assignee: ticket.assignee,
+        project: ticket.project,
+        cycle: ticket.cycle,
+        url: ticket.url,
+        description: ticket.description,
+        branch: ticket.branch,
+        ..linear::Issue::default()
+    }
 }
 
-/// Lists tickets on a thread of its own, so the screen never waits on the
-/// network. Only the latest request waiting is read; older ones are stale.
-pub struct Loader {
-    requests: Sender<Filters>,
-    pub results: Receiver<Loaded>,
+impl Backend for ReadOnly {
+    fn name(&self) -> &str {
+        &self.0.name
+    }
+
+    fn list(&self, filters: &Filters) -> Result<Vec<linear::Issue>, String> {
+        Ok(self.0.list(filters)?.into_iter().map(issue).collect())
+    }
+
+    fn detail(&self, id: &str) -> Result<linear::Detail, String> {
+        Ok(linear::Detail {
+            issue: issue(self.0.get(id)?),
+            comments: Vec::new(),
+        })
+    }
 }
 
-impl Loader {
-    pub fn spawn(checkout: PathBuf) -> Self {
-        let (requests, queue) = mpsc::channel::<Filters>();
-        let (results_tx, results) = mpsc::channel();
-        thread::spawn(move || {
-            while let Ok(mut filters) = queue.recv() {
-                while let Ok(newer) = queue.try_recv() {
-                    filters = newer;
-                }
-                let result = Source::of(&checkout)
-                    .and_then(|source| Ok((source.name.clone(), source.list(&filters)?)));
-                if results_tx.send(Loaded { filters, result }).is_err() {
-                    return;
-                }
-            }
-        });
-        Loader { requests, results }
+/// Every issue source in the config as a backend for the Issues screen, and
+/// the index of the repository's own. Linear's built-in plugin gets the full
+/// screen; any other plugin is read-only.
+pub fn backends(checkout: &Path) -> Result<(Vec<Arc<dyn Backend>>, usize), String> {
+    let config = config::load()?;
+    let own = config
+        .source_for(checkout)
+        .ok()
+        .map(|(name, _)| name.to_string());
+    let mut backends: Vec<Arc<dyn Backend>> = Vec::new();
+    let mut at = 0;
+    for (name, source) in &config.issues {
+        if own.as_deref() == Some(name.as_str()) {
+            at = backends.len();
+        }
+        let plugin = plugin::named(Kind::Tickets, &source.plugin)
+            .ok_or_else(|| format!("[issues.{name}]: no ticket plugin {}", source.plugin))?;
+        let setting = |key: &str| {
+            source
+                .settings
+                .get(key)
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        };
+        if plugin == Plugin::Builtin("linear") {
+            backends.push(Arc::new(issues::Linear::new(
+                name,
+                setting("key_env").as_deref(),
+                setting("team"),
+            )));
+        } else {
+            backends.push(Arc::new(ReadOnly(Source {
+                name: name.clone(),
+                plugin,
+                config: source.config(),
+            })));
+        }
     }
-
-    pub fn request(&self, filters: Filters) {
-        let _ = self.requests.send(filters);
-    }
+    Ok((backends, at))
 }
 
 #[cfg(test)]

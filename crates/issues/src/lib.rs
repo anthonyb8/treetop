@@ -1,8 +1,61 @@
-//! treetop's Issues screen: a ticket system's issues, narrowed by a filter
-//! line. It knows nothing about trees; the program it runs in tells it what
-//! it needs to.
+//! treetop's Issues screen: a ticket system's issues on top, narrowed by a
+//! filter line, and the one under the cursor below with its description and
+//! comments. It knows nothing about trees; the program it runs in hands it
+//! its sources as backends and acts on what the screen asks for.
 
+mod backend;
+mod draw;
+mod markdown;
+mod screen;
+mod worker;
+
+use ratatui::style::{Color, Modifier, Style};
 use serde::{Deserialize, Serialize};
+
+pub use backend::{Backend, Linear, READ_ONLY};
+pub use screen::{Action, Screen};
+
+/// The colours the screen draws in, given by the program it runs in so the
+/// two look like one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Palette {
+    pub text: Color,
+    pub muted: Color,
+    pub success: Color,
+    pub warning: Color,
+    pub danger: Color,
+    pub info: Color,
+    pub accent: Color,
+    pub special: Color,
+    pub title: Color,
+    pub bar: Style,
+    pub badge: Style,
+    pub header: Style,
+    pub cursor: Style,
+    pub border: Color,
+}
+
+impl Default for Palette {
+    /// The terminal's own sixteen colours.
+    fn default() -> Self {
+        Palette {
+            text: Color::Reset,
+            muted: Color::Gray,
+            success: Color::Green,
+            warning: Color::Yellow,
+            danger: Color::Red,
+            info: Color::Cyan,
+            accent: Color::Cyan,
+            special: Color::Magenta,
+            title: Color::Yellow,
+            bar: Style::new().add_modifier(Modifier::REVERSED),
+            badge: Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD),
+            header: Style::new().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            cursor: Style::new().add_modifier(Modifier::REVERSED),
+            border: Color::DarkGray,
+        }
+    }
+}
 
 /// What narrows a list of issues. Each is optional; none lists the team's open issues.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -27,15 +27,21 @@ pub fn shell(path: &Path) {
 /// happened, for the status line.
 pub fn browse(port: u16, tree: &str) -> Result<String> {
     let url = format!("http://localhost:{port}");
-    if has_desktop() && open_in_browser(&url).is_ok() {
-        return Ok(format!("opened {url} from tree {tree}"));
+    open_url(&url).map(|said| format!("{said} from tree {tree}"))
+}
+
+/// Opens `url` the way `browse` opens a port, or copies it to the clipboard
+/// where there is no desktop.
+pub fn open_url(url: &str) -> Result<String> {
+    if has_desktop() && open_in_browser(url).is_ok() {
+        return Ok(format!("opened {url}"));
     }
     let mut stdout = std::io::stdout();
     stdout
-        .write_all(osc52(&url).as_bytes())
+        .write_all(osc52(url).as_bytes())
         .and_then(|()| stdout.flush())
         .context("copying the URL")?;
-    Ok(format!("copied {url} from tree {tree} to the clipboard"))
+    Ok(format!("copied {url} to the clipboard"))
 }
 
 /// A desktop session to open a browser in: macOS, or a graphical session's

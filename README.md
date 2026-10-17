@@ -47,7 +47,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | `o` | open the lowest port the tree serves, `http://localhost:<port>`, in the browser, or copy it to the clipboard where there is no desktop |
 | `b` | rename the branch of the tree under the cursor |
 | `w` | switch to another workspace: the pool of another repository treetop has been opened in |
-| Tab | switch to the repository's tickets (see [Tickets](#tickets)) |
+| Tab | switch to the Issues screen, and back (see [Issues](#issues)) |
 | `j` `k` / arrows, `g` `G` | move |
 | Esc | clear the filter, then the marks |
 | `?` | show every key |
@@ -268,7 +268,7 @@ It sees and steers the other agents through three treetop commands, which it may
 | `treetop status` | prints JSON: each held tree's branch, uncommitted and unpushed counts and ports, its agents and their state, and each background agent's latest report (the question it is waiting on, its answer once done, else what it is doing now); idle trees are only counted |
 | `treetop send <tree\|agent> <message>` | types the message into the chat of every agent in that tree (a number or `main`), or of the agent of that name, and submits it |
 | `treetop dispatch <new\|main\|N> <task>` | starts a new agent on the task in a fresh tree, the main checkout or tree N |
-| `treetop pick <ID>` | picks a ticket up: an agent on it in a fresh tree, on its branch (see [Tickets](#tickets)) |
+| `treetop pick <ID>` | picks a ticket up: an agent on it in a fresh tree, on its branch (see [Issues](#issues)) |
 
 They work from any shell too.
 Each prints only what it is asked for, so a question costs the coordinator one small read rather than a crawl through every transcript.
@@ -310,17 +310,22 @@ When an agent comes to need you, or finishes, treetop rings the terminal bell, a
 The summary counts the trees that need you, and, as "elsewhere", agents outside the pool waiting on you, which have no row.
 These job files are internal to Claude Code, like its session files, so a release that changes them blanks SAYS until treetop catches up.
 
-## Tickets
+## Issues
 
-Tab switches to the repository's tickets, from its ticket source in the config (see [Config](#config)), and back.
-They load in the background, your own open tickets first, the most recently updated at the top; the pane below shows the one under the cursor.
+treetop has two screens, Trees and Issues; Tab switches between them, and `treetop issues` opens straight onto Issues.
+The Issues screen shows the repository's issues from its issue source in the config (see [Config](#config)): the list on top, your own open issues first, the most recently updated at the top, and below it the issue under the cursor with its fields, its description rendered from Markdown, and its comments.
+Everything loads in the background, and an issue's description and comments are kept once read, so moving the cursor never waits on the network.
+`→` (or `l`) moves the keys to the issue to scroll it, and `←` brings them back to the list.
+`w` switches to the next issue source, so a work and a personal workspace are one key apart, and `o` opens the issue in the browser.
 
 `/` edits the filter line, which starts from the filters in use; Enter applies it and Esc keeps the last.
 It takes `mine`, `label:`, `state:`, `project:` and `cycle:` (`current` or a number), a value with spaces in double quotes, and any other words search titles: `mine label:Bug state:"In Review" login`.
-With no `state:`, only open tickets show.
-`m` switches between yours and everyone's, `r` lists them again, and `?` shows these keys.
+With no `state:`, only open issues show.
+`m` switches between yours and everyone's, `r` reads the list and the team again, and `?` shows these keys.
 
-Enter picks the ticket under the cursor up, in one step:
+A Linear source gets all of this; an issue source on another ticket plugin lists and reads through the plugin contract.
+
+Enter picks the issue under the cursor up, in one step:
 
 1. a fresh tree is leased on the branch the ticket system names for the ticket (Linear's `branchName`), or on that branch as it already is, here or on `origin`, when the ticket was picked up before;
 2. an agent starts there, its session named for the ticket (`END-123 fix the login redirect`), its first message the ticket's id, title, text and link;
