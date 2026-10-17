@@ -164,6 +164,7 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
     let refresher = Refresher::spawn(checkout.to_path_buf(), app.trees.clone());
     let worker = Worker::spawn();
     let diffs = diff::Loader::spawn(diff::base(checkout));
+    let tickets = tickets::Loader::spawn(checkout.to_path_buf());
     // Drawn only when something changed, or every REDRAW: drawing the whole
     // table ten times a second is most of what treetop costs while idle.
     let mut is_stale = true;
@@ -218,6 +219,14 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
         }
         if let Some(path) = app.wanted_diff() {
             diffs.request(path);
+        }
+        while let Ok(loaded) = tickets.results.try_recv() {
+            is_stale = true;
+            app.tickets_loaded(loaded);
+        }
+        if let Some(filters) = app.wanted_tickets() {
+            is_stale = true;
+            tickets.request(filters);
         }
         if app.is_quitting && app.active_jobs() == 0 {
             return Ok(Exit::Quit);

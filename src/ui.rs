@@ -11,7 +11,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 
 use crate::agents::{Agent, Status};
-use crate::app::{App, DiffView, Item, JobState, LogEntry, Opening, Pending, Picker, Review};
+use crate::app::{
+    App, DiffView, Item, JobState, LogEntry, Opening, Pending, Picker, Review, TicketsView,
+};
 use crate::chat::Chat;
 use crate::coordinator;
 use crate::diff::{Change, FileDiff, Layout as DiffLayout, Row as DiffRow, Side, ViewRow};
@@ -20,6 +22,7 @@ use crate::pool::{Tree, Work};
 use crate::popup;
 use crate::reports::{self, State};
 use crate::theme::theme;
+use crate::tickets;
 
 /// The bar's keys, most useful first: on a narrow bar the keys at the end
 /// are the ones left out, and `?` lists them all.
@@ -36,8 +39,35 @@ const KEYS: [(&str, &str); 10] = [
     ("q", "quit"),
 ];
 
+/// The tickets screen's bar.
+const TICKET_KEYS: [(&str, &str); 7] = [
+    ("/", "filter"),
+    ("m", "mine"),
+    ("?", "help"),
+    ("r", "reload"),
+    ("Tab", "trees"),
+    ("w", "workspace"),
+    ("q", "quit"),
+];
+
+/// Every key on the tickets screen, for the `?` overlay.
+const TICKET_HELP: [(&str, &str); 9] = [
+    (
+        "/",
+        "filter: mine label:Bug state:\"In Review\" project:x cycle:current, words",
+    ),
+    ("m", "only yours, or everyone's"),
+    ("r", "list them again"),
+    ("j k ↑ ↓", "move"),
+    ("g G", "top, bottom"),
+    ("Tab, Esc", "back to the trees"),
+    ("w", "switch workspace"),
+    ("?", "this help"),
+    ("q", "quit"),
+];
+
 /// Every key on the list, for the `?` overlay.
-const HELP: [(&str, &str); 16] = [
+const HELP: [(&str, &str); 17] = [
     (
         "Enter",
         "open the agent: its chat, a cold one started again, else its tree",
@@ -58,6 +88,7 @@ const HELP: [(&str, &str); 16] = [
     ("o", "open the lowest port the tree serves"),
     ("b", "rename the tree's branch"),
     ("w", "switch workspace"),
+    ("Tab", "the repository's tickets"),
     ("j k ↑ ↓", "move"),
     ("g G", "top, bottom"),
     ("Esc", "clear the filter, then the marks"),
@@ -92,8 +123,13 @@ pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>) {
         Constraint::Length(1),
     ])
     .areas(frame.area());
-    draw_table(frame, app, body);
-    draw_detail(frame, app, detail);
+    if app.is_tickets {
+        draw_tickets(frame, &app.tickets, body);
+        draw_ticket(frame, &app.tickets, detail);
+    } else {
+        draw_table(frame, app, body);
+        draw_detail(frame, app, detail);
+    }
     draw_footer(frame, app, footer);
     if chat.is_some()
         || app.view.is_some()
@@ -122,7 +158,7 @@ pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>) {
     } else if let Some(pending) = &app.pending {
         draw_confirm(frame, pending);
     } else if app.is_help {
-        draw_help(frame);
+        draw_help(frame, if app.is_tickets { &TICKET_HELP } else { &HELP });
     }
 }
 
@@ -135,7 +171,9 @@ pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>) {
 fn summary(app: &App, is_compact: bool) -> Vec<Span<'static>> {
     let t = theme();
     let mut spans = vec![Span::raw("  ")];
-    if app.is_loaded {
+    if app.is_tickets {
+        spans.extend(tickets_summary(&app.tickets, is_compact));
+    } else if app.is_loaded {
         let pool = app.trees.iter().filter(|t| !t.is_main);
         let (trees, held) = (pool.clone().count(), pool.filter(|t| t.is_held()).count());
         let running = app.trees.iter().filter(|t| !t.processes.is_empty()).count();
@@ -196,6 +234,29 @@ fn summary(app: &App, is_compact: bool) -> Vec<Span<'static>> {
         name => format!(" treetop · {name} "),
     };
     spans.push(Span::styled(badge, t.badge));
+    spans
+}
+
+/// The tickets screen's part of the bar: how many, from where, narrowed by
+/// what.
+fn tickets_summary(view: &TicketsView, is_compact: bool) -> Vec<Span<'static>> {
+    let t = theme();
+    let mut spans = vec![Span::raw(format!("{} tickets", view.tickets.len()))];
+    if let Some(source) = &view.source {
+        spans.push(Span::raw(format!("  from {source}")));
+    }
+    if !is_compact {
+        let line = tickets::line(&view.filters);
+        let line = if line.is_empty() {
+            "all open".to_string()
+        } else {
+            line
+        };
+        spans.push(Span::styled(format!("  {line}"), fg(t.accent)));
+    }
+    if view.is_loading {
+        spans.push(Span::styled("  loading...", fg(t.info)));
+    }
     spans
 }
 
@@ -512,6 +573,11 @@ fn fitting_keys(keys: &[(&str, &str)], width: u16) -> Vec<Span<'static>> {
 /// message there is, else the keys.
 fn footer_left(app: &App, width: u16) -> Line<'static> {
     let t = theme();
+    if let (true, Some(line)) = (app.is_tickets, &app.tickets.editing) {
+        return Line::raw(format!(
+            " Filter: {line}_   Enter applies it, Esc keeps the last"
+        ));
+    }
     if app.is_filtering {
         return Line::raw(format!(
             " Filter: {}_   Enter keeps it, Esc clears it",
@@ -534,7 +600,8 @@ fn footer_left(app: &App, width: u16) -> Line<'static> {
         ));
     }
     let used = u16::try_from(narrowing.iter().map(Span::width).sum::<usize>()).unwrap_or(width);
-    let mut spans = fitting_keys(&KEYS, width.saturating_sub(used));
+    let keys: &[(&str, &str)] = if app.is_tickets { &TICKET_KEYS } else { &KEYS };
+    let mut spans = fitting_keys(keys, width.saturating_sub(used));
     spans.extend(narrowing);
     Line::from(spans)
 }
@@ -601,6 +668,104 @@ fn says_cell(app: &App, tree: &Tree) -> Cell<'static> {
         Span::styled(format!("{glyph} "), style),
         Span::styled(first, text_style),
     ]))
+}
+
+/// The tickets the filter line asks for, the newest first.
+fn draw_tickets(frame: &mut Frame, view: &TicketsView, area: Rect) {
+    let t = theme();
+    let note = match (&view.error, view.tickets.is_empty(), view.is_loading) {
+        (Some(err), _, _) => Some(Paragraph::new(format!(" {err}")).style(fg(t.danger))),
+        (None, true, true) => Some(Paragraph::new(" reading tickets...").style(fg(t.muted))),
+        (None, true, false) => Some(
+            Paragraph::new(" no tickets match; / changes the filter, m shows everyone's")
+                .style(fg(t.muted)),
+        ),
+        _ => None,
+    };
+    if let Some(note) = note {
+        frame.render_widget(note.wrap(Wrap { trim: false }), area);
+        return;
+    }
+    let header = Row::new([
+        "ID", "STATE", "TITLE", "LABELS", "ASSIGNEE", "PROJECT", "CYCLE",
+    ])
+    .style(t.header);
+    let muted = fg(t.muted);
+    let rows: Vec<Row> = view
+        .tickets
+        .iter()
+        .map(|ticket| {
+            Row::new(vec![
+                Cell::from(ticket.id.clone()).style(fg(t.accent)),
+                Cell::from(ticket.state.clone()).style(fg(t.info)),
+                Cell::from(ticket.title.clone()),
+                Cell::from(ticket.labels.join(", ")).style(fg(t.special)),
+                Cell::from(ticket.assignee.clone().unwrap_or_default()).style(muted),
+                Cell::from(ticket.project.clone().unwrap_or_default()).style(muted),
+                Cell::from(ticket.cycle.clone().unwrap_or_default()).style(muted),
+            ])
+        })
+        .collect();
+    let widths = [
+        Constraint::Length(10),
+        Constraint::Length(13),
+        Constraint::Fill(1),
+        Constraint::Length(16),
+        Constraint::Length(14),
+        Constraint::Length(14),
+        Constraint::Length(10),
+    ];
+    let table = Table::new(rows, widths)
+        .header(header)
+        .row_highlight_style(t.cursor);
+    let mut state = TableState::default().with_selected(Some(view.selected));
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
+/// The ticket under the cursor in full.
+fn draw_ticket(frame: &mut Frame, view: &TicketsView, area: Rect) {
+    let t = theme();
+    let Some(ticket) = view.current() else {
+        frame.render_widget(Paragraph::new("").block(pane_block()), area);
+        return;
+    };
+    let field = |label: &str, value: String| {
+        Line::from(vec![
+            Span::styled(format!("{label:<10}"), fg(t.muted)),
+            Span::raw(value),
+        ])
+    };
+    let or_none = |value: &Option<String>| value.clone().unwrap_or_else(|| "none".into());
+    let labels = if ticket.labels.is_empty() {
+        "none".to_string()
+    } else {
+        ticket.labels.join(", ")
+    };
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("{} ", ticket.id),
+                fg(t.accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                ticket.title.clone(),
+                Style::new().add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        field("state", ticket.state.clone()),
+        field("labels", labels),
+        field("assignee", or_none(&ticket.assignee)),
+        field("project", or_none(&ticket.project)),
+        field("cycle", or_none(&ticket.cycle)),
+        field("branch", or_none(&ticket.branch)),
+        field("url", or_none(&ticket.url)),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(pane_block()),
+        area,
+    );
 }
 
 /// Rows the detail pane takes, borders included.
@@ -936,17 +1101,17 @@ fn branch_line(prompt: &Prompt) -> Line<'static> {
 }
 
 /// Every key, over the list, until any key closes it.
-fn draw_help(frame: &mut Frame) {
+fn draw_help(frame: &mut Frame, help: &[(&str, &str)]) {
     let t = theme();
     // A space, the key in nine columns, a space, then what it does, inside
     // the border and a column of air on the right.
-    let width = HELP
+    let width = help
         .iter()
         .map(|(_, does)| does.chars().count())
         .max()
         .unwrap_or(0)
         + 14;
-    let lines: Vec<Line> = HELP
+    let lines: Vec<Line> = help
         .iter()
         .map(|(key, does)| {
             Line::from(vec![

@@ -47,6 +47,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | `o` | open the lowest port the tree serves, `http://localhost:<port>`, in the browser, or copy it to the clipboard where there is no desktop |
 | `b` | rename the branch of the tree under the cursor |
 | `w` | switch to another workspace: the pool of another repository treetop has been opened in |
+| Tab | switch to the repository's tickets (see [Tickets](#tickets)) |
 | `j` `k` / arrows, `g` `G` | move |
 | Esc | clear the filter, then the marks |
 | `?` | show every key |
@@ -307,6 +308,16 @@ The coordinator's own reports are left off its row, since it is talked to throug
 When an agent comes to need you, or finishes, treetop rings the terminal bell, and inside tmux shows it in the status line for five seconds, so it is heard from any window; the coordinator finishing an answer rings it too.
 The summary counts the trees that need you, and, as "elsewhere", agents outside the pool waiting on you, which have no row.
 These job files are internal to Claude Code, like its session files, so a release that changes them blanks SAYS until treetop catches up.
+
+## Tickets
+
+Tab switches to the repository's tickets, from its ticket source in the config (see [Config](#config)), and back.
+They load in the background, your own open tickets first, the most recently updated at the top; the pane below shows the one under the cursor.
+
+`/` edits the filter line, which starts from the filters in use; Enter applies it and Esc keeps the last.
+It takes `mine`, `label:`, `state:`, `project:` and `cycle:` (`current` or a number), a value with spaces in double quotes, and any other words search titles: `mine label:Bug state:"In Review" login`.
+With no `state:`, only open tickets show.
+`m` switches between yours and everyone's, `r` lists them again, and `?` shows these keys.
 
 ## Workspaces
 
