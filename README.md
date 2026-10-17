@@ -117,6 +117,26 @@ A pid two sources both see counts once, where the more specific source saw it; a
 
 A waiting agent is drawn in the warning colour, a busy one in green and an idle one muted; `·` means the source cannot tell.
 
+When treetop leases a tree to start an agent, it records the lease in `treetop.json` in the same git directory: the agent, when it leased the tree, and later its job, ticket and branch.
+A return removes it, so a tree handed out again never carries the last agent's record.
+`treetop status` includes it as each tree's `sidecar`.
+
+## Plugins
+
+A plugin is any executable file in `~/.config/treetop/plugins` (or `$XDG_CONFIG_HOME/treetop/plugins`) that speaks JSON on stdin and stdout; `treetop plugins` lists what it finds and why it cannot use one.
+treetop runs it once per call, writes one request and closes stdin, then reads one reply:
+
+```json
+{"protocol": 1, "op": "describe", "config": {}, "args": {}}
+{"ok": true, "result": {"protocol": 1, "name": "my-agent", "kind": "agent", "ops": ["start", "find"]}}
+{"ok": false, "error": {"code": "not_found", "message": "no job 0908e7f3"}}
+```
+
+- `describe` says what the plugin is: its `protocol`, which must be 1, its `name`, its `kind` (`agent` or `tickets`) and the `ops` it answers.
+- An error's `code` is one of `not_found`, `unsupported`, `auth`, `conflict`, `unavailable` or `failed`; any other reads as `failed`. A non-zero exit or a reply that is not JSON fails with what the plugin wrote to stderr.
+- Each call has a timeout: 3 s for `describe` and `find`, 10 s for `list` and `get`, 30 s for anything else. The plugin runs in its own process group, which is killed at the timeout, so it must not leave a child holding its stdout once it exits.
+- Fields are only ever added within a protocol, so a plugin should ignore the ones it does not know.
+
 ## What the actions run
 
 Both run in the background, one tree at a time, while treetop stays on screen; each row's STATUS shows queued, returning, destroying, returned, destroyed or failed.

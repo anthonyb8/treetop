@@ -10,6 +10,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 use crate::pool::Tree;
+use crate::sidecar::{self, Sidecar};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -241,13 +242,17 @@ fn lease_new(job: &mut Job, log: &mut String) -> bool {
 }
 
 /// Leases the tree when nobody holds it, so the pool cannot hand it to
-/// someone else under the agent, then starts the agent in it.
+/// someone else under the agent, then starts the agent in it. A tree
+/// treetop leases gets its sidecar before the agent starts, and loses it
+/// again if the agent does not.
 fn start(job: &mut Job, log: &mut String) -> bool {
-    if job.launch.as_ref().is_some_and(|l| l.is_new_tree) {
+    let is_new_tree = job.launch.as_ref().is_some_and(|l| l.is_new_tree);
+    let is_leasing = is_new_tree || !job.tree.is_held();
+    if is_new_tree {
         if !lease_new(job, log) {
             return false;
         }
-    } else if !job.tree.is_held() {
+    } else if is_leasing {
         let leased = capture(
             Command::new("treehouse").args(["lease", &job.tree.name, "--lease-holder", "treetop"]),
             log,
@@ -260,10 +265,45 @@ fn start(job: &mut Job, log: &mut String) -> bool {
     let Some((program, args)) = command.split_first() else {
         return false;
     };
-    capture(
+    if is_leasing {
+        let record = Sidecar {
+            agent: Some(agent_name(program)),
+            ..Sidecar::leased_now()
+        };
+        if let Err(err) = sidecar::write(&job.tree.path, &record) {
+            let _ = writeln!(log, "could not write {}: {err}", sidecar::FILE);
+            return false;
+        }
+    }
+    let is_started = capture(
         Command::new(program).args(args).current_dir(&job.tree.path),
         log,
+    );
+    if !is_started && is_leasing {
+        let _ = sidecar::remove(&job.tree.path);
+    }
+    is_started
+}
+
+/// The agent a command starts, as the sidecar names it: the program's file
+/// name.
+fn agent_name(program: &str) -> String {
+    Path::new(program).file_name().map_or_else(
+        || program.to_string(),
+        |name| name.to_string_lossy().into_owned(),
     )
+}
+
+/// Returns the tree, then drops its sidecar, which described a lease that
+/// is now over.
+fn give_back(tree: &Path, log: &mut String) -> bool {
+    if !capture(treehouse("return", tree).arg("--force"), log) {
+        return false;
+    }
+    if let Err(err) = sidecar::remove(tree) {
+        let _ = writeln!(log, "could not remove {}: {err}", sidecar::FILE);
+    }
+    true
 }
 
 fn treehouse(subcommand: &str, path: &Path) -> Command {
@@ -281,7 +321,7 @@ pub fn run(job: &mut Job) -> (bool, String) {
     let mut log = String::new();
     let is_ok = match job.kind {
         Kind::Start => start(job, &mut log),
-        Kind::Return => capture(treehouse("return", &job.tree.path).arg("--force"), &mut log),
+        Kind::Return => give_back(&job.tree.path, &mut log),
         Kind::Preview => capture(treehouse("destroy", &job.tree.path).args(INCLUDE), &mut log),
         Kind::Destroy => capture(
             treehouse("destroy", &job.tree.path)
@@ -324,6 +364,12 @@ mod tests {
             agent_command(custom, Some(&launch("fix login"))),
             ["codex", "exec", "fix login"]
         );
+    }
+
+    #[test]
+    fn the_sidecar_names_the_agent_by_its_program() {
+        assert_eq!(agent_name("claude"), "claude");
+        assert_eq!(agent_name("/usr/local/bin/codex"), "codex");
     }
 
     #[test]

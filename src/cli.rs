@@ -18,8 +18,10 @@ use crate::coordinator;
 use crate::dispatch::Recipient;
 use crate::jobs::{self, Job, Kind, Launch};
 use crate::live;
+use crate::plugin;
 use crate::pool::{self, Tree};
 use crate::reports::{self, Report};
+use crate::sidecar;
 use crate::watch::Check;
 
 const USAGE: &str = "usage:
@@ -28,7 +30,8 @@ const USAGE: &str = "usage:
   treetop send <tree|agent> <msg>  type a message into an agent's chat and send it
   treetop dispatch <new|main|N> <task>
                                    start a new agent on a task in a fresh tree,
-                                   the main checkout or tree N";
+                                   the main checkout or tree N
+  treetop plugins                  every plugin found, and what each says it is";
 
 /// How long `send` waits for every message to go in.
 const SEND_TIMEOUT: Duration = Duration::from_secs(45);
@@ -40,16 +43,43 @@ const SEND_GRACE: Duration = Duration::from_secs(1);
 /// The size of the terminal a message is typed into, unseen.
 const SEND_SIZE: (u16, u16) = (40, 120);
 
-/// Answers `--help` and `--version`, which need no repository, so they
-/// work from any directory. None for every other command.
+/// Answers `--help`, `--version` and `plugins`, which need no repository,
+/// so they work from any directory. None for every other command.
 pub fn answer_anywhere(args: &[String]) -> Option<String> {
     match args {
         [flag] if flag == "-h" || flag == "--help" || flag == "help" => Some(USAGE.into()),
         [flag] if flag == "-V" || flag == "--version" => {
             Some(format!("treetop {}", env!("CARGO_PKG_VERSION")))
         }
+        [command] if command == "plugins" => Some(plugins()),
         _ => None,
     }
+}
+
+/// One line per file in the plugin directory: its name, kind, path and
+/// ops, or why treetop cannot use it.
+fn plugins() -> String {
+    let Some(dir) = plugin::dir() else {
+        return "no plugin directory: neither XDG_CONFIG_HOME nor HOME is set".into();
+    };
+    let found = plugin::discover(&dir);
+    if found.is_empty() {
+        return format!("no plugins in {}", dir.display());
+    }
+    let lines: Vec<String> = found
+        .iter()
+        .map(|found| match &found.description {
+            Ok(d) => format!(
+                "{:<16} {:<8} {} ({})",
+                d.name,
+                d.kind.label(),
+                found.path.display(),
+                d.ops.join(", ")
+            ),
+            Err(err) => format!("{:<16} {:<8} {}: {err}", "-", "-", found.path.display()),
+        })
+        .collect();
+    lines.join("\n")
 }
 
 /// Runs the command `args` names, from the main checkout `checkout`.
@@ -161,6 +191,7 @@ fn status_json(trees: &[Tree], reports: &[Report], now: SystemTime) -> Value {
             "ports": tree.ports(),
             "agents": agents,
             "reports": tree_reports,
+            "sidecar": sidecar::read(&tree.path),
         }));
     }
     let elsewhere: Vec<Value> = reports
