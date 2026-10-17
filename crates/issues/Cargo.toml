@@ -1,0 +1,9 @@
+[package]
+name = "issues"
+version.workspace = true
+edition.workspace = true
+description = "treetop's Issues screen"
+publish = false
+
+[dependencies]
+serde.workspace = true

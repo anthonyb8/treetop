@@ -137,25 +137,25 @@ A hook is a command and its arguments, run in the tree with `TREETOP_TREE`, `TRE
 One that fails is written to the log and never stops the start or return it belongs to.
 A config file treetop cannot parse is reported in the log, and no hooks run.
 
-Tickets come from named sources, each a ticket plugin and the settings it is given; Linear's plugin is built in and the default.
+Issues come from named sources, each a ticket plugin and the settings it is given; Linear's plugin is built in and the default.
 A repository picks its source by its main checkout's path under `[repos]`; with a single source, every repository uses it.
 Each Linear source names the environment variable holding its personal API key (Linear's Settings > Security & access > Personal API keys), so a work and a personal workspace each get their own:
 
 ```toml
-[tickets.work]
+[issues.work]
 key_env = "LINEAR_API_KEY_WORK"
 team = "END"
 
-[tickets.personal]
+[issues.personal]
 key_env = "LINEAR_API_KEY_PERSONAL"
 team = "ANT"
 
 [repos."~/endo/app"]
-tickets = "work"
+issues = "work"
 ```
 
 `treetop tickets` lists the repository's open tickets from its source, `--mine` those assigned to you, and any other words search their titles; it is the quickest check that a key and team are right.
-The Linear plugin calls `https://api.linear.app/graphql` with `curl`, writing the request to curl's stdin so the key never appears in a process list.
+The Linear plugin calls `https://api.linear.app/graphql` over HTTPS from treetop itself, so the key never appears in a process list.
 
 ## Plugins
 

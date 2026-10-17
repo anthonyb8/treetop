@@ -14,22 +14,22 @@
 //! fails is shown in the log, and never stops the start or return it belongs
 //! to.
 //!
-//! Tickets come from named sources, each a ticket plugin and its settings,
+//! Issues come from named sources, each a ticket plugin and its settings,
 //! which the plugin gets as its `config`. A repository picks its source by
 //! its main checkout's path; with a single source, every repository uses it.
 //!
 //! ```toml
-//! [tickets.work]
+//! [issues.work]
 //! plugin = "linear"                 # the default
 //! key_env = "LINEAR_API_KEY_WORK"
 //! team = "END"
 //!
-//! [tickets.personal]
+//! [issues.personal]
 //! key_env = "LINEAR_API_KEY_PERSONAL"
 //! team = "ANT"
 //!
 //! [repos."~/endo/app"]
-//! tickets = "work"
+//! issues = "work"
 //! ```
 
 use std::collections::BTreeMap;
@@ -51,7 +51,7 @@ pub struct Hooks {
     pub on_return: Vec<String>,
 }
 
-/// A place tickets come from: a ticket plugin and the settings it is given.
+/// A place issues come from: a ticket plugin and the settings it is given.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Source {
     #[serde(default = "linear")]
@@ -76,9 +76,9 @@ impl Source {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Repo {
-    /// The name of its ticket source.
+    /// The name of its issue source.
     #[serde(default)]
-    pub tickets: Option<String>,
+    pub issues: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -86,7 +86,7 @@ pub struct Config {
     #[serde(default)]
     pub hooks: Hooks,
     #[serde(default)]
-    pub tickets: BTreeMap<String, Source>,
+    pub issues: BTreeMap<String, Source>,
     #[serde(default)]
     pub repos: BTreeMap<String, Repo>,
     /// The first message of an agent picking up a ticket, with `{id}`,
@@ -104,7 +104,7 @@ fn expand(path: &str) -> PathBuf {
 }
 
 impl Config {
-    /// The ticket source of the repository checked out at `checkout`, with
+    /// The issue source of the repository checked out at `checkout`, with
     /// its name: the one its `[repos]` entry names, else the only one there
     /// is. An error says what to set.
     pub fn source_for(&self, checkout: &Path) -> Result<(&str, &Source), String> {
@@ -112,29 +112,29 @@ impl Config {
             .repos
             .iter()
             .find(|(path, _)| expand(path) == checkout)
-            .and_then(|(_, repo)| repo.tickets.as_deref());
-        let name = match (named, self.tickets.len()) {
+            .and_then(|(_, repo)| repo.issues.as_deref());
+        let name = match (named, self.issues.len()) {
             (Some(name), _) => name,
             (None, 1) => self
-                .tickets
+                .issues
                 .keys()
                 .next()
                 .map(String::as_str)
                 .unwrap_or_default(),
             (None, 0) => {
-                return Err("no ticket source: add a [tickets.<name>] table to config.toml".into());
+                return Err("no issue source: add an [issues.<name>] table to config.toml".into());
             }
             (None, _) => {
                 return Err(format!(
-                    "several ticket sources: name one for this repository under [repos.\"{}\"]",
+                    "several issue sources: name one for this repository under [repos.\"{}\"]",
                     checkout.display()
                 ));
             }
         };
-        self.tickets
+        self.issues
             .get_key_value(name)
             .map(|(name, source)| (name.as_str(), source))
-            .ok_or_else(|| format!("no ticket source named {name}"))
+            .ok_or_else(|| format!("no issue source named {name}"))
     }
 }
 
@@ -175,9 +175,9 @@ mod tests {
     #[test]
     fn a_repository_takes_the_source_it_names_else_the_only_one() {
         let config = parse(
-            "[tickets.work]\nkey_env = \"W\"\nteam = \"END\"\n\
-             [tickets.personal]\nplugin = \"linear\"\nkey_env = \"P\"\n\
-             [repos.\"/home/me/app\"]\ntickets = \"work\"\n",
+            "[issues.work]\nkey_env = \"W\"\nteam = \"END\"\n\
+             [issues.personal]\nplugin = \"linear\"\nkey_env = \"P\"\n\
+             [repos.\"/home/me/app\"]\nissues = \"work\"\n",
         )
         .unwrap();
         let (name, source) = config.source_for(Path::new("/home/me/app")).unwrap();
@@ -190,9 +190,9 @@ mod tests {
             config
                 .source_for(Path::new("/home/me/other"))
                 .unwrap_err()
-                .starts_with("several ticket sources")
+                .starts_with("several issue sources")
         );
-        let one = parse("[tickets.only]\nkey_env = \"K\"\n").unwrap();
+        let one = parse("[issues.only]\nkey_env = \"K\"\n").unwrap();
         assert_eq!(one.source_for(Path::new("/anywhere")).unwrap().0, "only");
         assert!(Config::default().source_for(Path::new("/x")).is_err());
     }

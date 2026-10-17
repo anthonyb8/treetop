@@ -20,7 +20,7 @@ mod coordinator;
 mod diff;
 mod dispatch;
 mod jobs;
-mod linear;
+mod linear_plugin;
 mod live;
 mod plugin;
 mod pool;

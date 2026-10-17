@@ -10,6 +10,8 @@ use std::thread;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+pub use issues::{Filters, line, parse};
+
 use crate::config;
 use crate::plugin::{self, Kind, Plugin};
 
@@ -37,26 +39,6 @@ pub struct Ticket {
     /// The branch the ticket system names for it.
     #[serde(default)]
     pub branch: Option<String>,
-}
-
-/// What narrows `list`. Each is optional; none lists the team's open tickets.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Filters {
-    /// Only tickets assigned to the key's user.
-    #[serde(default)]
-    pub mine: bool,
-    #[serde(default)]
-    pub label: Option<String>,
-    #[serde(default)]
-    pub state: Option<String>,
-    #[serde(default)]
-    pub project: Option<String>,
-    /// `current` for the active cycle, else a cycle number.
-    #[serde(default)]
-    pub cycle: Option<String>,
-    /// Words the title contains.
-    #[serde(default)]
-    pub query: Option<String>,
 }
 
 /// The repository's ticket source: its name, its plugin and the settings the
@@ -130,76 +112,6 @@ pub fn prompt(template: Option<&str>, ticket: &Ticket) -> String {
     out
 }
 
-/// The filter line's words, split at spaces outside double quotes.
-fn words(text: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    let (mut word, mut is_quoted) = (String::new(), false);
-    for c in text.chars() {
-        match c {
-            '"' => is_quoted = !is_quoted,
-            c if c.is_whitespace() && !is_quoted => {
-                if !word.is_empty() {
-                    words.push(std::mem::take(&mut word));
-                }
-            }
-            c => word.push(c),
-        }
-    }
-    if !word.is_empty() {
-        words.push(word);
-    }
-    words
-}
-
-/// The filters a filter line asks for: `mine`, `label:`, `state:`,
-/// `project:` and `cycle:` (`current` or a number) take a value, quoted when
-/// it has spaces; every other word searches titles.
-pub fn parse(text: &str) -> Filters {
-    let mut filters = Filters::default();
-    let mut query = Vec::new();
-    for word in words(text) {
-        let (key, value) = word.split_once(':').unwrap_or(("", &word));
-        let value = Some(value.to_string()).filter(|v| !v.is_empty());
-        match key {
-            "label" => filters.label = value,
-            "state" => filters.state = value,
-            "project" => filters.project = value,
-            "cycle" => filters.cycle = value,
-            _ if word == "mine" => filters.mine = true,
-            _ => query.push(word),
-        }
-    }
-    filters.query = (!query.is_empty()).then(|| query.join(" "));
-    filters
-}
-
-/// `filters` as the filter line that asks for them, which `parse` reads back.
-pub fn line(filters: &Filters) -> String {
-    let quoted = |value: &str| {
-        if value.contains(' ') {
-            format!("\"{value}\"")
-        } else {
-            value.to_string()
-        }
-    };
-    let mut parts = Vec::new();
-    if filters.mine {
-        parts.push("mine".to_string());
-    }
-    for (key, value) in [
-        ("label", &filters.label),
-        ("state", &filters.state),
-        ("project", &filters.project),
-        ("cycle", &filters.cycle),
-    ] {
-        if let Some(value) = value {
-            parts.push(format!("{key}:{}", quoted(value)));
-        }
-    }
-    parts.extend(filters.query.clone());
-    parts.join(" ")
-}
-
 /// Tickets read for a filter, or why they could not be.
 pub struct Loaded {
     pub filters: Filters,
@@ -259,23 +171,5 @@ mod tests {
             prompt(Some("Work on {id}. Use /pickup {id}."), &ticket),
             "Work on END-812. Use /pickup END-812."
         );
-    }
-
-    #[test]
-    fn a_filter_line_reads_keys_quoted_values_and_search_words() {
-        let filters = parse(r#"mine label:Bug state:"In Review" cycle:current fix login"#);
-        assert_eq!(
-            filters,
-            Filters {
-                mine: true,
-                label: Some("Bug".into()),
-                state: Some("In Review".into()),
-                cycle: Some("current".into()),
-                query: Some("fix login".into()),
-                ..Filters::default()
-            }
-        );
-        assert_eq!(parse(&line(&filters)), filters, "it reads back");
-        assert_eq!(parse("  "), Filters::default());
     }
 }

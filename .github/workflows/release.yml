@@ -33,14 +33,23 @@ jobs:
 
       - name: Check the tag matches Cargo.toml
         run: |
-          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "treetop") | .version')
           if [ "$GITHUB_REF_NAME" != "v$version" ]; then
             echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
             exit 1
           fi
 
       - run: rustup target add ${{ matrix.target }}
-      - run: cargo test --locked
+
+      # rustls's crypto (ring) compiles C, which a static musl build needs a
+      # musl C compiler for.
+      - name: Install a musl C compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          echo "CC_$(echo '${{ matrix.target }}' | tr - _)=musl-gcc" >> "$GITHUB_ENV"
+
+      - run: cargo test --workspace --locked
       - run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package

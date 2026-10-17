@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::agents::claude;
-use crate::linear;
+use crate::linear_plugin;
 use crate::plugin::{Code, Error, Kind, PROTOCOL};
 
 /// Every built-in by name, with its kind.
@@ -21,7 +21,7 @@ pub const KINDS: [(&str, Kind); 2] = [("claude", Kind::Agent), ("linear", Kind::
 pub fn handle(name: &str, op: &str, args: &Value, config: &Value) -> Result<Value, Error> {
     match name {
         "claude" => claude::op(op, args),
-        "linear" => linear::op(op, args, config),
+        "linear" => linear_plugin::op(op, args, config),
         _ => Err(Error::new(
             Code::NotFound,
             format!("no built-in plugin {name}"),
