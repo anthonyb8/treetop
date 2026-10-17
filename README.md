@@ -360,6 +360,7 @@ A Linear source gets all of this; an issue source on another ticket plugin lists
 3. once it runs, the ticket is marked started and assigned to you.
 
 The tree's `treetop.json` records the ticket, so the TICKET column shows it, the filter finds it, and `p` on a ticket already in a tree goes to that tree rather than starting a second agent.
+On the trees, `i` opens the issue the tree under the cursor works on, on the whole screen, and Esc comes back to the trees.
 A step that fails undoes the ones before it, as any start does; marking the ticket started is the exception, and a failure there only shows in the detail pane, since the agent is already working.
 `treetop pick END-123` does the same from a shell.
 

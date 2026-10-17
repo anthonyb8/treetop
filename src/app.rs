@@ -207,6 +207,9 @@ pub struct App {
     /// The Issues screen is shown in place of the trees; the program
     /// around the app owns it and gives it the keys.
     pub is_issues: bool,
+    /// The issue to open on the Issues screen as it comes on, by id, taken
+    /// once by the program around the app.
+    pub open_issue: Option<String>,
     /// Agents have been read at least once; until then a tree with none is
     /// unknown, not orphaned.
     pub is_agents_read: bool,
@@ -1206,6 +1209,21 @@ impl App {
         Outcome::Continue
     }
 
+    /// Shows the issue the tree under the cursor works on, on the Issues
+    /// screen.
+    fn show_issue(&mut self) {
+        let Some(tree) = self.current() else {
+            return;
+        };
+        match tree.sidecar.as_ref().and_then(|s| s.ticket.clone()) {
+            Some(ticket) => {
+                self.open_issue = Some(ticket);
+                self.is_issues = true;
+            }
+            None => self.message = Some(format!("tree {} works on no issue", tree.name)),
+        }
+    }
+
     /// The tree a ticket has been picked up in, by its sidecar.
     fn tree_of_ticket(&self, id: &str) -> Option<&Tree> {
         self.trees.iter().find(|t| {
@@ -1371,6 +1389,7 @@ impl App {
         match key.code {
             KeyCode::Enter => return self.open_agent(),
             KeyCode::Tab => self.is_issues = true,
+            KeyCode::Char('i') => self.show_issue(),
             KeyCode::Char('m') => self.open_message(),
             KeyCode::Char('q') => return self.quit(),
             KeyCode::Char('?') => self.is_help = true,
@@ -1607,6 +1626,30 @@ mod tests {
         assert!(
             matches!(press(&mut app, KeyCode::Enter), Outcome::Enter(t) if t.name == "8"),
             "with no chat to open, Enter goes to the tree"
+        );
+    }
+
+    #[test]
+    fn i_shows_the_issue_a_tree_works_on() {
+        let mut app = app();
+        dispatched(&mut app, "/p/8/app", "j1");
+        let mut sidecar = *app.trees[2].sidecar.clone().unwrap();
+        sidecar.ticket = Some("END-799".into());
+        app.apply_sidecars(HashMap::from([(PathBuf::from("/p/8/app"), sidecar)]));
+        app.selected = app.visible().iter().position(|t| t.name == "8").unwrap();
+        press(&mut app, KeyCode::Char('i'));
+        assert!(app.is_issues);
+        assert_eq!(app.open_issue.as_deref(), Some("END-799"));
+        app.is_issues = false;
+        app.open_issue = None;
+        app.selected = app.visible().iter().position(|t| t.name != "8").unwrap();
+        press(&mut app, KeyCode::Char('i'));
+        assert!(!app.is_issues, "a tree on no issue stays");
+        assert!(
+            app.message
+                .as_deref()
+                .unwrap()
+                .ends_with("works on no issue")
         );
     }
 

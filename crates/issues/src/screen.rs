@@ -113,6 +113,9 @@ pub struct Screen {
     pub(crate) picker: Option<Picker>,
     /// The comment being written, if one is.
     pub(crate) compose: Option<Compose>,
+    /// The open issue was opened from the program's own screen, which Esc
+    /// goes back to.
+    pub(crate) is_from_outside: bool,
     /// The issue being written, new or edited, if one is.
     pub(crate) form: Option<Form>,
     /// A form Linear refused while another was open, which `n` opens again.
@@ -170,6 +173,7 @@ impl Screen {
             picker: None,
             compose: None,
             form: None,
+            is_from_outside: false,
             retry: None,
             editor_text: None,
             is_loading: false,
@@ -1077,7 +1081,7 @@ impl Screen {
                 KeyCode::PageUp => self.scroll = by(self.scroll, -20),
                 KeyCode::Home | KeyCode::Char('g') => self.scroll = 0,
                 KeyCode::End | KeyCode::Char('G') => self.scroll = max,
-                KeyCode::Left | KeyCode::Char('h') | KeyCode::Esc => self.back(),
+                KeyCode::Left | KeyCode::Char('h') | KeyCode::Esc => return self.back(),
                 _ => return self.on_issue(key),
             }
             return Action::None;
@@ -1090,6 +1094,7 @@ impl Screen {
             KeyCode::End | KeyCode::Char('G') => self.move_by(isize::MAX),
             KeyCode::Enter | KeyCode::Right if self.current().is_some() => {
                 self.focus = Focus::Issue;
+                self.is_from_outside = false;
                 self.scroll = 0;
                 self.target = None;
             }
@@ -1162,14 +1167,34 @@ impl Screen {
         }
     }
 
-    /// Back from the open issue: to the one it was opened from, or the list.
-    fn back(&mut self) {
+    /// Opens issue `id` on the whole screen, as asked from the program's
+    /// own screen; Esc goes back there.
+    pub fn show_issue(&mut self, id: &str) {
+        self.focus = Focus::Issue;
+        self.trail = vec![id.to_string()];
+        self.is_from_outside = true;
+        self.scroll = 0;
+        self.target = None;
+        self.viewer = None;
+        self.panel = None;
+        self.search = None;
+    }
+
+    /// Back from the open issue: to the one it was opened from, else the
+    /// list, or the program's own screen when it was opened from there.
+    fn back(&mut self) -> Action {
         let from = self.trail.pop();
         self.scroll = 0;
         self.target = None;
+        if self.is_from_outside && self.trail.is_empty() {
+            self.is_from_outside = false;
+            self.focus = Focus::List;
+            return Action::Back;
+        }
         if from.is_none() {
             self.focus = Focus::List;
         }
+        Action::None
     }
 
     /// The keys of an image over the whole screen.
@@ -2134,6 +2159,28 @@ mod tests {
         );
         screen.handle_key(key(KeyCode::Esc));
         assert_eq!(screen.focus, Focus::List);
+    }
+
+    #[test]
+    fn an_issue_shown_from_the_trees_goes_back_there() {
+        let (mut screen, _) = screen();
+        screen.show_issue("END-40");
+        wait_for(&mut screen, |s| s.current().is_some());
+        assert_eq!(
+            screen.current().unwrap().id,
+            "END-40",
+            "off the list, read on its own"
+        );
+        let top = drawn(&screen)[0].clone();
+        assert!(top.contains(" END-40 ") && !top.contains("END-1"), "{top}");
+        assert_eq!(screen.handle_key(key(KeyCode::Esc)), Action::Back);
+        assert_eq!(screen.focus, Focus::List);
+        screen.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Esc)),
+            Action::None,
+            "an issue opened from the list goes back to the list"
+        );
     }
 
     #[test]

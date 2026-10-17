@@ -266,6 +266,9 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                 Some(_) => {}
             }
             if let Some(screen) = issues.as_mut() {
+                if let Some(id) = app.open_issue.take() {
+                    screen.show_issue(&id);
+                }
                 is_stale |= screen.poll();
                 // Asked only once an image is wanted, since a terminal that
                 // never answers holds the screen up while it is asked.

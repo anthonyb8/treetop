@@ -502,10 +502,12 @@ impl Screen {
     /// The open issue over the whole of `area`: its title and fields, its
     /// links, its description with its images, and its comments, scrolled.
     fn draw_reading(&self, frame: &mut Frame, area: Rect, p: &Palette) {
-        // Where it was opened from, then each issue opened from a link.
+        // Where it was opened from, then each issue opened from a link; one
+        // opened from the trees starts the trail itself.
         let mut trail: Vec<&str> = self
             .issues
             .get(self.selected)
+            .filter(|_| !self.is_from_outside)
             .map(|i| i.id.as_str())
             .into_iter()
             .collect();

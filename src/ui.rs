@@ -23,13 +23,14 @@ use crate::theme::theme;
 
 /// The bar's keys, most useful first: on a narrow bar the keys at the end
 /// are the ones left out, and `?` lists them all.
-const KEYS: [(&str, &str); 10] = [
+const KEYS: [(&str, &str); 11] = [
     ("Enter", "open"),
     ("?", "help"),
     ("n", "new"),
     ("m", "message"),
     ("c", "coordinator"),
     ("d", "diff"),
+    ("i", "issue"),
     ("r", "return"),
     ("Space", "mark"),
     ("/", "filter"),
@@ -37,7 +38,7 @@ const KEYS: [(&str, &str); 10] = [
 ];
 
 /// Every key on the list, for the `?` overlay.
-const HELP: [(&str, &str); 17] = [
+const HELP: [(&str, &str); 18] = [
     (
         "Enter",
         "open the agent: its chat, a cold one started again, else its tree",
@@ -59,6 +60,7 @@ const HELP: [(&str, &str); 17] = [
     ("b", "rename the tree's branch"),
     ("w", "switch workspace"),
     ("Tab", "the repository's issues"),
+    ("i", "the issue the tree works on, on the whole screen"),
     ("j k ↑ ↓", "move"),
     ("g G", "top, bottom"),
     ("Esc", "clear the filter, then the marks"),
