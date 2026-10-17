@@ -18,23 +18,19 @@
 
 use std::fmt;
 use std::fs;
-use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::process::{Command, ExitStatus};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::child::{self, End};
+
 /// The protocol this treetop speaks.
 pub const PROTOCOL: u32 = 1;
-
-/// How often a running plugin is checked for having exited.
-const POLL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -147,95 +143,34 @@ pub fn dir() -> Option<PathBuf> {
         .map(|config| config.join("treetop").join("plugins"))
 }
 
-/// Reads a pipe to its end on a thread of its own, so a plugin that writes
-/// more than a pipe holds is never stuck waiting for treetop to read.
-fn drain(mut pipe: impl Read + Send + 'static) -> Receiver<Vec<u8>> {
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = pipe.read_to_end(&mut bytes);
-        let _ = tx.send(bytes);
-    });
-    rx
-}
-
-fn kill_group(child: &mut Child) {
-    // The plugin leads its own group, so this reaches whatever it started.
-    if let Ok(pid) = i32::try_from(child.id()) {
-        unsafe { libc::kill(-pid, libc::SIGKILL) };
-    }
-    let _ = child.wait();
-}
-
-/// Waits for `child` to exit, killing its group at `deadline`.
-fn wait(child: &mut Child, deadline: Instant) -> Option<ExitStatus> {
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Some(status),
-            Ok(None) if Instant::now() < deadline => thread::sleep(POLL),
-            _ => {
-                kill_group(child);
-                return None;
-            }
-        }
-    }
-}
-
-/// Starts the plugin in a process group of its own. A plugin file still
-/// open for writing, because it is being installed or because another
-/// thread forked while writing it, is busy for a moment, so that is retried
-/// until `deadline`.
-fn spawn(program: &Path, deadline: Instant) -> Result<Child, Error> {
-    loop {
-        let spawned = Command::new(program)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0)
-            .spawn();
-        match spawned {
-            Err(err) if err.raw_os_error() == Some(libc::ETXTBSY) && Instant::now() < deadline => {
-                thread::sleep(POLL);
-            }
-            Err(err) => {
-                let message = format!("{}: {err}", program.display());
-                return Err(Error::new(Code::Unavailable, message));
-            }
-            Ok(child) => return Ok(child),
-        }
-    }
-}
-
 /// Runs `op` on the plugin at `program` with `args`, and returns its result.
 pub fn call(program: &Path, op: &str, args: Value, limit: Duration) -> Result<Value, Error> {
+    call_command(Command::new(program), op, args, limit)
+}
+
+/// Runs `op` on the plugin `command` starts, which for a built-in is treetop
+/// itself, with `args`.
+pub fn call_command(
+    mut command: Command,
+    op: &str,
+    args: Value,
+    limit: Duration,
+) -> Result<Value, Error> {
     let request = json!({ "protocol": PROTOCOL, "op": op, "config": {}, "args": args });
-    let deadline = Instant::now() + limit;
-    let mut child = spawn(program, deadline)?;
-    let (Some(mut stdin), Some(stdout), Some(stderr)) =
-        (child.stdin.take(), child.stdout.take(), child.stderr.take())
-    else {
-        kill_group(&mut child);
-        return Err(Error::new(Code::Failed, "no pipes to the plugin"));
-    };
-    // Written on a thread too: a plugin that never reads its request must
-    // not hold treetop past the deadline.
-    thread::spawn(move || {
-        let _ = stdin.write_all(request.to_string().as_bytes());
-    });
-    let (stdout, stderr) = (drain(stdout), drain(stderr));
-    let timed_out = || Error::new(Code::Unavailable, format!("{op} took over {limit:?}"));
-    let status = wait(&mut child, deadline).ok_or_else(timed_out)?;
-    let left = deadline.saturating_duration_since(Instant::now());
-    let Ok(stdout) = stdout.recv_timeout(left) else {
-        kill_group(&mut child);
-        return Err(Error::new(
+    let ran = child::run(&mut command, Some(request.to_string().into_bytes()), limit)
+        .map_err(|err| Error::new(Code::Unavailable, err.to_string()))?;
+    let stderr = String::from_utf8_lossy(&ran.stderr).trim().to_string();
+    match ran.end {
+        End::Exited(status) => reply(&ran.stdout, status, stderr),
+        End::TimedOut => Err(Error::new(
+            Code::Unavailable,
+            format!("{op} took over {limit:?}"),
+        )),
+        End::HeldOpen(_) => Err(Error::new(
             Code::Unavailable,
             format!("{op} exited but left its output open"),
-        ));
-    };
-    let stderr = stderr.recv_timeout(POLL).unwrap_or_default();
-    let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
-    reply(&stdout, status, stderr)
+        )),
+    }
 }
 
 /// The result a plugin's stdout gives, or its error.
@@ -320,6 +255,8 @@ pub fn discover(dir: &Path) -> Vec<Found> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
 
     /// A fresh directory for one test's plugins.

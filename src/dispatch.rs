@@ -48,12 +48,21 @@ pub enum Purpose {
     Dispatch { targets: Vec<Target>, at: usize },
     /// Type the text into each of these agents.
     Message { to: Vec<Recipient> },
+    /// The text is the new name of this tree's branch.
+    Rename { tree: Tree },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prompt {
     pub purpose: Purpose,
     pub text: String,
+    /// The branch a new agent will work on, once it has been edited; until
+    /// then it follows the task.
+    pub branch: Option<String>,
+    /// Keys go to the branch rather than the task.
+    pub is_editing_branch: bool,
+    /// Whose branches these are, for the name a task gives.
+    pub user: String,
 }
 
 /// What a key did to the box.
@@ -65,32 +74,94 @@ pub enum Edit {
 }
 
 impl Prompt {
-    pub fn dispatch(targets: Vec<Target>) -> Self {
+    fn new(purpose: Purpose) -> Self {
         Prompt {
-            purpose: Purpose::Dispatch { targets, at: 0 },
+            purpose,
             text: String::new(),
+            branch: None,
+            is_editing_branch: false,
+            user: String::new(),
+        }
+    }
+
+    pub fn dispatch(targets: Vec<Target>, user: String) -> Self {
+        Prompt {
+            user,
+            ..Prompt::new(Purpose::Dispatch { targets, at: 0 })
         }
     }
 
     pub fn message(to: Vec<Recipient>) -> Self {
+        Prompt::new(Purpose::Message { to })
+    }
+
+    /// Renaming `tree`'s branch, starting from its current name.
+    pub fn rename(tree: Tree) -> Self {
         Prompt {
-            purpose: Purpose::Message { to },
-            text: String::new(),
+            text: tree.branch.clone().unwrap_or_default(),
+            ..Prompt::new(Purpose::Rename { tree })
         }
     }
 
     pub fn target(&self) -> Option<&Target> {
         match &self.purpose {
             Purpose::Dispatch { targets, at } => targets.get(*at),
-            Purpose::Message { .. } => None,
+            Purpose::Message { .. } | Purpose::Rename { .. } => None,
+        }
+    }
+
+    /// The target gets a branch named for it: a new tree, or one nobody
+    /// holds. A held tree keeps the branch its holder chose.
+    pub fn names_branch(&self) -> bool {
+        match self.target() {
+            Some(Target::NewTree) => true,
+            Some(Target::Tree(tree)) => !tree.is_held(),
+            _ => false,
+        }
+    }
+
+    /// The branch the agent will start on, as the box shows it: the edited
+    /// name, else the task's. None when the target keeps its own branch, or
+    /// the task has no words yet.
+    pub fn branch_name(&self) -> Option<String> {
+        if !self.names_branch() {
+            return None;
+        }
+        self.branch
+            .clone()
+            .or_else(|| crate::branch::for_task(&self.user, &self.text))
+    }
+
+    /// The line keys edit: the branch while it has the focus, else the text.
+    fn line(&mut self) -> &mut String {
+        if self.is_editing_branch {
+            self.branch.get_or_insert_with(String::new)
+        } else {
+            &mut self.text
         }
     }
 
     /// Pasted text is kept whole, line breaks and all: the agent reads it as
-    /// one message.
+    /// one message. A branch takes it as one line.
     pub fn paste(&mut self, text: &str) {
-        self.text
-            .push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if self.is_editing_branch {
+            self.line().push_str(&text.replace('\n', ""));
+        } else {
+            self.text.push_str(&text);
+        }
+    }
+
+    /// Moves the focus between the task and the branch. The branch starts
+    /// from the name the task gave it, so it is edited rather than retyped.
+    fn toggle_branch(&mut self) {
+        if !self.names_branch() {
+            return;
+        }
+        if !self.is_editing_branch && self.branch.is_none() {
+            self.branch = self.branch_name();
+        }
+        self.is_editing_branch = !self.is_editing_branch;
     }
 
     pub fn edit(&mut self, key: KeyEvent) -> Edit {
@@ -105,20 +176,26 @@ impl Prompt {
                     .modifiers
                     .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
             {
-                self.text.push('\n');
+                if !self.is_editing_branch {
+                    self.text.push('\n');
+                }
             }
             KeyCode::Enter => return Edit::Submit,
-            KeyCode::Char('u') if ctrl => self.text.clear(),
+            KeyCode::Up | KeyCode::Down => self.toggle_branch(),
+            KeyCode::Char('u') if ctrl => self.line().clear(),
             KeyCode::Char('w') if ctrl => {
-                let kept = self.text.trim_end().len();
-                let cut = self.text[..kept]
-                    .rfind(char::is_whitespace)
+                // A branch's words are split by / and - rather than spaces.
+                let is_branch = self.is_editing_branch;
+                let line = self.line();
+                let kept = line.trim_end().len();
+                let cut = line[..kept]
+                    .rfind(|c: char| c.is_whitespace() || (is_branch && "/-".contains(c)))
                     .map_or(0, |at| at + 1);
-                self.text.truncate(cut);
+                line.truncate(cut);
             }
-            KeyCode::Char(c) if !ctrl => self.text.push(c),
+            KeyCode::Char(c) if !ctrl => self.line().push(c),
             KeyCode::Backspace => {
-                self.text.pop();
+                self.line().pop();
             }
             KeyCode::Tab | KeyCode::BackTab => {
                 if let Purpose::Dispatch { targets, at } = &mut self.purpose {
@@ -128,6 +205,9 @@ impl Prompt {
                         targets.len().saturating_sub(1)
                     };
                     *at = (*at + step) % targets.len().max(1);
+                }
+                if !self.names_branch() {
+                    self.is_editing_branch = false;
                 }
             }
             _ => {}
@@ -178,11 +258,10 @@ mod tests {
     #[test]
     fn tab_cycles_the_targets_both_ways() {
         let main = crate::pool::main_tree(std::path::Path::new("/repo"));
-        let mut prompt = Prompt::dispatch(vec![
-            Target::Coordinator,
-            Target::NewTree,
-            Target::InPlace(main),
-        ]);
+        let mut prompt = Prompt::dispatch(
+            vec![Target::Coordinator, Target::NewTree, Target::InPlace(main)],
+            "anthony".into(),
+        );
         assert_eq!(prompt.target(), Some(&Target::Coordinator));
         prompt.edit(KeyEvent::from(KeyCode::Tab));
         assert_eq!(prompt.target(), Some(&Target::NewTree));
@@ -206,6 +285,49 @@ mod tests {
         assert_eq!(prompt.text, "\n", "Alt+Enter breaks the line");
         assert_eq!(prompt.edit(KeyEvent::from(KeyCode::Enter)), Edit::Submit);
         assert_eq!(prompt.edit(KeyEvent::from(KeyCode::Esc)), Edit::Cancel);
+    }
+
+    #[test]
+    fn a_new_tree_gets_a_branch_that_follows_the_task_until_edited() {
+        let mut prompt = Prompt::dispatch(vec![Target::NewTree], "anthony".into());
+        assert_eq!(prompt.branch_name(), None, "no words yet");
+        type_in(&mut prompt, "Fix login");
+        assert_eq!(prompt.branch_name().as_deref(), Some("anthony/fix-login"));
+        prompt.edit(KeyEvent::from(KeyCode::Down));
+        prompt.edit(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        type_in(&mut prompt, "auth");
+        assert_eq!(prompt.branch_name().as_deref(), Some("anthony/fix-auth"));
+        prompt.edit(KeyEvent::from(KeyCode::Up));
+        type_in(&mut prompt, " now");
+        assert_eq!(prompt.text, "Fix login now");
+        assert_eq!(
+            prompt.branch_name().as_deref(),
+            Some("anthony/fix-auth"),
+            "an edited branch no longer follows the task"
+        );
+    }
+
+    #[test]
+    fn a_held_tree_or_the_coordinator_keeps_its_branch() {
+        let held = Tree {
+            status: "leased".into(),
+            ..crate::pool::stand_in(std::path::PathBuf::from("/p/4/app"))
+        };
+        let available = Tree {
+            status: "available".into(),
+            ..held.clone()
+        };
+        for (target, names) in [
+            (Target::Tree(held), false),
+            (Target::Tree(available), true),
+            (Target::Coordinator, false),
+        ] {
+            let mut prompt = Prompt::dispatch(vec![target], "anthony".into());
+            type_in(&mut prompt, "fix it");
+            prompt.edit(KeyEvent::from(KeyCode::Down));
+            assert_eq!(prompt.is_editing_branch, names);
+            assert_eq!(prompt.branch_name().is_some(), names);
+        }
     }
 
     #[test]

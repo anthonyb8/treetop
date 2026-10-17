@@ -12,7 +12,7 @@ use crate::agents::{Agent, Status};
 use crate::coordinator;
 use crate::diff::Layout;
 use crate::dispatch::{Edit, Prompt, Purpose, Recipient, Target};
-use crate::jobs::{Job, Kind, Launch};
+use crate::jobs::{Job, Kind, Launch, attach_id};
 use crate::pool::{self, Process, Tree, Work};
 use crate::reports::{Report, State};
 
@@ -311,6 +311,8 @@ pub struct App {
     pub prompt: Option<Prompt>,
     /// Stand-ins handed out for trees not leased yet.
     new_trees: usize,
+    /// Whose branches new agents start on, as `branch::user` gives it.
+    pub user: String,
 }
 
 /// How long a started agent may take to show up before treetop stops
@@ -323,19 +325,6 @@ pub struct Opening {
     pub agent: String,
     /// The tree's name, `new` until a new tree is leased.
     pub tree: String,
-}
-
-/// The id `claude --bg` prints for `claude attach`, from the line it
-/// suggests running: `claude attach cbcfd8c8    open in this terminal`.
-fn attach_id(output: &str) -> Option<&str> {
-    output.lines().find_map(|line| {
-        let id = line
-            .split("claude attach ")
-            .nth(1)?
-            .split_whitespace()
-            .next()?;
-        id.chars().all(|c| c.is_ascii_alphanumeric()).then_some(id)
-    })
 }
 
 /// A tree an agent was just started in, and the agents already there, so
@@ -355,6 +344,17 @@ fn last_line(output: &str) -> &str {
         .map(str::trim)
         .find(|line| !line.is_empty())
         .unwrap_or("no output")
+}
+
+/// Why git would refuse the branch the compose box would send: the renamed
+/// one, or the one a new agent starts on.
+fn branch_problem(prompt: &Prompt) -> Option<String> {
+    let name = match &prompt.purpose {
+        Purpose::Rename { .. } => prompt.text.trim().to_string(),
+        _ => prompt.branch_name()?,
+    };
+    let problem = crate::branch::problem(&name)?;
+    Some(format!("branch {name}: {problem}"))
 }
 
 impl App {
@@ -962,7 +962,27 @@ impl App {
         if let Some(main) = self.trees.iter().find(|t| t.is_main) {
             targets.push(Target::InPlace(main.clone()));
         }
-        self.prompt = Some(Prompt::dispatch(targets));
+        self.prompt = Some(Prompt::dispatch(targets, self.user.clone()));
+    }
+
+    /// Opens the compose box on the name of the branch of the tree under the
+    /// cursor, to rename it. A tree nobody holds has no branch to keep, and
+    /// the main checkout's is yours.
+    fn open_rename(&mut self) {
+        let Some(tree) = self.current() else { return };
+        self.message = if tree.is_main {
+            Some("the main checkout's branch is yours to rename".into())
+        } else if !tree.is_held() {
+            Some(format!(
+                "tree {} is available: no branch to rename",
+                tree.name
+            ))
+        } else if self.jobs.get(&tree.path).is_some_and(|s| s.is_active()) {
+            Some(format!("tree {} already has an action queued", tree.name))
+        } else {
+            self.prompt = Some(Prompt::rename(tree.clone()));
+            None
+        };
     }
 
     /// Opens the compose box to write to the agents in the marked trees, else in the
@@ -1103,6 +1123,12 @@ impl App {
                 self.prompt = None;
                 Outcome::Continue
             }
+            // A branch git would refuse keeps the box open on it, so it is
+            // fixed rather than typed again.
+            Edit::Submit if let Some(why) = branch_problem(prompt) => {
+                self.message = Some(why);
+                Outcome::Continue
+            }
             Edit::Submit => match self.prompt.take() {
                 Some(prompt) => self.submit(prompt),
                 None => Outcome::Continue,
@@ -1112,7 +1138,19 @@ impl App {
 
     fn submit(&mut self, prompt: Prompt) -> Outcome {
         let text = prompt.text.trim().to_string();
+        let branch = prompt.branch_name();
         match prompt.purpose {
+            Purpose::Rename { tree } => {
+                if tree.branch.as_deref() == Some(text.as_str()) {
+                    return Outcome::Continue;
+                }
+                self.jobs
+                    .insert(tree.path.clone(), JobState::Queued(Kind::Rename));
+                Outcome::Queue(vec![Job {
+                    rename: Some(text),
+                    ..Job::new(Kind::Rename, tree)
+                }])
+            }
             Purpose::Message { to } => {
                 if text.is_empty() {
                     self.message = Some("nothing to send".into());
@@ -1127,7 +1165,7 @@ impl App {
                 }
                 match targets.swap_remove(at) {
                     Target::Coordinator => self.converse(text),
-                    target => self.dispatch(target, text),
+                    target => self.dispatch(target, text, branch),
                 }
             }
         }
@@ -1159,16 +1197,21 @@ impl App {
             Launch {
                 task: text,
                 name: Some(coordinator::NAME.into()),
+                branch: None,
                 is_new_tree: false,
                 is_coordinator: true,
             },
         )
     }
 
-    /// Queues a Start for `task` at `target`. An empty task starts the agent
-    /// idle and opens its chat, as `n` always has.
-    fn dispatch(&mut self, target: Target, task: String) -> Outcome {
-        let launch = Launch::agent(task, target == Target::NewTree);
+    /// Queues a Start for `task` at `target`, on `branch` when the target
+    /// takes one. An empty task starts the agent idle and opens its chat, as
+    /// `n` always has.
+    fn dispatch(&mut self, target: Target, task: String, branch: Option<String>) -> Outcome {
+        let launch = Launch {
+            branch,
+            ..Launch::agent(task, target == Target::NewTree)
+        };
         let tree = match target {
             Target::Coordinator => return self.converse(launch.task),
             Target::Tree(tree) | Target::InPlace(tree) => tree,
@@ -1415,6 +1458,7 @@ impl App {
                 self.log_scroll = 0;
             }
             KeyCode::Char('d') => self.open_diff(),
+            KeyCode::Char('b') => self.open_rename(),
             KeyCode::PageUp if self.pane == Pane::Log => self.log_scroll += 10,
             KeyCode::PageDown if self.pane == Pane::Log => {
                 self.log_scroll = self.log_scroll.saturating_sub(10);

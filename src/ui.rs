@@ -23,7 +23,7 @@ use crate::theme::theme;
 
 /// Most useful first: on a narrow bar the keys at the end are the ones left
 /// out.
-const KEYS: [(&str, &str); 18] = [
+const KEYS: [(&str, &str); 19] = [
     ("Tab", "inbox"),
     ("n", "ask/dispatch"),
     ("w", "workspace"),
@@ -31,6 +31,7 @@ const KEYS: [(&str, &str); 18] = [
     ("t", "tree"),
     ("c", "chat"),
     ("d", "diff"),
+    ("b", "branch"),
     ("o", "open port"),
     ("a", "no agent"),
     ("Space", "mark"),
@@ -822,10 +823,11 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
         .clamp(COMPOSE_ROWS.0, COMPOSE_ROWS.1);
     let targets = match &prompt.purpose {
         Purpose::Dispatch { targets, at } => Some((targets, *at)),
-        Purpose::Message { .. } => None,
+        Purpose::Message { .. } | Purpose::Rename { .. } => None,
     };
-    // Borders, the targets and a blank line under them when there are any.
-    let chrome = if targets.is_some() { 4 } else { 2 };
+    // Borders, then the targets, the branch and a blank line when there are
+    // targets.
+    let chrome = if targets.is_some() { 5 } else { 2 };
     let area = popup::centered(screen, width, text_height + chrome);
     let (title, placeholder) = match (prompt.target(), &prompt.purpose) {
         (Some(Target::Coordinator), _) => (
@@ -844,12 +846,18 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
             "what to tell it",
         ),
         (None, Purpose::Dispatch { .. }) => (" New agent ".to_string(), ""),
+        (None, Purpose::Rename { tree }) => (
+            format!(" Rename the branch of tree {} ", tree.name),
+            "the branch's new name",
+        ),
     };
-    let mut keys = vec![
-        ("Enter", "send"),
-        ("Alt+Enter", "new line"),
-        ("Esc", "cancel"),
-    ];
+    let mut keys = vec![("Enter", "send"), ("Esc", "cancel")];
+    if !matches!(prompt.purpose, Purpose::Rename { .. }) && !prompt.is_editing_branch {
+        keys.insert(1, ("Alt+Enter", "new line"));
+    }
+    if prompt.names_branch() {
+        keys.insert(0, ("↑↓", "branch"));
+    }
     if targets.is_some() {
         keys.insert(0, ("Tab", "to"));
     }
@@ -883,11 +891,21 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
             Paragraph::new(Line::from(spans)),
             Rect::new(inner.x, inner.y, inner.width, 1),
         );
+        let branch_row = Rect::new(inner.x, inner.y + 1, inner.width, 1);
+        frame.render_widget(Paragraph::new(branch_line(prompt)), branch_row);
+        if prompt.is_editing_branch {
+            let typed = prompt.branch.as_deref().map_or(0, str::len);
+            let at = u16::try_from("branch ".len() + typed).unwrap_or(u16::MAX);
+            frame.set_cursor_position(Position::new(
+                (branch_row.x + at).min(branch_row.right().saturating_sub(1)),
+                branch_row.y,
+            ));
+        }
         text_area = Rect::new(
             inner.x,
-            inner.y + 2,
+            inner.y + 3,
             inner.width,
-            inner.height.saturating_sub(2),
+            inner.height.saturating_sub(3),
         );
     }
     if prompt.text.is_empty() {
@@ -897,7 +915,9 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
                 .style(fg(t.muted).add_modifier(Modifier::ITALIC)),
             text_area,
         );
-        frame.set_cursor_position(Position::new(text_area.x, text_area.y));
+        if !prompt.is_editing_branch {
+            frame.set_cursor_position(Position::new(text_area.x, text_area.y));
+        }
         return;
     }
     // The end of a long text stays in view, since that is where it is typed.
@@ -905,12 +925,54 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
     let first = rows.len().saturating_sub(shown);
     let lines: Vec<Line> = rows[first..].iter().map(|r| Line::raw(r.clone())).collect();
     frame.render_widget(Paragraph::new(lines), text_area);
+    if prompt.is_editing_branch {
+        return;
+    }
     let last = rows.last().map_or(0, |row| row.chars().count());
     let cursor_row = u16::try_from(rows.len() - 1 - first).unwrap_or(0);
     frame.set_cursor_position(Position::new(
         text_area.x + u16::try_from(last).unwrap_or(0),
         text_area.y + cursor_row,
     ));
+}
+
+/// The compose box's branch line: the branch a new agent will start on,
+/// edited or following the task, or the branch a held tree keeps.
+fn branch_line(prompt: &Prompt) -> Line<'static> {
+    let t = theme();
+    let label = Span::styled("branch ", fg(t.muted));
+    let kept = |branch: Option<&String>| {
+        Line::from(vec![
+            label.clone(),
+            Span::styled(
+                format!("{} (kept)", branch.map_or("(detached)", String::as_str)),
+                fg(t.muted),
+            ),
+        ])
+    };
+    match prompt.target() {
+        Some(Target::Tree(tree) | Target::InPlace(tree)) if !prompt.names_branch() => {
+            kept(tree.branch.as_ref())
+        }
+        Some(Target::NewTree | Target::Tree(_)) => {
+            let name = if prompt.is_editing_branch {
+                Span::styled(
+                    prompt.branch.clone().unwrap_or_default(),
+                    fg(t.accent).add_modifier(Modifier::BOLD),
+                )
+            } else {
+                match prompt.branch_name() {
+                    Some(name) => Span::raw(name),
+                    None => Span::styled(
+                        "named from the task",
+                        fg(t.muted).add_modifier(Modifier::ITALIC),
+                    ),
+                }
+            };
+            Line::from(vec![label, name])
+        }
+        _ => Line::default(),
+    }
 }
 
 /// A dialog's frame: a border in `color` and its title in the theme's title

@@ -62,7 +62,7 @@ pub fn command(treetop: &str, checkout: &Path, task: &str) -> Vec<String> {
         NAME.into(),
     ]);
     if !task.trim().is_empty() {
-        command.push(task.into());
+        command.extend(["--".into(), task.into()]);
     }
     command
 }
@@ -93,8 +93,8 @@ mod tests {
         assert!(command[prompt + 1].contains("pool of /repo"));
         assert!(command[prompt + 1].contains("`/bin/treetop send <tree|agent> <message>`"));
         assert_eq!(
-            command[command.len() - 3..],
-            ["--name", NAME, "what needs me?"]
+            command[command.len() - 4..],
+            ["--name", NAME, "--", "what needs me?"]
         );
         let idle = super::command("/bin/treetop", Path::new("/repo"), " ");
         assert_eq!(idle.last().map(String::as_str), Some(NAME), "no task, idle");

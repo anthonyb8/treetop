@@ -9,8 +9,10 @@
 mod actions;
 mod agents;
 mod app;
+mod branch;
 mod cache;
 mod chat;
+mod child;
 mod cli;
 mod coordinator;
 mod diff;
@@ -376,6 +378,7 @@ fn show(term: &mut Term, start: PathBuf, mut checkout: PathBuf) -> Result<()> {
         let mut app = App::new(here.take());
         app.is_in_tmux = tmux::is_inside();
         app.checkout = checkout.clone();
+        app.user = branch::user();
         if let Some(mut cached) = cache::read(&checkout) {
             cached.insert(0, pool::main_tree(&checkout));
             app.set_cached(cached);

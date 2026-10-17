@@ -139,7 +139,7 @@ treetop runs it once per call, writes one request and closes stdin, then reads o
 
 ## What the actions run
 
-Both run in the background, one tree at a time, while treetop stays on screen; each row's STATUS shows queued, returning, destroying, returned, destroyed or failed.
+Both run in the background, up to four trees at once, while treetop stays on screen; each row's STATUS shows queued, returning, destroying, returned, destroyed or failed.
 Their output goes to the log (`L`), and a failure also shows its last line in the status line.
 
 - **Return** first shows a dialog listing each tree's uncommitted files, unpushed commits and running processes, or "unknown changes" where git cannot read it. On `y` it runs `treehouse return --force`, which stops the processes left in the tree: that dialog replaces treehouse's own prompt before discarding changes. Anything started outside the tree, such as a container, is for whatever started it to stop.
@@ -210,9 +210,16 @@ It is told to run `treetop status` before answering anything about the agents, t
 
 ### New agents
 
-Every tree is leased with `treetop` as the holder, and the agent starts on its detached HEAD and makes its own branch.
-The agent is `claude --bg --name <the task's first words> <task>`, which Claude Code's own agent view lists too; `TREETOP_NEW_AGENT` names another command, which gets the task as its last argument.
+Every tree is leased with `treetop` as the holder, and a tree treetop leases always gets a branch: `<git user.name>/<the task as a slug>`, shown on the compose box's branch line.
+Up or Down moves to that line to change the name before sending; a tree someone already holds keeps its branch.
+`b` renames the branch of the tree under the cursor, or names one on a detached HEAD.
+
+The agent is `claude --bg --name <the task's first words> -- <task>`, which Claude Code's own agent view lists too; `TREETOP_NEW_AGENT` names another command, which gets the task as its last argument.
 An empty task starts the agent idle and opens its chat as soon as it shows up, so its first message is typed there; paired with `a`, that puts an agent to work in a tree nobody is working in.
+
+A start runs as steps, each with its own timeout: lease the tree (`treehouse get --lease --branch`), check it is a clean worktree, name the branch, write `treetop.json`, start the agent, and wait for `claude agents` to list it, since `claude --bg` exits as soon as the session is queued.
+When a step fails, the ones before it are undone in reverse: the agent stopped, the record removed, the branch deleted and the tree returned. The row shows "failed" and the status line which step failed and why.
+Up to four actions run at once, each on its own tree, so a slow one never holds up the rest.
 
 ### Messages
 
