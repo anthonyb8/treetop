@@ -23,6 +23,7 @@ use crate::plugin;
 use crate::pool::{self, Tree};
 use crate::reports::{self, Report};
 use crate::sidecar;
+use crate::tickets::{Filters, Source};
 use crate::watch::Check;
 
 const USAGE: &str = "usage:
@@ -32,6 +33,7 @@ const USAGE: &str = "usage:
   treetop dispatch <new|main|N> <task>
                                    start a new agent on a task in a fresh tree,
                                    the main checkout or tree N
+  treetop tickets [--mine] [words] this repository's open tickets, from its ticket source
   treetop plugins                  every plugin, built in or found, and what each is
   treetop plugin <name>            answer one request on stdin as a built-in plugin";
 
@@ -107,6 +109,7 @@ pub fn run(args: &[String], checkout: &Path) -> Result<()> {
         [command, place, task @ ..] if command == "dispatch" && !task.is_empty() => {
             dispatch(checkout, place, &task.join(" "))
         }
+        [command, rest @ ..] if command == "tickets" => tickets(checkout, rest),
         _ => bail!("{USAGE}"),
     }
 }
@@ -340,6 +343,30 @@ fn send(checkout: &Path, target: &str, message: &str) -> Result<()> {
     }
     if delivered < to.len() {
         bail!("sent to {delivered} of {} agent(s)", to.len());
+    }
+    Ok(())
+}
+
+/// One line per open ticket of the repository's source: its id, state and
+/// title. `--mine` keeps those assigned to you; other words search titles.
+fn tickets(checkout: &Path, args: &[String]) -> Result<()> {
+    let source = Source::of(checkout).map_err(anyhow::Error::msg)?;
+    let words: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|a| *a != "--mine")
+        .collect();
+    let filters = Filters {
+        mine: args.iter().any(|a| a == "--mine"),
+        query: (!words.is_empty()).then(|| words.join(" ")),
+        ..Filters::default()
+    };
+    let tickets = source.list(&filters).map_err(anyhow::Error::msg)?;
+    if tickets.is_empty() {
+        println!("no open tickets in {}", source.name);
+    }
+    for ticket in tickets {
+        println!("{:<10} {:<14} {}", ticket.id, ticket.state, ticket.title);
     }
     Ok(())
 }

@@ -164,7 +164,18 @@ pub fn dir() -> Option<PathBuf> {
 
 /// Runs `op` on the plugin at `program` with `args`, and returns its result.
 pub fn call(program: &Path, op: &str, args: Value, limit: Duration) -> Result<Value, Error> {
-    let request = json!({ "protocol": PROTOCOL, "op": op, "config": {}, "args": args });
+    call_with(program, op, args, json!({}), limit)
+}
+
+/// `call`, with `config`, the plugin's table from the config file.
+fn call_with(
+    program: &Path,
+    op: &str,
+    args: Value,
+    config: Value,
+    limit: Duration,
+) -> Result<Value, Error> {
+    let request = json!({ "protocol": PROTOCOL, "op": op, "config": config, "args": args });
     let ran = child::run(
         &mut Command::new(program),
         Some(request.to_string().into_bytes()),
@@ -313,9 +324,14 @@ impl Plugin {
     }
 
     pub fn call(&self, op: &str, args: Value) -> Result<Value, Error> {
+        self.call_with(op, args, json!({}))
+    }
+
+    /// `call`, with `config`, such as a ticket source's table.
+    pub fn call_with(&self, op: &str, args: Value, config: Value) -> Result<Value, Error> {
         match self {
-            Plugin::Builtin(name) => builtin::handle(name, op, &args),
-            Plugin::External { path, .. } => call(path, op, args, timeout(op)),
+            Plugin::Builtin(name) => builtin::handle(name, op, &args, &config),
+            Plugin::External { path, .. } => call_with(path, op, args, config, timeout(op)),
         }
     }
 
@@ -323,7 +339,7 @@ impl Plugin {
     pub fn description(&self) -> Result<Description, Error> {
         match self {
             Plugin::Builtin(name) => {
-                let result = builtin::handle(name, "describe", &json!({}))?;
+                let result = builtin::handle(name, "describe", &json!({}), &json!({}))?;
                 serde_json::from_value(result)
                     .map_err(|err| Error::new(Code::Failed, format!("invalid description: {err}")))
             }

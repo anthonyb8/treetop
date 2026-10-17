@@ -136,6 +136,26 @@ A hook is a command and its arguments, run in the tree with `TREETOP_TREE`, `TRE
 One that fails is written to the log and never stops the start or return it belongs to.
 A config file treetop cannot parse is reported in the log, and no hooks run.
 
+Tickets come from named sources, each a ticket plugin and the settings it is given; Linear's plugin is built in and the default.
+A repository picks its source by its main checkout's path under `[repos]`; with a single source, every repository uses it.
+Each Linear source names the environment variable holding its personal API key (Linear's Settings > Security & access > Personal API keys), so a work and a personal workspace each get their own:
+
+```toml
+[tickets.work]
+key_env = "LINEAR_API_KEY_WORK"
+team = "END"
+
+[tickets.personal]
+key_env = "LINEAR_API_KEY_PERSONAL"
+team = "ANT"
+
+[repos."~/endo/app"]
+tickets = "work"
+```
+
+`treetop tickets` lists the repository's open tickets from its source, `--mine` those assigned to you, and any other words search their titles; it is the quickest check that a key and team are right.
+The Linear plugin calls `https://api.linear.app/graphql` with `curl`, writing the request to curl's stdin so the key never appears in a process list.
+
 ## Plugins
 
 A plugin is any executable file in `~/.config/treetop/plugins` (or `$XDG_CONFIG_HOME/treetop/plugins`) that speaks JSON on stdin and stdout; `treetop plugins` lists what it finds and why it cannot use one.
@@ -165,7 +185,17 @@ An agent plugin answers these ops:
 Claude Code's is `{"input": "❯", "rule": "─", "dialogs": ["Do you want to", "❯ 1."]}`; without one, treetop types on a timer.
 | `stop` | `id` | nothing |
 
+A ticket plugin answers these, with its source's settings as `config`:
+
+| Op | Args | Result |
+|---|---|---|
+| `list` | `filters`: `mine`, `label`, `state`, `project`, `cycle` (`current` or a number) and `query`, each optional | `tickets`: each with `id`, `title`, `state`, `labels`, and optionally `assignee`, `project`, `cycle`, `url` and `branch` |
+| `get` | `id` | the ticket, with its `description` |
+| `branch` | `id` | `branch`, the name its system gives the ticket's branch |
+| `start` | `id` | nothing; marks it started and assigns it to the key's user |
+
 Claude Code's plugin is built in, and `treetop plugin claude` serves it on stdin and stdout like any other; a plugin of your own named `claude` replaces it.
+Linear's is built in the same way, as `treetop plugin linear`.
 treetop starts new agents with it unless `TREETOP_NEW_AGENT` names a command.
 
 ## What the actions run

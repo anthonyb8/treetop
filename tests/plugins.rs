@@ -51,7 +51,7 @@ fn plugins(config: &Path) -> String {
 fn lists_each_plugin_and_why_one_cannot_be_used() {
     let listing = plugins(&config_dir());
     let lines: Vec<&str> = listing.lines().collect();
-    assert_eq!(lines.len(), 4, "{listing}");
+    assert_eq!(lines.len(), 5, "{listing}");
     assert!(
         lines[0].contains("broken: failed: missing LINEAR_API_KEY"),
         "{listing}"
@@ -67,6 +67,10 @@ fn lists_each_plugin_and_why_one_cannot_be_used() {
     );
     assert!(
         lines[3].starts_with("claude") && lines[3].ends_with("built in (treetop plugin claude)"),
+        "{listing}"
+    );
+    assert!(
+        lines[4].starts_with("linear") && lines[4].contains("tickets"),
         "{listing}"
     );
 }

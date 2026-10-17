@@ -10,15 +10,18 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::agents::claude;
+use crate::linear;
 use crate::plugin::{Code, Error, Kind, PROTOCOL};
 
 /// Every built-in by name, with its kind.
-pub const KINDS: [(&str, Kind); 1] = [("claude", Kind::Agent)];
+pub const KINDS: [(&str, Kind); 2] = [("claude", Kind::Agent), ("linear", Kind::Tickets)];
 
-/// Answers `op` with `args` as the built-in `name`.
-pub fn handle(name: &str, op: &str, args: &Value) -> Result<Value, Error> {
+/// Answers `op` with `args` as the built-in `name`, with `config`, its table
+/// from the config file.
+pub fn handle(name: &str, op: &str, args: &Value, config: &Value) -> Result<Value, Error> {
     match name {
         "claude" => claude::op(op, args),
+        "linear" => linear::op(op, args, config),
         _ => Err(Error::new(
             Code::NotFound,
             format!("no built-in plugin {name}"),
@@ -32,6 +35,8 @@ struct Request {
     op: String,
     #[serde(default)]
     args: Value,
+    #[serde(default)]
+    config: Value,
 }
 
 /// The reply to one request's text.
@@ -48,7 +53,7 @@ fn answer(name: &str, text: &str) -> Value {
                     ),
                 ));
             }
-            handle(name, &request.op, &request.args)
+            handle(name, &request.op, &request.args, &request.config)
         });
     match reply {
         Ok(result) => json!({ "ok": true, "result": result }),
