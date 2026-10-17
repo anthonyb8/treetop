@@ -1,16 +1,29 @@
 //! A client for Linear's GraphQL API, as treetop uses it: listing a team's
-//! issues with filters, reading one, and marking one started. Requests go
-//! over HTTPS from the process itself, with a personal API key, so nothing
-//! waits on a process start and the key never shows in a process list.
+//! issues with filters, reading one with its comments, reading what a team's
+//! issues can be set to, and changing, creating and commenting on issues.
+//! Requests go over HTTPS from the process itself, with a personal API key,
+//! so nothing waits on a process start and the key never shows in a process
+//! list.
 //!
 //! It knows nothing about screens or trees; treetop's ticket plugin and its
 //! Issues screen are built on it.
 
+mod edit;
+mod filter;
+mod model;
+
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+pub use edit::{Change, NewIssue};
+pub use filter::Filter;
+pub use model::{Comment, Cycle, Detail, Issue, Named, State, Team};
+
+use model::{ISSUE_FIELDS, RawIssue, RawTeam};
 
 const API: &str = "https://api.linear.app/graphql";
 
@@ -59,44 +72,12 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// An issue, as much of it as treetop shows.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Issue {
-    /// The id people use, such as `END-123`.
-    pub id: String,
-    pub title: String,
-    pub state: String,
-    pub labels: Vec<String>,
-    pub assignee: Option<String>,
-    pub project: Option<String>,
-    pub cycle: Option<String>,
-    pub url: Option<String>,
-    /// Its Markdown text; only a single issue's read carries it.
-    pub description: Option<String>,
-    /// The branch name Linear gives it.
-    pub branch: Option<String>,
-}
-
-/// What narrows a list. Each is optional; none lists the team's open issues.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Filter {
-    /// Only issues assigned to the key's user.
-    pub mine: bool,
-    pub label: Option<String>,
-    /// A state's name; without one, only open issues are listed.
-    pub state: Option<String>,
-    /// Part of a project's name.
-    pub project: Option<String>,
-    /// `current` for the active cycle, else a cycle number.
-    pub cycle: Option<String>,
-    /// Words the title contains.
-    pub query: Option<String>,
-}
-
-/// Talks to Linear with one API key.
+/// Talks to Linear with one API key, keeping each team's states, labels,
+/// members, projects and cycles once read.
 pub struct Client {
     key: String,
     agent: ureq::Agent,
+    teams: Mutex<HashMap<String, Arc<Team>>>,
 }
 
 impl Client {
@@ -111,6 +92,7 @@ impl Client {
         Client {
             key: key.into(),
             agent,
+            teams: Mutex::default(),
         }
     }
 
@@ -149,26 +131,134 @@ impl Client {
     pub fn issues(&self, team: Option<&str>, filter: &Filter) -> Result<Vec<Issue>, Error> {
         let query = format!(
             "query($filter: IssueFilter, $first: Int) {{ issues(filter: $filter, first: $first, \
-             orderBy: updatedAt) {{ nodes {{ {FIELDS} }} }} }}"
+             orderBy: updatedAt) {{ nodes {{ {ISSUE_FIELDS} }} }} }}"
         );
         let data = self.query(
             &query,
-            json!({ "filter": issue_filter(team, filter), "first": PAGE }),
+            json!({ "filter": filter.to_value(team), "first": PAGE }),
         )?;
-        Ok(data
+        let nodes = data
             .pointer("/issues/nodes")
-            .and_then(Value::as_array)
-            .map(|nodes| nodes.iter().filter_map(|n| issue(n, false)).collect())
-            .unwrap_or_default())
+            .cloned()
+            .unwrap_or(Value::Array(Vec::new()));
+        let raw: Vec<RawIssue> = serde_json::from_value(nodes)
+            .map_err(|err| Error::failed(format!("unreadable issues: {err}")))?;
+        Ok(raw.into_iter().map(Issue::from).collect())
+    }
+
+    /// One issue, by its id or uuid, with its description and comments.
+    pub fn detail(&self, id: &str) -> Result<Detail, Error> {
+        let query = format!(
+            "query($id: String!) {{ issue(id: $id) {{ {ISSUE_FIELDS} description \
+             comments(first: 100) {{ nodes {{ body createdAt user {{ id name }} }} }} }} }}"
+        );
+        let data = self.query(&query, json!({ "id": id }))?;
+        raw_issue(data.get("issue"), id).map(RawIssue::into_detail)
     }
 
     /// One issue, by its id, with its description.
     pub fn issue(&self, id: &str) -> Result<Issue, Error> {
-        let query = format!("query($id: String!) {{ issue(id: $id) {{ {FIELDS} description }} }}");
-        let data = self.query(&query, json!({ "id": id }))?;
-        data.get("issue")
-            .and_then(|node| issue(node, true))
-            .ok_or_else(|| Error::new(ErrorKind::NotFound, format!("no issue {id}")))
+        self.detail(id).map(|detail| detail.issue)
+    }
+
+    /// The team with key `key`, read once and then kept; `refresh` reads it
+    /// again.
+    pub fn team(&self, key: &str) -> Result<Arc<Team>, Error> {
+        let cached = self
+            .teams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key.to_lowercase())
+            .cloned();
+        if let Some(team) = cached {
+            return Ok(team);
+        }
+        let team = Arc::new(self.read_team(key)?);
+        self.teams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key.to_lowercase(), Arc::clone(&team));
+        Ok(team)
+    }
+
+    /// Forgets every team read, so the next `team` reads it again.
+    pub fn refresh(&self) {
+        self.teams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+
+    fn read_team(&self, key: &str) -> Result<Team, Error> {
+        let query = "query($key: String!) { viewer { id name } \
+            issueLabels(first: 250, filter: { team: { null: true } }) { nodes { id name } } \
+            teams(filter: { key: { eqIgnoreCase: $key } }) { nodes { id key name \
+              states { nodes { id name type position } } \
+              labels(first: 250) { nodes { id name } } \
+              members(first: 250) { nodes { id name } } \
+              projects(first: 250) { nodes { id name } } \
+              cycles(first: 50) { nodes { id number name isActive } } } } }";
+        let mut data = self.query(query, json!({ "key": key }))?;
+        let raw = data
+            .pointer_mut("/teams/nodes/0")
+            .map(Value::take)
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, format!("no team {key}")))?;
+        let raw: RawTeam = serde_json::from_value(raw)
+            .map_err(|err| Error::failed(format!("unreadable team {key}: {err}")))?;
+        let workspace_labels = model::named_list(data.pointer_mut("/issueLabels").map(Value::take));
+        let me = model::one_named(data.pointer_mut("/viewer").map(Value::take));
+        Ok(raw.into_team(workspace_labels, me))
+    }
+
+    /// Applies `change` to the issue with uuid `uuid`, and returns the issue
+    /// as it now is.
+    pub fn update(&self, uuid: &str, change: &Change) -> Result<Issue, Error> {
+        let query = format!(
+            "mutation($id: String!, $input: IssueUpdateInput!) {{ \
+             issueUpdate(id: $id, input: $input) {{ success issue {{ {ISSUE_FIELDS} }} }} }}"
+        );
+        let data = self.query(&query, json!({ "id": uuid, "input": change.input() }))?;
+        succeeded(&data, "/issueUpdate/success", uuid)?;
+        raw_issue(data.pointer("/issueUpdate/issue"), uuid).map(Issue::from)
+    }
+
+    /// Creates `new` and returns it.
+    pub fn create(&self, new: &NewIssue) -> Result<Issue, Error> {
+        let query = format!(
+            "mutation($input: IssueCreateInput!) {{ \
+             issueCreate(input: $input) {{ success issue {{ {ISSUE_FIELDS} }} }} }}"
+        );
+        let data = self.query(&query, json!({ "input": new.input() }))?;
+        succeeded(&data, "/issueCreate/success", &new.title)?;
+        raw_issue(data.pointer("/issueCreate/issue"), &new.title).map(Issue::from)
+    }
+
+    /// Posts `body`, Markdown, as a comment on the issue with uuid `uuid`.
+    pub fn comment(&self, uuid: &str, body: &str) -> Result<Comment, Error> {
+        let query = "mutation($input: CommentCreateInput!) { commentCreate(input: $input) { \
+                     success comment { body createdAt user { id name } } } }";
+        let data = self.query(query, json!({ "input": { "issueId": uuid, "body": body } }))?;
+        succeeded(&data, "/commentCreate/success", uuid)?;
+        let comment = data
+            .pointer("/commentCreate/comment")
+            .ok_or_else(|| Error::failed("Linear returned no comment"))?;
+        Ok(Comment {
+            author: comment
+                .pointer("/user/name")
+                .and_then(Value::as_str)
+                .unwrap_or("you")
+                .to_string(),
+            body: comment
+                .get("body")
+                .and_then(Value::as_str)
+                .unwrap_or(body)
+                .to_string(),
+            created_at: comment
+                .get("createdAt")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        })
     }
 
     /// Moves the issue to its team's first started state and assigns it to
@@ -177,7 +267,7 @@ impl Client {
         let query = "query($id: String!) { viewer { id } issue(id: $id) { id team { \
                      states(filter: { type: { eq: \"started\" } }) { nodes { id position } } } } }";
         let data = self.query(query, json!({ "id": id }))?;
-        let issue = data
+        let uuid = data
             .pointer("/issue/id")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::new(ErrorKind::NotFound, format!("no issue {id}")))?;
@@ -198,16 +288,32 @@ impl Client {
             .and_then(|s| s.get("id"))
             .and_then(Value::as_str)
             .ok_or_else(|| Error::failed(format!("{id}'s team has no started state")))?;
-        let update = "mutation($id: String!, $input: IssueUpdateInput!) { \
-                      issueUpdate(id: $id, input: $input) { success } }";
-        let done = self.query(
-            update,
-            json!({ "id": issue, "input": { "stateId": state, "assigneeId": viewer } }),
-        )?;
-        if done.pointer("/issueUpdate/success") != Some(&Value::Bool(true)) {
-            return Err(Error::failed(format!("Linear did not update {id}")));
-        }
+        let change = Change {
+            state_id: Some(state.to_string()),
+            assignee_id: Some(Some(viewer.to_string())),
+            ..Change::default()
+        };
+        self.update(uuid, &change).map(|_| ())
+    }
+}
+
+/// An issue node, or that `what` was not found.
+fn raw_issue(node: Option<&Value>, what: &str) -> Result<RawIssue, Error> {
+    let node = node
+        .filter(|n| !n.is_null())
+        .cloned()
+        .ok_or_else(|| Error::new(ErrorKind::NotFound, format!("no issue {what}")))?;
+    serde_json::from_value(node).map_err(|err| Error::failed(format!("unreadable issue: {err}")))
+}
+
+/// A mutation's `success` was true.
+fn succeeded(data: &Value, pointer: &str, what: &str) -> Result<(), Error> {
+    if data.pointer(pointer) == Some(&Value::Bool(true)) {
         Ok(())
+    } else {
+        Err(Error::failed(format!(
+            "Linear did not apply the change to {what}"
+        )))
     }
 }
 
@@ -240,154 +346,84 @@ fn reply(body: &[u8]) -> Result<Value, Error> {
         .unwrap_or(Value::Null))
 }
 
-/// The issue fields every read asks for.
-const FIELDS: &str = "identifier title url branchName state { name } assignee { name } \
-    labels { nodes { name } } project { name } cycle { number name }";
-
-fn issue(node: &Value, with_description: bool) -> Option<Issue> {
-    let text = |pointer: &str| {
-        node.pointer(pointer)
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    };
-    let cycle = node.get("cycle").filter(|c| !c.is_null()).map(|c| {
-        c.get("name")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("cycle {}", c.get("number").unwrap_or(&Value::Null)))
-    });
-    Some(Issue {
-        id: text("/identifier")?,
-        title: text("/title").unwrap_or_default(),
-        state: text("/state/name").unwrap_or_default(),
-        labels: node
-            .pointer("/labels/nodes")
-            .and_then(Value::as_array)
-            .map(|labels| {
-                labels
-                    .iter()
-                    .filter_map(|l| l.get("name").and_then(Value::as_str).map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        assignee: text("/assignee/name"),
-        project: text("/project/name"),
-        cycle,
-        url: text("/url"),
-        description: if with_description {
-            text("/description")
-        } else {
-            None
-        },
-        branch: text("/branchName"),
-    })
-}
-
-/// The issue filter `filter` and the team ask for: open issues only, unless
-/// a state is named.
-fn issue_filter(team: Option<&str>, filter: &Filter) -> Value {
-    let mut out = serde_json::Map::new();
-    if let Some(team) = team {
-        out.insert("team".into(), json!({ "key": { "eqIgnoreCase": team } }));
-    }
-    if filter.mine {
-        out.insert("assignee".into(), json!({ "isMe": { "eq": true } }));
-    }
-    if let Some(label) = &filter.label {
-        out.insert(
-            "labels".into(),
-            json!({ "some": { "name": { "eqIgnoreCase": label } } }),
-        );
-    }
-    match &filter.state {
-        Some(state) => out.insert("state".into(), json!({ "name": { "eqIgnoreCase": state } })),
-        None => out.insert(
-            "state".into(),
-            json!({ "type": { "nin": ["completed", "canceled"] } }),
-        ),
-    };
-    if let Some(project) = &filter.project {
-        out.insert(
-            "project".into(),
-            json!({ "name": { "containsIgnoreCase": project } }),
-        );
-    }
-    match filter.cycle.as_deref() {
-        Some("current") => {
-            out.insert("cycle".into(), json!({ "isActive": { "eq": true } }));
-        }
-        Some(number) => {
-            if let Ok(number) = number.parse::<u32>() {
-                out.insert("cycle".into(), json!({ "number": { "eq": number } }));
-            }
-        }
-        None => {}
-    }
-    if let Some(query) = filter.query.as_deref().filter(|q| !q.trim().is_empty()) {
-        out.insert(
-            "title".into(),
-            json!({ "containsIgnoreCase": query.trim() }),
-        );
-    }
-    Value::Object(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const ISSUE: &str = r#"{"id":"u-123","identifier":"END-123","title":"Fix login",
+        "url":"https://linear.app/x/issue/END-123","branchName":"anthony/end-123-fix-login",
+        "priority":2,"updatedAt":"2026-10-17T10:00:00.000Z","team":{"id":"t1"},
+        "state":{"id":"s1","name":"Todo"},"assignee":null,
+        "labels":{"nodes":[{"id":"l1","name":"Bug"}]},"project":{"id":"p1","name":"Auth"},
+        "cycle":{"number":12,"name":null}}"#;
+
     #[test]
-    fn a_filter_becomes_an_issue_filter_open_issues_by_default() {
-        let none = issue_filter(Some("END"), &Filter::default());
+    fn reads_an_issue_with_names_to_show_and_ids_to_change() {
+        let raw: RawIssue = serde_json::from_str(ISSUE).unwrap();
+        let issue = Issue::from(raw);
         assert_eq!(
-            none,
-            json!({
-                "team": { "key": { "eqIgnoreCase": "END" } },
-                "state": { "type": { "nin": ["completed", "canceled"] } },
-            })
+            (issue.uuid.as_str(), issue.id.as_str()),
+            ("u-123", "END-123")
         );
-        let all = issue_filter(
-            None,
-            &Filter {
-                mine: true,
-                label: Some("Bug".into()),
-                state: Some("In Review".into()),
-                project: Some("checkout".into()),
-                cycle: Some("current".into()),
-                query: Some(" login ".into()),
-            },
-        );
-        assert_eq!(all["assignee"], json!({ "isMe": { "eq": true } }));
-        assert_eq!(all["labels"]["some"]["name"]["eqIgnoreCase"], "Bug");
         assert_eq!(
-            all["state"],
-            json!({ "name": { "eqIgnoreCase": "In Review" } })
+            (issue.labels, issue.label_ids),
+            (vec!["Bug".into()], vec!["l1".into()])
         );
-        assert_eq!(all["cycle"], json!({ "isActive": { "eq": true } }));
-        assert_eq!(all["title"], json!({ "containsIgnoreCase": "login" }));
-        let numbered = issue_filter(
-            None,
-            &Filter {
-                cycle: Some("12".into()),
-                ..Filter::default()
-            },
-        );
-        assert_eq!(numbered["cycle"], json!({ "number": { "eq": 12 } }));
+        assert_eq!(issue.state_id.as_deref(), Some("s1"));
+        assert_eq!((issue.assignee, issue.assignee_id), (None, None));
+        assert_eq!(issue.cycle.as_deref(), Some("cycle 12"));
+        assert_eq!(issue.priority, 2);
+        assert_eq!(issue.team_id.as_deref(), Some("t1"));
     }
 
     #[test]
-    fn reads_issues_from_a_reply() {
-        let body = br#"{"data":{"issues":{"nodes":[{"identifier":"END-123",
-            "title":"Fix login","url":"https://linear.app/x/issue/END-123","branchName":"anthony/end-123-fix-login",
-            "state":{"name":"Todo"},"assignee":null,"labels":{"nodes":[{"name":"Bug"}]},
-            "project":{"name":"Auth"},"cycle":{"number":12,"name":null}}]}}}"#;
-        let data = reply(body).unwrap();
-        let issue = issue(&data["issues"]["nodes"][0], false).unwrap();
-        assert_eq!(issue.id, "END-123");
-        assert_eq!(issue.labels, ["Bug"]);
-        assert_eq!(issue.assignee, None);
-        assert_eq!(issue.cycle.as_deref(), Some("cycle 12"));
-        assert_eq!(issue.branch.as_deref(), Some("anthony/end-123-fix-login"));
+    fn a_detail_carries_its_comments_oldest_first() {
+        let with_comments = ISSUE.replace(
+            r#""cycle":{"number":12,"name":null}}"#,
+            r#""cycle":null,"description":"Keep return_to.","comments":{"nodes":[
+                {"body":"second","createdAt":"2026-10-17T12:00:00Z","user":{"id":"u2","name":"Bo"}},
+                {"body":"first","createdAt":"2026-10-17T11:00:00Z","user":null}]}}"#,
+        );
+        let raw: RawIssue = serde_json::from_str(&with_comments).unwrap();
+        let detail = raw.into_detail();
+        assert_eq!(detail.issue.description.as_deref(), Some("Keep return_to."));
+        assert_eq!(detail.issue.cycle, None);
+        let said: Vec<(&str, &str)> = detail
+            .comments
+            .iter()
+            .map(|c| (c.author.as_str(), c.body.as_str()))
+            .collect();
+        assert_eq!(said, [("someone", "first"), ("Bo", "second")]);
+    }
+
+    #[test]
+    fn reads_a_team_with_states_in_workflow_order_and_workspace_labels() {
+        let raw: RawTeam = serde_json::from_str(
+            r#"{"id":"t1","key":"END","name":"Endo","states":{"nodes":[
+                {"id":"d","name":"Done","type":"completed","position":0},
+                {"id":"r","name":"In Review","type":"started","position":2},
+                {"id":"p","name":"In Progress","type":"started","position":1},
+                {"id":"b","name":"Backlog","type":"backlog","position":5}]},
+               "labels":{"nodes":[{"id":"l2","name":"bug"}]},
+               "members":{"nodes":[{"id":"u2","name":"Zoe"},{"id":"u1","name":"anthony"}]},
+               "projects":{"nodes":[]},"cycles":{"nodes":[{"id":"c","number":14,"name":"","isActive":true}]}}"#,
+        )
+        .unwrap();
+        let team = raw.into_team(
+            vec![Named {
+                id: "l1".into(),
+                name: "Feature".into(),
+            }],
+            None,
+        );
+        let states: Vec<&str> = team.states.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(states, ["Backlog", "In Progress", "In Review", "Done"]);
+        let labels: Vec<&str> = team.labels.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(labels, ["bug", "Feature"]);
+        let members: Vec<&str> = team.members.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(members, ["anthony", "Zoe"]);
+        assert_eq!(team.cycles[0].name, None, "an empty name is no name");
+        assert!(team.cycles[0].is_active);
     }
 
     #[test]
@@ -399,6 +435,112 @@ mod tests {
             (ErrorKind::Auth, "Authentication required")
         );
         assert_eq!(reply(b"<html>").unwrap_err().kind, ErrorKind::Failed);
+    }
+
+    #[test]
+    fn a_failed_mutation_says_so() {
+        let data = json!({ "issueUpdate": { "success": false } });
+        assert!(succeeded(&data, "/issueUpdate/success", "END-1").is_err());
+        let data = json!({ "issueUpdate": { "success": true } });
+        assert!(succeeded(&data, "/issueUpdate/success", "END-1").is_ok());
+    }
+
+    /// Linear validates a request against its schema before it checks the
+    /// key, so with a bad key a request that fits the schema is refused for
+    /// authentication and one that does not is refused for what is wrong
+    /// with it. Run with `cargo test -p linear -- --ignored`; it needs the
+    /// network.
+    #[test]
+    #[ignore = "calls Linear"]
+    fn every_request_fits_linears_schema() {
+        let client = Client::new("lin_api_not_a_real_key");
+        let all = Filter {
+            mine: true,
+            label: Some("Bug".into()),
+            state: Some("Todo".into()),
+            project: Some("x".into()),
+            cycle: Some("current".into()),
+            query: Some("login".into()),
+        };
+        let change = Change {
+            title: Some("t".into()),
+            description: Some("d".into()),
+            state_id: Some("s".into()),
+            assignee_id: Some(None),
+            label_ids: Some(vec!["l".into()]),
+            project_id: Some(Some("p".into())),
+            priority: Some(2),
+        };
+        let new = NewIssue {
+            team_id: "t".into(),
+            title: "t".into(),
+            description: Some("d".into()),
+            label_ids: vec!["l".into()],
+            priority: Some(3),
+            ..NewIssue::default()
+        };
+        let results = [
+            ("issues", client.issues(Some("END"), &all).err()),
+            ("detail", client.detail("END-1").err()),
+            ("team", client.team("END").err()),
+            ("update", client.update("u", &change).err()),
+            ("create", client.create(&new).err()),
+            ("comment", client.comment("u", "hi").err()),
+            ("start", client.start("END-1").err()),
+        ];
+        for (name, err) in results {
+            let err = err.unwrap_or_else(|| panic!("{name} succeeded with a bad key"));
+            assert_eq!(err.kind, ErrorKind::Auth, "{name}: {}", err.message);
+        }
+        // Variables are only read after the key is checked, so the inputs
+        // are checked again written into the query, where the schema
+        // validates them.
+        let inline = [
+            (
+                "filter",
+                format!(
+                    "{{ issues(filter: {}) {{ nodes {{ id }} }} }}",
+                    literal(&all.to_value(Some("END")))
+                ),
+            ),
+            (
+                "change",
+                format!(
+                    "mutation {{ issueUpdate(id: \"u\", input: {}) {{ success }} }}",
+                    literal(&change.input())
+                ),
+            ),
+            (
+                "new issue",
+                format!(
+                    "mutation {{ issueCreate(input: {}) {{ success }} }}",
+                    literal(&new.input())
+                ),
+            ),
+        ];
+        for (name, query) in inline {
+            let err = client.query(&query, json!({})).unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Auth, "{name}: {}", err.message);
+        }
+    }
+
+    /// `value` written as a GraphQL literal: keys bare, everything else as
+    /// JSON writes it.
+    fn literal(value: &Value) -> String {
+        match value {
+            Value::Object(map) => {
+                let fields: Vec<String> = map
+                    .iter()
+                    .map(|(key, value)| format!("{key}: {}", literal(value)))
+                    .collect();
+                format!("{{ {} }}", fields.join(", "))
+            }
+            Value::Array(items) => {
+                let items: Vec<String> = items.iter().map(literal).collect();
+                format!("[{}]", items.join(", "))
+            }
+            other => other.to_string(),
+        }
     }
 
     #[test]
