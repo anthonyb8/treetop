@@ -14,13 +14,15 @@ use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
+use crate::agents::claude;
 use crate::branch;
 use crate::child::{self, End};
+use crate::plugin::{self, Kind as PluginKind, Plugin};
 use crate::pool::{self, Tree};
 use crate::sidecar::{self, Sidecar};
 
@@ -36,12 +38,6 @@ const GIT_LIMIT: Duration = Duration::from_secs(30);
 
 /// How long an agent's command gets to start it.
 const AGENT_LIMIT: Duration = Duration::from_secs(60);
-
-/// How long a started Claude Code session gets to show up in `claude agents`.
-const CONFIRM_LIMIT: Duration = Duration::from_secs(20);
-
-/// How often `claude agents` is asked again while confirming.
-const CONFIRM_EVERY: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -131,6 +127,9 @@ pub struct Job {
     pub launch: Option<Launch>,
     /// The branch name a Rename gives the tree.
     pub rename: Option<String>,
+    /// The command that opens the chat of the agent a Start started, once it
+    /// has.
+    pub attach: Option<Vec<String>>,
 }
 
 impl Job {
@@ -141,6 +140,7 @@ impl Job {
             tree,
             launch: None,
             rename: None,
+            attach: None,
         }
     }
 }
@@ -231,14 +231,33 @@ fn capture(command: &mut Command, limit: Duration, log: &mut String) -> bool {
     }
 }
 
-/// The command a Start runs in a tree: the coordinator's when it is the one
-/// starting, else `TREETOP_NEW_AGENT`, split on whitespace, with the task as
-/// its last argument, else Claude Code in the background, named for the
-/// task, whose chat `c` opens and which Claude Code's own agent view lists
-/// too.
-fn new_agent(launch: &Launch, dir: &Path) -> Vec<String> {
+/// The agent plugin new agents start with when nobody names another.
+const DEFAULT_AGENT: &str = "claude";
+
+/// How a Start runs its agent.
+enum Starter {
+    /// `TREETOP_NEW_AGENT`, split on whitespace, with the task as its last
+    /// argument: any agent, with no plugin.
+    Command(Vec<String>),
+    /// The coordinator, a Claude Code session with its own flags, run by the
+    /// Claude Code plugin's rules.
+    Coordinator(Vec<String>, Plugin),
+    /// An agent plugin's `start`.
+    Plugin(Plugin),
+}
+
+/// How `launch` starts: the coordinator's command, else `TREETOP_NEW_AGENT`,
+/// else the default agent plugin, else the first there is.
+fn starter(launch: &Launch, dir: &Path) -> Result<Starter, String> {
+    let agent = || {
+        plugin::named(PluginKind::Agent, DEFAULT_AGENT)
+            .or_else(|| plugin::of_kind(PluginKind::Agent).into_iter().next())
+            .ok_or_else(|| "start: no agent plugin".to_string())
+    };
     if launch.is_coordinator {
-        return crate::coordinator::command(&crate::coordinator::treetop(), dir, &launch.task);
+        let command =
+            crate::coordinator::command(&crate::coordinator::treetop(), dir, &launch.task);
+        return Ok(Starter::Coordinator(command, agent()?));
     }
     let custom = std::env::var("TREETOP_NEW_AGENT")
         .ok()
@@ -249,45 +268,16 @@ fn new_agent(launch: &Launch, dir: &Path) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .filter(|command| !command.is_empty());
-    agent_command(custom, Some(launch))
-}
-
-/// A custom agent gets the task as its last argument, as it always has.
-/// Claude Code gets `--` before it, so a task that starts with `-` is never
-/// read as a flag.
-fn agent_command(custom: Option<Vec<String>>, launch: Option<&Launch>) -> Vec<String> {
-    let task = launch
-        .map(|l| l.task.clone())
-        .filter(|t| !t.trim().is_empty());
     match custom {
-        Some(mut command) => {
-            command.extend(task);
-            command
-        }
-        None => {
-            let mut command = vec!["claude".to_string(), "--bg".to_string()];
-            if let Some(name) = launch.and_then(|l| l.name.clone()) {
-                command.extend(["--name".to_string(), name]);
-            }
-            if let Some(task) = task {
-                command.extend(["--".to_string(), task]);
-            }
-            command
-        }
+        Some(command) => Ok(Starter::Command(custom_command(command, launch))),
+        None => agent().map(Starter::Plugin),
     }
 }
 
-/// The id `claude --bg` prints for `claude attach`, from the line it
-/// suggests running: `claude attach cbcfd8c8    open in this terminal`.
-pub fn attach_id(output: &str) -> Option<&str> {
-    output.lines().find_map(|line| {
-        let id = line
-            .split("claude attach ")
-            .nth(1)?
-            .split_whitespace()
-            .next()?;
-        id.chars().all(|c| c.is_ascii_alphanumeric()).then_some(id)
-    })
+/// A custom agent gets the task as its last argument, as it always has.
+fn custom_command(mut command: Vec<String>, launch: &Launch) -> Vec<String> {
+    command.extend(Some(launch.task.clone()).filter(|t| !t.trim().is_empty()));
+    command
 }
 
 /// The pool number of a tree at `path`, `<pool>/<number>/<repo>`, else its
@@ -319,8 +309,8 @@ enum Undo {
     /// Leave the branch and delete it.
     Branch(String),
     Sidecar,
-    /// Stop the Claude Code session with this id.
-    Agent(String),
+    /// Stop the agent with this id through its plugin.
+    Agent(Plugin, String),
 }
 
 fn git(tree: &Path) -> Command {
@@ -337,7 +327,13 @@ fn treehouse(subcommand: &str, path: &Path) -> Command {
 
 fn undo(step: Undo, tree: &Path, log: &mut String) {
     let _ = match step {
-        Undo::Agent(id) => capture(Command::new("claude").args(["stop", &id]), GIT_LIMIT, log),
+        Undo::Agent(plugin, id) => match plugin.call("stop", json!({ "id": id })) {
+            Ok(_) => true,
+            Err(err) => {
+                let _ = writeln!(log, "could not stop {id}: {err}");
+                false
+            }
+        },
         Undo::Sidecar => sidecar::remove(tree).is_ok(),
         Undo::Branch(name) => {
             capture(git(tree).args(["switch", "--detach"]), GIT_LIMIT, log)
@@ -380,38 +376,6 @@ fn checked_out(tree: &Path) -> Option<String> {
     head.trim()
         .strip_prefix("ref: refs/heads/")
         .map(str::to_string)
-}
-
-/// Waits for Claude Code to list session `id`, which is what says it
-/// started: `claude --bg` exits 0 once the session is queued, not running.
-fn confirm(id: &str, log: &mut String) -> Result<(), String> {
-    let deadline = Instant::now() + CONFIRM_LIMIT;
-    loop {
-        let mut scratch = String::new();
-        let listed = exec(
-            Command::new("claude").args(["agents", "--json", "--all"]),
-            GIT_LIMIT,
-            &mut scratch,
-        );
-        let is_listed = listed.is_ok_and(|json| {
-            serde_json::from_str::<Vec<Value>>(&json).is_ok_and(|sessions| {
-                sessions
-                    .iter()
-                    .any(|s| s.get("id").and_then(Value::as_str) == Some(id))
-            })
-        });
-        if is_listed {
-            let _ = writeln!(log, "claude lists session {id}");
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "claude never listed session {id} in {}s",
-                CONFIRM_LIMIT.as_secs()
-            ));
-        }
-        thread::sleep(CONFIRM_EVERY);
-    }
 }
 
 /// Leases a tree, then names its branch, checks it, writes its sidecar,
@@ -493,29 +457,68 @@ fn start_steps(job: &mut Job, log: &mut String, undone: &mut Vec<Undo>) -> Resul
         .map_err(|why| format!("branch: {why}"))?;
         undone.push(Undo::Branch(name.clone()));
     }
-    let command = new_agent(&launch, &job.tree.path);
-    let (program, args) = command.split_first().ok_or("start: no agent command")?;
+    let starter = starter(&launch, &job.tree.path)?;
     if is_leasing {
-        record.agent = Some(agent_name(program));
+        record.agent = Some(match &starter {
+            Starter::Command(command) => agent_name(&command[0]),
+            Starter::Coordinator(_, plugin) | Starter::Plugin(plugin) => plugin.name().to_string(),
+        });
         record.branch = checked_out(&job.tree.path);
         sidecar::write(&job.tree.path, &record)
             .map_err(|err| format!("sidecar: could not write {}: {err}", sidecar::FILE))?;
         undone.push(Undo::Sidecar);
     }
-    let out = exec(
-        Command::new(program).args(args).current_dir(&job.tree.path),
-        AGENT_LIMIT,
-        log,
-    )
-    .map_err(|why| format!("start: {why}"))?;
-    if agent_name(program) != "claude" {
-        return Ok(());
-    }
-    let id = attach_id(&out)
-        .ok_or("start: claude printed no session id")?
-        .to_string();
-    undone.push(Undo::Agent(id.clone()));
-    confirm(&id, log).map_err(|why| format!("confirm: {why}"))?;
+    let (plugin, id) = match starter {
+        Starter::Command(command) => {
+            let (program, args) = command.split_first().ok_or("start: no agent command")?;
+            exec(
+                Command::new(program).args(args).current_dir(&job.tree.path),
+                AGENT_LIMIT,
+                log,
+            )
+            .map_err(|why| format!("start: {why}"))?;
+            return Ok(());
+        }
+        Starter::Coordinator(command, plugin) => {
+            let (program, args) = command.split_first().ok_or("start: no agent command")?;
+            let out = exec(
+                Command::new(program).args(args).current_dir(&job.tree.path),
+                AGENT_LIMIT,
+                log,
+            )
+            .map_err(|why| format!("start: {why}"))?;
+            let id = claude::attach_id(&out)
+                .ok_or("start: claude printed no session id")?
+                .to_string();
+            undone.push(Undo::Agent(plugin.clone(), id.clone()));
+            claude::confirm(&id).map_err(|err| format!("confirm: {}", err.message))?;
+            (plugin, id)
+        }
+        Starter::Plugin(plugin) => {
+            let started = plugin
+                .call(
+                    "start",
+                    json!({
+                        "dir": job.tree.path,
+                        "name": launch.name,
+                        "prompt": launch.task,
+                    }),
+                )
+                .map_err(|err| format!("start: {}", err.message))?;
+            let id = started
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("start: {} gave no id", plugin.name()))?
+                .to_string();
+            undone.push(Undo::Agent(plugin.clone(), id.clone()));
+            (plugin, id)
+        }
+    };
+    let _ = writeln!(log, "{} started {id}", plugin.name());
+    job.attach = plugin
+        .call("attach", json!({ "id": id }))
+        .ok()
+        .and_then(|reply| serde_json::from_value(reply["argv"].clone()).ok());
     if is_leasing {
         record.job = Some(id);
         if let Err(err) = sidecar::write(&job.tree.path, &record) {
@@ -635,33 +638,13 @@ mod tests {
     }
 
     #[test]
-    fn a_task_starts_claude_named_for_it_after_a_double_dash() {
-        assert_eq!(
-            agent_command(None, Some(&launch("END-9 fix login"))),
-            [
-                "claude",
-                "--bg",
-                "--name",
-                "END-9 fix login",
-                "--",
-                "END-9 fix login"
-            ]
-        );
-        assert_eq!(
-            agent_command(None, Some(&launch("--help me")))[4..],
-            ["--", "--help me"]
-        );
-        assert_eq!(agent_command(None, Some(&launch("  "))), ["claude", "--bg"]);
-        assert_eq!(agent_command(None, None), ["claude", "--bg"]);
-    }
-
-    #[test]
     fn a_custom_agent_gets_the_task_as_its_last_argument() {
-        let custom = Some(vec!["codex".to_string(), "exec".to_string()]);
+        let custom = vec!["codex".to_string(), "exec".to_string()];
         assert_eq!(
-            agent_command(custom, Some(&launch("fix login"))),
+            custom_command(custom.clone(), &launch("fix login")),
             ["codex", "exec", "fix login"]
         );
+        assert_eq!(custom_command(custom, &launch("  ")), ["codex", "exec"]);
     }
 
     #[test]

@@ -12,9 +12,10 @@ use crate::agents::{Agent, Status};
 use crate::coordinator;
 use crate::diff::Layout;
 use crate::dispatch::{Edit, Prompt, Purpose, Recipient, Target};
-use crate::jobs::{Job, Kind, Launch, attach_id};
+use crate::jobs::{Job, Kind, Launch};
 use crate::pool::{self, Process, Tree, Work};
 use crate::reports::{Report, State};
+use crate::sidecar::Sidecar;
 
 /// Where a tree's latest job stands, shown in its STATUS cell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,7 +73,7 @@ impl<'a> Item<'a> {
     fn new(report: &'a Report, trees: &'a [Tree], is_read: bool) -> Self {
         Item {
             report,
-            tree: report.dir.as_deref().and_then(|d| pool::holding(trees, d)),
+            tree: crate::reports::tree_of(report, trees),
             agent: trees
                 .iter()
                 .flat_map(|t| &t.agents)
@@ -332,7 +333,7 @@ pub struct Opening {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Awaiting {
     path: PathBuf,
-    known: Vec<u32>,
+    known: Vec<Option<u32>>,
     since: Instant,
 }
 
@@ -436,6 +437,14 @@ impl App {
         }
     }
 
+    /// Takes the sidecars read on the git clock. A tree absent from the map
+    /// has none.
+    pub fn apply_sidecars(&mut self, mut sidecars: HashMap<PathBuf, Sidecar>) {
+        for tree in &mut self.trees {
+            tree.sidecar = sidecars.remove(&tree.path).map(Box::new);
+        }
+    }
+
     /// Takes the agents read on the git clock. A tree absent from the map has
     /// no agent working in it.
     pub fn apply_agents(&mut self, agents: &HashMap<PathBuf, Vec<Agent>>) {
@@ -454,6 +463,7 @@ impl App {
             if let Some(old) = self.trees.iter().find(|old| old.path == tree.path) {
                 tree.processes = old.processes.clone();
                 tree.agents = old.agents.clone();
+                tree.sidecar = old.sidecar.clone().filter(|_| tree.is_held());
                 tree.work = old.work.filter(|_| tree.is_held());
             }
         }
@@ -522,7 +532,7 @@ impl App {
                 .find(|t| t.path == path)
                 .map(|t| t.agents.iter().map(|a| a.pid).collect())
                 .unwrap_or_default();
-            match (self.opening.as_mut(), attach_id(&output)) {
+            match (self.opening.as_mut(), job.attach.clone()) {
                 (None, _) => {
                     self.message = Some(if is_coordinator {
                         "the coordinator started; c on main opens its chat".to_string()
@@ -530,9 +540,9 @@ impl App {
                         format!("agent started in tree {}; c opens its chat", job.tree.name)
                     });
                 }
-                (Some(opening), Some(id)) => {
+                (Some(opening), Some(command)) => {
                     self.started_chat = Some(Outcome::Chat {
-                        command: vec!["claude".into(), "attach".into(), id.to_string()],
+                        command,
                         agent: opening.agent.clone(),
                         tree: job.tree.name.clone(),
                     });
@@ -1792,7 +1802,7 @@ mod tests {
     fn agent(name: &str) -> Agent {
         Agent {
             name: name.into(),
-            pid: 1,
+            pid: Some(1),
             status: None,
             source: crate::agents::Source::Process,
             is_background: false,
@@ -1923,7 +1933,7 @@ mod tests {
         app.job_finished(job, true, "printed no id".into());
         assert_eq!(app.ready_chat(), None, "not shown up yet");
         let started = Agent {
-            pid: 99,
+            pid: Some(99),
             is_background: true,
             attach: Some(vec!["claude".into(), "attach".into(), "1234abcd".into()]),
             ..agent("new-session")
@@ -1948,22 +1958,19 @@ mod tests {
         assert!(app.opening.is_none());
     }
 
-    /// What `claude --bg` prints.
-    const BACKGROUNDED: &str = "backgrounded · cbcfd8c8 · treetop-coordinator (working)
-  claude agents             list sessions
-  claude attach cbcfd8c8    open in this terminal
-  claude stop cbcfd8c8      stop this session
-";
+    /// What a start's job carries once its agent's plugin says how to open it.
+    fn started(mut job: Job) -> Job {
+        job.attach = Some(vec!["claude".into(), "attach".into(), "cbcfd8c8".into()]);
+        job
+    }
 
     #[test]
-    fn a_started_chat_opens_from_the_id_claude_prints_without_waiting_to_see_it() {
-        assert_eq!(attach_id(BACKGROUNDED), Some("cbcfd8c8"));
-        assert_eq!(attach_id("started"), None);
+    fn a_started_chat_opens_from_the_command_its_start_gave_without_waiting_to_see_it() {
         let mut app = app_with_main();
         press(&mut app, KeyCode::Char('n'));
         let job = queued(press(&mut app, KeyCode::Enter)).remove(0);
         assert_eq!(app.opening.as_ref().unwrap().agent, coordinator::NAME);
-        app.job_finished(job, true, BACKGROUNDED.into());
+        app.job_finished(started(job), true, String::new());
         assert_eq!(
             app.ready_chat(),
             Some(Outcome::Chat {
@@ -1988,7 +1995,7 @@ mod tests {
         );
         press(&mut app, KeyCode::Esc);
         assert!(app.opening.is_none());
-        app.job_finished(job, true, BACKGROUNDED.into());
+        app.job_finished(started(job), true, String::new());
         assert_eq!(app.ready_chat(), None, "dismissed, it opens only with c");
         assert!(
             app.message
@@ -2123,9 +2130,37 @@ mod tests {
         }
     }
 
+    /// Records `job` as the job treetop started in the tree at `path`.
+    fn dispatched(app: &mut App, path: &str, job: &str) {
+        let mut sidecars = HashMap::new();
+        for tree in app.trees.iter().filter(|t| t.sidecar.is_some()) {
+            sidecars.insert(tree.path.clone(), *tree.sidecar.clone().unwrap());
+        }
+        sidecars.insert(
+            PathBuf::from(path),
+            Sidecar {
+                job: Some(job.into()),
+                ..Sidecar::leased_now()
+            },
+        );
+        app.apply_sidecars(sidecars);
+    }
+
+    #[test]
+    fn a_report_is_never_placed_by_its_directory_alone() {
+        let mut app = app();
+        app.apply_reports(vec![report("gone", State::Done, "/p/4/app", 1)]);
+        assert_eq!(
+            app.inbox()[0].place(),
+            "app",
+            "tree 4 was returned and handed out again since"
+        );
+    }
+
     #[test]
     fn the_inbox_puts_what_needs_you_first_then_news_then_work_then_what_is_read() {
         let mut app = app();
+        dispatched(&mut app, "/p/8/app", "ask");
         app.apply_reports(vec![
             report("work", State::Working, "/p/8/app", 1),
             report("old-done", State::Done, "/p/4/app", 50),
@@ -2157,6 +2192,7 @@ mod tests {
     #[test]
     fn enter_in_the_inbox_replies_through_the_reports_agent_else_by_its_job() {
         let mut app = app();
+        dispatched(&mut app, "/p/4/app", "e6b79280");
         app.apply_reports(vec![report("e6b79280", State::Blocked, "/p/4/app", 1)]);
         press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Enter);

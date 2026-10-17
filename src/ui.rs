@@ -269,6 +269,7 @@ fn agent_style(status: Option<Status>) -> (&'static str, Style) {
         Some(Status::Waiting) => ("●", fg(t.warning).add_modifier(Modifier::BOLD)),
         Some(Status::Busy) => ("●", fg(t.success)),
         Some(Status::Idle) => ("○", fg(t.muted)),
+        Some(Status::Cold) => ("◌", fg(t.muted).add_modifier(Modifier::ITALIC)),
         None => ("·", Style::new()),
     }
 }
@@ -457,10 +458,10 @@ fn agents_line(app: &App, tree: &Tree) -> Line<'static> {
 
 fn agent_spans(agent: &Agent) -> Vec<Span<'static>> {
     let (glyph, style) = agent_style(agent.status);
-    let mut about = vec![
-        agent.source.label().to_string(),
-        format!("pid {}", agent.pid),
-    ];
+    let mut about = vec![agent.source.label().to_string()];
+    if let Some(pid) = agent.pid {
+        about.push(format!("pid {pid}"));
+    }
     if let Some(status) = agent.status {
         about.insert(0, status.label().to_string());
     }
@@ -694,8 +695,8 @@ fn draw_report(frame: &mut Frame, app: &App, area: Rect) {
         place.push(Span::styled(format!("  {}", dir.display()), fg(t.muted)));
     }
     let live = match item.agent {
-        Some(agent) => format!("running, pid {}", agent.pid),
-        None => "not running; c or a reply starts it again".into(),
+        Some(Agent { pid: Some(pid), .. }) => format!("running, pid {pid}"),
+        Some(Agent { pid: None, .. }) | None => "not running; c or a reply starts it again".into(),
     };
     place.push(Span::styled(
         format!("  job {} · {live}", item.report.job),

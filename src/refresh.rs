@@ -23,6 +23,7 @@ use crate::cache;
 use crate::live;
 use crate::pool::{self, Process, Tree, Work};
 use crate::reports::{self, Report};
+use crate::sidecar::{self, Sidecar};
 use crate::watch::Watcher;
 
 const FAST: Duration = Duration::from_secs(2);
@@ -35,6 +36,8 @@ pub enum Update {
     Processes(HashMap<PathBuf, Vec<Process>>),
     Work(HashMap<PathBuf, Option<Work>>),
     Agents(HashMap<PathBuf, Vec<Agent>>),
+    /// treetop's record of each tree it leased, read with the agents.
+    Sidecars(HashMap<PathBuf, Sidecar>),
     /// Every background agent's latest report, read with the agents.
     Reports(Vec<Report>),
 }
@@ -140,11 +143,13 @@ fn fast(
                 let processes = live::processes(&known);
                 let mut sent = Ok(());
                 if tick.is_multiple_of(GIT_EVERY) {
-                    let agents = agents::find(&known, &processes);
+                    let sidecars = sidecar::read_all(&known);
+                    let agents = agents::find(&known, &processes, &sidecars);
                     work.extend(live::work(watcher.take(&known, &work)));
                     work.retain(|path, _| known.iter().any(|t| t.is_held() && t.path == *path));
                     sent = updates
                         .send(Update::Work(work.clone()))
+                        .and_then(|()| updates.send(Update::Sidecars(sidecars)))
                         .and_then(|()| updates.send(Update::Agents(agents)))
                         .and_then(|()| updates.send(Update::Reports(reports.read())));
                 }

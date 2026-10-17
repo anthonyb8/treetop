@@ -10,6 +10,7 @@
 //!   "branch": "anthony/fix-login", "lease_id": null, "leased_at": 1792227120 }
 //! ```
 
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -17,7 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::pool;
+use crate::pool::{self, Tree};
 
 /// The format this treetop writes. A file from a newer one is left alone.
 pub const VERSION: u32 = 1;
@@ -65,6 +66,15 @@ pub fn read(tree: &Path) -> Option<Sidecar> {
     let text = fs::read_to_string(file(tree)?).ok()?;
     let sidecar: Sidecar = serde_json::from_str(&text).ok()?;
     (sidecar.version <= VERSION).then_some(sidecar)
+}
+
+/// The record of every tree in `trees` that has one.
+pub fn read_all(trees: &[Tree]) -> HashMap<PathBuf, Sidecar> {
+    trees
+        .iter()
+        .filter(|t| t.is_held() && !t.is_main)
+        .filter_map(|t| Some((t.path.clone(), read(&t.path)?)))
+        .collect()
 }
 
 /// Written through a temporary file and a rename, so a reader never sees

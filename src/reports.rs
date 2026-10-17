@@ -22,6 +22,8 @@ use std::time::{Duration, SystemTime};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::pool::Tree;
+
 /// How long a finished or stopped job stays in the inbox. One still working
 /// or waiting on you stays however old it is.
 const RECENT: Duration = Duration::from_secs(24 * 60 * 60);
@@ -163,6 +165,18 @@ fn report(job: &str, state_json: &str, timeline: &str, updated: SystemTime) -> O
 
 fn modified(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// The tree a report's job works in: the one whose sidecar names the job,
+/// or where its agent runs now. A job is never placed by its directory
+/// alone, since a tree that has been returned and handed out again would
+/// show the last agent's report.
+pub fn tree_of<'a>(report: &Report, trees: &'a [Tree]) -> Option<&'a Tree> {
+    let job = Some(report.job.as_str());
+    trees.iter().find(|tree| {
+        tree.sidecar.as_ref().and_then(|s| s.job.as_deref()) == job
+            || tree.agents.iter().any(|a| a.job.as_deref() == job)
+    })
 }
 
 /// Reads the jobs again only where their files have changed since the last

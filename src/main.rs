@@ -10,6 +10,7 @@ mod actions;
 mod agents;
 mod app;
 mod branch;
+mod builtin;
 mod cache;
 mod chat;
 mod child;
@@ -183,6 +184,7 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                         announce(&news)?;
                     }
                 }
+                Update::Sidecars(sidecars) => app.apply_sidecars(sidecars),
                 Update::Agents(agents) => {
                     app.apply_agents(&agents);
                     let live: Vec<&Vec<String>> = agents
@@ -396,6 +398,11 @@ fn main() -> Result<()> {
     if let Some(answer) = cli::answer_anywhere(&args) {
         println!("{answer}");
         return Ok(());
+    }
+    if let [command, name] = args.as_slice()
+        && command == "plugin"
+    {
+        return builtin::serve(name);
     }
     let checkout = checkout_for(&start, args.is_empty())?;
     std::env::set_current_dir(&checkout)?;

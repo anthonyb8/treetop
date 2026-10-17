@@ -16,23 +16,26 @@
 //! Within a protocol, fields are only ever added, and both sides ignore the
 //! ones they do not know.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
+use std::sync::{LazyLock, Mutex, PoisonError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::builtin;
 use crate::child::{self, End};
 
 /// The protocol this treetop speaks.
 pub const PROTOCOL: u32 = 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
     /// Starts, finds, attaches to, messages and stops agents.
@@ -61,7 +64,7 @@ pub struct Description {
     pub ops: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Code {
     NotFound,
@@ -88,7 +91,7 @@ impl Code {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Error {
     pub code: Code,
     #[serde(default)]
@@ -96,7 +99,7 @@ pub struct Error {
 }
 
 impl Error {
-    fn new(code: Code, message: impl Into<String>) -> Self {
+    pub fn new(code: Code, message: impl Into<String>) -> Self {
         Error {
             code,
             message: message.into(),
@@ -145,20 +148,13 @@ pub fn dir() -> Option<PathBuf> {
 
 /// Runs `op` on the plugin at `program` with `args`, and returns its result.
 pub fn call(program: &Path, op: &str, args: Value, limit: Duration) -> Result<Value, Error> {
-    call_command(Command::new(program), op, args, limit)
-}
-
-/// Runs `op` on the plugin `command` starts, which for a built-in is treetop
-/// itself, with `args`.
-pub fn call_command(
-    mut command: Command,
-    op: &str,
-    args: Value,
-    limit: Duration,
-) -> Result<Value, Error> {
     let request = json!({ "protocol": PROTOCOL, "op": op, "config": {}, "args": args });
-    let ran = child::run(&mut command, Some(request.to_string().into_bytes()), limit)
-        .map_err(|err| Error::new(Code::Unavailable, err.to_string()))?;
+    let ran = child::run(
+        &mut Command::new(program),
+        Some(request.to_string().into_bytes()),
+        limit,
+    )
+    .map_err(|err| Error::new(Code::Unavailable, err.to_string()))?;
     let stderr = String::from_utf8_lossy(&ran.stderr).trim().to_string();
     match ran.end {
         End::Exited(status) => reply(&ran.stdout, status, stderr),
@@ -251,6 +247,113 @@ pub fn discover(dir: &Path) -> Vec<Found> {
         })
         .collect();
     handles.into_iter().filter_map(|h| h.join().ok()).collect()
+}
+
+/// An agent as an agent plugin's `find` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Seen {
+    /// What `attach`, `send` and `stop` take; None for an agent they cannot
+    /// reach.
+    #[serde(default)]
+    pub id: Option<String>,
+    pub name: String,
+    /// Where it works, which places it in a tree.
+    pub dir: PathBuf,
+    /// Running now. One that is not is cold, and opening it starts it again.
+    #[serde(default = "running")]
+    pub live: bool,
+    #[serde(default)]
+    pub pid: Option<u32>,
+    /// `busy`, `idle` or `waiting`, where the plugin can tell.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Runs with no terminal of its own.
+    #[serde(default)]
+    pub background: bool,
+    /// The command that opens its chat in a terminal.
+    #[serde(default)]
+    pub attach: Option<Vec<String>>,
+}
+
+fn running() -> bool {
+    true
+}
+
+/// A plugin treetop can call: one it ships, answered in process with the
+/// same requests and replies `treetop plugin <name>` serves, or one in the
+/// plugin directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Plugin {
+    Builtin(&'static str),
+    External { name: String, path: PathBuf },
+}
+
+impl Plugin {
+    pub fn name(&self) -> &str {
+        match self {
+            Plugin::Builtin(name) => name,
+            Plugin::External { name, .. } => name,
+        }
+    }
+
+    pub fn call(&self, op: &str, args: Value) -> Result<Value, Error> {
+        match self {
+            Plugin::Builtin(name) => builtin::handle(name, op, &args),
+            Plugin::External { path, .. } => call(path, op, args, timeout(op)),
+        }
+    }
+}
+
+/// What each plugin file said it is, with the file's modification time, so
+/// a plugin is described again only once it changes.
+type Described = HashMap<PathBuf, (Option<SystemTime>, Result<Description, Error>)>;
+
+static DESCRIBED: LazyLock<Mutex<Described>> = LazyLock::new(Mutex::default);
+
+fn described(path: &Path) -> Result<Description, Error> {
+    let modified = fs::metadata(path).and_then(|m| m.modified()).ok();
+    if let Some((at, description)) = DESCRIBED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(path)
+        && *at == modified
+    {
+        return description.clone();
+    }
+    let description = describe(path);
+    DESCRIBED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(path.to_path_buf(), (modified, description.clone()));
+    description
+}
+
+/// Every plugin of `kind`: the user's, then each built-in no plugin of the
+/// user's replaces by name.
+pub fn of_kind(kind: Kind) -> Vec<Plugin> {
+    let mut plugins: Vec<Plugin> = dir()
+        .map(|dir| executables(&dir))
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|path| {
+            let description = described(&path).ok()?;
+            (description.kind == kind).then_some(Plugin::External {
+                name: description.name,
+                path,
+            })
+        })
+        .collect();
+    for (name, builtin_kind) in builtin::KINDS {
+        if builtin_kind == kind && !plugins.iter().any(|p| p.name() == name) {
+            plugins.push(Plugin::Builtin(name));
+        }
+    }
+    plugins
+}
+
+/// The plugin of `kind` named `name`, whoever provides it.
+pub fn named(kind: Kind, name: &str) -> Option<Plugin> {
+    of_kind(kind).into_iter().find(|p| p.name() == name)
 }
 
 #[cfg(test)]

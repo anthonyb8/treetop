@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 
 use crate::agents;
 use crate::app::report_state;
+use crate::builtin;
 use crate::cache;
 use crate::chat::Chats;
 use crate::coordinator;
@@ -31,7 +32,8 @@ const USAGE: &str = "usage:
   treetop dispatch <new|main|N> <task>
                                    start a new agent on a task in a fresh tree,
                                    the main checkout or tree N
-  treetop plugins                  every plugin found, and what each says it is";
+  treetop plugins                  every plugin, built in or found, and what each is
+  treetop plugin <name>            answer one request on stdin as a built-in plugin";
 
 /// How long `send` waits for every message to go in.
 const SEND_TIMEOUT: Duration = Duration::from_secs(45);
@@ -57,16 +59,13 @@ pub fn answer_anywhere(args: &[String]) -> Option<String> {
 }
 
 /// One line per file in the plugin directory: its name, kind, path and
-/// ops, or why treetop cannot use it.
+/// ops, or why treetop cannot use it; then each built-in none replaces.
 fn plugins() -> String {
     let Some(dir) = plugin::dir() else {
         return "no plugin directory: neither XDG_CONFIG_HOME nor HOME is set".into();
     };
     let found = plugin::discover(&dir);
-    if found.is_empty() {
-        return format!("no plugins in {}", dir.display());
-    }
-    let lines: Vec<String> = found
+    let mut lines: Vec<String> = found
         .iter()
         .map(|found| match &found.description {
             Ok(d) => format!(
@@ -79,6 +78,22 @@ fn plugins() -> String {
             Err(err) => format!("{:<16} {:<8} {}: {err}", "-", "-", found.path.display()),
         })
         .collect();
+    if found.is_empty() {
+        lines.push(format!("no plugins in {}", dir.display()));
+    }
+    let replaced = |name: &str| {
+        found
+            .iter()
+            .any(|f| f.description.as_ref().is_ok_and(|d| d.name == name))
+    };
+    for (name, kind) in builtin::KINDS {
+        if !replaced(name) {
+            lines.push(format!(
+                "{name:<16} {:<8} built in (treetop plugin {name})",
+                kind.label()
+            ));
+        }
+    }
     lines.join("\n")
 }
 
@@ -119,10 +134,12 @@ fn cached_listing(checkout: &Path) -> Result<Vec<Tree>> {
 /// Fills in each tree's processes and agents.
 fn read_agents(trees: &mut [Tree]) {
     let processes = live::processes(trees);
-    let mut agents = agents::find(trees, &processes);
+    let sidecars = sidecar::read_all(trees);
+    let mut agents = agents::find(trees, &processes, &sidecars);
     for tree in trees.iter_mut() {
         tree.processes = processes.get(&tree.path).cloned().unwrap_or_default();
         tree.agents = agents.remove(&tree.path).unwrap_or_default();
+        tree.sidecar = sidecars.get(&tree.path).cloned().map(Box::new);
     }
 }
 
@@ -149,13 +166,7 @@ fn status_json(trees: &[Tree], reports: &[Report], now: SystemTime) -> Value {
         .iter()
         .filter(|r| r.name != coordinator::NAME)
         .collect();
-    let holding = |report: &Report| {
-        report
-            .dir
-            .as_deref()
-            .and_then(|dir| pool::holding(trees, dir))
-            .map(|tree| tree.path.clone())
-    };
+    let holding = |report: &Report| reports::tree_of(report, trees).map(|tree| tree.path.clone());
     let mut listed = Vec::new();
     let mut available = 0;
     for tree in trees {
@@ -191,7 +202,7 @@ fn status_json(trees: &[Tree], reports: &[Report], now: SystemTime) -> Value {
             "ports": tree.ports(),
             "agents": agents,
             "reports": tree_reports,
-            "sidecar": sidecar::read(&tree.path),
+            "sidecar": tree.sidecar,
         }));
     }
     let elsewhere: Vec<Value> = reports
@@ -261,10 +272,7 @@ fn recipients(trees: &[Tree], reports: &[Report], target: &str) -> Vec<Recipient
         .max_by_key(|r| r.updated)
         .map(|r| Recipient {
             agent: r.name.clone(),
-            tree: r
-                .dir
-                .as_deref()
-                .and_then(|dir| pool::holding(trees, dir))
+            tree: reports::tree_of(r, trees)
                 .map_or_else(|| "outside the pool".into(), |t| t.name.clone()),
             command: vec!["claude".into(), "attach".into(), r.job.clone()],
         })
@@ -358,9 +366,9 @@ mod tests {
     fn agent(name: &str, job: &str) -> Agent {
         Agent {
             name: name.into(),
-            pid: 1,
+            pid: Some(1),
             status: Some(Status::Busy),
-            source: Source::Claude,
+            source: Source::Plugin,
             is_background: true,
             attach: Some(vec!["claude".into(), "attach".into(), job.into()]),
             job: Some(job.into()),

@@ -108,9 +108,10 @@ A pid two sources both see counts once, where the more specific source saw it; a
   { "name": "fix-login", "pid": 4242, "status": "waiting", "attach": ["my-agent", "attach", "fix-login"] }
   ```
 
-- **Claude Code**, whose `EnterWorktree` moves a session into a tree without changing its process's working directory.
-  treetop reads its running sessions from `~/.claude/sessions` (or `$CLAUDE_CONFIG_DIR`), checks each pid is the one that started the session, and takes the tree from the latest `cwd` in the session's transcript.
+- **Agent plugins** (see [Plugins](#plugins)), each asked what agents it sees. Claude Code's is built in: Claude Code's `EnterWorktree` moves a session into a tree without changing its process's working directory, so the plugin reads its running sessions from `~/.claude/sessions` (or `$CLAUDE_CONFIG_DIR`), checks each pid is the one that started the session, and takes the tree from the latest `cwd` in the session's transcript.
   This gives the session's name and whether it is busy, idle or waiting on you.
+  It also reports every background job in `~/.claude/jobs` with no running session as a **cold** agent, drawn `◌`: `c` attaches to it, which starts it again with its conversation kept.
+  A cold agent shows only in the tree whose `treetop.json` names its job, so a tree that has been returned and handed out again never shows the last agent.
   These files are internal to Claude Code, so a release that changes them blanks this source until treetop catches up.
 - **A process** standing in the tree whose name, or the script its interpreter runs, is a known agent: `claude`, `codex`, `aider`, `opencode`, `gemini`, `goose`, `amp` or `cursor-agent`.
   `TREETOP_AGENTS=one,two` adds names. This sees any agent started inside a tree, by name only.
@@ -136,6 +137,19 @@ treetop runs it once per call, writes one request and closes stdin, then reads o
 - An error's `code` is one of `not_found`, `unsupported`, `auth`, `conflict`, `unavailable` or `failed`; any other reads as `failed`. A non-zero exit or a reply that is not JSON fails with what the plugin wrote to stderr.
 - Each call has a timeout: 3 s for `describe` and `find`, 10 s for `list` and `get`, 30 s for anything else. The plugin runs in its own process group, which is killed at the timeout, so it must not leave a child holding its stdout once it exits.
 - Fields are only ever added within a protocol, so a plugin should ignore the ones it does not know.
+
+An agent plugin answers these ops:
+
+| Op | Args | Result |
+|---|---|---|
+| `start` | `dir`, `name`, `prompt` | `id`, once the agent runs |
+| `find` | `dirs` | `agents`: each with `id`, `name`, `dir`, `live`, and optionally `pid`, `status` (`busy`, `idle` or `waiting`), `background` and `attach` |
+| `attach` | `id` | `argv`, the command that opens its chat in a terminal |
+| `send` | `id`, `text` | `delivered`, for an agent that is not running |
+| `stop` | `id` | nothing |
+
+Claude Code's plugin is built in, and `treetop plugin claude` serves it on stdin and stdout like any other; a plugin of your own named `claude` replaces it.
+treetop starts new agents with it unless `TREETOP_NEW_AGENT` names a command.
 
 ## What the actions run
 
