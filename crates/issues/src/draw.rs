@@ -17,7 +17,7 @@ use crate::screen::{Focus, Screen};
 use crate::{Palette, line};
 
 /// The bar's keys, most used first; `?` lists them all.
-const KEYS: [(&str, &str); 13] = [
+const KEYS: [(&str, &str); 15] = [
     ("Enter", "pick up"),
     ("?", "help"),
     ("→", "read"),
@@ -25,6 +25,8 @@ const KEYS: [(&str, &str); 13] = [
     ("l", "labels"),
     ("a", "assign"),
     ("c", "comment"),
+    ("n", "new"),
+    ("e", "edit"),
     ("/", "filter"),
     ("m", "mine"),
     ("w", "source"),
@@ -34,7 +36,7 @@ const KEYS: [(&str, &str); 13] = [
 ];
 
 /// Every key, for the `?` overlay.
-const HELP: [(&str, &str); 18] = [
+const HELP: [(&str, &str); 20] = [
     ("Enter", "pick it up: an agent on it in a new tree"),
     ("→", "read it: the description and comments take the keys"),
     ("← h Esc", "back to the list"),
@@ -45,6 +47,11 @@ const HELP: [(&str, &str); 18] = [
         "c",
         "comment: Markdown, Alt+Enter for a new line, Enter sends",
     ),
+    (
+        "n",
+        "new issue: title, status, labels, assignee, project, then $EDITOR",
+    ),
+    ("e", "edit: the title here, then the description in $EDITOR"),
     (
         "/",
         "filter: mine label:Bug state:\"In Review\" project:x cycle:current, words",
@@ -466,7 +473,11 @@ fn draw_compose(frame: &mut Frame, area: Rect, compose: &Compose, p: &Palette) {
         }
         rows.extend(chars.chunks(inner_width).map(|c| c.iter().collect()));
     }
-    let shown = rows.len().clamp(6, 14);
+    let shown = if compose.is_one_line() {
+        rows.len().clamp(1, 3)
+    } else {
+        rows.len().clamp(6, 14)
+    };
     let height = u16::try_from(shown + 2)
         .unwrap_or(u16::MAX)
         .min(area.height);
@@ -479,11 +490,15 @@ fn draw_compose(frame: &mut Frame, area: Rect, compose: &Compose, p: &Palette) {
     let block = Block::bordered()
         .border_style(fg(p.accent))
         .title(Span::styled(
-            format!(" Comment on {} ", compose.issue),
+            compose.title(),
             fg(p.title).add_modifier(Modifier::BOLD),
         ))
         .title_bottom(Line::styled(
-            " Enter sends  Alt+Enter new line  Esc cancels ",
+            if compose.is_one_line() {
+                " Enter goes on  Esc cancels "
+            } else {
+                " Enter sends  Alt+Enter new line  Esc cancels "
+            },
             fg(p.muted),
         ));
     let inner = block.inner(popup);
@@ -491,8 +506,12 @@ fn draw_compose(frame: &mut Frame, area: Rect, compose: &Compose, p: &Palette) {
     frame.render_widget(block, popup);
     if compose.text.is_empty() {
         frame.render_widget(
-            Paragraph::new("Markdown; mention people with @name")
-                .style(fg(p.muted).add_modifier(Modifier::ITALIC)),
+            Paragraph::new(if compose.is_one_line() {
+                ""
+            } else {
+                "Markdown; mention people with @name"
+            })
+            .style(fg(p.muted).add_modifier(Modifier::ITALIC)),
             inner,
         );
         frame.set_cursor_position((inner.x, inner.y));

@@ -12,6 +12,7 @@ pub enum Kind {
     Status,
     Labels,
     Assignee,
+    Project,
 }
 
 impl Kind {
@@ -20,6 +21,7 @@ impl Kind {
             Kind::Status => "Status",
             Kind::Labels => "Labels",
             Kind::Assignee => "Assignee",
+            Kind::Project => "Project",
         }
     }
 }
@@ -99,6 +101,14 @@ impl Picker {
                 );
                 (choices, issue.assignee_id.clone())
             }
+            Kind::Project => {
+                let mut choices = vec![Choice {
+                    id: None,
+                    name: "no project".into(),
+                }];
+                choices.extend(named(&team.projects));
+                (choices, issue.project_id.clone())
+            }
         };
         let marked = match kind {
             Kind::Labels => issue.label_ids.iter().cloned().collect(),
@@ -170,6 +180,15 @@ impl Picker {
                 after.assignee_id = choice.id.clone();
                 Change {
                     assignee_id: Some(choice.id.clone()),
+                    ..Change::default()
+                }
+            }
+            Kind::Project => {
+                let choice = self.shown().get(self.cursor).copied()?;
+                after.project = choice.id.as_ref().map(|_| choice.name.clone());
+                after.project_id = choice.id.clone();
+                Change {
+                    project_id: Some(choice.id.clone()),
                     ..Change::default()
                 }
             }

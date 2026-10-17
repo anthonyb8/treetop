@@ -6,10 +6,11 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
-use linear::{Change, Comment, Detail, Issue, Team};
+use linear::{Change, Comment, Detail, Issue, NewIssue, Team};
 
 use crate::Filters;
 use crate::backend::Backend;
+use crate::screen::Draft;
 
 pub(crate) enum Request {
     List {
@@ -36,6 +37,13 @@ pub(crate) enum Request {
         issue: Box<Issue>,
         body: String,
     },
+    /// Create `new`, put together as `draft`, which `n` starts from again if
+    /// it is refused.
+    Create {
+        source: usize,
+        new: Box<NewIssue>,
+        draft: Box<Draft>,
+    },
 }
 
 impl Request {
@@ -44,7 +52,10 @@ impl Request {
         match self {
             Request::List { .. } => Some(0),
             Request::Detail { .. } => Some(1),
-            Request::Team { .. } | Request::Update { .. } | Request::Comment { .. } => None,
+            Request::Team { .. }
+            | Request::Update { .. }
+            | Request::Comment { .. }
+            | Request::Create { .. } => None,
         }
     }
 }
@@ -67,6 +78,11 @@ pub(crate) enum Reply {
     Updated {
         source: usize,
         before: Box<Issue>,
+        result: Result<Box<Issue>, String>,
+    },
+    Created {
+        source: usize,
+        draft: Box<Draft>,
         result: Result<Box<Issue>, String>,
     },
     Commented {
@@ -111,6 +127,11 @@ fn run(backends: &[Arc<dyn Backend>], request: Request) -> Option<Reply> {
             source,
             result: backends.get(source)?.update(&before, &change).map(Box::new),
             before,
+        },
+        Request::Create { source, new, draft } => Reply::Created {
+            source,
+            result: backends.get(source)?.create(&new).map(Box::new),
+            draft,
         },
         Request::Comment {
             source,

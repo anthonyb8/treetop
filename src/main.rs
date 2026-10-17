@@ -140,6 +140,33 @@ fn announce(news: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Opens `text` in the user's editor, `$VISUAL`, else `$EDITOR`, else `vi`,
+/// with treetop's screen given back to the terminal until it exits, and
+/// returns what was saved.
+fn edit_in_editor(term: &mut Term, text: &str) -> Result<String, String> {
+    let path = std::env::temp_dir().join(format!("treetop-issue-{}.md", std::process::id()));
+    std::fs::write(&path, text).map_err(|err| format!("{}: {err}", path.display()))?;
+    let editor = ["VISUAL", "EDITOR"]
+        .iter()
+        .find_map(|name| std::env::var(name).ok().filter(|v| !v.trim().is_empty()))
+        .unwrap_or_else(|| "vi".into());
+    let mut words = editor.split_whitespace();
+    let program = words.next().unwrap_or("vi");
+    leave_screen().map_err(|err| format!("{err:#}"))?;
+    let status = std::process::Command::new(program)
+        .args(words)
+        .arg(&path)
+        .status();
+    *term = enter_screen().map_err(|err| format!("{err:#}"))?;
+    let saved = std::fs::read_to_string(&path);
+    let _ = std::fs::remove_file(&path);
+    match status {
+        Ok(status) if status.success() => saved.map_err(|err| err.to_string()),
+        Ok(status) => Err(format!("{program} {status}")),
+        Err(err) => Err(format!("{program}: {err}")),
+    }
+}
+
 /// Why `run` stopped showing a pool.
 enum Exit {
     Quit,
@@ -236,10 +263,15 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                 Some(screen) if !was_issues => screen.open(),
                 Some(_) => {}
             }
-            if let Some(screen) = issues.as_mut()
-                && screen.poll()
-            {
-                is_stale = true;
+            if let Some(screen) = issues.as_mut() {
+                is_stale |= screen.poll();
+                if let Some(text) = screen.take_editor() {
+                    refresher.set_paused(true);
+                    let edited = edit_in_editor(term, &text);
+                    refresher.set_paused(false);
+                    screen.edited(edited);
+                    is_stale = true;
+                }
             }
         }
         was_issues = app.is_issues;

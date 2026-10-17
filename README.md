@@ -336,6 +336,10 @@ With no `state:`, only open issues show.
 The change shows on the row at once and is sent behind it; if Linear refuses it, the row goes back to what it was and the bar says why.
 `c` writes a comment on the issue: Markdown, Alt+Enter for a new line, Enter to post it under the issue's other comments; one Linear refuses opens again with its text, so nothing written is lost.
 
+`n` creates an issue in the source's team: its title, then the status, labels, assignee and project pickers in turn (Enter keeps what each starts on: the team's first open state, no labels, you, no project), then its description in your editor (`$VISUAL`, else `$EDITOR`, else `vi`).
+It appears at the top of the list once Linear has it; one Linear refuses is kept, and `n` starts again from it.
+`e` edits the issue under the cursor: its title in place, then its description in your editor; only what changed is sent.
+
 A Linear source gets all of this; an issue source on another ticket plugin lists and reads through the plugin contract, and its edits say they cannot be made.
 
 Enter picks the issue under the cursor up, in one step:

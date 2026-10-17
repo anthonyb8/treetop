@@ -10,7 +10,7 @@ use linear::{Detail, Issue, Team};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::backend::{Backend, READ_ONLY};
-use crate::compose::{Compose, Edit};
+use crate::compose::{Compose, Edit, Purpose};
 use crate::picker::{self, Picked, Picker};
 use crate::views::{self, Group, View};
 use crate::worker::{Reply, Request, Worker};
@@ -18,6 +18,36 @@ use crate::{Filters, line, parse};
 
 /// How old a list may get on screen before it is read again.
 const STALE: Duration = Duration::from_secs(60);
+
+/// The pickers a new issue goes through, in order, before its description.
+const STEPS: [picker::Kind; 4] = [
+    picker::Kind::Status,
+    picker::Kind::Labels,
+    picker::Kind::Assignee,
+    picker::Kind::Project,
+];
+
+/// A new issue being put together: its title, then what its pickers chose,
+/// held on an issue the pickers read, then its description.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Draft {
+    pub(crate) title: String,
+    pub(crate) description: Option<String>,
+    pub(crate) issue: Issue,
+    /// The next picker, an index into STEPS.
+    pub(crate) step: usize,
+}
+
+/// What text in the user's editor is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Editor {
+    New(Box<Draft>),
+    /// The description of the issue with this id, saved with its new title.
+    Edit {
+        id: String,
+        title: String,
+    },
+}
 
 /// What a key asks the program around the screen to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,15 +89,25 @@ pub struct Screen {
     pub(crate) scroll: u16,
     /// Each issue's detail as last read, by id.
     pub(crate) details: HashMap<String, Detail>,
-    /// The issue whose detail was last asked for, so it is asked once.
-    asked: Option<String>,
+    /// The issue whose detail was last asked for, by id and the time it last
+    /// changed, so each version of it is asked for once.
+    asked: Option<(String, String)>,
     pub(crate) teams: HashMap<usize, Arc<Team>>,
     /// Sources whose issues cannot be changed from here.
     read_only: HashSet<usize>,
     /// The picker open over the list, if one is.
     pub(crate) picker: Option<Picker>,
-    /// The comment being written, if one is.
+    /// The comment or title being written, if one is.
     pub(crate) compose: Option<Compose>,
+    /// A new issue being put together, while its pickers are open.
+    pub(crate) draft: Option<Draft>,
+    /// A new issue Linear refused, which `n` starts from again.
+    retry: Option<Draft>,
+    /// Text waiting for the program to open in the user's editor, taken
+    /// once.
+    editor_text: Option<String>,
+    /// What the text in the user's editor is for, until it comes back.
+    editor: Option<Editor>,
     pub(crate) is_loading: bool,
     pub(crate) error: Option<String>,
     pub(crate) message: Option<String>,
@@ -104,6 +144,10 @@ impl Screen {
             read_only: HashSet::new(),
             picker: None,
             compose: None,
+            draft: None,
+            retry: None,
+            editor_text: None,
+            editor: None,
             is_loading: false,
             error: None,
             message: None,
@@ -141,7 +185,8 @@ impl Screen {
         let issue = self.current()?;
         self.details
             .get(&issue.id)
-            .filter(|d| d.issue.updated_at == issue.updated_at || issue.updated_at.is_empty())
+            // Times are RFC 3339 in one format, so they compare as text.
+            .filter(|d| d.issue.updated_at >= issue.updated_at)
     }
 
     /// Asks for the list again, and the team when it is not known yet.
@@ -184,10 +229,10 @@ impl Screen {
         }
         if let Some(issue) = self.current()
             && self.detail().is_none()
-            && self.asked.as_deref() != Some(issue.id.as_str())
+            && self.asked.as_ref() != Some(&(issue.id.clone(), issue.updated_at.clone()))
         {
             let id = issue.id.clone();
-            self.asked = Some(id.clone());
+            self.asked = Some((id.clone(), issue.updated_at.clone()));
             self.worker.send(Request::Detail {
                 source: self.source,
                 id,
@@ -273,6 +318,27 @@ impl Screen {
                 self.message = Some(said);
                 self.replace(issue);
             }
+            Reply::Created {
+                source,
+                draft,
+                result,
+            } => match result {
+                Ok(issue) if source == self.source => {
+                    self.message = Some(format!("created {}", issue.id));
+                    self.retry = None;
+                    self.issues.insert(0, *issue);
+                    self.arrange();
+                    self.selected = 0;
+                    self.scroll = 0;
+                }
+                Ok(issue) => self.message = Some(format!("created {}", issue.id)),
+                Err(err) => {
+                    self.message = Some(format!(
+                        "could not create it: {err}; n starts again from it"
+                    ));
+                    self.retry = Some(*draft);
+                }
+            },
             Reply::Commented {
                 source,
                 id,
@@ -291,7 +357,7 @@ impl Screen {
                 Err(err) => {
                     self.message = Some(format!("{id}: {err}; the comment is still in the box"));
                     if source == self.source && self.compose.is_none() {
-                        self.compose = Some(Compose::new(&id, body));
+                        self.compose = Some(Compose::new(Purpose::Comment(id), body));
                     }
                 }
             },
@@ -314,20 +380,169 @@ impl Screen {
             self.message = Some(READ_ONLY.into());
             return;
         }
-        self.compose = Some(Compose::new(&issue.id, String::new()));
+        self.compose = Some(Compose::new(
+            Purpose::Comment(issue.id.clone()),
+            String::new(),
+        ));
     }
 
-    /// Posts the comment in the box on its issue.
-    fn post(&mut self, compose: Compose) {
-        let Some(issue) = self.issues.iter().find(|i| i.id == compose.issue).cloned() else {
-            self.message = Some(format!("{} is no longer listed", compose.issue));
+    /// Posts `body` as a comment on the issue with id `id`.
+    fn post(&mut self, id: &str, body: &str) {
+        let Some(issue) = self.issues.iter().find(|i| i.id == id).cloned() else {
+            self.message = Some(format!("{id} is no longer listed"));
             return;
         };
         self.message = Some(format!("commenting on {}...", issue.id));
         self.worker.send(Request::Comment {
             source: self.source,
             issue: Box::new(issue),
-            body: compose.text.trim_end().to_string(),
+            body: body.trim_end().to_string(),
+        });
+    }
+
+    /// The team of the source on screen, if its issues can be changed and it
+    /// has been read; else says why not, and asks for it.
+    fn team_to_change(&mut self) -> Option<Arc<Team>> {
+        if self.read_only.contains(&self.source) {
+            self.message = Some(READ_ONLY.into());
+            return None;
+        }
+        let team = self.teams.get(&self.source).cloned();
+        if team.is_none() {
+            self.message = Some(format!(
+                "reading {}'s states, labels and members; try again in a moment",
+                self.source_name()
+            ));
+            self.worker.send(Request::Team {
+                source: self.source,
+            });
+        }
+        team
+    }
+
+    /// Starts a new issue with its title, or the one Linear last refused.
+    fn open_new(&mut self) {
+        if self.team_to_change().is_none() {
+            return;
+        }
+        let title = self
+            .retry
+            .as_ref()
+            .map(|d| d.title.clone())
+            .unwrap_or_default();
+        self.compose = Some(Compose::new(Purpose::NewTitle, title));
+    }
+
+    /// Opens the next picker of the new issue, or, after the last, its
+    /// description in the editor.
+    fn next_step(&mut self, mut draft: Draft) {
+        let Some(team) = self.teams.get(&self.source).cloned() else {
+            return;
+        };
+        match STEPS.get(draft.step) {
+            Some(kind) => {
+                draft.step += 1;
+                self.picker = Some(Picker::new(*kind, &draft.issue, &team));
+                self.draft = Some(draft);
+            }
+            None => {
+                self.editor_text = Some(draft.description.clone().unwrap_or_default());
+                self.editor = Some(Editor::New(Box::new(draft)));
+            }
+        }
+    }
+
+    /// Edits the issue under the cursor: its title here, then its
+    /// description in the editor.
+    fn open_edit(&mut self) {
+        let Some(issue) = self.current() else {
+            return;
+        };
+        let id = issue.id.clone();
+        let title = issue.title.clone();
+        if self.team_to_change().is_none() {
+            return;
+        }
+        if self.detail().is_none() {
+            self.message = Some(format!("reading {id}; try e again in a moment"));
+            return;
+        }
+        self.compose = Some(Compose::new(Purpose::Title(id), title));
+    }
+
+    /// Text for the user's editor, taken once: the program opens it, then
+    /// hands back what was written to `edited`.
+    pub fn take_editor(&mut self) -> Option<String> {
+        self.editor_text.take()
+    }
+
+    /// What the user's editor gave back, or why it gave nothing.
+    pub fn edited(&mut self, result: Result<String, String>) {
+        let Some(editor) = self.editor.take() else {
+            return;
+        };
+        let text = match result {
+            Ok(text) => text.trim().to_string(),
+            Err(err) => {
+                self.message = Some(format!("the editor did not run: {err}"));
+                if let Editor::New(draft) = editor {
+                    self.retry = Some(*draft);
+                }
+                return;
+            }
+        };
+        match editor {
+            Editor::New(mut draft) => {
+                draft.description = Some(text).filter(|t| !t.is_empty());
+                self.create(*draft);
+            }
+            Editor::Edit { id, title } => {
+                let Some(before) = self.issues.iter().find(|i| i.id == id).cloned() else {
+                    return;
+                };
+                let old = self
+                    .details
+                    .get(&id)
+                    .and_then(|d| d.issue.description.clone())
+                    .unwrap_or_default();
+                let change = linear::Change {
+                    title: Some(title.clone()).filter(|t| *t != before.title),
+                    description: Some(text).filter(|t| t.trim() != old.trim()),
+                    ..linear::Change::default()
+                };
+                if change.is_empty() {
+                    self.message = Some(format!("{id} unchanged"));
+                    return;
+                }
+                if let Some(at) = self.issues.iter().position(|i| i.id == id) {
+                    self.selected = at;
+                }
+                let after = Issue { title, ..before };
+                self.change(change, after);
+            }
+        }
+    }
+
+    /// Sends the new issue `draft` describes.
+    fn create(&mut self, draft: Draft) {
+        let Some(team) = self.teams.get(&self.source) else {
+            return;
+        };
+        let new = linear::NewIssue {
+            team_id: team.id.clone(),
+            title: draft.title.clone(),
+            description: draft.description.clone(),
+            state_id: draft.issue.state_id.clone(),
+            assignee_id: draft.issue.assignee_id.clone(),
+            label_ids: draft.issue.label_ids.clone(),
+            project_id: draft.issue.project_id.clone(),
+            priority: None,
+        };
+        self.message = Some(format!("creating {}...", draft.title));
+        self.worker.send(Request::Create {
+            source: self.source,
+            new: Box::new(new),
+            draft: Box::new(draft),
         });
     }
 
@@ -365,6 +580,61 @@ impl Screen {
             return;
         };
         self.picker = Some(Picker::new(kind, issue, team));
+    }
+
+    /// What the box was written for, now that Enter sent it.
+    fn sent(&mut self, compose: Compose) {
+        match compose.purpose {
+            Purpose::Comment(id) => self.post(&id, &compose.text),
+            Purpose::NewTitle => {
+                let title = compose.text.trim().to_string();
+                let draft = match self.retry.take() {
+                    Some(retry) => Draft {
+                        title,
+                        step: 0,
+                        ..retry
+                    },
+                    None => self.new_draft(title),
+                };
+                self.next_step(draft);
+            }
+            Purpose::Title(id) => {
+                let description = self
+                    .details
+                    .get(&id)
+                    .and_then(|d| d.issue.description.clone())
+                    .unwrap_or_default();
+                let title = compose.text.trim().to_string();
+                self.editor_text = Some(description);
+                self.editor = Some(Editor::Edit { id, title });
+            }
+        }
+    }
+
+    /// A new issue titled `title`, in the team's first open state and
+    /// assigned to you, until the pickers say otherwise.
+    fn new_draft(&self, title: String) -> Draft {
+        let team = self.teams.get(&self.source);
+        let state = team.and_then(|t| {
+            t.states
+                .iter()
+                .find(|s| s.kind == "unstarted")
+                .or_else(|| t.states.first())
+        });
+        let me = team.and_then(|t| t.me.clone());
+        Draft {
+            title,
+            description: None,
+            step: 0,
+            issue: Issue {
+                id: "new issue".into(),
+                state: state.map(|s| s.name.clone()).unwrap_or_default(),
+                state_id: state.map(|s| s.id.clone()),
+                assignee: me.as_ref().map(|m| m.name.clone()),
+                assignee_id: me.map(|m| m.id),
+                ..Issue::default()
+            },
+        }
     }
 
     /// Makes `change` on screen at once, and sends it.
@@ -463,12 +733,6 @@ impl Screen {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            return match key.code {
-                KeyCode::Char('c') => Action::Quit,
-                _ => Action::None,
-            };
-        }
         if self.is_help {
             self.is_help = false;
             return Action::None;
@@ -479,26 +743,51 @@ impl Screen {
                 Edit::Cancel => self.compose = None,
                 Edit::Send => {
                     if let Some(compose) = self.compose.take() {
-                        self.post(compose);
+                        self.sent(compose);
                     }
                 }
             }
             return Action::None;
         }
         if let Some(picker) = &mut self.picker {
-            let Some(issue) = self.issues.get(self.selected) else {
-                self.picker = None;
-                return Action::None;
+            let issue = match &self.draft {
+                Some(draft) => &draft.issue,
+                None => match self.issues.get(self.selected) {
+                    Some(issue) => issue,
+                    None => {
+                        self.picker = None;
+                        return Action::None;
+                    }
+                },
             };
             match picker.handle_key(key, issue) {
                 Picked::Continue => {}
-                Picked::Cancel => self.picker = None,
+                Picked::Cancel => {
+                    self.picker = None;
+                    if self.draft.take().is_some() {
+                        self.message = Some("new issue dropped".into());
+                    }
+                }
                 Picked::Apply(change, after) => {
                     self.picker = None;
-                    self.change(*change, *after);
+                    match self.draft.take() {
+                        Some(draft) => self.next_step(Draft {
+                            issue: *after,
+                            ..draft
+                        }),
+                        None => self.change(*change, *after),
+                    }
                 }
             }
             return Action::None;
+        }
+        // Ctrl keys belong to the boxes and pickers above; past them only
+        // Ctrl+C means anything, and it quits.
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return match key.code {
+                KeyCode::Char('c') => Action::Quit,
+                _ => Action::None,
+            };
         }
         if let Some(text) = &mut self.editing {
             match key.code {
@@ -567,6 +856,8 @@ impl Screen {
             KeyCode::Char('l') => self.open_picker(picker::Kind::Labels),
             KeyCode::Char('a') => self.open_picker(picker::Kind::Assignee),
             KeyCode::Char('c') => self.open_compose(),
+            KeyCode::Char('n') => self.open_new(),
+            KeyCode::Char('e') => self.open_edit(),
             KeyCode::Char('w') => self.next_source(),
             KeyCode::Char('o') => {
                 if let Some(url) = self.current().and_then(|i| i.url.clone()) {
@@ -600,6 +891,8 @@ mod tests {
         pub(crate) team: Option<Arc<Team>>,
         /// Why an update is refused, when it is.
         pub(crate) refuse: Option<String>,
+        /// Issues as their updates left them, by id.
+        pub(crate) changed: Mutex<HashMap<String, Issue>>,
     }
 
     impl Backend for Fake {
@@ -639,21 +932,40 @@ mod tests {
                     .iter()
                     .find(|s| Some(&s.id) == change.state_id.as_ref())
             });
-            Ok(Issue {
+            let updated = Issue {
                 state: state.map_or(issue.state.clone(), |s| s.name.clone()),
                 state_id: change.state_id.clone().or(issue.state_id.clone()),
+                title: change.title.clone().unwrap_or(issue.title.clone()),
                 updated_at: "2026-10-17T11:00:00Z".into(),
                 ..issue.clone()
+            };
+            self.changed
+                .lock()
+                .unwrap()
+                .insert(updated.id.clone(), updated.clone());
+            Ok(updated)
+        }
+
+        fn create(&self, new: &linear::NewIssue) -> Result<Issue, String> {
+            if let Some(why) = &self.refuse {
+                return Err(why.clone());
+            }
+            self.asked
+                .lock()
+                .unwrap()
+                .push(format!("create {} in {:?}", new.title, new.state_id));
+            Ok(Issue {
+                description: new.description.clone(),
+                state_id: new.state_id.clone(),
+                ..issue("END-900")
             })
         }
 
         fn detail(&self, id: &str) -> Result<Detail, String> {
             self.asked.lock().unwrap().push(format!("detail {id}"));
-            let issue = self
-                .issues
-                .iter()
-                .find(|i| i.id == id)
-                .cloned()
+            let changed = self.changed.lock().unwrap().get(id).cloned();
+            let issue = changed
+                .or_else(|| self.issues.iter().find(|i| i.id == id).cloned())
                 .unwrap_or_default();
             Ok(Detail {
                 issue: Issue {
@@ -984,6 +1296,129 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         screen
+    }
+
+    fn type_text(screen: &mut Screen, text: &str) {
+        for c in text.chars() {
+            screen.handle_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    fn wait_for(screen: &mut Screen, done: impl Fn(&Screen) -> bool) {
+        for _ in 0..200 {
+            screen.poll();
+            if done(screen) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn creating(refuse: Option<&str>) -> (Screen, Arc<Fake>) {
+        let fake = Arc::new(Fake {
+            name: "work".into(),
+            issues: vec![issue("END-1")],
+            team: Some(team_of(&["todo", "doing"])),
+            refuse: refuse.map(str::to_string),
+            ..Fake::default()
+        });
+        let mut screen = Screen::new(vec![fake.clone()], 0, Vec::new());
+        settle(&mut screen);
+        screen.handle_key(key(KeyCode::Char('n')));
+        type_text(&mut screen, "Fix login");
+        screen.handle_key(key(KeyCode::Enter));
+        for kind in ["Status", "Labels", "Assignee", "Project"] {
+            assert_eq!(screen.picker.as_ref().unwrap().kind.noun(), kind);
+            if kind == "Status" {
+                screen.handle_key(key(KeyCode::Down));
+            }
+            screen.handle_key(key(KeyCode::Enter));
+        }
+        assert!(screen.picker.is_none());
+        assert_eq!(screen.take_editor().as_deref(), Some(""), "then the editor");
+        assert_eq!(screen.take_editor(), None, "taken once");
+        screen.edited(Ok("Keep return_to.\n".into()));
+        wait_for(&mut screen, |s| {
+            s.message
+                .as_deref()
+                .is_some_and(|m| !m.starts_with("creating"))
+        });
+        (screen, fake)
+    }
+
+    #[test]
+    fn n_puts_a_new_issue_together_step_by_step_and_creates_it() {
+        let (screen, fake) = creating(None);
+        assert_eq!(screen.message.as_deref(), Some("created END-900"));
+        assert_eq!(
+            screen.current().unwrap().id,
+            "END-900",
+            "first, under the cursor"
+        );
+        assert_eq!(
+            screen.current().unwrap().description.as_deref(),
+            Some("Keep return_to.")
+        );
+        assert!(
+            fake.asked
+                .lock()
+                .unwrap()
+                .contains(&"create Fix login in Some(\"doing\")".to_string())
+        );
+    }
+
+    #[test]
+    fn a_new_issue_refused_is_kept_for_n_to_start_from_again() {
+        let (mut screen, _) = creating(Some("Linear: title too long"));
+        assert!(
+            screen
+                .message
+                .as_deref()
+                .unwrap()
+                .ends_with("n starts again from it")
+        );
+        screen.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(screen.compose.as_ref().unwrap().text, "Fix login");
+        screen.handle_key(key(KeyCode::Enter));
+        for _ in 0..4 {
+            screen.handle_key(key(KeyCode::Enter));
+        }
+        assert_eq!(
+            screen.take_editor().as_deref(),
+            Some("Keep return_to."),
+            "the description comes back too"
+        );
+    }
+
+    #[test]
+    fn e_edits_the_title_here_and_the_description_in_the_editor() {
+        let fake = Arc::new(Fake {
+            name: "work".into(),
+            issues: vec![issue("END-1")],
+            team: Some(team_of(&["todo"])),
+            ..Fake::default()
+        });
+        let mut screen = Screen::new(vec![fake], 0, Vec::new());
+        settle(&mut screen);
+        screen.handle_key(key(KeyCode::Char('e')));
+        assert_eq!(screen.compose.as_ref().unwrap().text, "END-1 title");
+        screen.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        type_text(&mut screen, "Fix the redirect");
+        screen.handle_key(key(KeyCode::Enter));
+        assert_eq!(screen.take_editor().as_deref(), Some("END-1 text"));
+        screen.edited(Ok("END-1 text".into()));
+        assert_eq!(screen.issues[0].title, "Fix the redirect", "shown at once");
+        wait_for(&mut screen, |s| {
+            s.message.as_deref() == Some("END-1 updated")
+        });
+        assert_eq!(screen.issues[0].title, "Fix the redirect");
+        // The issue changed, so its text is read again before the next edit.
+        wait_for(&mut screen, |s| s.detail().is_some());
+        screen.handle_key(key(KeyCode::Char('e')));
+        screen.handle_key(key(KeyCode::Enter));
+        screen.take_editor();
+        screen.edited(Ok("END-1 text".into()));
+        assert_eq!(screen.message.as_deref(), Some("END-1 unchanged"));
     }
 
     #[test]
