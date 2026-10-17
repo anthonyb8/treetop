@@ -310,7 +310,6 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             Outcome::Quit => return Ok(Exit::Quit),
             Outcome::Workspaces => app.open_picker(choices()),
             Outcome::Switch(path) => return Ok(Exit::Switch(path)),
-            Outcome::Refresh => refresher.refresh(),
             Outcome::Chat {
                 command,
                 agent,

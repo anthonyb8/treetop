@@ -21,26 +21,48 @@ use crate::popup;
 use crate::reports::{self, State};
 use crate::theme::theme;
 
-/// Most useful first: on a narrow bar the keys at the end are the ones left
-/// out.
-const KEYS: [(&str, &str); 17] = [
-    ("n", "ask/dispatch"),
-    ("w", "workspace"),
+/// The bar's keys, most useful first: on a narrow bar the keys at the end
+/// are the ones left out, and `?` lists them all.
+const KEYS: [(&str, &str); 10] = [
+    ("Enter", "open"),
+    ("?", "help"),
+    ("n", "new"),
     ("m", "message"),
-    ("t", "tree"),
-    ("c", "chat"),
+    ("c", "coordinator"),
     ("d", "diff"),
-    ("b", "branch"),
-    ("o", "open port"),
-    ("a", "no agent"),
-    ("Space", "mark"),
     ("r", "return"),
-    ("D", "destroy"),
+    ("Space", "mark"),
     ("/", "filter"),
     ("q", "quit"),
-    ("^R", "refresh"),
-    ("u", "unmark"),
-    ("j/k", "move"),
+];
+
+/// Every key on the list, for the `?` overlay.
+const HELP: [(&str, &str); 16] = [
+    (
+        "Enter",
+        "open the agent: its chat, a cold one started again, else its tree",
+    ),
+    (
+        "n",
+        "new agent in a fresh tree, on a branch named for the task",
+    ),
+    ("m", "message the agents in the marked trees, or this one"),
+    ("c", "ask the coordinator; send nothing to open its chat"),
+    ("d", "diff of the tree against its base"),
+    (
+        "r",
+        "return the marked trees, or this one; D in the dialog destroys",
+    ),
+    ("Space", "mark or unmark"),
+    ("/", "filter by tree, branch, holder or agent"),
+    ("o", "open the lowest port the tree serves"),
+    ("b", "rename the tree's branch"),
+    ("w", "switch workspace"),
+    ("j k ↑ ↓", "move"),
+    ("g G", "top, bottom"),
+    ("Esc", "clear the filter, then the marks"),
+    ("?", "this help"),
+    ("q", "quit"),
 ];
 
 /// Most useful first, as with `KEYS`; Esc stays early so the way out is
@@ -78,6 +100,7 @@ pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>) {
         || app.prompt.is_some()
         || app.opening.is_some()
         || app.picker.is_some()
+        || app.is_help
     {
         let area = frame.area();
         frame
@@ -98,6 +121,8 @@ pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>) {
         draw_review(frame, review, app.reviews.len() - 1);
     } else if let Some(pending) = &app.pending {
         draw_confirm(frame, pending);
+    } else if app.is_help {
+        draw_help(frame);
     }
 }
 
@@ -502,9 +527,6 @@ fn footer_left(app: &App, width: u16) -> Line<'static> {
     // What narrows the list is placed first, so the keys give way to it
     // rather than push it off the bar.
     let mut narrowing = Vec::new();
-    if app.is_orphans_only {
-        narrowing.push(Span::styled(" no agent only", fg(t.accent)));
-    }
     if !app.filter.is_empty() {
         narrowing.push(Span::styled(
             format!(" filter: {}", app.filter),
@@ -799,21 +821,16 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
     let text_height = u16::try_from(rows.len())
         .unwrap_or(u16::MAX)
         .clamp(COMPOSE_ROWS.0, COMPOSE_ROWS.1);
-    let targets = match &prompt.purpose {
-        Purpose::Dispatch { targets, at } => Some((targets, *at)),
-        Purpose::Message { .. } | Purpose::Rename { .. } => None,
-    };
-    // Borders, then the targets, the branch and a blank line when there are
-    // targets.
-    let chrome = if targets.is_some() { 5 } else { 2 };
+    // Borders, then the branch and a blank line when the box names one.
+    let chrome = if prompt.names_branch() { 4 } else { 2 };
     let area = popup::centered(screen, width, text_height + chrome);
     let (title, placeholder) = match (prompt.target(), &prompt.purpose) {
         (Some(Target::Coordinator), _) => (
             " Ask the coordinator ".to_string(),
             "ask about the agents or give it work; send nothing to just open its chat",
         ),
-        (Some(_), _) => (
-            " New agent ".to_string(),
+        (Some(Target::NewTree), _) => (
+            " New agent in a fresh tree ".to_string(),
             "the task, or nothing to start it idle and open its chat",
         ),
         (None, Purpose::Message { to }) => (
@@ -836,9 +853,6 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
     if prompt.names_branch() {
         keys.insert(0, ("↑↓", "branch"));
     }
-    if targets.is_some() {
-        keys.insert(0, ("Tab", "to"));
-    }
     let block = popup_block(Line::styled(
         title,
         fg(t.title).add_modifier(Modifier::BOLD),
@@ -854,22 +868,8 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
         inner.height,
     );
     let mut text_area = inner;
-    if let Some((targets, at)) = targets {
-        let mut spans = vec![Span::styled("to ", fg(t.muted))];
-        for (i, target) in targets.iter().enumerate() {
-            let label = format!(" {} ", target.label());
-            spans.push(if i == at {
-                Span::styled(label, t.badge)
-            } else {
-                Span::styled(label, fg(t.muted))
-            });
-            spans.push(Span::raw(" "));
-        }
-        frame.render_widget(
-            Paragraph::new(Line::from(spans)),
-            Rect::new(inner.x, inner.y, inner.width, 1),
-        );
-        let branch_row = Rect::new(inner.x, inner.y + 1, inner.width, 1);
+    if prompt.names_branch() {
+        let branch_row = Rect::new(inner.x, inner.y, inner.width, 1);
         frame.render_widget(Paragraph::new(branch_line(prompt)), branch_row);
         if prompt.is_editing_branch {
             let typed = prompt.branch.as_deref().map_or(0, str::len);
@@ -881,9 +881,9 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
         }
         text_area = Rect::new(
             inner.x,
-            inner.y + 3,
+            inner.y + 2,
             inner.width,
-            inner.height.saturating_sub(3),
+            inner.height.saturating_sub(2),
         );
     }
     if prompt.text.is_empty() {
@@ -915,42 +915,63 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
 }
 
 /// The compose box's branch line: the branch a new agent will start on,
-/// edited or following the task, or the branch a held tree keeps.
+/// edited or following the task.
 fn branch_line(prompt: &Prompt) -> Line<'static> {
     let t = theme();
-    let label = Span::styled("branch ", fg(t.muted));
-    let kept = |branch: Option<&String>| {
-        Line::from(vec![
-            label.clone(),
-            Span::styled(
-                format!("{} (kept)", branch.map_or("(detached)", String::as_str)),
-                fg(t.muted),
+    let name = if prompt.is_editing_branch {
+        Span::styled(
+            prompt.branch.clone().unwrap_or_default(),
+            fg(t.accent).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        match prompt.branch_name() {
+            Some(name) => Span::raw(name),
+            None => Span::styled(
+                "named from the task",
+                fg(t.muted).add_modifier(Modifier::ITALIC),
             ),
-        ])
+        }
     };
-    match prompt.target() {
-        Some(Target::Tree(tree) | Target::InPlace(tree)) if !prompt.names_branch() => {
-            kept(tree.branch.as_ref())
-        }
-        Some(Target::NewTree | Target::Tree(_)) => {
-            let name = if prompt.is_editing_branch {
+    Line::from(vec![Span::styled("branch ", fg(t.muted)), name])
+}
+
+/// Every key, over the list, until any key closes it.
+fn draw_help(frame: &mut Frame) {
+    let t = theme();
+    // A space, the key in nine columns, a space, then what it does, inside
+    // the border and a column of air on the right.
+    let width = HELP
+        .iter()
+        .map(|(_, does)| does.chars().count())
+        .max()
+        .unwrap_or(0)
+        + 14;
+    let lines: Vec<Line> = HELP
+        .iter()
+        .map(|(key, does)| {
+            Line::from(vec![
                 Span::styled(
-                    prompt.branch.clone().unwrap_or_default(),
+                    format!(" {key:<9} "),
                     fg(t.accent).add_modifier(Modifier::BOLD),
-                )
-            } else {
-                match prompt.branch_name() {
-                    Some(name) => Span::raw(name),
-                    None => Span::styled(
-                        "named from the task",
-                        fg(t.muted).add_modifier(Modifier::ITALIC),
-                    ),
-                }
-            };
-            Line::from(vec![label, name])
-        }
-        _ => Line::default(),
-    }
+                ),
+                Span::raw(does.to_string()),
+            ])
+        })
+        .collect();
+    let height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
+    let width = u16::try_from(width).unwrap_or(u16::MAX);
+    let area = popup::centered(frame.area(), width, height);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            popup_block(Line::styled(
+                " Keys ",
+                fg(t.title).add_modifier(Modifier::BOLD),
+            ))
+            .title_bottom(Line::styled(" any key closes ", fg(t.muted))),
+        ),
+        area,
+    );
 }
 
 /// A dialog's frame: a border in `color` and its title in the theme's title
@@ -1007,8 +1028,9 @@ fn draw_confirm(frame: &mut Frame, pending: &Pending) {
         " Uncommitted changes are discarded and running processes stopped.",
     ));
     lines.push(Line::raw(
-        " y returns them to the pool; any other key cancels.",
+        " y returns them to the pool, D destroys them from disk after a preview;",
     ));
+    lines.push(Line::raw(" any other key cancels."));
     let title = format!(" Return {} tree(s)? ", pending.trees.len());
     let height = u16::try_from(lines.len())
         .unwrap_or(u16::MAX)

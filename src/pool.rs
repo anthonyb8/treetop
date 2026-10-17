@@ -70,11 +70,6 @@ impl Tree {
         ports.dedup();
         ports
     }
-
-    /// Held, with no agent working in it: the tree most likely to be forgotten.
-    pub fn is_orphan(&self) -> bool {
-        self.is_held() && !self.is_main && self.agents.is_empty()
-    }
 }
 
 /// The tree `dir` is in. A tree can sit inside another, as a worktree under

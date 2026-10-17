@@ -1,37 +1,21 @@
-//! The compose box where you write to agents: a word with the coordinator, a
-//! task for a new agent in a fresh tree, the tree under the cursor or the main
-//! checkout, or a line for agents already working. Kept free of terminal I/O,
-//! like `app`.
+//! The compose box where you write to agents: a word with the coordinator
+//! (`c`), a task for a new agent in a fresh tree (`n`), a line for agents
+//! already working (`m`), or a branch's new name (`b`). Kept free of terminal
+//! I/O, like `app`.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::pool::Tree;
 
-/// Where the text goes: to the coordinator, or to a new agent and where it
-/// runs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Where the text goes: to the coordinator, or to a new agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
     /// The one agent that oversees the rest, started in the main checkout on
     /// first use; see `coordinator`.
     Coordinator,
-    /// A tree the pool hands out when the job runs, so two quick dispatches
-    /// never share one.
+    /// A new agent in a tree the pool hands out when the job runs, so two
+    /// quick dispatches never share one.
     NewTree,
-    /// A tree from the pool, leased first if nobody holds it.
-    Tree(Tree),
-    /// The main checkout, for a quick job that needs no tree of its own.
-    InPlace(Tree),
-}
-
-impl Target {
-    pub fn label(&self) -> String {
-        match self {
-            Target::Coordinator => "coordinator".into(),
-            Target::NewTree => "new tree".into(),
-            Target::Tree(tree) => format!("tree {}", tree.name),
-            Target::InPlace(_) => "in place".into(),
-        }
-    }
 }
 
 /// An agent a line is typed into, through the chat command it offers.
@@ -82,12 +66,12 @@ impl Recipient {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Purpose {
-    /// Send the text to `targets[at]`; Tab moves `at`.
-    Dispatch { targets: Vec<Target>, at: usize },
+    /// Send the text to `target`.
+    Dispatch { target: Target },
     /// Type the text into each of these agents.
     Message { to: Vec<Recipient> },
     /// The text is the new name of this tree's branch.
-    Rename { tree: Tree },
+    Rename { tree: Box<Tree> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,10 +106,10 @@ impl Prompt {
         }
     }
 
-    pub fn dispatch(targets: Vec<Target>, user: String) -> Self {
+    pub fn dispatch(target: Target, user: String) -> Self {
         Prompt {
             user,
-            ..Prompt::new(Purpose::Dispatch { targets, at: 0 })
+            ..Prompt::new(Purpose::Dispatch { target })
         }
     }
 
@@ -137,25 +121,23 @@ impl Prompt {
     pub fn rename(tree: Tree) -> Self {
         Prompt {
             text: tree.branch.clone().unwrap_or_default(),
-            ..Prompt::new(Purpose::Rename { tree })
+            ..Prompt::new(Purpose::Rename {
+                tree: Box::new(tree),
+            })
         }
     }
 
-    pub fn target(&self) -> Option<&Target> {
+    pub fn target(&self) -> Option<Target> {
         match &self.purpose {
-            Purpose::Dispatch { targets, at } => targets.get(*at),
+            Purpose::Dispatch { target } => Some(*target),
             Purpose::Message { .. } | Purpose::Rename { .. } => None,
         }
     }
 
-    /// The target gets a branch named for it: a new tree, or one nobody
-    /// holds. A held tree keeps the branch its holder chose.
+    /// The target gets a branch named for it: a new agent's tree does, the
+    /// coordinator's main checkout keeps its own.
     pub fn names_branch(&self) -> bool {
-        match self.target() {
-            Some(Target::NewTree) => true,
-            Some(Target::Tree(tree)) => !tree.is_held(),
-            _ => false,
-        }
+        self.target() == Some(Target::NewTree)
     }
 
     /// The branch the agent will start on, as the box shows it: the edited
@@ -235,19 +217,6 @@ impl Prompt {
             KeyCode::Backspace => {
                 self.line().pop();
             }
-            KeyCode::Tab | KeyCode::BackTab => {
-                if let Purpose::Dispatch { targets, at } = &mut self.purpose {
-                    let step = if key.code == KeyCode::Tab {
-                        1
-                    } else {
-                        targets.len().saturating_sub(1)
-                    };
-                    *at = (*at + step) % targets.len().max(1);
-                }
-                if !self.names_branch() {
-                    self.is_editing_branch = false;
-                }
-            }
             _ => {}
         }
         Edit::Continue
@@ -294,21 +263,6 @@ mod tests {
     }
 
     #[test]
-    fn tab_cycles_the_targets_both_ways() {
-        let main = crate::pool::main_tree(std::path::Path::new("/repo"));
-        let mut prompt = Prompt::dispatch(
-            vec![Target::Coordinator, Target::NewTree, Target::InPlace(main)],
-            "anthony".into(),
-        );
-        assert_eq!(prompt.target(), Some(&Target::Coordinator));
-        prompt.edit(KeyEvent::from(KeyCode::Tab));
-        assert_eq!(prompt.target(), Some(&Target::NewTree));
-        prompt.edit(KeyEvent::from(KeyCode::BackTab));
-        prompt.edit(KeyEvent::from(KeyCode::BackTab));
-        assert_eq!(prompt.target().unwrap().label(), "in place", "wraps");
-    }
-
-    #[test]
     fn edits_like_a_shell_line() {
         let mut prompt = Prompt::message(Vec::new());
         type_in(&mut prompt, "fix the  login");
@@ -327,7 +281,7 @@ mod tests {
 
     #[test]
     fn a_new_tree_gets_a_branch_that_follows_the_task_until_edited() {
-        let mut prompt = Prompt::dispatch(vec![Target::NewTree], "anthony".into());
+        let mut prompt = Prompt::dispatch(Target::NewTree, "anthony".into());
         assert_eq!(prompt.branch_name(), None, "no words yet");
         type_in(&mut prompt, "Fix login");
         assert_eq!(prompt.branch_name().as_deref(), Some("anthony/fix-login"));
@@ -346,26 +300,12 @@ mod tests {
     }
 
     #[test]
-    fn a_held_tree_or_the_coordinator_keeps_its_branch() {
-        let held = Tree {
-            status: "leased".into(),
-            ..crate::pool::stand_in(std::path::PathBuf::from("/p/4/app"))
-        };
-        let available = Tree {
-            status: "available".into(),
-            ..held.clone()
-        };
-        for (target, names) in [
-            (Target::Tree(held), false),
-            (Target::Tree(available), true),
-            (Target::Coordinator, false),
-        ] {
-            let mut prompt = Prompt::dispatch(vec![target], "anthony".into());
-            type_in(&mut prompt, "fix it");
-            prompt.edit(KeyEvent::from(KeyCode::Down));
-            assert_eq!(prompt.is_editing_branch, names);
-            assert_eq!(prompt.branch_name().is_some(), names);
-        }
+    fn the_coordinator_keeps_the_main_checkouts_branch() {
+        let mut prompt = Prompt::dispatch(Target::Coordinator, "anthony".into());
+        type_in(&mut prompt, "fix it");
+        prompt.edit(KeyEvent::from(KeyCode::Down));
+        assert!(!prompt.is_editing_branch);
+        assert_eq!(prompt.branch_name(), None);
     }
 
     #[test]

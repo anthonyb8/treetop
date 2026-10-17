@@ -164,8 +164,6 @@ pub enum Outcome {
     Enter(Tree),
     /// Hand these to the worker, in order.
     Queue(Vec<Job>),
-    /// List the pool again now rather than at the next interval.
-    Refresh,
     /// Read the workspaces and open the picker on them.
     Workspaces,
     /// Show the pool of the repository checked out here instead.
@@ -204,9 +202,8 @@ pub struct App {
     pub listed_at: Option<Instant>,
     pub filter: String,
     pub is_filtering: bool,
-    /// Only held trees with no agent are shown, for reviewing what was left
-    /// behind.
-    pub is_orphans_only: bool,
+    /// The `?` overlay of every key is open.
+    pub is_help: bool,
     /// Agents have been read at least once; until then a tree with none is
     /// unknown, not orphaned.
     pub is_agents_read: bool,
@@ -325,7 +322,6 @@ impl App {
         let mut visible: Vec<&Tree> = self
             .trees
             .iter()
-            .filter(|t| !self.is_orphans_only || t.is_orphan())
             .filter(|t| {
                 needle.is_empty()
                     || [Some(&t.name), t.branch.as_ref(), t.holder.as_ref()]
@@ -470,11 +466,14 @@ impl App {
             self.jobs
                 .insert(path.clone(), JobState::Done(job.kind, Instant::now()));
             self.message = Some(if is_coordinator {
-                "the coordinator started on your message; n, Enter opens its chat".to_string()
+                "the coordinator started on your message; c, Enter opens its chat".to_string()
             } else if job.tree.is_main {
-                "dispatched to the main checkout; c opens its chat".to_string()
+                "dispatched to the main checkout; Enter on it opens its chat".to_string()
             } else {
-                format!("dispatched to tree {}; c opens its chat", job.tree.name)
+                format!(
+                    "dispatched to tree {}; Enter on it opens its chat",
+                    job.tree.name
+                )
             });
         } else if job.kind == Kind::Start {
             self.jobs
@@ -490,9 +489,12 @@ impl App {
             match (self.opening.as_mut(), job.attach.clone()) {
                 (None, _) => {
                     self.message = Some(if is_coordinator {
-                        "the coordinator started; c on main opens its chat".to_string()
+                        "the coordinator started; c, Enter opens its chat".to_string()
                     } else {
-                        format!("agent started in tree {}; c opens its chat", job.tree.name)
+                        format!(
+                            "agent started in tree {}; Enter on it opens its chat",
+                            job.tree.name
+                        )
                     });
                 }
                 (Some(opening), Some(command)) => {
@@ -724,10 +726,11 @@ impl App {
         Outcome::Queue(jobs)
     }
 
-    /// Opens the chat of the first agent in the tree under the cursor that
-    /// offers one. An agent in a tmux pane cannot be attached from here, so
-    /// inside tmux `c` switches to its pane instead, as Enter does.
-    fn chat(&mut self) -> Outcome {
+    /// Opens the agent of the tree under the cursor: the chat of the first
+    /// that offers one, in a popup, which starts a cold one again; else the
+    /// tree itself, which inside tmux is the pane its agent runs in, or a
+    /// window, and outside tmux a shell.
+    fn open_agent(&mut self) -> Outcome {
         let Some(tree) = self.current() else {
             return Outcome::Continue;
         };
@@ -742,14 +745,7 @@ impl App {
                 tree: tree.name.clone(),
             };
         }
-        if self.is_in_tmux && tree.agents.iter().any(|a| !a.is_background) {
-            return Outcome::Enter(tree.clone());
-        }
-        self.message = Some(match tree.agents.first() {
-            None => format!("tree {} has no agent to open", tree.name),
-            Some(agent) => format!("{} has no chat to open in place", agent.name),
-        });
-        Outcome::Continue
+        Outcome::Enter(tree.clone())
     }
 
     /// The chat of an agent `n` started: at once when its start printed the
@@ -780,7 +776,7 @@ impl App {
         }
         if awaiting.since.elapsed() >= AWAIT_CHAT {
             self.message = Some(format!(
-                "the agent started in tree {} has not shown up; c opens it once it does",
+                "the agent started in tree {} has not shown up; Enter on it opens it once it does",
                 tree.name
             ));
             self.awaiting_chat = None;
@@ -909,12 +905,6 @@ impl App {
             .count()
     }
 
-    /// The tree the cursor stands on, for the compose box's "this tree"
-    /// target.
-    fn cursor_tree(&self) -> Option<&Tree> {
-        self.current()
-    }
-
     /// Puts the cursor back on the tree at `path` after the list re-sorts.
     fn reselect(&mut self, path: Option<PathBuf>) {
         if let Some(at) = path.and_then(|p| self.visible().iter().position(|t| t.path == p)) {
@@ -951,18 +941,14 @@ impl App {
         })
     }
 
-    /// Opens the compose box. The coordinator comes first, since it is who
-    /// you talk to about the agents; then a new tree, since most new work
-    /// wants its own; then the tree under the cursor; then in place.
+    /// Opens the compose box for a new agent in a fresh tree.
     fn open_dispatch(&mut self) {
-        let mut targets = vec![Target::Coordinator, Target::NewTree];
-        if let Some(tree) = self.cursor_tree().filter(|t| !t.is_main) {
-            targets.push(Target::Tree(tree.clone()));
-        }
-        if let Some(main) = self.trees.iter().find(|t| t.is_main) {
-            targets.push(Target::InPlace(main.clone()));
-        }
-        self.prompt = Some(Prompt::dispatch(targets, self.user.clone()));
+        self.prompt = Some(Prompt::dispatch(Target::NewTree, self.user.clone()));
+    }
+
+    /// Opens the compose box to the coordinator.
+    fn open_coordinator(&mut self) {
+        self.prompt = Some(Prompt::dispatch(Target::Coordinator, self.user.clone()));
     }
 
     /// Opens the compose box on the name of the branch of the tree under the
@@ -1060,7 +1046,7 @@ impl App {
                     .insert(tree.path.clone(), JobState::Queued(Kind::Rename));
                 Outcome::Queue(vec![Job {
                     rename: Some(text),
-                    ..Job::new(Kind::Rename, tree)
+                    ..Job::new(Kind::Rename, *tree)
                 }])
             }
             Purpose::Message { to } => {
@@ -1071,15 +1057,10 @@ impl App {
                 self.message = Some(format!("sending to {} agent(s)...", to.len()));
                 Outcome::Send { to, text }
             }
-            Purpose::Dispatch { mut targets, at } => {
-                if at >= targets.len() {
-                    return Outcome::Continue;
-                }
-                match targets.swap_remove(at) {
-                    Target::Coordinator => self.converse(text),
-                    target => self.dispatch(target, text, branch),
-                }
-            }
+            Purpose::Dispatch { target } => match target {
+                Target::Coordinator => self.converse(text),
+                Target::NewTree => self.dispatch(text, branch),
+            },
         }
     }
 
@@ -1116,25 +1097,16 @@ impl App {
         )
     }
 
-    /// Queues a Start for `task` at `target`, on `branch` when the target
-    /// takes one. An empty task starts the agent idle and opens its chat, as
-    /// `n` always has.
-    fn dispatch(&mut self, target: Target, task: String, branch: Option<String>) -> Outcome {
+    /// Queues a Start for `task` in a new tree, on `branch`. An empty task
+    /// starts the agent idle and opens its chat, as `n` always has.
+    fn dispatch(&mut self, task: String, branch: Option<String>) -> Outcome {
         let launch = Launch {
             branch,
-            ..Launch::agent(task, target == Target::NewTree)
+            ..Launch::agent(task, true)
         };
-        let tree = match target {
-            Target::Coordinator => return self.converse(launch.task),
-            Target::Tree(tree) | Target::InPlace(tree) => tree,
-            Target::NewTree => {
-                self.new_trees += 1;
-                pool::stand_in(PathBuf::from(format!("(new tree {})", self.new_trees)))
-            }
-        };
-        if launch.is_new_tree {
-            self.message = Some("leasing a new tree for the agent...".into());
-        }
+        self.new_trees += 1;
+        let tree = pool::stand_in(PathBuf::from(format!("(new tree {})", self.new_trees)));
+        self.message = Some("leasing a new tree for the agent...".into());
         self.start(tree, launch)
     }
 
@@ -1256,7 +1228,7 @@ impl App {
             let is_back = key.code == KeyCode::Esc || crate::chat::is_exit(key);
             if is_back {
                 self.message = Some(format!(
-                    "{} keeps starting; c opens its chat once it is up",
+                    "{} keeps starting; Enter on its tree opens its chat once it is up",
                     opening.agent
                 ));
                 self.opening = None;
@@ -1268,12 +1240,12 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return match key.code {
                 KeyCode::Char('c') => Outcome::Quit,
-                KeyCode::Char('r') => {
-                    self.diffs.clear();
-                    Outcome::Refresh
-                }
                 _ => Outcome::Continue,
             };
+        }
+        if self.is_help {
+            self.is_help = false;
+            return Outcome::Continue;
         }
         if let Some(review) = self.reviews.front_mut() {
             match key.code {
@@ -1301,7 +1273,19 @@ impl App {
             return match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     self.marked.clear();
-                    self.queue(Kind::Return, pending.trees)
+                    let (held, free): (Vec<Tree>, Vec<Tree>) =
+                        pending.trees.into_iter().partition(Tree::is_held);
+                    if let Some(tree) = free.first() {
+                        self.message = Some(format!(
+                            "tree {} is already available; D in the dialog destroys it",
+                            tree.name
+                        ));
+                    }
+                    self.queue(Kind::Return, held)
+                }
+                KeyCode::Char('D') => {
+                    self.marked.clear();
+                    self.queue(Kind::Preview, pending.trees)
                 }
                 _ => Outcome::Continue,
             };
@@ -1329,13 +1313,15 @@ impl App {
             return Outcome::Workspaces;
         }
         match key.code {
+            KeyCode::Enter => return self.open_agent(),
             KeyCode::Char('m') => self.open_message(),
             KeyCode::Char('q') => return self.quit(),
+            KeyCode::Char('?') => self.is_help = true,
             KeyCode::Esc if !self.filter.is_empty() => {
                 self.filter.clear();
                 self.selected = 0;
             }
-            KeyCode::Esc => return self.quit(),
+            KeyCode::Esc => self.marked.clear(),
             KeyCode::Down | KeyCode::Char('j') => self.move_by(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_by(-1),
             KeyCode::Home | KeyCode::Char('g') => self.move_by(isize::MIN),
@@ -1349,32 +1335,17 @@ impl App {
                     self.move_by(1);
                 }
             }
-            KeyCode::Char('u') => self.marked.clear(),
-            KeyCode::Char('a') => {
-                self.is_orphans_only = !self.is_orphans_only;
-                self.selected = 0;
-            }
             KeyCode::Char('o') => return self.browse(),
-            KeyCode::Char('c') => return self.chat(),
+            KeyCode::Char('c') => self.open_coordinator(),
             KeyCode::Char('n') => self.open_dispatch(),
             KeyCode::Char('d') => self.open_diff(),
             KeyCode::Char('b') => self.open_rename(),
-            KeyCode::Char('t') => {
-                if let Some(tree) = self.current() {
-                    return Outcome::Enter(tree.clone());
-                }
-            }
             KeyCode::Char('r') => {
-                let trees = self.targets(Kind::Return);
-                if !trees.is_empty() {
-                    self.pending = Some(Pending { trees });
-                }
-            }
-            KeyCode::Char('D') => {
+                // Destroy is asked inside the return dialog, so it takes
+                // every tree a destroy could, available ones too.
                 let trees = self.targets(Kind::Destroy);
                 if !trees.is_empty() {
-                    self.marked.clear();
-                    return self.queue(Kind::Preview, trees);
+                    self.pending = Some(Pending { trees });
                 }
             }
             _ => {}
@@ -1429,9 +1400,19 @@ mod tests {
             press(&mut app, KeyCode::Char(' '));
         }
         press(&mut app, KeyCode::Char('r'));
-        assert_eq!(app.message.as_deref(), Some("tree 7 is already available"));
+        assert_eq!(
+            app.pending.as_ref().unwrap().trees.len(),
+            3,
+            "7 can be destroyed"
+        );
         let jobs = queued(press(&mut app, KeyCode::Char('y')));
         assert_eq!(names(&jobs), [(Kind::Return, "4"), (Kind::Return, "8")]);
+        assert!(
+            app.message
+                .as_deref()
+                .unwrap()
+                .starts_with("tree 7 is already available")
+        );
         assert_eq!(app.active_jobs(), 2);
         assert!(app.marked.is_empty());
     }
@@ -1446,9 +1427,10 @@ mod tests {
     }
 
     #[test]
-    fn destroy_previews_first_and_only_y_on_the_review_destroys() {
+    fn d_in_the_return_dialog_previews_a_destroy_and_only_y_on_it_destroys() {
         let mut app = app();
         press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char('r'));
         let jobs = queued(press(&mut app, KeyCode::Char('D')));
         assert_eq!(names(&jobs), [(Kind::Preview, "7")]);
         let preview = jobs.into_iter().next().unwrap();
@@ -1465,6 +1447,7 @@ mod tests {
     #[test]
     fn n_on_a_review_keeps_the_tree() {
         let mut app = app();
+        press(&mut app, KeyCode::Char('r'));
         let preview = queued(press(&mut app, KeyCode::Char('D'))).remove(0);
         app.job_finished(preview, true, "preview".into());
         assert_eq!(press(&mut app, KeyCode::Char('n')), Outcome::Continue);
@@ -1500,7 +1483,6 @@ mod tests {
         let tree = app.trees.iter().find(|t| t.name == "4").unwrap();
         assert_eq!(tree.status, "available");
         assert_eq!((tree.holder.as_ref(), tree.branch.as_ref()), (None, None));
-        assert!(!tree.is_orphan());
     }
 
     #[test]
@@ -1526,7 +1508,7 @@ mod tests {
         let mut app = app();
         press(&mut app, KeyCode::Char('r'));
         press(&mut app, KeyCode::Char('y'));
-        press(&mut app, KeyCode::Char('D'));
+        press(&mut app, KeyCode::Char('r'));
         assert!(app.reviews.is_empty() && app.pending.is_none());
         assert_eq!(
             app.message.as_deref(),
@@ -1550,7 +1532,8 @@ mod tests {
     fn never_targets_the_tree_treetop_started_in() {
         let mut app = app();
         app.here = Some(PathBuf::from("/p/4/app/ui"));
-        assert_eq!(press(&mut app, KeyCode::Char('D')), Outcome::Continue);
+        assert_eq!(press(&mut app, KeyCode::Char('r')), Outcome::Continue);
+        assert!(app.pending.is_none());
         assert!(app.message.unwrap().contains("cd out first"));
     }
 
@@ -1564,15 +1547,19 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         let visible: Vec<&str> = app.visible().iter().map(|t| t.name.as_str()).collect();
         assert_eq!(visible, ["8"]);
-        assert!(matches!(press(&mut app, KeyCode::Char('t')), Outcome::Enter(t) if t.name == "8"));
+        assert!(
+            matches!(press(&mut app, KeyCode::Enter), Outcome::Enter(t) if t.name == "8"),
+            "with no chat to open, Enter goes to the tree"
+        );
     }
 
     #[test]
-    fn ctrl_r_refreshes_and_never_returns() {
+    fn question_mark_shows_every_key_and_the_next_key_only_closes_it() {
         let mut app = app();
-        let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
-        assert_eq!(app.handle_key(ctrl_r), Outcome::Refresh);
-        assert!(app.pending.is_none());
+        press(&mut app, KeyCode::Char('?'));
+        assert!(app.is_help);
+        assert_eq!(press(&mut app, KeyCode::Char('r')), Outcome::Continue);
+        assert!(!app.is_help && app.pending.is_none());
     }
 
     #[test]
@@ -1713,7 +1700,7 @@ mod tests {
     }
 
     #[test]
-    fn c_opens_an_attachable_chat_else_the_pane_inside_tmux_else_says_why() {
+    fn enter_opens_an_attachable_chat_else_goes_to_the_tree() {
         let mut app = app();
         let attachable = Agent {
             is_background: true,
@@ -1725,7 +1712,7 @@ mod tests {
             (PathBuf::from("/p/8/app"), vec![agent("codex")]),
         ]));
         assert_eq!(
-            press(&mut app, KeyCode::Char('c')),
+            press(&mut app, KeyCode::Enter),
             Outcome::Chat {
                 command: vec!["claude".into(), "attach".into(), "e6b79280".into()],
                 agent: "fix-login".into(),
@@ -1733,16 +1720,12 @@ mod tests {
             }
         );
         press(&mut app, KeyCode::Char('j'));
-        assert_eq!(press(&mut app, KeyCode::Char('c')), Outcome::Continue);
-        assert_eq!(app.message.as_deref(), Some("tree 7 has no agent to open"));
+        assert!(matches!(press(&mut app, KeyCode::Enter), Outcome::Enter(t) if t.name == "7"));
         press(&mut app, KeyCode::Char('j'));
-        assert_eq!(press(&mut app, KeyCode::Char('c')), Outcome::Continue);
-        assert_eq!(
-            app.message.as_deref(),
-            Some("codex has no chat to open in place")
+        assert!(
+            matches!(press(&mut app, KeyCode::Enter), Outcome::Enter(t) if t.name == "8"),
+            "an agent with no chat is in a pane, which going to the tree finds"
         );
-        app.is_in_tmux = true;
-        assert!(matches!(press(&mut app, KeyCode::Char('c')), Outcome::Enter(t) if t.name == "8"));
     }
 
     #[test]
@@ -1759,20 +1742,6 @@ mod tests {
         }
         let visible: Vec<&str> = app.visible().iter().map(|t| t.name.as_str()).collect();
         assert_eq!(visible, ["4"]);
-    }
-
-    #[test]
-    fn a_shows_only_held_trees_with_no_agent() {
-        let mut app = app();
-        app.apply_agents(&HashMap::from([(
-            PathBuf::from("/p/4/app"),
-            vec![agent("codex")],
-        )]));
-        press(&mut app, KeyCode::Char('a'));
-        let visible: Vec<&str> = app.visible().iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(visible, ["8"]);
-        press(&mut app, KeyCode::Char('a'));
-        assert_eq!(app.visible().len(), 3);
     }
 
     #[test]
@@ -1796,13 +1765,6 @@ mod tests {
         assert_eq!(app.message.as_deref(), Some("tree 7 serves no port"));
     }
 
-    #[test]
-    fn enter_does_nothing_and_t_goes_to_the_tree() {
-        let mut app = app();
-        assert_eq!(press(&mut app, KeyCode::Enter), Outcome::Continue);
-        assert!(matches!(press(&mut app, KeyCode::Char('t')), Outcome::Enter(t) if t.name == "4"));
-    }
-
     fn type_in(app: &mut App, text: &str) {
         for c in text.chars() {
             press(app, KeyCode::Char(c));
@@ -1810,27 +1772,22 @@ mod tests {
     }
 
     #[test]
-    fn n_to_the_tree_under_the_cursor_with_no_task_starts_it_idle_and_opens_its_chat() {
+    fn n_with_no_task_starts_an_idle_agent_and_opens_its_chat_once_it_shows() {
         let mut app = app();
         app.apply_agents(&HashMap::from([(
             PathBuf::from("/p/4/app"),
             vec![agent("old")],
         )]));
         press(&mut app, KeyCode::Char('n'));
-        press(&mut app, KeyCode::Tab);
-        press(&mut app, KeyCode::Tab);
-        assert_eq!(
-            app.prompt.as_ref().unwrap().target().unwrap().label(),
-            "tree 4"
-        );
-        let job = queued(press(&mut app, KeyCode::Enter)).remove(0);
-        assert_eq!((job.kind, job.tree.name.as_str()), (Kind::Start, "4"));
+        assert_eq!(app.prompt.as_ref().unwrap().target(), Some(Target::NewTree));
+        let mut job = queued(press(&mut app, KeyCode::Enter)).remove(0);
+        assert_eq!(job.kind, Kind::Start);
+        assert!(job.launch.as_ref().unwrap().is_new_tree);
         assert_eq!(job.launch.as_ref().unwrap().task, "");
-        assert_eq!(
-            app.opening.as_ref().unwrap().tree,
-            "4",
-            "its popup stands in"
-        );
+        assert!(app.opening.is_some(), "its popup stands in");
+        // The pool handed it tree 4, where an old agent already was.
+        job.tree.path = PathBuf::from("/p/4/app");
+        job.tree.name = "4".into();
         app.job_finished(job, true, "printed no id".into());
         assert_eq!(app.ready_chat(), None, "not shown up yet");
         let started = Agent {
@@ -1868,7 +1825,7 @@ mod tests {
     #[test]
     fn a_started_chat_opens_from_the_command_its_start_gave_without_waiting_to_see_it() {
         let mut app = app_with_main();
-        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('c'));
         let job = queued(press(&mut app, KeyCode::Enter)).remove(0);
         assert_eq!(app.opening.as_ref().unwrap().agent, coordinator::NAME);
         app.job_finished(started(job), true, String::new());
@@ -1886,7 +1843,7 @@ mod tests {
     #[test]
     fn esc_on_a_chat_on_its_way_stops_waiting_and_a_failed_start_ends_it() {
         let mut app = app_with_main();
-        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('c'));
         let job = queued(press(&mut app, KeyCode::Enter)).remove(0);
         assert!(app.opening.is_some());
         assert_eq!(
@@ -1902,9 +1859,9 @@ mod tests {
             app.message
                 .as_deref()
                 .unwrap()
-                .contains("c on main opens its chat")
+                .contains("c, Enter opens its chat")
         );
-        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('c'));
         let job = queued(press(&mut app, KeyCode::Enter)).remove(0);
         app.job_finished(job, false, "claude: not found".into());
         assert!(app.opening.is_none());
@@ -1920,34 +1877,10 @@ mod tests {
     }
 
     #[test]
-    fn a_task_dispatched_in_place_starts_in_the_main_checkout_and_opens_no_chat() {
-        let mut app = app_with_main();
-        press(&mut app, KeyCode::Char('n'));
-        type_in(&mut app, "say hi");
-        press(&mut app, KeyCode::BackTab);
-        assert_eq!(
-            app.prompt.as_ref().unwrap().target().unwrap().label(),
-            "in place"
-        );
-        let job = queued(press(&mut app, KeyCode::Enter)).remove(0);
-        assert!(job.tree.is_main);
-        let launch = job.launch.clone().unwrap();
-        assert_eq!(
-            (launch.task.as_str(), launch.is_new_tree),
-            ("say hi", false)
-        );
-        assert_eq!(launch.name.as_deref(), Some("say hi"));
-        app.job_finished(job, true, String::new());
-        assert_eq!(app.ready_chat(), None);
-        assert!(app.message.unwrap().contains("the main checkout"));
-    }
-
-    #[test]
     fn a_new_tree_dispatch_runs_under_a_stand_in_until_its_tree_is_leased() {
         let mut app = app();
         press(&mut app, KeyCode::Char('n'));
         type_in(&mut app, "fix login");
-        press(&mut app, KeyCode::Tab);
         let mut job = queued(press(&mut app, KeyCode::Enter)).remove(0);
         assert!(job.launch.as_ref().unwrap().is_new_tree);
         assert_eq!(job.key, PathBuf::from("(new tree 1)"));
@@ -2011,11 +1944,6 @@ mod tests {
         assert_eq!(
             app.message.as_deref(),
             Some("the main checkout is never returned or destroyed")
-        );
-        press(&mut app, KeyCode::Char('a'));
-        assert!(
-            app.visible().iter().all(|t| !t.is_main),
-            "an agentless main is no orphan"
         );
     }
 
@@ -2225,7 +2153,7 @@ mod tests {
         press(&mut app, KeyCode::Home);
         assert_eq!(app.current().unwrap().name, "8", "it sorts first");
         assert!(matches!(
-            press(&mut app, KeyCode::Char('c')),
+            press(&mut app, KeyCode::Enter),
             Outcome::Chat { tree, .. } if tree == "8"
         ));
     }
@@ -2248,12 +2176,12 @@ mod tests {
     }
 
     #[test]
-    fn n_talks_to_the_coordinator_first_and_starts_it_in_the_main_checkout() {
+    fn c_talks_to_the_coordinator_and_starts_it_in_the_main_checkout() {
         let mut app = app_with_main();
-        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('c'));
         assert_eq!(
             app.prompt.as_ref().unwrap().target(),
-            Some(&Target::Coordinator)
+            Some(Target::Coordinator)
         );
         type_in(&mut app, "what needs me?");
         let job = queued(press(&mut app, KeyCode::Enter)).remove(0);
@@ -2288,7 +2216,7 @@ mod tests {
             PathBuf::from("/repo"),
             vec![attachable(coordinator::NAME)],
         )]));
-        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('c'));
         type_in(&mut app, "status?");
         match press(&mut app, KeyCode::Enter) {
             Outcome::Send { to, text } => {
@@ -2299,7 +2227,7 @@ mod tests {
             other => panic!("expected the message sent as m sends, got {other:?}"),
         }
         assert!(app.opening.is_none(), "no chat opens");
-        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('c'));
         assert!(
             matches!(press(&mut app, KeyCode::Enter), Outcome::Chat { agent, .. } if agent == coordinator::NAME),
             "nothing typed opens its chat"
@@ -2314,7 +2242,7 @@ mod tests {
             ..report(job, State::Stopped, "/repo", age)
         };
         app.apply_reports(vec![stopped("old", 50), stopped("latest", 5)]);
-        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('c'));
         assert!(matches!(
             press(&mut app, KeyCode::Enter),
             Outcome::Chat { command, .. } if command == ["claude", "attach", "latest"]
