@@ -225,7 +225,9 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
         if app.is_issues {
             match issues.as_mut() {
                 None => match tickets::backends(checkout) {
-                    Ok((backends, at)) => issues = Some(issues::Screen::new(backends, at)),
+                    Ok((backends, at)) => {
+                        issues = Some(issues::Screen::new(backends, at, tickets::views()));
+                    }
                     Err(err) => {
                         app.is_issues = false;
                         app.message = Some(err);

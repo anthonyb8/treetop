@@ -318,6 +318,15 @@ Everything loads in the background, and an issue's description and comments are 
 `→` (or `l`) moves the keys to the issue to scroll it, and `←` brings them back to the list.
 `w` switches to the next issue source, so a work and a personal workspace are one key apart, and `o` opens the issue in the browser.
 
+Number keys switch between views: `1` your open issues, `2` everyone's, `3` grouped by project, `4` grouped by status in the team's workflow order, and `5` the current cycle.
+Views of your own go on `6` to `9`, in name order, from `[views]` in the config, each a filter line that may also say `group:project` or `group:status`:
+
+```toml
+[views]
+bugs = "label:Bug group:status"
+review = "mine state:\"In Review\""
+```
+
 `/` edits the filter line, which starts from the filters in use; Enter applies it and Esc keeps the last.
 It takes `mine`, `label:`, `state:`, `project:` and `cycle:` (`current` or a number), a value with spaces in double quotes, and any other words search titles: `mine label:Bug state:"In Review" login`.
 With no `state:`, only open issues show.

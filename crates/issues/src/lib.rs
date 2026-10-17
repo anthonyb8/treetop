@@ -7,6 +7,7 @@ mod backend;
 mod draw;
 mod markdown;
 mod screen;
+mod views;
 mod worker;
 
 use ratatui::style::{Color, Modifier, Style};
@@ -14,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 pub use backend::{Backend, Linear, READ_ONLY};
 pub use screen::{Action, Screen};
+pub use views::{Group, View};
 
 /// The colours the screen draws in, given by the program it runs in so the
 /// two look like one.

@@ -10,6 +10,7 @@ use linear::{Detail, Issue, Team};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::backend::Backend;
+use crate::views::{self, Group, View};
 use crate::worker::{Reply, Request, Worker};
 use crate::{Filters, line, parse};
 
@@ -44,6 +45,11 @@ pub struct Screen {
     pub(crate) issues: Vec<Issue>,
     pub(crate) selected: usize,
     pub(crate) filters: Filters,
+    /// The views on keys 1 to 9: the five built in, then the config's.
+    pub(crate) views: Vec<View>,
+    /// The view on screen, None once the filter line has changed it.
+    pub(crate) view: Option<usize>,
+    pub(crate) group: Group,
     /// The filter line, while it is being edited.
     pub(crate) editing: Option<String>,
     pub(crate) focus: Focus,
@@ -65,19 +71,22 @@ pub struct Screen {
 
 impl Screen {
     /// The screen over `backends`, showing the one at `source` first, its
-    /// list already on its way.
-    pub fn new(backends: Vec<Arc<dyn Backend>>, source: usize) -> Self {
+    /// list already on its way, with `extra` views after the built-in ones.
+    pub fn new(backends: Vec<Arc<dyn Backend>>, source: usize, extra: Vec<View>) -> Self {
         let worker = Worker::spawn(backends.clone());
+        let mut views = views::builtin();
+        views.extend(extra);
+        views.truncate(9);
         let mut screen = Screen {
             source: source.min(backends.len().saturating_sub(1)),
             backends,
             worker,
             issues: Vec::new(),
             selected: 0,
-            filters: Filters {
-                mine: true,
-                ..Filters::default()
-            },
+            filters: views[0].filters.clone(),
+            group: views[0].group,
+            view: Some(0),
+            views,
             editing: None,
             focus: Focus::List,
             scroll: 0,
@@ -196,6 +205,7 @@ impl Screen {
                     Ok(issues) => {
                         let cursor = self.current().map(|i| i.id.clone());
                         self.issues = issues;
+                        self.arrange();
                         self.selected = cursor
                             .and_then(|id| self.issues.iter().position(|i| i.id == id))
                             .unwrap_or(0);
@@ -218,6 +228,13 @@ impl Screen {
             Reply::Team { source, result } => match result {
                 Ok(Some(team)) => {
                     self.teams.insert(source, team);
+                    if source == self.source {
+                        let cursor = self.current().map(|i| i.id.clone());
+                        self.arrange();
+                        self.selected = cursor
+                            .and_then(|id| self.issues.iter().position(|i| i.id == id))
+                            .unwrap_or(0);
+                    }
                 }
                 Ok(None) => {}
                 Err(err) if source == self.source => {
@@ -226,6 +243,53 @@ impl Screen {
                 Err(_) => {}
             },
         }
+    }
+
+    /// Orders the list into its groups, keeping each group in Linear's
+    /// order.
+    fn arrange(&mut self) {
+        let team = self.teams.get(&self.source).cloned();
+        let group = self.group;
+        self.issues
+            .sort_by_cached_key(|issue| views::place(issue, group, team.as_deref()));
+    }
+
+    /// The heading the issue at `at` starts, when it is the first of its
+    /// group.
+    pub(crate) fn heading(&self, at: usize) -> Option<String> {
+        if self.group == Group::None {
+            return None;
+        }
+        let team = self.teams.get(&self.source).map(Arc::as_ref);
+        let place = |i: &Issue| views::place(i, self.group, team);
+        let this = place(self.issues.get(at)?);
+        let is_first = at == 0 || self.issues.get(at - 1).map(place) != Some(this.clone());
+        is_first.then_some(this.1)
+    }
+
+    /// Shows view `at`, listing it afresh.
+    fn show_view(&mut self, at: usize) {
+        let Some(view) = self.views.get(at) else {
+            self.message = Some(format!(
+                "no view {}; add views under [views] in the config",
+                at + 1
+            ));
+            return;
+        };
+        self.filters = view.filters.clone();
+        self.group = view.group;
+        self.view = Some(at);
+        self.selected = 0;
+        self.scroll = 0;
+        self.load();
+    }
+
+    /// The name of the view on screen, `custom` once the filter line has
+    /// changed it.
+    pub(crate) fn view_name(&self) -> &str {
+        self.view
+            .and_then(|at| self.views.get(at))
+            .map_or("custom", |v| v.name.as_str())
     }
 
     fn move_by(&mut self, delta: isize) {
@@ -277,6 +341,7 @@ impl Screen {
             match key.code {
                 KeyCode::Enter => {
                     self.filters = parse(text);
+                    self.view = None;
                     self.editing = None;
                     self.selected = 0;
                     self.load();
@@ -325,7 +390,11 @@ impl Screen {
                 }
                 self.editing = Some(text);
             }
+            KeyCode::Char(c @ '1'..='9') => {
+                self.show_view(usize::from(c as u8 - b'1'));
+            }
             KeyCode::Char('m') => {
+                self.view = None;
                 self.filters.mine = !self.filters.mine;
                 self.selected = 0;
                 self.load();
@@ -361,6 +430,7 @@ mod tests {
         pub(crate) name: String,
         pub(crate) issues: Vec<Issue>,
         pub(crate) asked: Mutex<Vec<String>>,
+        pub(crate) team: Option<Arc<Team>>,
     }
 
     impl Backend for Fake {
@@ -374,6 +444,10 @@ mod tests {
                 .unwrap()
                 .push(format!("list mine={}", filters.mine));
             Ok(self.issues.clone())
+        }
+
+        fn team(&self) -> Result<Option<Arc<Team>>, String> {
+            Ok(self.team.clone())
         }
 
         fn detail(&self, id: &str) -> Result<Detail, String> {
@@ -424,7 +498,7 @@ mod tests {
             issues: vec![issue("END-1"), issue("END-2")],
             ..Fake::default()
         });
-        let mut screen = Screen::new(vec![fake.clone()], 0);
+        let mut screen = Screen::new(vec![fake.clone()], 0, Vec::new());
         settle(&mut screen);
         (screen, fake)
     }
@@ -509,6 +583,63 @@ mod tests {
     }
 
     #[test]
+    fn number_keys_show_views_and_status_groups_follow_the_workflow() {
+        let todo = Issue {
+            state: "Todo".into(),
+            state_id: Some("todo".into()),
+            ..issue("END-1")
+        };
+        let doing = Issue {
+            state: "In Progress".into(),
+            state_id: Some("doing".into()),
+            ..issue("END-2")
+        };
+        let fake = Arc::new(Fake {
+            name: "work".into(),
+            issues: vec![doing, todo],
+            team: Some(Arc::new(Team {
+                id: "t".into(),
+                key: "END".into(),
+                name: "Endo".into(),
+                states: ["todo", "doing"]
+                    .iter()
+                    .map(|id| linear::State {
+                        id: (*id).into(),
+                        name: (*id).into(),
+                        kind: "unstarted".into(),
+                        position: 0.0,
+                    })
+                    .collect(),
+                labels: Vec::new(),
+                members: Vec::new(),
+                projects: Vec::new(),
+                cycles: Vec::new(),
+                me: None,
+            })),
+            ..Fake::default()
+        });
+        let mine = View::parse("bugs", "mine label:Bug");
+        let mut screen = Screen::new(vec![fake.clone()], 0, vec![mine]);
+        settle(&mut screen);
+        assert_eq!(screen.view_name(), "mine");
+        screen.handle_key(key(KeyCode::Char('4')));
+        settle(&mut screen);
+        assert_eq!(screen.view_name(), "by status");
+        let order: Vec<&str> = screen.issues.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(order, ["END-1", "END-2"], "Todo comes before In Progress");
+        assert_eq!(screen.heading(0).as_deref(), Some("Todo"));
+        assert_eq!(screen.heading(1).as_deref(), Some("In Progress"));
+        screen.handle_key(key(KeyCode::Char('6')));
+        settle(&mut screen);
+        assert_eq!(screen.view_name(), "bugs");
+        assert_eq!(screen.heading(0), None, "no grouping");
+        screen.handle_key(key(KeyCode::Char('m')));
+        assert_eq!(screen.view_name(), "custom");
+        screen.handle_key(key(KeyCode::Char('9')));
+        assert!(screen.message.as_deref().unwrap().starts_with("no view 9"));
+    }
+
+    #[test]
     fn w_switches_between_sources() {
         let work = Arc::new(Fake {
             name: "work".into(),
@@ -520,7 +651,7 @@ mod tests {
             issues: vec![issue("ANT-7")],
             ..Fake::default()
         });
-        let mut screen = Screen::new(vec![work, personal], 0);
+        let mut screen = Screen::new(vec![work, personal], 0, Vec::new());
         settle(&mut screen);
         screen.handle_key(key(KeyCode::Char('w')));
         settle(&mut screen);

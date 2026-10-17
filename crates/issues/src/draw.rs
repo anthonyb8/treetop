@@ -28,7 +28,7 @@ const KEYS: [(&str, &str); 9] = [
 ];
 
 /// Every key, for the `?` overlay.
-const HELP: [(&str, &str); 12] = [
+const HELP: [(&str, &str); 14] = [
     ("Enter", "pick it up: an agent on it in a new tree"),
     ("→ l", "read it: the description and comments take the keys"),
     ("← h Esc", "back to the list"),
@@ -36,6 +36,11 @@ const HELP: [(&str, &str); 12] = [
         "/",
         "filter: mine label:Bug state:\"In Review\" project:x cycle:current, words",
     ),
+    (
+        "1 to 5",
+        "views: mine, all, by project, by status, this cycle",
+    ),
+    ("6 to 9", "your own views, from [views] in the config"),
     ("m", "only yours, or everyone's"),
     ("w", "the next issue source: work, personal"),
     ("o", "open it in the browser"),
@@ -149,20 +154,39 @@ impl Screen {
         }
         let header =
             Row::new(["ID", "STATUS", "PRIORITY", "TITLE", "LABELS", "ASSIGNEE"]).style(p.header);
-        let rows: Vec<Row> = self
-            .issues
-            .iter()
-            .map(|issue| {
-                Row::new(vec![
-                    Cell::from(issue.id.clone()).style(fg(p.accent)),
-                    Cell::from(issue.state.clone()).style(fg(p.info)),
-                    priority(issue, p),
-                    Cell::from(issue.title.clone()),
-                    Cell::from(issue.labels.join(", ")).style(fg(p.special)),
-                    Cell::from(issue.assignee.clone().unwrap_or_default()).style(fg(p.muted)),
-                ])
-            })
-            .collect();
+        // A grouped list puts a heading row above each group, so the cursor's
+        // row on screen counts the headings above it.
+        let mut rows: Vec<Row> = Vec::new();
+        let mut cursor_row = 0;
+        for (at, issue) in self.issues.iter().enumerate() {
+            if let Some(heading) = self.heading(at) {
+                let count = self.issues[at..]
+                    .iter()
+                    .enumerate()
+                    .take_while(|(n, _)| *n == 0 || self.heading(at + n).is_none())
+                    .count();
+                rows.push(Row::new(vec![
+                    Cell::from("▾").style(fg(p.accent)),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(Line::from(vec![
+                        Span::styled(heading, fg(p.title).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!("  {count}"), fg(p.muted)),
+                    ])),
+                ]));
+            }
+            if at == self.selected {
+                cursor_row = rows.len();
+            }
+            rows.push(Row::new(vec![
+                Cell::from(issue.id.clone()).style(fg(p.accent)),
+                Cell::from(issue.state.clone()).style(fg(p.info)),
+                priority(issue, p),
+                Cell::from(issue.title.clone()),
+                Cell::from(issue.labels.join(", ")).style(fg(p.special)),
+                Cell::from(issue.assignee.clone().unwrap_or_default()).style(fg(p.muted)),
+            ]));
+        }
         let widths = [
             Constraint::Length(10),
             Constraint::Length(14),
@@ -179,7 +203,7 @@ impl Screen {
         let table = Table::new(rows, widths)
             .header(header)
             .row_highlight_style(cursor);
-        let mut state = TableState::default().with_selected(Some(self.selected));
+        let mut state = TableState::default().with_selected(Some(cursor_row));
         frame.render_stateful_widget(table, area, &mut state);
     }
 
@@ -266,6 +290,7 @@ impl Screen {
             format!("  {}", self.source_name())
         };
         right.push(Span::raw(source));
+        right.push(Span::raw(format!("  {}", self.view_name())));
         let filter = line(&self.filters);
         right.push(Span::styled(
             format!(

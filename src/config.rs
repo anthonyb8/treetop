@@ -89,6 +89,11 @@ pub struct Config {
     pub issues: BTreeMap<String, Source>,
     #[serde(default)]
     pub repos: BTreeMap<String, Repo>,
+    /// Views of your own on the Issues screen, on keys 6 to 9 in name
+    /// order: a filter line each, which may say `group:project` or
+    /// `group:status`.
+    #[serde(default)]
+    pub views: BTreeMap<String, String>,
     /// The first message of an agent picking up a ticket, with `{id}`,
     /// `{title}`, `{description}`, `{url}` and `{branch}` filled in.
     #[serde(default)]
@@ -195,6 +200,12 @@ mod tests {
         let one = parse("[issues.only]\nkey_env = \"K\"\n").unwrap();
         assert_eq!(one.source_for(Path::new("/anywhere")).unwrap().0, "only");
         assert!(Config::default().source_for(Path::new("/x")).is_err());
+    }
+
+    #[test]
+    fn views_are_named_filter_lines() {
+        let config = parse("[views]\nbugs = \"label:Bug group:status\"\n").unwrap();
+        assert_eq!(config.views["bugs"], "label:Bug group:status");
     }
 
     #[test]

@@ -151,6 +151,20 @@ impl Backend for ReadOnly {
     }
 }
 
+/// The config's own views for the Issues screen, in name order; none when
+/// the config cannot be read, which the screen's source says instead.
+pub fn views() -> Vec<issues::View> {
+    config::load()
+        .map(|config| {
+            config
+                .views
+                .iter()
+                .map(|(name, text)| issues::View::parse(name, text))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Every issue source in the config as a backend for the Issues screen, and
 /// the index of the repository's own. Linear's built-in plugin gets the full
 /// screen; any other plugin is read-only.
