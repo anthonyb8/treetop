@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::agents::Agent;
+use crate::sidecar::Sidecar;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Process {
@@ -42,6 +43,8 @@ pub struct Tree {
     /// The repository's main checkout, listed above the pool so agents working
     /// in place are seen too. It is never returned or destroyed.
     pub is_main: bool,
+    /// treetop's record of the lease, when treetop leased it.
+    pub sidecar: Option<Box<Sidecar>>,
 }
 
 impl Tree {
@@ -66,11 +69,6 @@ impl Tree {
         ports.sort_unstable();
         ports.dedup();
         ports
-    }
-
-    /// Held, with no agent working in it: the tree most likely to be forgotten.
-    pub fn is_orphan(&self) -> bool {
-        self.is_held() && !self.is_main && self.agents.is_empty()
     }
 }
 
@@ -104,6 +102,7 @@ pub fn main_tree(checkout: &Path) -> Tree {
         agents: Vec::new(),
         work: None,
         is_main: true,
+        sidecar: None,
     }
 }
 
@@ -121,6 +120,7 @@ pub fn stand_in(path: PathBuf) -> Tree {
         agents: Vec::new(),
         work: None,
         is_main: false,
+        sidecar: None,
     }
 }
 
@@ -172,6 +172,7 @@ pub fn parse(json: &str) -> Result<Vec<Tree>> {
             agents: Vec::new(),
             work: None,
             is_main: false,
+            sidecar: None,
         })
         .collect();
     trees.sort_by(|a, b| {

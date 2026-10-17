@@ -1,37 +1,21 @@
-//! The compose box where you write to agents: a word with the coordinator, a
-//! task for a new agent in a fresh tree, the tree under the cursor or the main
-//! checkout, or a line for agents already working. Kept free of terminal I/O,
-//! like `app`.
+//! The compose box where you write to agents: a word with the coordinator
+//! (`c`), a task for a new agent in a fresh tree (`n`), a line for agents
+//! already working (`m`), or a branch's new name (`b`). Kept free of terminal
+//! I/O, like `app`.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::pool::Tree;
 
-/// Where the text goes: to the coordinator, or to a new agent and where it
-/// runs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Where the text goes: to the coordinator, or to a new agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
     /// The one agent that oversees the rest, started in the main checkout on
     /// first use; see `coordinator`.
     Coordinator,
-    /// A tree the pool hands out when the job runs, so two quick dispatches
-    /// never share one.
+    /// A new agent in a tree the pool hands out when the job runs, so two
+    /// quick dispatches never share one.
     NewTree,
-    /// A tree from the pool, leased first if nobody holds it.
-    Tree(Tree),
-    /// The main checkout, for a quick job that needs no tree of its own.
-    InPlace(Tree),
-}
-
-impl Target {
-    pub fn label(&self) -> String {
-        match self {
-            Target::Coordinator => "coordinator".into(),
-            Target::NewTree => "new tree".into(),
-            Target::Tree(tree) => format!("tree {}", tree.name),
-            Target::InPlace(_) => "in place".into(),
-        }
-    }
 }
 
 /// An agent a line is typed into, through the chat command it offers.
@@ -40,20 +24,67 @@ pub struct Recipient {
     pub agent: String,
     pub tree: String,
     pub command: Vec<String>,
+    /// The agent plugin that reaches it, and its id there.
+    pub plugin: Option<String>,
+    pub job: Option<String>,
+    /// Not running: a message starts it again through its plugin rather
+    /// than being typed into its chat.
+    pub is_cold: bool,
+}
+
+impl Recipient {
+    /// `agent` in tree `tree`, if it has a chat to type into or a plugin to
+    /// send through.
+    pub fn of(agent: &crate::agents::Agent, tree: &str) -> Option<Self> {
+        let is_cold = agent.status == Some(crate::agents::Status::Cold);
+        if is_cold && (agent.plugin.is_none() || agent.job.is_none()) {
+            return None;
+        }
+        Some(Recipient {
+            agent: agent.name.clone(),
+            tree: tree.to_string(),
+            command: agent.attach.clone()?,
+            plugin: agent.plugin.clone(),
+            job: agent.job.clone(),
+            is_cold,
+        })
+    }
+
+    /// The Claude Code background job `job`, named `agent`, from its report:
+    /// cold unless `is_running`.
+    pub fn of_job(agent: &str, tree: String, job: &str, is_running: bool) -> Self {
+        Recipient {
+            agent: agent.to_string(),
+            tree,
+            command: vec!["claude".into(), "attach".into(), job.to_string()],
+            plugin: Some("claude".into()),
+            job: Some(job.to_string()),
+            is_cold: !is_running,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Purpose {
-    /// Send the text to `targets[at]`; Tab moves `at`.
-    Dispatch { targets: Vec<Target>, at: usize },
+    /// Send the text to `target`.
+    Dispatch { target: Target },
     /// Type the text into each of these agents.
     Message { to: Vec<Recipient> },
+    /// The text is the new name of this tree's branch.
+    Rename { tree: Box<Tree> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prompt {
     pub purpose: Purpose,
     pub text: String,
+    /// The branch a new agent will work on, once it has been edited; until
+    /// then it follows the task.
+    pub branch: Option<String>,
+    /// Keys go to the branch rather than the task.
+    pub is_editing_branch: bool,
+    /// Whose branches these are, for the name a task gives.
+    pub user: String,
 }
 
 /// What a key did to the box.
@@ -65,32 +96,92 @@ pub enum Edit {
 }
 
 impl Prompt {
-    pub fn dispatch(targets: Vec<Target>) -> Self {
+    fn new(purpose: Purpose) -> Self {
         Prompt {
-            purpose: Purpose::Dispatch { targets, at: 0 },
+            purpose,
             text: String::new(),
+            branch: None,
+            is_editing_branch: false,
+            user: String::new(),
+        }
+    }
+
+    pub fn dispatch(target: Target, user: String) -> Self {
+        Prompt {
+            user,
+            ..Prompt::new(Purpose::Dispatch { target })
         }
     }
 
     pub fn message(to: Vec<Recipient>) -> Self {
+        Prompt::new(Purpose::Message { to })
+    }
+
+    /// Renaming `tree`'s branch, starting from its current name.
+    pub fn rename(tree: Tree) -> Self {
         Prompt {
-            purpose: Purpose::Message { to },
-            text: String::new(),
+            text: tree.branch.clone().unwrap_or_default(),
+            ..Prompt::new(Purpose::Rename {
+                tree: Box::new(tree),
+            })
         }
     }
 
-    pub fn target(&self) -> Option<&Target> {
+    pub fn target(&self) -> Option<Target> {
         match &self.purpose {
-            Purpose::Dispatch { targets, at } => targets.get(*at),
-            Purpose::Message { .. } => None,
+            Purpose::Dispatch { target } => Some(*target),
+            Purpose::Message { .. } | Purpose::Rename { .. } => None,
+        }
+    }
+
+    /// The target gets a branch named for it: a new agent's tree does, the
+    /// coordinator's main checkout keeps its own.
+    pub fn names_branch(&self) -> bool {
+        self.target() == Some(Target::NewTree)
+    }
+
+    /// The branch the agent will start on, as the box shows it: the edited
+    /// name, else the task's. None when the target keeps its own branch, or
+    /// the task has no words yet.
+    pub fn branch_name(&self) -> Option<String> {
+        if !self.names_branch() {
+            return None;
+        }
+        self.branch
+            .clone()
+            .or_else(|| crate::branch::for_task(&self.user, &self.text))
+    }
+
+    /// The line keys edit: the branch while it has the focus, else the text.
+    fn line(&mut self) -> &mut String {
+        if self.is_editing_branch {
+            self.branch.get_or_insert_with(String::new)
+        } else {
+            &mut self.text
         }
     }
 
     /// Pasted text is kept whole, line breaks and all: the agent reads it as
-    /// one message.
+    /// one message. A branch takes it as one line.
     pub fn paste(&mut self, text: &str) {
-        self.text
-            .push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if self.is_editing_branch {
+            self.line().push_str(&text.replace('\n', ""));
+        } else {
+            self.text.push_str(&text);
+        }
+    }
+
+    /// Moves the focus between the task and the branch. The branch starts
+    /// from the name the task gave it, so it is edited rather than retyped.
+    fn toggle_branch(&mut self) {
+        if !self.names_branch() {
+            return;
+        }
+        if !self.is_editing_branch && self.branch.is_none() {
+            self.branch = self.branch_name();
+        }
+        self.is_editing_branch = !self.is_editing_branch;
     }
 
     pub fn edit(&mut self, key: KeyEvent) -> Edit {
@@ -105,30 +196,26 @@ impl Prompt {
                     .modifiers
                     .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
             {
-                self.text.push('\n');
+                if !self.is_editing_branch {
+                    self.text.push('\n');
+                }
             }
             KeyCode::Enter => return Edit::Submit,
-            KeyCode::Char('u') if ctrl => self.text.clear(),
+            KeyCode::Up | KeyCode::Down => self.toggle_branch(),
+            KeyCode::Char('u') if ctrl => self.line().clear(),
             KeyCode::Char('w') if ctrl => {
-                let kept = self.text.trim_end().len();
-                let cut = self.text[..kept]
-                    .rfind(char::is_whitespace)
+                // A branch's words are split by / and - rather than spaces.
+                let is_branch = self.is_editing_branch;
+                let line = self.line();
+                let kept = line.trim_end().len();
+                let cut = line[..kept]
+                    .rfind(|c: char| c.is_whitespace() || (is_branch && "/-".contains(c)))
                     .map_or(0, |at| at + 1);
-                self.text.truncate(cut);
+                line.truncate(cut);
             }
-            KeyCode::Char(c) if !ctrl => self.text.push(c),
+            KeyCode::Char(c) if !ctrl => self.line().push(c),
             KeyCode::Backspace => {
-                self.text.pop();
-            }
-            KeyCode::Tab | KeyCode::BackTab => {
-                if let Purpose::Dispatch { targets, at } = &mut self.purpose {
-                    let step = if key.code == KeyCode::Tab {
-                        1
-                    } else {
-                        targets.len().saturating_sub(1)
-                    };
-                    *at = (*at + step) % targets.len().max(1);
-                }
+                self.line().pop();
             }
             _ => {}
         }
@@ -176,22 +263,6 @@ mod tests {
     }
 
     #[test]
-    fn tab_cycles_the_targets_both_ways() {
-        let main = crate::pool::main_tree(std::path::Path::new("/repo"));
-        let mut prompt = Prompt::dispatch(vec![
-            Target::Coordinator,
-            Target::NewTree,
-            Target::InPlace(main),
-        ]);
-        assert_eq!(prompt.target(), Some(&Target::Coordinator));
-        prompt.edit(KeyEvent::from(KeyCode::Tab));
-        assert_eq!(prompt.target(), Some(&Target::NewTree));
-        prompt.edit(KeyEvent::from(KeyCode::BackTab));
-        prompt.edit(KeyEvent::from(KeyCode::BackTab));
-        assert_eq!(prompt.target().unwrap().label(), "in place", "wraps");
-    }
-
-    #[test]
     fn edits_like_a_shell_line() {
         let mut prompt = Prompt::message(Vec::new());
         type_in(&mut prompt, "fix the  login");
@@ -206,6 +277,35 @@ mod tests {
         assert_eq!(prompt.text, "\n", "Alt+Enter breaks the line");
         assert_eq!(prompt.edit(KeyEvent::from(KeyCode::Enter)), Edit::Submit);
         assert_eq!(prompt.edit(KeyEvent::from(KeyCode::Esc)), Edit::Cancel);
+    }
+
+    #[test]
+    fn a_new_tree_gets_a_branch_that_follows_the_task_until_edited() {
+        let mut prompt = Prompt::dispatch(Target::NewTree, "anthony".into());
+        assert_eq!(prompt.branch_name(), None, "no words yet");
+        type_in(&mut prompt, "Fix login");
+        assert_eq!(prompt.branch_name().as_deref(), Some("anthony/fix-login"));
+        prompt.edit(KeyEvent::from(KeyCode::Down));
+        prompt.edit(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        type_in(&mut prompt, "auth");
+        assert_eq!(prompt.branch_name().as_deref(), Some("anthony/fix-auth"));
+        prompt.edit(KeyEvent::from(KeyCode::Up));
+        type_in(&mut prompt, " now");
+        assert_eq!(prompt.text, "Fix login now");
+        assert_eq!(
+            prompt.branch_name().as_deref(),
+            Some("anthony/fix-auth"),
+            "an edited branch no longer follows the task"
+        );
+    }
+
+    #[test]
+    fn the_coordinator_keeps_the_main_checkouts_branch() {
+        let mut prompt = Prompt::dispatch(Target::Coordinator, "anthony".into());
+        type_in(&mut prompt, "fix it");
+        prompt.edit(KeyEvent::from(KeyCode::Down));
+        assert!(!prompt.is_editing_branch);
+        assert_eq!(prompt.branch_name(), None);
     }
 
     #[test]

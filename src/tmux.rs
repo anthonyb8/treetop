@@ -87,7 +87,8 @@ fn open_agent(tree: &Tree) -> Result<Option<String>> {
         "#{session_id}\t#{window_id}\t#{pane_id}\t#{pane_pid}",
     ])?;
     for agent in agents {
-        if let Some(pane) = pane_in(&panes, &lineage(agent.pid)) {
+        let Some(pid) = agent.pid else { continue };
+        if let Some(pane) = pane_in(&panes, &lineage(pid)) {
             // Switching the client is only needed, and only possible from a
             // client, when the agent is in another session.
             let current = tmux(&["display-message", "-p", "#{session_id}"])?;

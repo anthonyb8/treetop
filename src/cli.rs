@@ -12,23 +12,32 @@ use serde_json::{Value, json};
 
 use crate::agents;
 use crate::app::report_state;
+use crate::builtin;
 use crate::cache;
 use crate::chat::Chats;
 use crate::coordinator;
 use crate::dispatch::Recipient;
 use crate::jobs::{self, Job, Kind, Launch};
 use crate::live;
+use crate::plugin;
 use crate::pool::{self, Tree};
 use crate::reports::{self, Report};
+use crate::sidecar;
+use crate::tickets::{Filters, Source};
 use crate::watch::Check;
 
 const USAGE: &str = "usage:
   treetop                          open the pool view
+  treetop issues                   open it on the Issues screen
   treetop status                   every tree, agent and report, as JSON
   treetop send <tree|agent> <msg>  type a message into an agent's chat and send it
   treetop dispatch <new|main|N> <task>
                                    start a new agent on a task in a fresh tree,
-                                   the main checkout or tree N";
+                                   the main checkout or tree N
+  treetop tickets [--mine] [words] this repository's open tickets, from its ticket source
+  treetop pick <ID>                pick a ticket up: an agent on it in a fresh tree
+  treetop plugins                  every plugin, built in or found, and what each is
+  treetop plugin <name>            answer one request on stdin as a built-in plugin";
 
 /// How long `send` waits for every message to go in.
 const SEND_TIMEOUT: Duration = Duration::from_secs(45);
@@ -40,16 +49,56 @@ const SEND_GRACE: Duration = Duration::from_secs(1);
 /// The size of the terminal a message is typed into, unseen.
 const SEND_SIZE: (u16, u16) = (40, 120);
 
-/// Answers `--help` and `--version`, which need no repository, so they
-/// work from any directory. None for every other command.
+/// Answers `--help`, `--version` and `plugins`, which need no repository,
+/// so they work from any directory. None for every other command.
 pub fn answer_anywhere(args: &[String]) -> Option<String> {
     match args {
         [flag] if flag == "-h" || flag == "--help" || flag == "help" => Some(USAGE.into()),
         [flag] if flag == "-V" || flag == "--version" => {
             Some(format!("treetop {}", env!("CARGO_PKG_VERSION")))
         }
+        [command] if command == "plugins" => Some(plugins()),
         _ => None,
     }
+}
+
+/// One line per file in the plugin directory: its name, kind, path and
+/// ops, or why treetop cannot use it; then each built-in none replaces.
+fn plugins() -> String {
+    let Some(dir) = plugin::dir() else {
+        return "no plugin directory: neither XDG_CONFIG_HOME nor HOME is set".into();
+    };
+    let found = plugin::discover(&dir);
+    let mut lines: Vec<String> = found
+        .iter()
+        .map(|found| match &found.description {
+            Ok(d) => format!(
+                "{:<16} {:<8} {} ({})",
+                d.name,
+                d.kind.label(),
+                found.path.display(),
+                d.ops.join(", ")
+            ),
+            Err(err) => format!("{:<16} {:<8} {}: {err}", "-", "-", found.path.display()),
+        })
+        .collect();
+    if found.is_empty() {
+        lines.push(format!("no plugins in {}", dir.display()));
+    }
+    let replaced = |name: &str| {
+        found
+            .iter()
+            .any(|f| f.description.as_ref().is_ok_and(|d| d.name == name))
+    };
+    for (name, kind) in builtin::KINDS {
+        if !replaced(name) {
+            lines.push(format!(
+                "{name:<16} {:<8} built in (treetop plugin {name})",
+                kind.label()
+            ));
+        }
+    }
+    lines.join("\n")
 }
 
 /// Runs the command `args` names, from the main checkout `checkout`.
@@ -62,6 +111,8 @@ pub fn run(args: &[String], checkout: &Path) -> Result<()> {
         [command, place, task @ ..] if command == "dispatch" && !task.is_empty() => {
             dispatch(checkout, place, &task.join(" "))
         }
+        [command, rest @ ..] if command == "tickets" => tickets(checkout, rest),
+        [command, id] if command == "pick" => pick(checkout, id),
         _ => bail!("{USAGE}"),
     }
 }
@@ -89,10 +140,12 @@ fn cached_listing(checkout: &Path) -> Result<Vec<Tree>> {
 /// Fills in each tree's processes and agents.
 fn read_agents(trees: &mut [Tree]) {
     let processes = live::processes(trees);
-    let mut agents = agents::find(trees, &processes);
+    let sidecars = sidecar::read_all(trees);
+    let mut agents = agents::find(trees, &processes, &sidecars);
     for tree in trees.iter_mut() {
         tree.processes = processes.get(&tree.path).cloned().unwrap_or_default();
         tree.agents = agents.remove(&tree.path).unwrap_or_default();
+        tree.sidecar = sidecars.get(&tree.path).cloned().map(Box::new);
     }
 }
 
@@ -119,13 +172,7 @@ fn status_json(trees: &[Tree], reports: &[Report], now: SystemTime) -> Value {
         .iter()
         .filter(|r| r.name != coordinator::NAME)
         .collect();
-    let holding = |report: &Report| {
-        report
-            .dir
-            .as_deref()
-            .and_then(|dir| pool::holding(trees, dir))
-            .map(|tree| tree.path.clone())
-    };
+    let holding = |report: &Report| reports::tree_of(report, trees).map(|tree| tree.path.clone());
     let mut listed = Vec::new();
     let mut available = 0;
     for tree in trees {
@@ -161,6 +208,7 @@ fn status_json(trees: &[Tree], reports: &[Report], now: SystemTime) -> Value {
             "ports": tree.ports(),
             "agents": agents,
             "reports": tree_reports,
+            "sidecar": tree.sidecar,
         }));
     }
     let elsewhere: Vec<Value> = reports
@@ -205,13 +253,7 @@ fn recipients(trees: &[Tree], reports: &[Report], target: &str) -> Vec<Recipient
         tree.agents
             .iter()
             .filter(|a| a.name != coordinator::NAME && is_named(&a.name))
-            .filter_map(|a| {
-                Some(Recipient {
-                    agent: a.name.clone(),
-                    tree: tree.name.clone(),
-                    command: a.attach.clone()?,
-                })
-            })
+            .filter_map(|a| Recipient::of(a, &tree.name))
             .collect()
     };
     if let Some(tree) = trees.iter().find(|t| t.name == target) {
@@ -228,14 +270,18 @@ fn recipients(trees: &[Tree], reports: &[Report], target: &str) -> Vec<Recipient
         .iter()
         .filter(|r| r.name != coordinator::NAME && r.name.eq_ignore_ascii_case(target))
         .max_by_key(|r| r.updated)
-        .map(|r| Recipient {
-            agent: r.name.clone(),
-            tree: r
-                .dir
-                .as_deref()
-                .and_then(|dir| pool::holding(trees, dir))
-                .map_or_else(|| "outside the pool".into(), |t| t.name.clone()),
-            command: vec!["claude".into(), "attach".into(), r.job.clone()],
+        .map(|r| {
+            let tree = reports::tree_of(r, trees);
+            let is_running = trees
+                .iter()
+                .flat_map(|t| &t.agents)
+                .any(|a| a.job.as_deref() == Some(r.job.as_str()) && a.pid.is_some());
+            Recipient::of_job(
+                &r.name,
+                tree.map_or_else(|| "outside the pool".into(), |t| t.name.clone()),
+                &r.job,
+                is_running,
+            )
         })
         .into_iter()
         .collect()
@@ -250,26 +296,44 @@ fn send(checkout: &Path, target: &str, message: &str) -> Result<()> {
         bail!("no agent with a chat to type into at {target}; `treetop status` lists them");
     }
     let mut chats = Chats::default();
+    let (mut delivered, mut failed) = (0, Vec::new());
+    let mut typed = 0;
     for recipient in &to {
-        chats.deliver(
-            &recipient.command,
-            message,
-            SEND_SIZE,
-            recipient.agent.clone(),
-            recipient.tree.clone(),
-        )?;
+        let (agent, tree) = (recipient.agent.clone(), recipient.tree.clone());
+        if let (true, Some(plugin), Some(id)) =
+            (recipient.is_cold, &recipient.plugin, &recipient.job)
+        {
+            let message = jobs::Message {
+                plugin: plugin.clone(),
+                id: id.clone(),
+                text: message.to_string(),
+            };
+            match jobs::send_cold(&message) {
+                Ok(()) => {
+                    println!("sent to {agent} in tree {tree}, starting it again");
+                    delivered += 1;
+                }
+                Err(why) => failed.push((agent, tree, why)),
+            }
+            continue;
+        }
+        let hints = recipient.plugin.as_deref().and_then(plugin::screen_of);
+        chats.deliver(&recipient.command, message, SEND_SIZE, (agent, tree), hints)?;
+        typed += 1;
     }
     let started = Instant::now();
-    let (mut delivered, mut failed) = (0, Vec::new());
-    while delivered + failed.len() < to.len() && started.elapsed() < SEND_TIMEOUT {
+    let (mut typed_in, mut typed_failed) = (0, 0);
+    while typed_in + typed_failed < typed && started.elapsed() < SEND_TIMEOUT {
         let pumped = chats.pump();
         for (agent, tree) in pumped.delivered {
             println!("sent to {agent} in tree {tree}");
-            delivered += 1;
+            typed_in += 1;
         }
-        failed.extend(pumped.undelivered);
+        typed_failed += pumped.failed.len();
+        failed.extend(pumped.failed);
         thread::sleep(Duration::from_millis(20));
     }
+    delivered += typed_in;
     // The Enter has been written; give the session a moment to take it
     // before the chat clients are ended.
     let grace = Instant::now();
@@ -277,12 +341,66 @@ fn send(checkout: &Path, target: &str, message: &str) -> Result<()> {
         chats.pump();
         thread::sleep(Duration::from_millis(20));
     }
-    for (agent, tree) in &failed {
-        eprintln!("could not reach {agent} in tree {tree}: its chat closed first");
+    for (agent, tree, why) in &failed {
+        eprintln!("not sent to {agent} in tree {tree}: {why}");
     }
     if delivered < to.len() {
         bail!("sent to {delivered} of {} agent(s)", to.len());
     }
+    Ok(())
+}
+
+/// One line per open ticket of the repository's source: its id, state and
+/// title. `--mine` keeps those assigned to you; other words search titles.
+fn tickets(checkout: &Path, args: &[String]) -> Result<()> {
+    let source = Source::of(checkout).map_err(anyhow::Error::msg)?;
+    let words: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|a| *a != "--mine")
+        .collect();
+    let filters = Filters {
+        mine: args.iter().any(|a| a == "--mine"),
+        query: (!words.is_empty()).then(|| words.join(" ")),
+        ..Filters::default()
+    };
+    let tickets = source.list(&filters).map_err(anyhow::Error::msg)?;
+    if tickets.is_empty() {
+        println!("no open tickets in {}", source.name);
+    }
+    for ticket in tickets {
+        println!("{:<10} {:<14} {}", ticket.id, ticket.state, ticket.title);
+    }
+    Ok(())
+}
+
+/// Picks ticket `id` up as Enter on it does: an agent on it in a fresh tree,
+/// unless a tree already has it.
+fn pick(checkout: &Path, id: &str) -> Result<()> {
+    let mut trees = cached_listing(checkout)?;
+    let sidecars = sidecar::read_all(&trees);
+    for tree in &mut trees {
+        tree.sidecar = sidecars.get(&tree.path).cloned().map(Box::new);
+    }
+    let picked = trees.iter().find(|t| {
+        t.sidecar
+            .as_ref()
+            .and_then(|s| s.ticket.as_deref())
+            .is_some_and(|ticket| ticket.eq_ignore_ascii_case(id))
+    });
+    if let Some(tree) = picked {
+        bail!("{id} is already in tree {}", tree.name);
+    }
+    let mut job = Job {
+        launch: Some(Launch::pick(id.to_string(), checkout.to_path_buf())),
+        ..Job::new(Kind::Start, pool::stand_in(PathBuf::from("(new tree)")))
+    };
+    let (is_ok, output) = jobs::run(&mut job);
+    print!("{output}");
+    if !is_ok {
+        bail!("{id} was not picked up");
+    }
+    println!("picked up {id} in tree {}", job.tree.name);
     Ok(())
 }
 
@@ -327,12 +445,13 @@ mod tests {
     fn agent(name: &str, job: &str) -> Agent {
         Agent {
             name: name.into(),
-            pid: 1,
+            pid: Some(1),
             status: Some(Status::Busy),
-            source: Source::Claude,
+            source: Source::Plugin,
             is_background: true,
             attach: Some(vec!["claude".into(), "attach".into(), job.into()]),
             job: Some(job.into()),
+            plugin: None,
         }
     }
 

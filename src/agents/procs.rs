@@ -67,7 +67,7 @@ fn cmdline(pid: u32) -> Vec<String> {
 /// helper processes do not count as a second agent. Each entry is the agent
 /// and its parent's pid.
 fn outermost(found: Vec<(Agent, Option<u32>)>) -> Vec<Agent> {
-    let pids: Vec<u32> = found.iter().map(|(agent, _)| agent.pid).collect();
+    let pids: Vec<u32> = found.iter().filter_map(|(agent, _)| agent.pid).collect();
     found
         .into_iter()
         .filter(|(_, ppid)| ppid.is_none_or(|ppid| !pids.contains(&ppid)))
@@ -86,12 +86,13 @@ pub fn find(processes: &HashMap<PathBuf, Vec<Process>>) -> Vec<Sighting> {
                     let name = agent_name(&p.name, &cmdline(p.pid), &known)?;
                     let agent = Agent {
                         name,
-                        pid: p.pid,
+                        pid: Some(p.pid),
                         status: None,
                         source: Source::Process,
                         is_background: false,
                         attach: None,
                         job: None,
+                        plugin: None,
                     };
                     Some((agent, live::stat(p.pid).map(|s| s.ppid)))
                 })
@@ -142,19 +143,20 @@ mod tests {
     fn an_agents_own_helpers_are_not_second_agents() {
         let agent = |pid| Agent {
             name: "claude".into(),
-            pid,
+            pid: Some(pid),
             status: None,
             source: Source::Process,
             is_background: false,
             attach: None,
             job: None,
+            plugin: None,
         };
         let found = vec![
             (agent(10), Some(1)),
             (agent(11), Some(10)),
             (agent(20), None),
         ];
-        let pids: Vec<u32> = outermost(found).iter().map(|a| a.pid).collect();
+        let pids: Vec<u32> = outermost(found).iter().filter_map(|a| a.pid).collect();
         assert_eq!(pids, [10, 20]);
     }
 }

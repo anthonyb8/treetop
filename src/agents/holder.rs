@@ -34,18 +34,19 @@ fn parse(text: &str) -> Option<Agent> {
     let holder: Holder = serde_json::from_str(text).ok()?;
     Some(Agent {
         name: holder.name,
-        pid: holder.pid,
+        pid: Some(holder.pid),
         status: holder.status.as_deref().and_then(Status::parse),
         source: Source::Holder,
         is_background: false,
         attach: holder.attach.filter(|command| !command.is_empty()),
         job: None,
+        plugin: None,
     })
 }
 
 fn read(tree: &Path) -> Option<Agent> {
     let text = fs::read_to_string(pool::git_dir(tree)?.join("agent.json")).ok()?;
-    parse(&text).filter(|agent| is_alive(agent.pid))
+    parse(&text).filter(|agent| agent.pid.is_some_and(is_alive))
 }
 
 pub fn find(trees: &[Tree]) -> Vec<Sighting> {
@@ -86,7 +87,7 @@ mod tests {
             )),
         );
         let agent = read(&tree).unwrap();
-        assert_eq!((agent.name.as_str(), agent.pid), ("fix-login", pid));
+        assert_eq!((agent.name.as_str(), agent.pid), ("fix-login", Some(pid)));
         assert_eq!(agent.status, Some(Status::Waiting));
     }
 

@@ -1,0 +1,11 @@
+[package]
+name = "linear"
+version.workspace = true
+edition.workspace = true
+description = "A client for Linear's GraphQL API, as treetop uses it"
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+ureq = "3"

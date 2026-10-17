@@ -9,19 +9,27 @@
 mod actions;
 mod agents;
 mod app;
+mod branch;
+mod builtin;
 mod cache;
 mod chat;
+mod child;
 mod cli;
+mod config;
 mod coordinator;
 mod diff;
 mod dispatch;
 mod jobs;
+mod linear_plugin;
 mod live;
+mod plugin;
 mod pool;
 mod popup;
 mod refresh;
 mod reports;
+mod sidecar;
 mod theme;
+mod tickets;
 mod tmux;
 mod ui;
 mod watch;
@@ -114,7 +122,7 @@ fn chat_closed(app: &mut App, agent: &str, tree: &str) -> Result<()> {
 
 /// Rings the terminal bell and, inside tmux, shows the most pressing piece of
 /// news in the status line, so an agent that needs you is heard from any
-/// window. News comes in inbox order, what needs you first.
+/// window. News comes what needs you first.
 fn announce(news: &[String]) -> Result<()> {
     let mut out = io::stdout();
     out.write_all(b"\x07")?;
@@ -124,12 +132,39 @@ fn announce(news: &[String]) -> Result<()> {
     {
         let more = match news.len() - 1 {
             0 => String::new(),
-            n => format!(" (+{n} more in the inbox)"),
+            n => format!(" (+{n} more)"),
         };
         let line: String = first.chars().take(160).collect();
         tmux::notify(&format!("treetop: {line}{more}"));
     }
     Ok(())
+}
+
+/// Opens `text` in the user's editor, `$VISUAL`, else `$EDITOR`, else `vi`,
+/// with treetop's screen given back to the terminal until it exits, and
+/// returns what was saved.
+fn edit_in_editor(term: &mut Term, text: &str) -> Result<String, String> {
+    let path = std::env::temp_dir().join(format!("treetop-issue-{}.md", std::process::id()));
+    std::fs::write(&path, text).map_err(|err| format!("{}: {err}", path.display()))?;
+    let editor = ["VISUAL", "EDITOR"]
+        .iter()
+        .find_map(|name| std::env::var(name).ok().filter(|v| !v.trim().is_empty()))
+        .unwrap_or_else(|| "vi".into());
+    let mut words = editor.split_whitespace();
+    let program = words.next().unwrap_or("vi");
+    leave_screen().map_err(|err| format!("{err:#}"))?;
+    let status = std::process::Command::new(program)
+        .args(words)
+        .arg(&path)
+        .status();
+    *term = enter_screen().map_err(|err| format!("{err:#}"))?;
+    let saved = std::fs::read_to_string(&path);
+    let _ = std::fs::remove_file(&path);
+    match status {
+        Ok(status) if status.success() => saved.map_err(|err| err.to_string()),
+        Ok(status) => Err(format!("{program} {status}")),
+        Err(err) => Err(format!("{program}: {err}")),
+    }
 }
 
 /// Why `run` stopped showing a pool.
@@ -156,11 +191,16 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
     let refresher = Refresher::spawn(checkout.to_path_buf(), app.trees.clone());
     let worker = Worker::spawn();
     let diffs = diff::Loader::spawn(diff::base(checkout));
+    // The Issues screen, made the first time it is shown.
+    let mut issues: Option<issues::Screen> = None;
+    let mut was_issues = false;
     // Drawn only when something changed, or every REDRAW: drawing the whole
     // table ten times a second is most of what treetop costs while idle.
     let mut is_stale = true;
     let mut drawn_at = Instant::now();
     let mut chats = Chats::default();
+    // Whether the mouse is captured for an open issue, apart from a chat's.
+    let mut is_issue_mouse = false;
     loop {
         while let Ok(update) = refresher.updates.try_recv() {
             is_stale = true;
@@ -179,6 +219,7 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                         announce(&news)?;
                     }
                 }
+                Update::Sidecars(sidecars) => app.apply_sidecars(sidecars),
                 Update::Agents(agents) => {
                     app.apply_agents(&agents);
                     let live: Vec<&Vec<String>> = agents
@@ -210,6 +251,56 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
         if let Some(path) = app.wanted_diff() {
             diffs.request(path);
         }
+        if app.is_issues {
+            match issues.as_mut() {
+                None => match tickets::backends(checkout) {
+                    Ok((backends, at)) => {
+                        issues = Some(issues::Screen::new(backends, at, tickets::views()));
+                    }
+                    Err(err) => {
+                        app.is_issues = false;
+                        app.message = Some(err);
+                    }
+                },
+                Some(screen) if !was_issues => screen.open(),
+                Some(_) => {}
+            }
+            if let Some(screen) = issues.as_mut() {
+                if let Some(id) = app.open_issue.take() {
+                    screen.show_issue(&id);
+                }
+                is_stale |= screen.poll();
+                // Asked only once an image is wanted, since a terminal that
+                // never answers holds the screen up while it is asked.
+                if screen.wants_terminal_asked() {
+                    screen.ask_terminal_for_images();
+                    is_stale = true;
+                }
+                if let Some(text) = screen.take_editor() {
+                    refresher.set_paused(true);
+                    let edited = edit_in_editor(term, &text);
+                    refresher.set_paused(false);
+                    screen.edited(edited);
+                    is_stale = true;
+                }
+            }
+        }
+        was_issues = app.is_issues;
+        // An open issue takes the mouse, for its links and the wheel; a
+        // chat captures it on its own, and gives it back when it closes.
+        if chats.is_open() {
+            is_issue_mouse = false;
+        } else {
+            let wants = app.is_issues && issues.as_ref().is_some_and(|s| s.wants_mouse());
+            if wants != is_issue_mouse {
+                if wants {
+                    execute!(io::stdout(), EnableMouseCapture)?;
+                } else {
+                    execute!(io::stdout(), DisableMouseCapture)?;
+                }
+                is_issue_mouse = wants;
+            }
+        }
         if app.is_quitting && app.active_jobs() == 0 {
             return Ok(Exit::Quit);
         }
@@ -232,10 +323,8 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             });
             is_stale = true;
         }
-        if let Some((agent, tree)) = pumped.undelivered.first() {
-            app.message = Some(format!(
-                "could not reach {agent} in {tree}: its chat closed before the message went in"
-            ));
+        if let Some((agent, tree, why)) = pumped.failed.first() {
+            app.message = Some(format!("not sent to {agent} in {tree}: {why}"));
             is_stale = true;
         }
         if let Some((agent, tree)) = pumped.ended {
@@ -244,7 +333,7 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
         }
         if is_stale || drawn_at.elapsed() >= REDRAW {
             app.screen_height = term.size()?.height;
-            term.draw(|frame| ui::draw(frame, app, chats.open()))?;
+            term.draw(|frame| ui::draw(frame, app, chats.open(), issues.as_ref()))?;
             is_stale = false;
             drawn_at = Instant::now();
         }
@@ -290,8 +379,18 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             }
             continue;
         }
+        if let Event::Mouse(mouse) = &event {
+            if let Some(screen) = issues.as_mut().filter(|_| app.is_issues) {
+                screen.handle_mouse(*mouse);
+                is_stale = true;
+            }
+            continue;
+        }
         if let Event::Paste(text) = &event {
-            app.paste(text);
+            match issues.as_mut().filter(|_| app.is_issues) {
+                Some(screen) => screen.paste(text),
+                None => app.paste(text),
+            }
             continue;
         }
         let Event::Key(key) = event else {
@@ -300,12 +399,30 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
         if key.kind != KeyEventKind::Press {
             continue;
         }
-        match app.handle_key(key) {
+        let on_issues = issues
+            .as_mut()
+            .filter(|_| app.is_issues && app.prompt.is_none());
+        let outcome = match on_issues {
+            Some(screen) => match screen.handle_key(key) {
+                issues::Action::None => Outcome::Continue,
+                issues::Action::Back => {
+                    app.is_issues = false;
+                    Outcome::Continue
+                }
+                issues::Action::Quit => app.quit(),
+                issues::Action::Pick(issue) => app.pick(issue.id),
+                issues::Action::Open(url) => {
+                    screen.say(actions::open_url(&url).unwrap_or_else(|err| format!("{err:#}")));
+                    Outcome::Continue
+                }
+            },
+            None => app.handle_key(key),
+        };
+        match outcome {
             Outcome::Continue => {}
             Outcome::Quit => return Ok(Exit::Quit),
             Outcome::Workspaces => app.open_picker(choices()),
             Outcome::Switch(path) => return Ok(Exit::Switch(path)),
-            Outcome::Refresh => refresher.refresh(),
             Outcome::Chat {
                 command,
                 agent,
@@ -329,13 +446,18 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             Outcome::Send { to, text } => {
                 let size = chat_size(term)?;
                 for recipient in to {
+                    if let Some(job) = app.send_cold(&recipient, &text) {
+                        worker.push(job);
+                        continue;
+                    }
                     let agent = recipient.agent.clone();
+                    let hints = recipient.plugin.as_deref().and_then(plugin::screen_of);
                     if let Err(err) = chats.deliver(
                         &recipient.command,
                         &text,
                         size,
-                        recipient.agent,
-                        recipient.tree,
+                        (recipient.agent, recipient.tree),
+                        hints,
                     ) {
                         app.message = Some(format!("could not reach {agent}: {err:#}"));
                     }
@@ -363,17 +485,20 @@ fn checkout_for(start: &Path, is_screen: bool) -> Result<PathBuf> {
 }
 
 /// Shows the pool of `checkout`, and of each workspace `w` switches to,
-/// until treetop quits. Each switch starts the pool's clocks, worker and
-/// chats afresh; ending the old pool's chat clients leaves its agents
-/// running.
-fn show(term: &mut Term, start: PathBuf, mut checkout: PathBuf) -> Result<()> {
+/// until treetop quits, opening on the Issues screen when `is_issues`. Each
+/// switch starts the pool's clocks, worker and chats afresh; ending the old
+/// pool's chat clients leaves its agents running.
+fn show(term: &mut Term, start: PathBuf, mut checkout: PathBuf, is_issues: bool) -> Result<()> {
     let mut here = Some(start);
+    let mut is_issues = is_issues;
     loop {
         std::env::set_current_dir(&checkout)?;
         workspaces::record(&checkout);
         let mut app = App::new(here.take());
         app.is_in_tmux = tmux::is_inside();
         app.checkout = checkout.clone();
+        app.user = branch::user();
+        app.is_issues = std::mem::take(&mut is_issues);
         if let Some(mut cached) = cache::read(&checkout) {
             cached.insert(0, pool::main_tree(&checkout));
             app.set_cached(cached);
@@ -392,9 +517,16 @@ fn main() -> Result<()> {
         println!("{answer}");
         return Ok(());
     }
-    let checkout = checkout_for(&start, args.is_empty())?;
+    if let [command, name] = args.as_slice()
+        && command == "plugin"
+    {
+        return builtin::serve(name);
+    }
+    // `treetop issues` opens the screen on the Issues screen.
+    let is_issues = args == ["issues"];
+    let checkout = checkout_for(&start, args.is_empty() || is_issues)?;
     std::env::set_current_dir(&checkout)?;
-    if !args.is_empty() {
+    if !args.is_empty() && !is_issues {
         return cli::run(&args, &checkout);
     }
 
@@ -405,7 +537,7 @@ fn main() -> Result<()> {
     }));
 
     let mut term = enter_screen()?;
-    let result = show(&mut term, start, checkout);
+    let result = show(&mut term, start, checkout, is_issues);
     leave_screen()?;
     result
 }
