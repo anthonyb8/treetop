@@ -138,7 +138,8 @@ One that fails is written to the log and never stops the start or return it belo
 A config file treetop cannot parse is reported in the log, and no hooks run.
 
 Issues come from named sources, each a ticket plugin and the settings it is given; Linear's plugin is built in and the default.
-A repository picks its source by its main checkout's path under `[repos]`; with a single source, every repository uses it.
+A repository picks its source by its main checkout's path under `[repos]`, and one without an entry has none, so an unrelated repository shows no one's issues.
+Its Issues screen says what to add, and `w` shows a source anyway.
 Each Linear source names the environment variable holding its personal API key (Linear's Settings > Security & access > Personal API keys), so a work and a personal workspace each get their own:
 
 ```toml
@@ -361,6 +362,7 @@ A Linear source gets all of this; an issue source on another ticket plugin lists
 
 The tree's `treetop.json` records the ticket, so the TICKET column shows it, the filter finds it, and `p` on a ticket already in a tree goes to that tree rather than starting a second agent.
 On the trees, `i` opens the issue the tree under the cursor works on, on the whole screen, and Esc comes back to the trees.
+A tree started without an issue gets one the same way: `i` on it, or `I` on any leased tree to change it, shows the Issues list to choose from, with search and filters, and Enter records the issue in the tree's `treetop.json`, so the TICKET and WORK columns show it at once.
 A step that fails undoes the ones before it, as any start does; marking the ticket started is the exception, and a failure there only shows in the detail pane, since the agent is already working.
 `treetop pick END-123` does the same from a shell.
 

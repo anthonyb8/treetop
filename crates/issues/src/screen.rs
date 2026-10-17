@@ -41,6 +41,8 @@ pub enum Action {
     Quit,
     /// Put an agent on this issue.
     Pick(Box<Issue>),
+    /// This is the issue asked for by `choose_issue`.
+    Attach(Box<Issue>),
     /// Open this URL in the browser.
     Open(String),
 }
@@ -113,6 +115,12 @@ pub struct Screen {
     pub(crate) picker: Option<Picker>,
     /// The comment being written, if one is.
     pub(crate) compose: Option<Compose>,
+    /// What an issue is being chosen for, said in the bar, while one is:
+    /// Enter on the list chooses it.
+    pub(crate) choosing: Option<String>,
+    /// The repository has no issue source of its own, and none has been
+    /// asked to show yet.
+    pub(crate) is_without_source: bool,
     /// The open issue was opened from the program's own screen, which Esc
     /// goes back to.
     pub(crate) is_from_outside: bool,
@@ -136,11 +144,32 @@ impl Screen {
     /// The screen over `backends`, showing the one at `source` first, its
     /// list already on its way, with `extra` views after the built-in ones.
     pub fn new(backends: Vec<Arc<dyn Backend>>, source: usize, extra: Vec<View>) -> Self {
+        let mut screen = Screen::idle(backends, source, extra);
+        screen.load();
+        screen
+    }
+
+    /// The screen for a repository with no issue source of its own: it
+    /// lists nothing, says `why`, and `w` shows the sources there are.
+    pub fn without_source(backends: Vec<Arc<dyn Backend>>, why: String, extra: Vec<View>) -> Self {
+        let mut screen = Screen::idle(backends, 0, extra);
+        screen.is_without_source = true;
+        let more = if screen.backends.is_empty() {
+            String::new()
+        } else {
+            format!("; w shows {} anyway", screen.source_name())
+        };
+        screen.error = Some(format!("{why}{more}"));
+        screen
+    }
+
+    /// The screen, nothing asked for yet.
+    fn idle(backends: Vec<Arc<dyn Backend>>, source: usize, extra: Vec<View>) -> Self {
         let worker = Worker::spawn(backends.clone());
         let mut views = views::builtin();
         views.extend(extra);
         views.truncate(9);
-        let mut screen = Screen {
+        Screen {
             source: source.min(backends.len().saturating_sub(1)),
             backends,
             worker,
@@ -174,6 +203,8 @@ impl Screen {
             compose: None,
             form: None,
             is_from_outside: false,
+            is_without_source: false,
+            choosing: None,
             retry: None,
             editor_text: None,
             is_loading: false,
@@ -182,9 +213,7 @@ impl Screen {
             is_help: false,
             seq: 0,
             loaded_at: None,
-        };
-        screen.load();
-        screen
+        }
     }
 
     /// The source's name, as the config gives it.
@@ -936,6 +965,12 @@ impl Screen {
 
     /// Shows the next source, listing it afresh.
     fn next_source(&mut self) {
+        if self.is_without_source && !self.backends.is_empty() {
+            self.is_without_source = false;
+            self.error = None;
+            self.load();
+            return;
+        }
         if self.backends.len() < 2 {
             self.message = Some("one issue source; add another [issues.<name>] to switch".into());
             return;
@@ -1086,6 +1121,22 @@ impl Screen {
             }
             return Action::None;
         }
+        if self.choosing.is_some() {
+            match key.code {
+                KeyCode::Enter => {
+                    if let Some(issue) = self.current().cloned() {
+                        self.choosing = None;
+                        return Action::Attach(Box::new(issue));
+                    }
+                    return Action::None;
+                }
+                KeyCode::Esc | KeyCode::Tab => {
+                    self.choosing = None;
+                    return Action::Back;
+                }
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Tab | KeyCode::Esc => return Action::Back,
             KeyCode::Down | KeyCode::Char('j') => self.move_by(1),
@@ -1165,6 +1216,16 @@ impl Screen {
             Some(Target::Image { .. }) => self.viewer = Some(at),
             None => {}
         }
+    }
+
+    /// Asks for an issue to be chosen from the list for `what`, such as
+    /// "the issue tree 4 works on": Enter answers with it, Esc without.
+    pub fn choose_issue(&mut self, what: String) {
+        self.choosing = Some(what);
+        self.focus = Focus::List;
+        self.trail.clear();
+        self.viewer = None;
+        self.panel = None;
     }
 
     /// Opens issue `id` on the whole screen, as asked from the program's
@@ -1544,6 +1605,63 @@ mod tests {
         let end = drawn(&screen).join("\n");
         assert!(end.contains("line 60"), "{end}");
         assert!(end.contains(" 100% "), "{end}");
+    }
+
+    #[test]
+    fn a_repository_without_a_source_lists_nothing_until_w() {
+        let fake = Arc::new(Fake {
+            name: "work".into(),
+            issues: vec![issue("END-1")],
+            ..Fake::default()
+        });
+        let mut screen = Screen::without_source(
+            vec![fake.clone()],
+            "/home/me/blog has no issue source".into(),
+            Vec::new(),
+        );
+        settle(&mut screen);
+        assert!(
+            fake.asked.lock().unwrap().is_empty(),
+            "nothing is asked of work"
+        );
+        assert!(screen.issues.is_empty());
+        let drawn = drawn(&screen).join("\n");
+        assert!(drawn.contains(" no issue source for this repository"), "{drawn}");
+        assert!(
+            drawn.contains("/home/me/blog has no issue source; w shows work anyway"),
+            "{drawn}"
+        );
+        screen.handle_key(key(KeyCode::Char('w')));
+        settle(&mut screen);
+        assert_eq!(screen.issues.len(), 1);
+    }
+
+    #[test]
+    fn an_issue_chosen_for_a_tree_comes_back_with_enter() {
+        let (mut screen, _) = screen();
+        screen.choose_issue("the issue tree 4 works on".into());
+        let bar = drawn(&screen)[0].clone();
+        assert!(
+            bar.contains("Choose the issue tree 4 works on  ·  Enter chooses it, Esc cancels"),
+            "{bar}"
+        );
+        screen.handle_key(key(KeyCode::Char('/')));
+        typed(&mut screen, "end-2");
+        screen.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(screen.handle_key(key(KeyCode::Enter)), Action::Attach(i) if i.id == "END-2"),
+            "search, then Enter chooses"
+        );
+        assert!(screen.choosing.is_none());
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Enter)),
+            Action::None,
+            "Enter reads again once chosen"
+        );
+        screen.handle_key(key(KeyCode::Esc));
+        screen.choose_issue("the issue tree 4 works on".into());
+        assert_eq!(screen.handle_key(key(KeyCode::Esc)), Action::Back);
+        assert!(screen.choosing.is_none());
     }
 
     #[test]

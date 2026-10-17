@@ -38,7 +38,7 @@ const KEYS: [(&str, &str); 11] = [
 ];
 
 /// Every key on the list, for the `?` overlay.
-const HELP: [(&str, &str); 18] = [
+const HELP: [(&str, &str); 19] = [
     (
         "Enter",
         "open the agent: its chat, a cold one started again, else its tree",
@@ -60,7 +60,11 @@ const HELP: [(&str, &str); 18] = [
     ("b", "rename the tree's branch"),
     ("w", "switch workspace"),
     ("Tab", "the repository's issues"),
-    ("i", "the issue the tree works on, on the whole screen"),
+    (
+        "i",
+        "the issue the tree works on, on the whole screen, else choose it",
+    ),
+    ("I", "choose the issue the tree works on, or another"),
     ("j k ↑ ↓", "move"),
     ("g G", "top, bottom"),
     ("Esc", "clear the filter, then the marks"),

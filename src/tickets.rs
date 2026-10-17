@@ -166,21 +166,22 @@ pub fn views() -> Vec<issues::View> {
         .unwrap_or_default()
 }
 
+/// The repository's own issue source, by its place among the backends, or
+/// why it has none.
+pub type Own = Result<usize, String>;
+
 /// Every issue source in the config as a backend for the Issues screen, and
-/// the index of the repository's own. Linear's built-in plugin gets the full
-/// screen; any other plugin is read-only.
-pub fn backends(checkout: &Path) -> Result<(Vec<Arc<dyn Backend>>, usize), String> {
+/// the index of the repository's own, or why it has none. Linear's built-in
+/// plugin gets the full screen; any other plugin is read-only.
+pub fn backends(checkout: &Path) -> Result<(Vec<Arc<dyn Backend>>, Own), String> {
     let config = config::load()?;
+    // The backends follow the config's order, so the repository's source
+    // is at its place there.
     let own = config
         .source_for(checkout)
-        .ok()
-        .map(|(name, _)| name.to_string());
+        .map(|(name, _)| config.issues.keys().position(|n| n == name).unwrap_or(0));
     let mut backends: Vec<Arc<dyn Backend>> = Vec::new();
-    let mut at = 0;
     for (name, source) in &config.issues {
-        if own.as_deref() == Some(name.as_str()) {
-            at = backends.len();
-        }
         let plugin = plugin::named(Kind::Tickets, &source.plugin)
             .ok_or_else(|| format!("[issues.{name}]: no ticket plugin {}", source.plugin))?;
         let setting = |key: &str| {
@@ -204,7 +205,7 @@ pub fn backends(checkout: &Path) -> Result<(Vec<Arc<dyn Backend>>, usize), Strin
             })));
         }
     }
-    Ok((backends, at))
+    Ok((backends, own))
 }
 
 #[cfg(test)]

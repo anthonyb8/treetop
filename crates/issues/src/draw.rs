@@ -355,6 +355,24 @@ impl Screen {
             frame.set_cursor_position((area.x + x, area.y));
             return;
         }
+        if let Some(what) = &self.choosing {
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(" Choose ", fg(p.accent).add_modifier(Modifier::BOLD)),
+                    Span::styled(what.clone(), fg(p.title).add_modifier(Modifier::BOLD)),
+                    Span::styled("  ·  Enter chooses it, Esc cancels", fg(p.muted)),
+                ])),
+                area,
+            );
+            return;
+        }
+        if self.is_without_source {
+            frame.render_widget(
+                Paragraph::new(" no issue source for this repository").style(fg(p.muted)),
+                area,
+            );
+            return;
+        }
         let mut spans = vec![Span::raw(" ")];
         for (at, piece) in panel::describe(&self.filters, self.group)
             .into_iter()
@@ -900,6 +918,18 @@ impl Screen {
                     ("x", "clear"),
                     ("c", "clear all"),
                     ("Esc", "close"),
+                ],
+                left_area.width,
+                p,
+            ))
+        } else if self.choosing.is_some() && self.message.is_none() {
+            Line::from(key_bar(
+                &[
+                    ("Enter", "choose"),
+                    ("/", "search"),
+                    ("f", "filters"),
+                    ("→", "read"),
+                    ("Esc", "cancel"),
                 ],
                 left_area.width,
                 p,

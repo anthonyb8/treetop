@@ -210,6 +210,12 @@ pub struct App {
     /// The issue to open on the Issues screen as it comes on, by id, taken
     /// once by the program around the app.
     pub open_issue: Option<String>,
+    /// The tree an issue is being chosen for on the Issues screen, by path
+    /// and name.
+    attaching: Option<(PathBuf, String)>,
+    /// What the Issues screen should ask for as it comes on: the issue the
+    /// named tree works on, taken once by the program around the app.
+    pub choose_issue_for: Option<String>,
     /// Agents have been read at least once; until then a tree with none is
     /// unknown, not orphaned.
     pub is_agents_read: bool,
@@ -1220,8 +1226,50 @@ impl App {
                 self.open_issue = Some(ticket);
                 self.is_issues = true;
             }
-            None => self.message = Some(format!("tree {} works on no issue", tree.name)),
+            None => self.choose_issue(),
         }
+    }
+
+    /// Lets the issue the tree under the cursor works on be chosen on the
+    /// Issues screen, for a tree started without one or on another.
+    fn choose_issue(&mut self) {
+        let Some(tree) = self.current() else {
+            return;
+        };
+        if !tree.is_held() || tree.is_main {
+            self.message = Some(format!(
+                "tree {} is not leased; only a leased tree works on an issue",
+                tree.name
+            ));
+            return;
+        }
+        let (path, name) = (tree.path.clone(), tree.name.clone());
+        self.choose_issue_for = Some(name.clone());
+        self.attaching = Some((path, name));
+        self.is_issues = true;
+    }
+
+    /// Records that the tree an issue was being chosen for works on issue
+    /// `id`, at once on screen; returns the tree and its record for the
+    /// program to write.
+    pub fn attach(&mut self, id: String) -> Option<(PathBuf, Sidecar)> {
+        let (path, name) = self.attaching.take()?;
+        self.is_issues = false;
+        let tree = self.trees.iter_mut().find(|t| t.path == path)?;
+        let mut record = tree
+            .sidecar
+            .as_deref()
+            .cloned()
+            .unwrap_or_else(Sidecar::leased_now);
+        record.ticket = Some(id.clone());
+        tree.sidecar = Some(Box::new(record.clone()));
+        self.message = Some(format!("tree {name} works on {id}"));
+        Some((path, record))
+    }
+
+    /// The Issues screen was left without an issue chosen.
+    pub fn stop_attaching(&mut self) {
+        self.attaching = None;
     }
 
     /// The tree a ticket has been picked up in, by its sidecar.
@@ -1390,6 +1438,7 @@ impl App {
             KeyCode::Enter => return self.open_agent(),
             KeyCode::Tab => self.is_issues = true,
             KeyCode::Char('i') => self.show_issue(),
+            KeyCode::Char('I') => self.choose_issue(),
             KeyCode::Char('m') => self.open_message(),
             KeyCode::Char('q') => return self.quit(),
             KeyCode::Char('?') => self.is_help = true,
@@ -1642,14 +1691,38 @@ mod tests {
         assert_eq!(app.open_issue.as_deref(), Some("END-799"));
         app.is_issues = false;
         app.open_issue = None;
-        app.selected = app.visible().iter().position(|t| t.name != "8").unwrap();
+        let unleased = app.visible().iter().position(|t| !t.is_held()).unwrap();
+        app.selected = unleased;
         press(&mut app, KeyCode::Char('i'));
-        assert!(!app.is_issues, "a tree on no issue stays");
-        assert!(
-            app.message
-                .as_deref()
-                .unwrap()
-                .ends_with("works on no issue")
+        assert!(!app.is_issues, "an unleased tree works on nothing");
+        assert!(app.message.as_deref().unwrap().contains("is not leased"));
+    }
+
+    #[test]
+    fn an_issue_chosen_for_a_tree_is_recorded_in_its_sidecar() {
+        let mut app = app();
+        dispatched(&mut app, "/p/8/app", "j1");
+        app.selected = app.visible().iter().position(|t| t.name == "8").unwrap();
+        press(&mut app, KeyCode::Char('i'));
+        assert!(app.is_issues, "a tree on no issue chooses one");
+        assert_eq!(app.choose_issue_for.as_deref(), Some("8"));
+        let (path, record) = app.attach("END-42".into()).unwrap();
+        assert_eq!(path, PathBuf::from("/p/8/app"));
+        assert_eq!(record.ticket.as_deref(), Some("END-42"));
+        assert!(!app.is_issues, "back on the trees");
+        let tree = app.trees.iter().find(|t| t.name == "8").unwrap();
+        assert_eq!(
+            tree.sidecar.as_ref().unwrap().ticket.as_deref(),
+            Some("END-42"),
+            "shown at once"
+        );
+        assert_eq!(app.message.as_deref(), Some("tree 8 works on END-42"));
+        assert_eq!(app.attach("END-43".into()), None, "chosen once");
+        press(&mut app, KeyCode::Char('I'));
+        assert_eq!(
+            app.choose_issue_for.as_deref(),
+            Some("8"),
+            "I chooses again"
         );
     }
 

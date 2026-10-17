@@ -254,8 +254,15 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
         if app.is_issues {
             match issues.as_mut() {
                 None => match tickets::backends(checkout) {
-                    Ok((backends, at)) => {
+                    Ok((backends, Ok(at))) => {
                         issues = Some(issues::Screen::new(backends, at, tickets::views()));
+                    }
+                    Ok((backends, Err(why))) => {
+                        issues = Some(issues::Screen::without_source(
+                            backends,
+                            why,
+                            tickets::views(),
+                        ));
                     }
                     Err(err) => {
                         app.is_issues = false;
@@ -268,6 +275,9 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             if let Some(screen) = issues.as_mut() {
                 if let Some(id) = app.open_issue.take() {
                     screen.show_issue(&id);
+                }
+                if let Some(tree) = app.choose_issue_for.take() {
+                    screen.choose_issue(format!("the issue tree {tree} works on"));
                 }
                 is_stale |= screen.poll();
                 // Asked only once an image is wanted, since a terminal that
@@ -407,10 +417,19 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                 issues::Action::None => Outcome::Continue,
                 issues::Action::Back => {
                     app.is_issues = false;
+                    app.stop_attaching();
                     Outcome::Continue
                 }
                 issues::Action::Quit => app.quit(),
                 issues::Action::Pick(issue) => app.pick(issue.id),
+                issues::Action::Attach(issue) => {
+                    if let Some((tree, record)) = app.attach(issue.id)
+                        && let Err(err) = sidecar::write(&tree, &record)
+                    {
+                        app.message = Some(format!("could not record the issue: {err}"));
+                    }
+                    Outcome::Continue
+                }
                 issues::Action::Open(url) => {
                     screen.say(actions::open_url(&url).unwrap_or_else(|err| format!("{err:#}")));
                     Outcome::Continue

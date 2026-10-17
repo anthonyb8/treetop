@@ -110,31 +110,29 @@ fn expand(path: &str) -> PathBuf {
 
 impl Config {
     /// The issue source of the repository checked out at `checkout`, with
-    /// its name: the one its `[repos]` entry names, else the only one there
-    /// is. An error says what to set.
+    /// its name: the one its `[repos]` entry names. A repository has none
+    /// unless it names one, so an unrelated repository shows no one's
+    /// issues; the error says what to add.
     pub fn source_for(&self, checkout: &Path) -> Result<(&str, &Source), String> {
+        if self.issues.is_empty() {
+            return Err("no issue source: add an [issues.<name>] table to config.toml".into());
+        }
         let named = self
             .repos
             .iter()
             .find(|(path, _)| expand(path) == checkout)
             .and_then(|(_, repo)| repo.issues.as_deref());
-        let name = match (named, self.issues.len()) {
-            (Some(name), _) => name,
-            (None, 1) => self
-                .issues
-                .keys()
-                .next()
-                .map(String::as_str)
-                .unwrap_or_default(),
-            (None, 0) => {
-                return Err("no issue source: add an [issues.<name>] table to config.toml".into());
-            }
-            (None, _) => {
-                return Err(format!(
-                    "several issue sources: name one for this repository under [repos.\"{}\"]",
-                    checkout.display()
-                ));
-            }
+        let Some(name) = named else {
+            let names: Vec<String> = self.issues.keys().map(|n| format!("\"{n}\"")).collect();
+            let names = match names.split_last() {
+                Some((last, [])) => last.clone(),
+                Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+                None => String::new(),
+            };
+            return Err(format!(
+                "{path} has no issue source: add [repos.\"{path}\"] with issues = {names} to the config",
+                path = checkout.display()
+            ));
         };
         self.issues
             .get_key_value(name)
@@ -178,7 +176,7 @@ mod tests {
     }
 
     #[test]
-    fn a_repository_takes_the_source_it_names_else_the_only_one() {
+    fn a_repository_takes_the_source_it_names_and_no_other() {
         let config = parse(
             "[issues.work]\nkey_env = \"W\"\nteam = \"END\"\n\
              [issues.personal]\nplugin = \"linear\"\nkey_env = \"P\"\n\
@@ -191,14 +189,18 @@ mod tests {
             source.config(),
             serde_json::json!({ "key_env": "W", "team": "END" })
         );
-        assert!(
-            config
-                .source_for(Path::new("/home/me/other"))
-                .unwrap_err()
-                .starts_with("several issue sources")
+        assert_eq!(
+            config.source_for(Path::new("/home/me/other")).unwrap_err(),
+            "/home/me/other has no issue source: add [repos.\"/home/me/other\"] with \
+             issues = \"personal\" or \"work\" to the config"
         );
+        // One source is not every repository's: an unrelated one shows none.
         let one = parse("[issues.only]\nkey_env = \"K\"\n").unwrap();
-        assert_eq!(one.source_for(Path::new("/anywhere")).unwrap().0, "only");
+        assert!(
+            one.source_for(Path::new("/anywhere"))
+                .unwrap_err()
+                .starts_with("/anywhere has no issue source")
+        );
         assert!(Config::default().source_for(Path::new("/x")).is_err());
     }
 
