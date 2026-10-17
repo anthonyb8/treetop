@@ -120,7 +120,7 @@ fn chat_closed(app: &mut App, agent: &str, tree: &str) -> Result<()> {
 
 /// Rings the terminal bell and, inside tmux, shows the most pressing piece of
 /// news in the status line, so an agent that needs you is heard from any
-/// window. News comes in inbox order, what needs you first.
+/// window. News comes what needs you first.
 fn announce(news: &[String]) -> Result<()> {
     let mut out = io::stdout();
     out.write_all(b"\x07")?;
@@ -130,7 +130,7 @@ fn announce(news: &[String]) -> Result<()> {
     {
         let more = match news.len() - 1 {
             0 => String::new(),
-            n => format!(" (+{n} more in the inbox)"),
+            n => format!(" (+{n} more)"),
         };
         let line: String = first.chars().take(160).collect();
         tmux::notify(&format!("treetop: {line}{more}"));

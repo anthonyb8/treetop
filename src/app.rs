@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
@@ -48,29 +48,19 @@ pub fn report_state(report: &Report, trees: &[Tree]) -> State {
     }
 }
 
-/// Which list fills the screen.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum Screen {
-    #[default]
-    Trees,
-    /// What the agents have reported, the ones that need you first.
-    Inbox,
-}
-
-/// One report in the inbox, with the tree it works in and its agent while
+/// One agent's latest report, with the tree it works in and its agent while
 /// it runs.
 #[derive(Debug, Clone, Copy)]
 pub struct Item<'a> {
     pub report: &'a Report,
     pub tree: Option<&'a Tree>,
     pub agent: Option<&'a Agent>,
-    pub is_read: bool,
-    /// The state the inbox goes by; see `report_state`.
+    /// The state the list goes by; see `report_state`.
     pub state: State,
 }
 
 impl<'a> Item<'a> {
-    fn new(report: &'a Report, trees: &'a [Tree], is_read: bool) -> Self {
+    fn new(report: &'a Report, trees: &'a [Tree]) -> Self {
         Item {
             report,
             tree: crate::reports::tree_of(report, trees),
@@ -78,7 +68,6 @@ impl<'a> Item<'a> {
                 .iter()
                 .flat_map(|t| &t.agents)
                 .find(|a| a.job.as_deref() == Some(report.job.as_str())),
-            is_read,
             state: report_state(report, trees),
         }
     }
@@ -89,7 +78,7 @@ impl<'a> Item<'a> {
         self.state != self.report.state
     }
 
-    /// What it has to say, as the inbox shows it.
+    /// What it has to say, as the list shows it.
     pub fn text(&self) -> &str {
         if self.is_at_prompt() {
             "waiting at a prompt in its chat: Enter opens it"
@@ -98,48 +87,13 @@ impl<'a> Item<'a> {
         }
     }
 
-    /// Where it works, as the inbox says it: the tree's number, `main`, or
-    /// the directory's name when it is in neither.
-    pub fn place(&self) -> String {
-        match (self.tree, &self.report.dir) {
-            (Some(tree), _) => tree.name.clone(),
-            (None, Some(dir)) => dir
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| dir.display().to_string()),
-            (None, None) => "-".into(),
-        }
-    }
-
-    /// The command that opens its chat: its agent's while it runs, else
-    /// `claude attach <job>`, which reopens a stopped one too.
-    fn attach(&self) -> Vec<String> {
-        self.agent
-            .and_then(|a| a.attach.clone())
-            .unwrap_or_else(|| vec!["claude".into(), "attach".into(), self.report.job.clone()])
-    }
-
-    fn recipient(&self) -> Recipient {
-        let is_running = self.agent.is_some_and(|a| a.pid.is_some());
-        Recipient {
-            command: self.attach(),
-            ..Recipient::of_job(
-                &self.report.name,
-                self.place(),
-                &self.report.job,
-                is_running,
-            )
-        }
-    }
-
-    /// Where it sorts: what needs you, then what is new, then what moves.
+    /// Where it sorts in the news: what needs you, then what finished, then
+    /// what moves.
     fn rank(&self) -> u8 {
-        match (self.state, self.is_read) {
-            (State::Blocked, false) => 0,
-            (State::Done | State::Stopped, false) => 1,
-            (State::Working, _) => 2,
-            (State::Blocked, true) => 3,
-            (State::Done | State::Stopped, true) => 4,
+        match self.state {
+            State::Blocked => 0,
+            State::Done | State::Stopped => 1,
+            State::Working => 2,
         }
     }
 }
@@ -158,14 +112,6 @@ pub struct Choice {
 pub struct Picker {
     pub choices: Vec<Choice>,
     pub selected: usize,
-}
-
-/// What the pane under the table shows.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum Pane {
-    #[default]
-    Info,
-    Log,
 }
 
 /// The diff of one tree in its popup, and where it is scrolled to.
@@ -269,10 +215,9 @@ pub struct App {
     pub pending: Option<Pending>,
     pub reviews: VecDeque<Review>,
     pub jobs: HashMap<PathBuf, JobState>,
+    /// Every finished job's output, newest last; the detail pane shows the
+    /// latest of the tree under the cursor.
     pub log: Vec<LogEntry>,
-    pub pane: Pane,
-    /// Lines scrolled up from the newest end of the log.
-    pub log_scroll: usize,
     pub view: Option<DiffView>,
     /// The terminal's height, for paging the diff popup.
     pub screen_height: u16,
@@ -296,20 +241,13 @@ pub struct App {
     /// A chat on its way: its popup stands in from the moment the box is
     /// sent until the chat itself opens in the same frame.
     pub opening: Option<Opening>,
-    pub screen: Screen,
     /// The main checkout of the pool on screen, the workspace.
     pub checkout: PathBuf,
     /// The workspace picker, while it is open.
     pub picker: Option<Picker>,
-    /// Every background agent's latest report, for the inbox, the bell and
-    /// finding a stopped coordinator.
+    /// Every background agent's latest report, for the SAYS column, the bell
+    /// and finding a stopped coordinator.
     pub reports: Vec<Report>,
-    /// The job under the inbox cursor. The cursor follows the job rather
-    /// than a row, since the inbox re-sorts whenever an agent's state moves.
-    inbox_job: Option<String>,
-    /// Reports marked read, by job, at the write they were read at: a newer
-    /// write makes one unread again.
-    read: HashMap<String, SystemTime>,
     /// Each job's state at the last read, so a change can be announced;
     /// None until the first read, which announces nothing.
     last_states: Option<HashMap<String, State>>,
@@ -380,9 +318,12 @@ impl App {
         self.jobs.values().filter(|s| s.is_active()).count()
     }
 
+    /// The trees the list shows, filtered, those waiting on you first and
+    /// the rest in pool order.
     pub fn visible(&self) -> Vec<&Tree> {
         let needle = self.filter.to_lowercase();
-        self.trees
+        let mut visible: Vec<&Tree> = self
+            .trees
             .iter()
             .filter(|t| !self.is_orphans_only || t.is_orphan())
             .filter(|t| {
@@ -393,7 +334,9 @@ impl App {
                         .chain(t.agents.iter().map(|a| &a.name))
                         .any(|field| field.to_lowercase().contains(&needle))
             })
-            .collect()
+            .collect();
+        visible.sort_by_key(|t| !self.needs_you(t));
+        visible
     }
 
     pub fn current(&self) -> Option<&Tree> {
@@ -453,10 +396,17 @@ impl App {
     /// Takes the agents read on the git clock. A tree absent from the map has
     /// no agent working in it.
     pub fn apply_agents(&mut self, agents: &HashMap<PathBuf, Vec<Agent>>) {
+        // Until agents are first read the list is unsorted, and the cursor
+        // stays at the top rather than following a row down.
+        let cursor = self
+            .current()
+            .filter(|_| self.is_agents_read)
+            .map(|t| t.path.clone());
         for tree in &mut self.trees {
             tree.agents = agents.get(&tree.path).cloned().unwrap_or_default();
         }
         self.is_agents_read = true;
+        self.reselect(cursor);
     }
 
     /// Keeps the cursor on the same tree, keeps each surviving tree's probed
@@ -868,11 +818,14 @@ impl App {
 
     /// Takes the latest reports. Returns what to announce: each job that has
     /// come to need you or finished since the last read, the coordinator
-    /// included, in inbox order.
+    /// included, what needs you first.
     pub fn apply_reports(&mut self, reports: Vec<Report>) -> Vec<String> {
-        self.read
-            .retain(|job, _| reports.iter().any(|r| &r.job == job));
+        let cursor = self
+            .current()
+            .filter(|_| self.last_states.is_some())
+            .map(|t| t.path.clone());
         self.reports = reports;
+        self.reselect(cursor);
         let items = self.items();
         let states: HashMap<String, State> = items
             .iter()
@@ -904,17 +857,13 @@ impl App {
         news
     }
 
-    /// Every report in inbox order: what needs you, then what is new, then
-    /// what is still moving, then what has been read, newest first within
-    /// each.
+    /// Every report, what needs you first, then what finished, then what is
+    /// still moving, newest first within each.
     fn items(&self) -> Vec<Item<'_>> {
         let mut items: Vec<Item> = self
             .reports
             .iter()
-            .map(|report| {
-                let is_read = self.read.get(&report.job) == Some(&report.updated);
-                Item::new(report, &self.trees, is_read)
-            })
+            .map(|report| Item::new(report, &self.trees))
             .collect();
         items.sort_by(|a, b| {
             a.rank()
@@ -925,54 +874,51 @@ impl App {
         items
     }
 
-    /// The inbox: every report but the coordinator's, which is talked to
-    /// through `n` rather than answered from here.
-    pub fn inbox(&self) -> Vec<Item<'_>> {
-        let mut items = self.items();
-        items.retain(|i| i.report.name != coordinator::NAME);
-        items
-    }
-
-    pub fn current_item(&self) -> Option<Item<'_>> {
-        self.inbox().get(self.inbox_selected()).copied()
-    }
-
-    /// The inbox row under the cursor: its job's row, else the first when
-    /// that job has left the inbox.
-    pub fn inbox_selected(&self) -> usize {
-        let job = self.inbox_job.as_deref();
-        self.inbox()
+    /// What the tree's agent last said: the newest report placed in it. The
+    /// coordinator's is left out, since it is talked to through `n`.
+    pub fn says(&self, tree: &Tree) -> Option<Item<'_>> {
+        self.reports
             .iter()
-            .position(|i| Some(i.report.job.as_str()) == job)
-            .unwrap_or(0)
+            .filter(|r| r.name != coordinator::NAME)
+            .filter(|r| {
+                crate::reports::tree_of(r, &self.trees).is_some_and(|t| t.path == tree.path)
+            })
+            .max_by_key(|r| r.updated)
+            .map(|r| Item::new(r, &self.trees))
     }
 
-    fn select_inbox(&mut self, index: usize) {
-        let items = self.inbox();
-        let index = index.min(items.len().saturating_sub(1));
-        self.inbox_job = items.get(index).map(|i| i.report.job.clone());
+    /// The tree waits on you: its agent asked something, or sits at a prompt.
+    pub fn needs_you(&self, tree: &Tree) -> bool {
+        tree.agents
+            .iter()
+            .any(|a| a.status == Some(Status::Waiting) && a.name != coordinator::NAME)
+            || self.says(tree).is_some_and(|i| i.state == State::Blocked)
     }
 
-    /// Reports waiting on you and not yet read, for the summary.
+    /// Trees waiting on you, for the summary.
     pub fn needing_you(&self) -> usize {
-        self.inbox()
+        self.trees.iter().filter(|t| self.needs_you(t)).count()
+    }
+
+    /// Agents outside the pool waiting on you, which have no row to show it.
+    pub fn elsewhere(&self) -> usize {
+        self.items()
             .iter()
-            .filter(|i| i.state == State::Blocked && !i.is_read)
+            .filter(|i| i.tree.is_none() && i.state == State::Blocked)
+            .filter(|i| i.report.name != coordinator::NAME)
             .count()
     }
 
-    fn mark_read(&mut self, job: &str) {
-        if let Some(report) = self.reports.iter().find(|r| r.job == job) {
-            self.read.insert(report.job.clone(), report.updated);
-        }
+    /// The tree the cursor stands on, for the compose box's "this tree"
+    /// target.
+    fn cursor_tree(&self) -> Option<&Tree> {
+        self.current()
     }
 
-    /// The tree the cursor stands on in either list, for the compose box's
-    /// "this tree" target.
-    fn cursor_tree(&self) -> Option<&Tree> {
-        match self.screen {
-            Screen::Trees => self.current(),
-            Screen::Inbox => self.current_item().and_then(|i| i.tree),
+    /// Puts the cursor back on the tree at `path` after the list re-sorts.
+    fn reselect(&mut self, path: Option<PathBuf>) {
+        if let Some(at) = path.and_then(|p| self.visible().iter().position(|t| t.path == p)) {
+            self.selected = at;
         }
     }
 
@@ -1071,88 +1017,6 @@ impl App {
             self.message = Some(format!("{skipped} agent(s) left out: no chat to type into"));
         }
         self.prompt = Some(Prompt::message(to));
-    }
-
-    /// Opens the compose box to answer the report under the inbox cursor.
-    fn open_reply(&mut self) {
-        let Some(item) = self.current_item() else {
-            return;
-        };
-        let (job, to) = (item.report.job.clone(), item.recipient());
-        self.mark_read(&job);
-        self.prompt = Some(Prompt::message(vec![to]));
-    }
-
-    /// Opens the chat of the report under the inbox cursor.
-    fn open_item_chat(&mut self) -> Outcome {
-        let Some(item) = self.current_item() else {
-            return Outcome::Continue;
-        };
-        let (job, to) = (item.report.job.clone(), item.recipient());
-        self.mark_read(&job);
-        Outcome::Chat {
-            command: to.command,
-            agent: to.agent,
-            tree: to.tree,
-        }
-    }
-
-    fn handle_inbox_key(&mut self, key: KeyEvent) -> Outcome {
-        let at = self.inbox_selected();
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return self.quit(),
-            KeyCode::Tab => self.screen = Screen::Trees,
-            KeyCode::Down | KeyCode::Char('j') => self.select_inbox(at + 1),
-            KeyCode::Up | KeyCode::Char('k') => self.select_inbox(at.saturating_sub(1)),
-            KeyCode::Home | KeyCode::Char('g') => self.select_inbox(0),
-            KeyCode::End | KeyCode::Char('G') => self.select_inbox(usize::MAX),
-            KeyCode::Enter | KeyCode::Char('m') => {
-                if self.current_item().is_some_and(|i| i.is_at_prompt()) {
-                    return self.open_item_chat();
-                }
-                self.open_reply();
-            }
-            KeyCode::Char('n') => self.open_dispatch(),
-            KeyCode::Char('x') => {
-                if let Some(item) = self.current_item() {
-                    let job = item.report.job.clone();
-                    if item.is_read {
-                        self.read.remove(&job);
-                    } else {
-                        self.mark_read(&job);
-                    }
-                }
-            }
-            KeyCode::Char('c') => return self.open_item_chat(),
-            KeyCode::Char('t') => match self.current_item().and_then(|i| i.tree) {
-                Some(tree) => return Outcome::Enter(tree.clone()),
-                None => self.message = Some("it works outside the pool".into()),
-            },
-            KeyCode::Char('r') => match self.current_item().and_then(|i| i.tree).cloned() {
-                Some(tree) => {
-                    let is_settled = self
-                        .current_item()
-                        .is_some_and(|i| i.report.state.is_settled());
-                    self.marked.clear();
-                    let path = tree.path.clone();
-                    self.selected = self
-                        .visible()
-                        .iter()
-                        .position(|t| t.path == path)
-                        .unwrap_or(self.selected);
-                    let trees = self.targets(Kind::Return);
-                    if !trees.is_empty() {
-                        if !is_settled {
-                            self.message = Some("its agent is still working".into());
-                        }
-                        self.pending = Some(Pending { trees });
-                    }
-                }
-                None => self.message = Some("it works outside the pool".into()),
-            },
-            _ => {}
-        }
-        Outcome::Continue
     }
 
     pub fn paste(&mut self, text: &str) {
@@ -1464,11 +1328,7 @@ impl App {
         if key.code == KeyCode::Char('w') {
             return Outcome::Workspaces;
         }
-        if self.screen == Screen::Inbox {
-            return self.handle_inbox_key(key);
-        }
         match key.code {
-            KeyCode::Tab => self.screen = Screen::Inbox,
             KeyCode::Char('m') => self.open_message(),
             KeyCode::Char('q') => return self.quit(),
             KeyCode::Esc if !self.filter.is_empty() => {
@@ -1497,20 +1357,8 @@ impl App {
             KeyCode::Char('o') => return self.browse(),
             KeyCode::Char('c') => return self.chat(),
             KeyCode::Char('n') => self.open_dispatch(),
-            KeyCode::Char('L') => {
-                self.pane = if self.pane == Pane::Log {
-                    Pane::Info
-                } else {
-                    Pane::Log
-                };
-                self.log_scroll = 0;
-            }
             KeyCode::Char('d') => self.open_diff(),
             KeyCode::Char('b') => self.open_rename(),
-            KeyCode::PageUp if self.pane == Pane::Log => self.log_scroll += 10,
-            KeyCode::PageDown if self.pane == Pane::Log => {
-                self.log_scroll = self.log_scroll.saturating_sub(10);
-            }
             KeyCode::Char('t') => {
                 if let Some(tree) = self.current() {
                     return Outcome::Enter(tree.clone());
@@ -1537,6 +1385,8 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
+
     use super::*;
     use crate::pool::parse;
     use ratatui::crossterm::event::KeyEvent;
@@ -2197,102 +2047,67 @@ mod tests {
         app.apply_sidecars(sidecars);
     }
 
+    fn rows(app: &App) -> Vec<String> {
+        app.visible().iter().map(|t| t.name.clone()).collect()
+    }
+
     #[test]
     fn a_report_is_never_placed_by_its_directory_alone() {
         let mut app = app();
-        app.apply_reports(vec![report("gone", State::Done, "/p/4/app", 1)]);
-        assert_eq!(
-            app.inbox()[0].place(),
-            "app",
+        app.apply_reports(vec![report("gone", State::Blocked, "/p/4/app", 1)]);
+        let four = app.trees.iter().find(|t| t.name == "4").unwrap();
+        assert!(
+            app.says(four).is_none(),
             "tree 4 was returned and handed out again since"
         );
+        assert_eq!(app.elsewhere(), 1, "it waits on you outside the pool");
     }
 
     #[test]
-    fn the_inbox_puts_what_needs_you_first_then_news_then_work_then_what_is_read() {
+    fn a_tree_says_what_its_agent_last_reported_and_needing_you_sorts_it_first() {
         let mut app = app();
         dispatched(&mut app, "/p/8/app", "ask");
         app.apply_reports(vec![
-            report("work", State::Working, "/p/8/app", 1),
-            report("old-done", State::Done, "/p/4/app", 50),
-            report("new-done", State::Done, "/home/me/app", 5),
+            report("older", State::Done, "/p/8/app", 90),
             report("ask", State::Blocked, "/p/8/app/ui", 40),
+            report("away", State::Done, "/home/me/app", 5),
         ]);
-        let order = |app: &App| -> Vec<String> {
-            app.inbox().iter().map(|i| i.report.job.clone()).collect()
-        };
-        assert_eq!(order(&app), ["ask", "new-done", "old-done", "work"]);
-        let ask = app.inbox()[0];
-        assert_eq!(ask.place(), "8", "joined to the tree it works in");
-        assert_eq!(
-            app.inbox()[1].place(),
-            "app",
-            "outside the pool: its directory"
-        );
+        let eight = app.trees.iter().find(|t| t.name == "8").unwrap();
+        assert_eq!(app.says(eight).unwrap().report.job, "ask");
+        assert_eq!(rows(&app), ["8", "4", "7"], "waiting on you, so first");
         assert_eq!(app.needing_you(), 1);
-        press(&mut app, KeyCode::Tab);
-        press(&mut app, KeyCode::Char('x'));
-        assert_eq!(
-            order(&app),
-            ["new-done", "old-done", "work", "ask"],
-            "read sinks"
-        );
-        assert_eq!(app.needing_you(), 0);
+        assert_eq!(app.elsewhere(), 0, "a finished job outside needs nothing");
     }
 
     #[test]
-    fn enter_in_the_inbox_replies_through_the_reports_agent_else_by_its_job() {
+    fn the_cursor_stays_on_its_tree_when_an_agent_starts_waiting() {
         let mut app = app();
-        dispatched(&mut app, "/p/4/app", "e6b79280");
-        app.apply_reports(vec![report("e6b79280", State::Blocked, "/p/4/app", 1)]);
-        press(&mut app, KeyCode::Tab);
-        press(&mut app, KeyCode::Enter);
-        type_in(&mut app, "after deploy");
-        match press(&mut app, KeyCode::Enter) {
-            Outcome::Send { to, text } => {
-                assert_eq!(text, "after deploy");
-                assert_eq!(to[0].command, ["claude", "attach", "e6b79280"]);
-                assert_eq!(to[0].tree, "4");
-            }
-            other => panic!("expected a send, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn the_inbox_cursor_stays_on_its_job_when_an_agent_starts_waiting() {
-        let mut app = app();
-        app.apply_reports(vec![
-            report("ping", State::Done, "/p/4/app", 1),
-            report("ask", State::Working, "/p/8/app", 2),
-        ]);
-        press(&mut app, KeyCode::Tab);
-        press(&mut app, KeyCode::Char('j'));
-        assert_eq!(app.current_item().unwrap().report.job, "ask");
+        app.apply_agents(&HashMap::new());
+        press(&mut app, KeyCode::End);
+        assert_eq!(app.current().unwrap().name, "8");
         let waiting = Agent {
             status: Some(Status::Waiting),
             job: Some("ask".into()),
             ..attachable("ask")
         };
         app.apply_agents(&HashMap::from([(PathBuf::from("/p/8/app"), vec![waiting])]));
-        assert_eq!(app.inbox()[0].report.job, "ask", "it moved to the top");
-        assert_eq!(
-            app.current_item().unwrap().report.job,
-            "ask",
-            "the cursor went with it"
-        );
+        assert_eq!(rows(&app)[0], "8", "it moved to the top");
+        assert_eq!(app.current().unwrap().name, "8", "the cursor went with it");
     }
 
     #[test]
-    fn the_coordinator_is_left_out_of_the_inbox_but_still_rings_the_bell() {
+    fn the_coordinator_says_nothing_on_its_row_but_still_rings_the_bell() {
         let mut app = app_with_main();
         let coordinator = |state| Report {
             name: coordinator::NAME.into(),
             ..report("c0", state, "/repo", 1)
         };
         app.apply_reports(vec![coordinator(State::Working)]);
-        let news = app.apply_reports(vec![coordinator(State::Done)]);
-        assert_eq!(news, [format!("{} done: c0 says", coordinator::NAME)]);
-        assert!(app.inbox().is_empty());
+        let news = app.apply_reports(vec![coordinator(State::Blocked)]);
+        assert_eq!(news, [format!("{} needs you: c0 says", coordinator::NAME)]);
+        let main = app.trees.iter().find(|t| t.is_main).unwrap();
+        assert!(app.says(main).is_none());
+        assert_eq!(app.elsewhere(), 0);
     }
 
     fn choice(path: &str, held: Option<usize>) -> Choice {
@@ -2407,9 +2222,10 @@ mod tests {
             ["job cde62519 needs you: waiting at a prompt in its chat: Enter opens it"]
         );
         assert_eq!(app.needing_you(), 1);
-        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Home);
+        assert_eq!(app.current().unwrap().name, "8", "it sorts first");
         assert!(matches!(
-            press(&mut app, KeyCode::Enter),
+            press(&mut app, KeyCode::Char('c')),
             Outcome::Chat { tree, .. } if tree == "8"
         ));
     }

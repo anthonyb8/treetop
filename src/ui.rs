@@ -11,7 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 
 use crate::agents::{Agent, Status};
-use crate::app::{App, DiffView, Item, JobState, Opening, Pane, Pending, Picker, Review, Screen};
+use crate::app::{App, DiffView, Item, JobState, LogEntry, Opening, Pending, Picker, Review};
 use crate::chat::Chat;
 use crate::coordinator;
 use crate::diff::{Change, FileDiff, Layout as DiffLayout, Row as DiffRow, Side, ViewRow};
@@ -23,8 +23,7 @@ use crate::theme::theme;
 
 /// Most useful first: on a narrow bar the keys at the end are the ones left
 /// out.
-const KEYS: [(&str, &str); 19] = [
-    ("Tab", "inbox"),
+const KEYS: [(&str, &str); 17] = [
     ("n", "ask/dispatch"),
     ("w", "workspace"),
     ("m", "message"),
@@ -38,25 +37,10 @@ const KEYS: [(&str, &str); 19] = [
     ("r", "return"),
     ("D", "destroy"),
     ("/", "filter"),
-    ("L", "log"),
     ("q", "quit"),
     ("^R", "refresh"),
     ("u", "unmark"),
     ("j/k", "move"),
-];
-
-/// The inbox's keys, most useful first, as with `KEYS`.
-const INBOX_KEYS: [(&str, &str); 10] = [
-    ("Enter", "reply"),
-    ("c", "chat"),
-    ("x", "read"),
-    ("n", "ask/dispatch"),
-    ("Tab", "trees"),
-    ("t", "tree"),
-    ("r", "return tree"),
-    ("w", "workspace"),
-    ("j/k", "move"),
-    ("q", "quit"),
 ];
 
 /// Most useful first, as with `KEYS`; Esc stays early so the way out is
@@ -80,27 +64,14 @@ pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>) {
     // The theme's text colour is the base for every cell; widgets below only
     // add accents, so nothing falls back to a theme's dim default.
     frame.render_widget(Block::new().style(fg(theme().text)), frame.area());
-    let is_inbox = app.screen == Screen::Inbox;
     let [body, detail, footer] = Layout::vertical([
         Constraint::Fill(1),
-        match (is_inbox, app.pane) {
-            (true, _) => Constraint::Length(13),
-            (false, Pane::Info) => Constraint::Length(6),
-            (false, Pane::Log) => Constraint::Fill(1),
-        },
+        Constraint::Length(DETAIL_HEIGHT),
         Constraint::Length(1),
     ])
     .areas(frame.area());
-    if is_inbox {
-        draw_inbox(frame, app, body);
-        draw_report(frame, app, detail);
-    } else {
-        draw_table(frame, app, body);
-        match app.pane {
-            Pane::Info => frame.render_widget(detail_pane(app), detail),
-            Pane::Log => frame.render_widget(log_pane(app, detail.height), detail),
-        }
-    }
+    draw_table(frame, app, body);
+    draw_detail(frame, app, detail);
     draw_footer(frame, app, footer);
     if chat.is_some()
         || app.view.is_some()
@@ -168,6 +139,12 @@ fn summary(app: &App, is_compact: bool) -> Vec<Span<'static>> {
             spans.push(Span::styled(
                 format!("  {n} need you"),
                 fg(t.danger).add_modifier(Modifier::BOLD),
+            ));
+        }
+        if let n @ 1.. = app.elsewhere() {
+            spans.push(Span::styled(
+                format!("  elsewhere: {n} need you"),
+                fg(t.warning),
             ));
         }
         if !app.marked.is_empty() {
@@ -324,7 +301,7 @@ fn row(app: &App, tree: &Tree) -> Row<'static> {
         status_cell(app, tree),
         branch,
         agent_cell(app, tree),
-        Cell::from(tree.holder.clone().unwrap_or_default()),
+        says_cell(app, tree),
         count_cell(procs, t.warning),
         ports_cell(tree),
         work_cell(tree, |w| w.changed, t.danger),
@@ -340,7 +317,7 @@ fn row(app: &App, tree: &Tree) -> Row<'static> {
 fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
     let t = theme();
     let header = Row::new([
-        "", "#", "STATUS", "BRANCH", "AGENT", "HOLDER", "PROCS", "PORTS", "CHANGED", "UNPUSHED",
+        "", "#", "STATUS", "BRANCH", "AGENT", "SAYS", "PROCS", "PORTS", "CHANGED", "UNPUSHED",
     ])
     .style(t.header);
     let rows: Vec<Row> = app
@@ -352,9 +329,9 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
         Constraint::Length(1),
         Constraint::Length(4),
         Constraint::Length(13),
-        Constraint::Fill(1),
+        Constraint::Fill(2),
         Constraint::Length(22),
-        Constraint::Length(14),
+        Constraint::Fill(3),
         Constraint::Length(6),
         Constraint::Length(11),
         Constraint::Length(8),
@@ -371,12 +348,9 @@ fn pane_block() -> Block<'static> {
     Block::bordered().border_style(fg(theme().border))
 }
 
-fn detail_pane(app: &App) -> Paragraph<'static> {
+/// Where the tree is, who holds it, its agents, ports and processes.
+fn detail_lines(app: &App, tree: &Tree) -> Vec<Line<'static>> {
     let t = theme();
-    let Some(tree) = app.current() else {
-        let text = if app.is_loaded { "no trees match" } else { "" };
-        return Paragraph::new(text).block(pane_block());
-    };
     let since = tree
         .leased_at
         .as_deref()
@@ -410,7 +384,12 @@ fn detail_pane(app: &App) -> Paragraph<'static> {
             .collect::<Vec<_>>()
             .join("   ")
     };
-    Paragraph::new(vec![
+    let holder = tree
+        .holder
+        .as_ref()
+        .map(|h| format!("  held by {h}"))
+        .unwrap_or_default();
+    vec![
         Line::from(vec![
             Span::styled(
                 tree.path.display().to_string(),
@@ -420,6 +399,7 @@ fn detail_pane(app: &App) -> Paragraph<'static> {
                 since.map(|s| format!("  leased {s}")).unwrap_or_default(),
                 fg(t.muted),
             ),
+            Span::styled(holder, fg(t.muted)),
         ]),
         agents_line(app, tree),
         Line::from(vec![
@@ -430,8 +410,7 @@ fn detail_pane(app: &App) -> Paragraph<'static> {
             Span::styled("processes ", fg(t.muted)),
             Span::raw(procs),
         ]),
-    ])
-    .block(pane_block())
+    ]
 }
 
 /// Each agent with its status, where it was seen and its pid.
@@ -533,11 +512,7 @@ fn footer_left(app: &App, width: u16) -> Line<'static> {
         ));
     }
     let used = u16::try_from(narrowing.iter().map(Span::width).sum::<usize>()).unwrap_or(width);
-    let keys: &[(&str, &str)] = match app.screen {
-        Screen::Trees => &KEYS,
-        Screen::Inbox => &INBOX_KEYS,
-    };
-    let mut spans = fitting_keys(keys, width.saturating_sub(used));
+    let mut spans = fitting_keys(&KEYS, width.saturating_sub(used));
     spans.extend(narrowing);
     Line::from(spans)
 }
@@ -576,162 +551,164 @@ fn wrapped_height(lines: &[Line], width: u16) -> usize {
         .sum()
 }
 
-/// How a report's state reads: what needs you is the loud one, what is new
-/// stands out, and what has been read steps back.
-fn report_style(item: &Item) -> (&'static str, Style) {
+/// How a report's state reads: what needs you is the loud one.
+fn state_style(state: State) -> (&'static str, Style) {
     let t = theme();
-    let style = match item.state {
-        State::Blocked => fg(t.warning).add_modifier(Modifier::BOLD),
-        State::Done => fg(t.success),
-        State::Working => fg(t.info),
-        State::Stopped => fg(t.muted),
+    match state {
+        State::Blocked => ("●", fg(t.warning).add_modifier(Modifier::BOLD)),
+        State::Done => ("✓", fg(t.success)),
+        State::Working => ("·", fg(t.info)),
+        State::Stopped => ("■", fg(t.muted)),
+    }
+}
+
+/// The tree's agent's latest word, its first line: the question it waits on,
+/// its answer once done, else what it is doing.
+fn says_cell(app: &App, tree: &Tree) -> Cell<'static> {
+    let Some(item) = app.says(tree) else {
+        return Cell::from("");
     };
-    let glyph = match item.state {
-        State::Blocked => "●",
-        State::Done => "✓",
-        State::Working => "·",
-        State::Stopped => "■",
-    };
-    if item.is_read {
-        (glyph, fg(t.muted))
+    let (glyph, style) = state_style(item.state);
+    let first = item.text().lines().next().unwrap_or("").to_string();
+    let text_style = if item.state == State::Blocked {
+        Style::new().add_modifier(Modifier::BOLD)
     } else {
-        (glyph, style)
-    }
+        Style::new()
+    };
+    Cell::from(Line::from(vec![
+        Span::styled(format!("{glyph} "), style),
+        Span::styled(first, text_style),
+    ]))
 }
 
-/// The inbox: one row per agent's latest report, what needs you first.
-fn draw_inbox(frame: &mut Frame, app: &App, area: Rect) {
-    let t = theme();
-    let items = app.inbox();
-    let header = Row::new(["", "WHERE", "AGENT", "STATE", "REPORT", "AGE"]).style(t.header);
-    let rows: Vec<Row> = items
-        .iter()
-        .map(|item| {
-            let (glyph, style) = report_style(item);
-            let text_style = if item.is_read {
-                fg(t.muted)
-            } else {
-                Style::new()
-            };
-            let first_line = item.text().lines().next().unwrap_or("").to_string();
-            Row::new(vec![
-                Cell::from(glyph).style(style),
-                Cell::from(item.place()),
-                Cell::from(item.report.name.clone()).style(text_style),
-                Cell::from(item.state.label()).style(style),
-                Cell::from(first_line).style(text_style),
-                Cell::from(reports::age(item.report.updated)).style(fg(t.muted)),
-            ])
-        })
-        .collect();
-    if rows.is_empty() {
-        frame.render_widget(
-            Paragraph::new(" No reports yet. n dispatches an agent; what it reports lands here.")
-                .style(fg(t.muted)),
-            area,
-        );
-        return;
-    }
-    // The report is what the inbox is for, so the agent's name gives way to
-    // it on a narrow screen.
-    let widths = [
-        Constraint::Length(1),
-        Constraint::Length(5),
-        Constraint::Length((area.width / 5).clamp(12, 28)),
-        Constraint::Length(9),
-        Constraint::Fill(1),
-        Constraint::Length(4),
-    ];
-    let table = Table::new(rows, widths)
-        .header(header)
-        .row_highlight_style(t.cursor);
-    let mut state = TableState::default().with_selected(Some(app.inbox_selected()));
-    frame.render_stateful_widget(table, area, &mut state);
-}
+/// Rows the detail pane takes, borders included.
+const DETAIL_HEIGHT: u16 = 12;
 
-/// The report under the cursor in full: where it works, what it says, and
-/// its latest steps.
-fn draw_report(frame: &mut Frame, app: &App, area: Rect) {
+/// The tree under the cursor in full: where it is, its agents, what it
+/// serves and runs, what its agent last said with its latest steps, and its
+/// last action's outcome.
+fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     let t = theme();
-    let Some(item) = app.current_item() else {
-        frame.render_widget(Paragraph::new("").block(pane_block()), area);
+    let Some(tree) = app.current() else {
+        let text = if app.is_loaded { "no trees match" } else { "" };
+        frame.render_widget(Paragraph::new(text).block(pane_block()), area);
         return;
     };
-    let block = pane_block().title(format!(" {} ", item.report.name));
+    let block = pane_block();
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let mut place = vec![Span::styled(
-        match item.tree {
-            Some(tree) if tree.is_main => "main checkout".to_string(),
-            Some(tree) => format!("tree {}", tree.name),
-            None => "outside the pool".to_string(),
-        },
-        Style::new().add_modifier(Modifier::BOLD),
-    )];
-    if let Some(tree) = item.tree {
-        place.push(Span::raw(format!(
-            "  {}",
-            tree.branch.as_deref().unwrap_or("(detached)")
-        )));
-        if let Some(work) = tree.work {
-            place.push(Span::styled(
-                format!("  {} changed", work.changed),
-                fg(if work.changed > 0 { t.danger } else { t.muted }),
-            ));
-            place.push(Span::styled(
-                format!("  {} unpushed", work.unpushed),
-                fg(if work.unpushed > 0 {
-                    t.special
-                } else {
-                    t.muted
-                }),
-            ));
-        }
-        if let Some(port) = tree.ports().first() {
-            place.push(Span::styled(format!("  :{port}"), fg(t.info)));
-        }
+    let mut lines = detail_lines(app, tree);
+    let item = app.says(tree);
+    if let Some(item) = &item {
+        lines.extend(said_lines(item, inner.width));
     }
-    if let Some(dir) = &item.report.dir {
-        place.push(Span::styled(format!("  {}", dir.display()), fg(t.muted)));
+    let last = app.log.iter().rev().find(|e| e.tree == tree.name);
+    let fixed = wrapped_height(&lines, inner.width);
+    let room = usize::from(inner.height).saturating_sub(fixed);
+    if let Some(entry) = last {
+        lines.extend(action_lines(entry, room.min(3)));
     }
+    let room = usize::from(inner.height).saturating_sub(wrapped_height(&lines, inner.width));
+    if let (Some(item), 2..) = (&item, room) {
+        let steps = &item.report.steps[item.report.steps.len().saturating_sub(room - 1)..];
+        lines.push(Line::styled("steps", fg(t.muted)));
+        lines.extend(steps.iter().map(|step| {
+            let at = step.at.map_or_else(|| "--:--".into(), reports::clock);
+            let state = step.state.map_or("", State::label);
+            Line::from(vec![
+                Span::styled(format!("{at} "), fg(t.muted)),
+                Span::styled(format!("{state:<9} "), fg(t.muted)),
+                Span::raw(step.detail.replace('\n', " ")),
+            ])
+        }));
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+/// Where the detail pane's values start, after their label.
+const INDENT: &str = "          ";
+
+/// What an agent last said, every line, led by its state, wrapped to `width`
+/// under its label.
+fn said_lines(item: &Item, width: u16) -> Vec<Line<'static>> {
+    let t = theme();
+    let (glyph, style) = state_style(item.state);
     let live = match item.agent {
-        Some(Agent { pid: Some(pid), .. }) => format!("running, pid {pid}"),
-        Some(Agent { pid: None, .. }) | None => "not running; c or a reply starts it again".into(),
+        Some(Agent { pid: Some(_), .. }) => "running",
+        _ => "not running; a message starts it again",
     };
-    place.push(Span::styled(
-        format!("  job {} · {live}", item.report.job),
-        fg(t.muted),
-    ));
-    let (glyph, style) = report_style(&item);
-    let mut said = vec![Line::from(place)];
-    for (i, text) in item.text().lines().enumerate() {
-        let lead = if i == 0 {
-            Span::styled(format!("{glyph} {} ", item.state.label()), style)
-        } else {
-            Span::raw("  ")
-        };
-        said.push(Line::from(vec![lead, Span::raw(text.to_string())]));
+    let mut lines = vec![Line::from(vec![
+        Span::styled("says      ", fg(t.muted)),
+        Span::styled(format!("{glyph} {} ", item.state.label()), style),
+        Span::styled(
+            format!(
+                "{} · {} · job {} · {live}",
+                item.report.name,
+                reports::age(item.report.updated),
+                item.report.job
+            ),
+            fg(t.muted),
+        ),
+    ])];
+    let room = usize::from(width).saturating_sub(INDENT.len()).max(1);
+    lines.extend(
+        item.text()
+            .lines()
+            .flat_map(|text| word_wrap(text, room))
+            .map(|row| Line::raw(format!("{INDENT}{row}"))),
+    );
+    lines
+}
+
+/// `text` broken at spaces into rows of at most `width` characters; a word
+/// longer than a row is cut.
+fn word_wrap(text: &str, width: usize) -> Vec<String> {
+    let mut rows = vec![String::new()];
+    for word in text.split(' ') {
+        let row = rows.last_mut().expect("rows starts with one");
+        let len = row.chars().count();
+        if len > 0 && len + 1 + word.chars().count() > width {
+            rows.push(String::new());
+        }
+        let row = rows.last_mut().expect("just pushed");
+        if !row.is_empty() {
+            row.push(' ');
+        }
+        row.push_str(word);
     }
-    let said_height = u16::try_from(wrapped_height(&said, inner.width) + 1)
-        .unwrap_or(u16::MAX)
-        .min(inner.height.saturating_sub(3).max(2));
-    let said = Paragraph::new(said).wrap(Wrap { trim: false });
-    let [said_area, steps_area] =
-        Layout::vertical([Constraint::Length(said_height), Constraint::Fill(1)]).areas(inner);
-    frame.render_widget(said, said_area);
-    let shown = usize::from(steps_area.height.saturating_sub(1));
-    let steps = &item.report.steps[item.report.steps.len().saturating_sub(shown)..];
-    let mut lines = vec![Line::styled("steps", fg(t.muted))];
-    lines.extend(steps.iter().map(|step| {
-        let at = step.at.map_or_else(|| "--:--".into(), reports::clock);
-        let state = step.state.map_or("", State::label);
-        Line::from(vec![
-            Span::styled(format!("{at} "), fg(t.muted)),
-            Span::styled(format!("{state:<9} "), fg(t.muted)),
-            Span::raw(step.detail.replace('\n', " ")),
-        ])
-    }));
-    frame.render_widget(Paragraph::new(lines), steps_area);
+    rows.into_iter()
+        .flat_map(|row| wrap_chars(&row, width))
+        .filter(|row| !row.is_empty())
+        .collect()
+}
+
+/// The tree's last action and the end of its output.
+fn action_lines(entry: &LogEntry, shown: usize) -> Vec<Line<'static>> {
+    let t = theme();
+    let (verdict, color) = if entry.is_ok {
+        ("ok", t.success)
+    } else {
+        ("failed", t.danger)
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::styled("last      ", fg(t.muted)),
+        Span::styled(
+            format!("{} {verdict}", entry.kind.noun()),
+            fg(color).add_modifier(Modifier::BOLD),
+        ),
+    ])];
+    let output: Vec<&str> = entry
+        .output
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    lines.extend(
+        output[output.len().saturating_sub(shown)..]
+            .iter()
+            .map(|l| Line::styled(format!("{INDENT}{l}"), fg(t.muted))),
+    );
+    lines
 }
 
 /// The workspace picker: every repository treetop has been opened in, this
@@ -1423,46 +1400,18 @@ fn draw_screen(screen: &vt100::Screen, buffer: &mut Buffer, area: Rect) -> Optio
         .then(|| Position::new(area.x + col, area.y + row))
 }
 
-/// Every finished job's output, newest at the bottom, scrolled up by
-/// `log_scroll` lines.
-fn log_pane(app: &App, height: u16) -> Paragraph<'static> {
-    let t = theme();
-    let mut lines: Vec<Line> = Vec::new();
-    for entry in &app.log {
-        if !lines.is_empty() {
-            lines.push(Line::raw(""));
-        }
-        let (verdict, color) = if entry.is_ok {
-            ("ok", t.success)
-        } else {
-            ("failed", t.danger)
-        };
-        lines.push(Line::styled(
-            format!("{} tree {}: {verdict}", entry.kind.noun(), entry.tree),
-            fg(color).add_modifier(Modifier::BOLD),
-        ));
-        lines.extend(entry.output.lines().map(|l| Line::raw(format!("  {l}"))));
-    }
-    if lines.is_empty() {
-        lines.push(Line::raw("no actions yet"));
-    }
-    let shown = usize::from(height.saturating_sub(2));
-    let top = lines
-        .len()
-        .saturating_sub(shown)
-        .saturating_sub(app.log_scroll);
-    Paragraph::new(lines)
-        .scroll((u16::try_from(top).unwrap_or(u16::MAX), 0))
-        .block(
-            pane_block()
-                .title(" log ")
-                .title_bottom(" PgUp/PgDn scroll   L closes "),
-        )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wraps_at_words_and_cuts_a_word_too_long_for_a_row() {
+        assert_eq!(
+            word_wrap("tell the agent what", 9),
+            ["tell the", "agent", "what"]
+        );
+        assert_eq!(word_wrap("abcdefghij", 4), ["abcd", "efgh", "ij"]);
+    }
 
     #[test]
     fn copies_a_terminal_screen_with_its_colours_and_cursor() {

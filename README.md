@@ -2,7 +2,7 @@
 
 An htop-style view of a [treehouse](https://github.com/kunchenguid/treehouse) worktree pool.
 See which coding agent works in each tree, whether it is waiting on you and what the tree serves, and jump to the agent in one key.
-Ask a coordinator agent about every other agent at once, send an agent a task in a fresh tree, a tree you pick or the main checkout, and read what each agent reports back in an inbox.
+Ask a coordinator agent about every other agent at once, send an agent a task in a fresh tree, a tree you pick or the main checkout, and read what each agent reports back on its tree's row.
 Switch between the pools of every repository you use it in without leaving it.
 Mark trees, then return them to the pool or destroy them, with git's view of each tree on screen so nothing unpushed goes by accident.
 
@@ -45,12 +45,10 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | `r` | return the marked trees, or the one under the cursor, to the pool |
 | `D` | destroy them from disk, after reviewing treehouse's preview of each |
 | `d` | open the side-by-side diff of the tree under the cursor in a popup |
-| `L` | show or hide the log of every action's output; PgUp and PgDn scroll it |
 | `t` | go to the tree: its agent's pane or a window inside tmux, else a shell |
 | `c` | open the agent's chat in a popup over treetop; Ctrl+Q comes back (see [Agent chats](#agent-chats)) |
 | `n` | open the compose box: ask the coordinator, or Tab to start a new agent in a new tree, the tree under the cursor or in place (see [The coordinator and dispatch](#the-coordinator-and-dispatch)) |
 | `m` | write a message to the agents in the marked trees, or the tree under the cursor |
-| `Tab` | switch between the trees and the inbox of what agents have reported (see [The inbox](#the-inbox)) |
 | `w` | switch to another workspace: the pool of another repository treetop has been opened in |
 | `Ctrl-R` | list the pool again now |
 | `q`, Esc | quit |
@@ -62,6 +60,8 @@ CHANGED counts uncommitted files and UNPUSHED counts commits on no remote; `?` m
 PROCS counts processes running inside the tree, and PORTS the TCP ports they listen on: the lowest, and how many more.
 `o` opens the lowest in the browser on a desktop; on a server reached over SSH it copies the URL to the clipboard of the computer you are typing at, through the terminal (OSC 52; inside tmux, `set-clipboard on`).
 AGENT names the coding agent working in the tree, from the sources under [Agents](#agents); `no agent` on a held tree marks one nobody is working in, which `a` lists on its own.
+SAYS is its agent's latest word (see [What agents say](#what-agents-say)), and trees waiting on you sort to the top.
+The pane below shows the tree under the cursor in full: its path and holder, its agents, ports and processes, everything its agent last said with its latest steps, and the outcome of its last action with the end of its output.
 The first row, `main`, is the repository's main checkout, so agents working in place show too; it is never returned or destroyed, and the summary's tree counts leave it out.
 
 treetop refreshes on two clocks, the way htop stays fast.
@@ -172,7 +172,7 @@ treetop starts new agents with it unless `TREETOP_NEW_AGENT` names a command.
 ## What the actions run
 
 Both run in the background, up to four trees at once, while treetop stays on screen; each row's STATUS shows queued, returning, destroying, returned, destroyed or failed.
-Their output goes to the log (`L`), and a failure also shows its last line in the status line.
+The detail pane shows the end of each tree's last action's output, and a failure also shows its last line in the status line.
 
 - **Return** first shows a dialog listing each tree's uncommitted files, unpushed commits and running processes, or "unknown changes" where git cannot read it. On `y`, for each tree at once:
   1. it stops the tree's background agents through their plugin, since a session that moved in with `EnterWorktree` runs from elsewhere and treehouse would not stop it;
@@ -270,30 +270,18 @@ An agent mid-turn queues it, as Claude Code queues anything typed while it works
 A cold agent gets it through its plugin instead, which for Claude Code is `claude --bg --resume`: the session starts again with the message as its next turn, under the same job.
 Agents with no chat to type into, such as an interactive session or a bare process, are left out, and the status line says how many.
 
-### The inbox
+### What agents say
 
-`Tab` switches to the inbox: one row per background agent's latest report, read from Claude Code's job files under `~/.claude/jobs`.
-Each row says where the agent works (the tree's number, `main`, or the directory outside the pool), its name, its state and what it says: the question while it needs you, the answer once it is done, else what it is doing now.
-What needs you comes first, then what is new, then what is still working, then what you have read; within each, the newest first.
+Every background agent's latest report is read from Claude Code's job files under `~/.claude/jobs` and shown on its tree's row, in SAYS: the question while it needs you, the answer once it is done, else what it is doing now.
+A report belongs to the tree whose `treetop.json` names its job, or where its agent runs now, so a recycled tree never shows the last agent's words.
 An agent sitting at a question dialog or permission prompt needs you too, though its report still says working, since only its chat can answer it.
-Finished and stopped reports leave the inbox after a day; working and waiting ones stay.
-The coordinator's own reports are left out, since it is talked to through `n`.
-The pane below shows the tree's branch, changes, unpushed commits and port beside the full report and its latest steps.
-
-| Key | Does |
-|---|---|
-| Enter, `m` | reply: the compose box, addressed to that agent; at a prompt, open its chat instead |
-| `c` | open its chat; a stopped agent starts again |
-| `x` | mark it read, or unread |
-| `n` | the compose box, as on the trees |
-| `t` | go to its tree |
-| `r` | return its tree to the pool, through the same confirm as the list |
-| `w` | switch workspace |
-| `Tab` | back to the trees |
+Trees waiting on you come first in the list, and the cursor stays on its tree as rows move.
+Finished and stopped reports go after a day; working and waiting ones stay.
+The coordinator's own reports are left off its row, since it is talked to through `n`.
 
 When an agent comes to need you, or finishes, treetop rings the terminal bell, and inside tmux shows it in the status line for five seconds, so it is heard from any window; the coordinator finishing an answer rings it too.
-The summary counts the reports that need you and are not yet read.
-These job files are internal to Claude Code, like its session files, so a release that changes them empties the inbox until treetop catches up.
+The summary counts the trees that need you, and, as "elsewhere", agents outside the pool waiting on you, which have no row.
+These job files are internal to Claude Code, like its session files, so a release that changes them blanks SAYS until treetop catches up.
 
 ## Workspaces
 
@@ -306,7 +294,7 @@ The list lives in `$XDG_CACHE_HOME/treetop/workspaces.json` (else `~/.cache/tree
 treetop never scans treehouse's own directories for pools, keeping to treehouse's CLI.
 
 A switch waits while an action is running in the pool on screen.
-The chats left open in the old pool are ended, which leaves their agents running, and the inbox stays the same across workspaces, since it reads every agent's reports.
+The chats left open in the old pool are ended, which leaves their agents running.
 Each workspace has its own coordinator; a stopped one is only ever taken up again in the pool it works in.
 
 ## Entering a tree
