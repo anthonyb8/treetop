@@ -89,6 +89,10 @@ pub struct Config {
     pub tickets: BTreeMap<String, Source>,
     #[serde(default)]
     pub repos: BTreeMap<String, Repo>,
+    /// The first message of an agent picking up a ticket, with `{id}`,
+    /// `{title}`, `{description}`, `{url}` and `{branch}` filled in.
+    #[serde(default)]
+    pub prompt: Option<String>,
 }
 
 /// `path` with a leading `~` as the home directory.

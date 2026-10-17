@@ -381,11 +381,16 @@ impl App {
             .iter()
             .filter(|t| {
                 needle.is_empty()
-                    || [Some(&t.name), t.branch.as_ref(), t.holder.as_ref()]
-                        .into_iter()
-                        .flatten()
-                        .chain(t.agents.iter().map(|a| &a.name))
-                        .any(|field| field.to_lowercase().contains(&needle))
+                    || [
+                        Some(&t.name),
+                        t.branch.as_ref(),
+                        t.holder.as_ref(),
+                        t.sidecar.as_ref().and_then(|s| s.ticket.as_ref()),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .chain(t.agents.iter().map(|a| &a.name))
+                    .any(|field| field.to_lowercase().contains(&needle))
             })
             .collect();
         visible.sort_by_key(|t| !self.needs_you(t));
@@ -514,7 +519,7 @@ impl App {
             }
             self.jobs.insert(path, JobState::Failed(job.kind));
             self.message = Some(format!(
-                "{} of tree {} failed: {}  (L shows the log)",
+                "{} of tree {} failed: {}  (its output is in the pane below)",
                 job.kind.noun(),
                 job.tree.name,
                 last_line(&output)
@@ -1150,6 +1155,7 @@ impl App {
                 branch: None,
                 is_new_tree: false,
                 is_coordinator: true,
+                ticket: None,
             },
         )
     }
@@ -1174,7 +1180,9 @@ impl App {
             self.message = Some(format!("tree {} already has an action queued", tree.name));
             return Outcome::Continue;
         }
-        if launch.task.trim().is_empty() {
+        // A pick's task comes from its ticket when the job runs, so it is
+        // never an idle start.
+        if launch.task.trim().is_empty() && launch.ticket.is_none() {
             self.opening = Some(Opening {
                 agent: launch.name.clone().unwrap_or_else(|| "new agent".into()),
                 tree: tree.name.clone(),
@@ -1314,9 +1322,42 @@ impl App {
                 view.load();
             }
             KeyCode::Char('r') => view.load(),
+            KeyCode::Enter => return self.pick_current(),
             _ => {}
         }
         Outcome::Continue
+    }
+
+    /// The tree a ticket has been picked up in, by its sidecar.
+    fn tree_of_ticket(&self, id: &str) -> Option<&Tree> {
+        self.trees.iter().find(|t| {
+            t.sidecar
+                .as_ref()
+                .and_then(|s| s.ticket.as_deref())
+                .is_some_and(|ticket| ticket.eq_ignore_ascii_case(id))
+        })
+    }
+
+    /// Picks up the ticket under the tickets cursor: a new agent on it in a
+    /// fresh tree, back on the trees. A ticket already in a tree is not
+    /// picked up twice; the cursor goes to its tree instead.
+    fn pick_current(&mut self) -> Outcome {
+        let Some(id) = self.tickets.current().map(|t| t.id.clone()) else {
+            return Outcome::Continue;
+        };
+        self.is_tickets = false;
+        if let Some(path) = self.tree_of_ticket(&id).map(|t| t.path.clone()) {
+            self.filter.clear();
+            self.reselect(Some(path));
+            self.message = Some(format!(
+                "{id} is already in this tree; Enter opens its agent"
+            ));
+            return Outcome::Continue;
+        }
+        self.new_trees += 1;
+        let tree = pool::stand_in(PathBuf::from(format!("(new tree {})", self.new_trees)));
+        self.message = Some(format!("picking up {id} in a new tree..."));
+        self.start(tree, Launch::pick(id, self.checkout.clone()))
     }
 
     /// Opens the lowest port the tree under the cursor serves.
@@ -1757,6 +1798,47 @@ mod tests {
         assert_eq!(
             app.tickets.error.as_deref(),
             Some("work: auth: LINEAR_API_KEY_WORK is not set")
+        );
+    }
+
+    #[test]
+    fn enter_on_a_ticket_picks_it_up_in_a_new_tree_once() {
+        let mut app = app();
+        app.checkout = PathBuf::from("/repo");
+        press(&mut app, KeyCode::Tab);
+        let filters = app.wanted_tickets().unwrap();
+        app.tickets_loaded(Loaded {
+            filters,
+            result: Ok(("work".into(), vec![ticket("END-812"), ticket("END-799")])),
+        });
+        let job = queued(press(&mut app, KeyCode::Enter)).remove(0);
+        assert!(!app.is_tickets, "back on the trees");
+        let launch = job.launch.unwrap();
+        assert!(launch.is_new_tree);
+        assert_eq!(
+            launch.ticket,
+            Some(crate::jobs::Pick {
+                id: "END-812".into(),
+                checkout: PathBuf::from("/repo"),
+            })
+        );
+        dispatched(&mut app, "/p/8/app", "j1");
+        let mut sidecar = *app.trees[2].sidecar.clone().unwrap();
+        sidecar.ticket = Some("END-799".into());
+        app.apply_sidecars(HashMap::from([(PathBuf::from("/p/8/app"), sidecar)]));
+        press(&mut app, KeyCode::Tab);
+        app.wanted_tickets();
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(press(&mut app, KeyCode::Enter), Outcome::Continue);
+        assert_eq!(
+            app.current().unwrap().name,
+            "8",
+            "the cursor went to its tree"
+        );
+        assert!(
+            app.message
+                .unwrap()
+                .starts_with("END-799 is already in this tree")
         );
     }
 

@@ -40,7 +40,8 @@ const KEYS: [(&str, &str); 10] = [
 ];
 
 /// The tickets screen's bar.
-const TICKET_KEYS: [(&str, &str); 7] = [
+const TICKET_KEYS: [(&str, &str); 8] = [
+    ("Enter", "pick up"),
     ("/", "filter"),
     ("m", "mine"),
     ("?", "help"),
@@ -51,7 +52,7 @@ const TICKET_KEYS: [(&str, &str); 7] = [
 ];
 
 /// Every key on the tickets screen, for the `?` overlay.
-const TICKET_HELP: [(&str, &str); 9] = [
+const TICKET_HELP: [(&str, &str); 10] = [
     (
         "/",
         "filter: mine label:Bug state:\"In Review\" project:x cycle:current, words",
@@ -60,6 +61,10 @@ const TICKET_HELP: [(&str, &str); 9] = [
     ("r", "list them again"),
     ("j k ↑ ↓", "move"),
     ("g G", "top, bottom"),
+    (
+        "Enter",
+        "pick it up: an agent on it in a new tree, on its branch",
+    ),
     ("Tab, Esc", "back to the trees"),
     ("w", "switch workspace"),
     ("?", "this help"),
@@ -385,6 +390,13 @@ fn row(app: &App, tree: &Tree) -> Row<'static> {
         Cell::from(mark),
         Cell::from(tree.name.clone()),
         status_cell(app, tree),
+        Cell::from(
+            tree.sidecar
+                .as_ref()
+                .and_then(|s| s.ticket.clone())
+                .unwrap_or_default(),
+        )
+        .style(fg(t.accent)),
         branch,
         agent_cell(app, tree),
         says_cell(app, tree),
@@ -403,7 +415,8 @@ fn row(app: &App, tree: &Tree) -> Row<'static> {
 fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
     let t = theme();
     let header = Row::new([
-        "", "#", "STATUS", "BRANCH", "AGENT", "SAYS", "PROCS", "PORTS", "CHANGED", "UNPUSHED",
+        "", "#", "STATUS", "TICKET", "BRANCH", "AGENT", "SAYS", "PROCS", "PORTS", "CHANGED",
+        "UNPUSHED",
     ])
     .style(t.header);
     let rows: Vec<Row> = app
@@ -415,6 +428,7 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
         Constraint::Length(1),
         Constraint::Length(4),
         Constraint::Length(13),
+        Constraint::Length(9),
         Constraint::Fill(2),
         Constraint::Length(22),
         Constraint::Fill(3),

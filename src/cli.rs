@@ -34,6 +34,7 @@ const USAGE: &str = "usage:
                                    start a new agent on a task in a fresh tree,
                                    the main checkout or tree N
   treetop tickets [--mine] [words] this repository's open tickets, from its ticket source
+  treetop pick <ID>                pick a ticket up: an agent on it in a fresh tree
   treetop plugins                  every plugin, built in or found, and what each is
   treetop plugin <name>            answer one request on stdin as a built-in plugin";
 
@@ -110,6 +111,7 @@ pub fn run(args: &[String], checkout: &Path) -> Result<()> {
             dispatch(checkout, place, &task.join(" "))
         }
         [command, rest @ ..] if command == "tickets" => tickets(checkout, rest),
+        [command, id] if command == "pick" => pick(checkout, id),
         _ => bail!("{USAGE}"),
     }
 }
@@ -368,6 +370,36 @@ fn tickets(checkout: &Path, args: &[String]) -> Result<()> {
     for ticket in tickets {
         println!("{:<10} {:<14} {}", ticket.id, ticket.state, ticket.title);
     }
+    Ok(())
+}
+
+/// Picks ticket `id` up as Enter on it does: an agent on it in a fresh tree,
+/// unless a tree already has it.
+fn pick(checkout: &Path, id: &str) -> Result<()> {
+    let mut trees = cached_listing(checkout)?;
+    let sidecars = sidecar::read_all(&trees);
+    for tree in &mut trees {
+        tree.sidecar = sidecars.get(&tree.path).cloned().map(Box::new);
+    }
+    let picked = trees.iter().find(|t| {
+        t.sidecar
+            .as_ref()
+            .and_then(|s| s.ticket.as_deref())
+            .is_some_and(|ticket| ticket.eq_ignore_ascii_case(id))
+    });
+    if let Some(tree) = picked {
+        bail!("{id} is already in tree {}", tree.name);
+    }
+    let mut job = Job {
+        launch: Some(Launch::pick(id.to_string(), checkout.to_path_buf())),
+        ..Job::new(Kind::Start, pool::stand_in(PathBuf::from("(new tree)")))
+    };
+    let (is_ok, output) = jobs::run(&mut job);
+    print!("{output}");
+    if !is_ok {
+        bail!("{id} was not picked up");
+    }
+    println!("picked up {id} in tree {}", job.tree.name);
     Ok(())
 }
 

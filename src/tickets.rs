@@ -89,11 +89,45 @@ impl Source {
             .map_err(|err| format!("{}: {err}", self.name))
     }
 
+    pub fn get(&self, id: &str) -> Result<Ticket, String> {
+        serde_json::from_value(self.call("get", json!({ "id": id }))?)
+            .map_err(|err| format!("{}: unreadable ticket: {err}", self.name))
+    }
+
+    /// Marks the ticket started and assigned to the key's user.
+    pub fn start(&self, id: &str) -> Result<(), String> {
+        self.call("start", json!({ "id": id })).map(|_| ())
+    }
+
     pub fn list(&self, filters: &Filters) -> Result<Vec<Ticket>, String> {
         let reply = self.call("list", json!({ "filters": filters }))?;
         serde_json::from_value(reply.get("tickets").cloned().unwrap_or(json!([])))
             .map_err(|err| format!("{}: unreadable tickets: {err}", self.name))
     }
+}
+
+/// The prompt an agent picking up `ticket` starts with: `template` from the
+/// config with `{id}`, `{title}`, `{description}`, `{url}` and `{branch}`
+/// filled in, else the ticket's id and title, its text and its link.
+pub fn prompt(template: Option<&str>, ticket: &Ticket) -> String {
+    const DEFAULT: &str = "{id}: {title}\n\n{description}\n\n{url}";
+    let text = |value: &Option<String>| value.clone().unwrap_or_default();
+    let filled = template
+        .unwrap_or(DEFAULT)
+        .replace("{id}", &ticket.id)
+        .replace("{title}", &ticket.title)
+        .replace("{description}", &text(&ticket.description))
+        .replace("{url}", &text(&ticket.url))
+        .replace("{branch}", &text(&ticket.branch));
+    // A field the ticket lacks leaves no run of blank lines behind.
+    let mut out = String::new();
+    for part in filled.split("\n\n").filter(|p| !p.trim().is_empty()) {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(part.trim_end());
+    }
+    out
 }
 
 /// The filter line's words, split at spaces outside double quotes.
@@ -207,6 +241,25 @@ impl Loader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_prompt_fills_the_template_and_drops_what_the_ticket_lacks() {
+        let ticket = Ticket {
+            id: "END-812".into(),
+            title: "Fix the login redirect".into(),
+            description: Some("Keep return_to through SSO.".into()),
+            url: None,
+            ..Ticket::default()
+        };
+        assert_eq!(
+            prompt(None, &ticket),
+            "END-812: Fix the login redirect\n\nKeep return_to through SSO."
+        );
+        assert_eq!(
+            prompt(Some("Work on {id}. Use /pickup {id}."), &ticket),
+            "Work on END-812. Use /pickup END-812."
+        );
+    }
 
     #[test]
     fn a_filter_line_reads_keys_quoted_values_and_search_words() {

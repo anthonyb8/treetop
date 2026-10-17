@@ -27,6 +27,7 @@ use crate::diff;
 use crate::plugin::{self, Kind as PluginKind, Plugin};
 use crate::pool::{self, Tree};
 use crate::sidecar::{self, Sidecar};
+use crate::tickets::{self, Source};
 
 /// Jobs that run at once, each on its own tree.
 const WORKERS: usize = 4;
@@ -112,6 +113,31 @@ pub struct Launch {
     pub is_new_tree: bool,
     /// Start the coordinator rather than an agent for the task.
     pub is_coordinator: bool,
+    /// The ticket it picks up, which gives it its task, name and branch.
+    pub ticket: Option<Pick>,
+}
+
+/// A ticket to pick up, from the ticket source of the repository checked
+/// out at `checkout`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pick {
+    pub id: String,
+    pub checkout: PathBuf,
+}
+
+impl Launch {
+    /// An agent on ticket `id`, in a new tree; its task, name and branch come
+    /// from the ticket when the job runs.
+    pub fn pick(id: String, checkout: PathBuf) -> Self {
+        Launch {
+            ticket: Some(Pick {
+                id: id.clone(),
+                checkout,
+            }),
+            name: Some(id),
+            ..Launch::agent(String::new(), true)
+        }
+    }
 }
 
 impl Launch {
@@ -123,6 +149,7 @@ impl Launch {
             branch: None,
             is_new_tree,
             is_coordinator: false,
+            ticket: None,
         }
     }
 }
@@ -330,6 +357,8 @@ enum Undo {
     },
     /// Leave the branch and delete it.
     Branch(String),
+    /// Leave a branch that was there before, keeping it.
+    Detach,
     Sidecar,
     /// Stop the agent with this id through its plugin.
     Agent(Plugin, String),
@@ -361,6 +390,7 @@ fn undo(step: Undo, tree: &Path, log: &mut String) {
             capture(git(tree).args(["switch", "--detach"]), GIT_LIMIT, log)
                 && capture(git(tree).args(["branch", "-D", &name]), GIT_LIMIT, log)
         }
+        Undo::Detach => capture(git(tree).args(["switch", "--detach"]), GIT_LIMIT, log),
         Undo::Lease { lease_id } => {
             let mut command = treehouse("return", tree);
             command.arg("--force");
@@ -405,10 +435,14 @@ fn checked_out(tree: &Path) -> Option<String> {
 /// A tree someone already holds is only started in: its branch and lease
 /// stay theirs.
 fn start_steps(job: &mut Job, log: &mut String, undone: &mut Vec<Undo>) -> Result<(), String> {
-    let launch = job
+    let mut launch = job
         .launch
         .clone()
         .unwrap_or_else(|| Launch::agent(String::new(), false));
+    if let Some(pick) = launch.ticket.clone() {
+        take_up(&pick, &mut launch).map_err(|why| format!("ticket: {why}"))?;
+        job.launch = Some(launch.clone());
+    }
     let is_leasing = launch.is_new_tree || !job.tree.is_held();
     let branch = (is_leasing && !launch.is_coordinator).then(|| {
         launch
@@ -421,11 +455,18 @@ fn start_steps(job: &mut Job, log: &mut String, undone: &mut Vec<Undo>) -> Resul
     {
         return Err(format!("branch {name}: {problem}"));
     }
+    // A ticket picked up again resumes its branch rather than failing on it.
+    let resumes = launch
+        .ticket
+        .as_ref()
+        .zip(branch.as_deref())
+        .is_some_and(|(pick, name)| has_branch(&pick.checkout, name));
     let mut record = Sidecar::leased_now();
+    record.ticket = launch.ticket.as_ref().map(|pick| pick.id.clone());
     if launch.is_new_tree {
         let mut command = Command::new("treehouse");
         command.args(["get", "--lease", "--json", "--lease-holder", "treetop"]);
-        if let Some(name) = &branch {
+        if let Some(name) = branch.as_ref().filter(|_| !resumes) {
             command.args(["--branch", name]);
         }
         let out =
@@ -439,7 +480,7 @@ fn start_steps(job: &mut Job, log: &mut String, undone: &mut Vec<Undo>) -> Resul
         job.tree.name = pool_name(&path);
         job.tree.path = path;
         job.tree.status = "leased".into();
-        if let Some(name) = &branch {
+        if let Some(name) = branch.as_ref().filter(|_| !resumes) {
             undone.push(Undo::Branch(name.clone()));
         }
         record.lease_id = lease.lease_id;
@@ -468,6 +509,12 @@ fn start_steps(job: &mut Job, log: &mut String, undone: &mut Vec<Undo>) -> Resul
         check(&job.tree.path, log).map_err(|why| format!("check: {why}"))?;
     }
     if let Some(name) = &branch
+        && resumes
+    {
+        exec(git(&job.tree.path).args(["switch", name]), GIT_LIMIT, log)
+            .map_err(|why| format!("branch: {why}"))?;
+        undone.push(Undo::Detach);
+    } else if let Some(name) = &branch
         && !launch.is_new_tree
         && checked_out(&job.tree.path).is_none()
     {
@@ -550,11 +597,50 @@ fn start_steps(job: &mut Job, log: &mut String, undone: &mut Vec<Undo>) -> Resul
     Ok(())
 }
 
+/// Fills `launch` from the ticket it picks up: the prompt from the config's
+/// template, a session name led by the ticket's id, and the branch the
+/// ticket system names, unless one was given.
+fn take_up(pick: &Pick, launch: &mut Launch) -> Result<(), String> {
+    let source = Source::of(&pick.checkout)?;
+    let ticket = source.get(&pick.id)?;
+    let template = config::load()?.prompt;
+    launch.task = tickets::prompt(template.as_deref(), &ticket);
+    launch.name = crate::dispatch::session_name(&format!("{} {}", ticket.id, ticket.title));
+    if launch.branch.is_none() {
+        launch.branch = ticket.branch;
+    }
+    Ok(())
+}
+
+/// The repository checked out at `checkout` has `branch`, here or on
+/// `origin`, so `git switch` can check it out.
+fn has_branch(checkout: &Path, branch: &str) -> bool {
+    [
+        format!("refs/heads/{branch}"),
+        format!("refs/remotes/origin/{branch}"),
+    ]
+    .iter()
+    .any(|r| pool::git(checkout, &["rev-parse", "--verify", "--quiet", r]).is_some())
+}
+
+/// Marks the picked ticket started and assigned once its agent runs. The
+/// agent keeps running if this fails, and the log says so.
+fn mark_started(pick: &Pick, log: &mut String) {
+    let marked = Source::of(&pick.checkout).and_then(|source| source.start(&pick.id));
+    let _ = match marked {
+        Ok(()) => writeln!(log, "marked {} started and assigned to you", pick.id),
+        Err(why) => writeln!(log, "could not mark {} started: {why}", pick.id),
+    };
+}
+
 /// Runs the start's steps and, when one fails, undoes the ones taken, then
 /// says which failed and why on the last line, which the status line shows.
 fn start(job: &mut Job, log: &mut String) -> bool {
     let mut undone = Vec::new();
     let Err(why) = start_steps(job, log, &mut undone) else {
+        if let Some(pick) = job.launch.as_ref().and_then(|l| l.ticket.as_ref()) {
+            mark_started(pick, log);
+        }
         run_hook("on_dispatch", &hooks(log).on_dispatch, &job.tree.path, log);
         return true;
     };

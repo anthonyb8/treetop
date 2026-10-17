@@ -268,6 +268,7 @@ It sees and steers the other agents through three treetop commands, which it may
 | `treetop status` | prints JSON: each held tree's branch, uncommitted and unpushed counts and ports, its agents and their state, and each background agent's latest report (the question it is waiting on, its answer once done, else what it is doing now); idle trees are only counted |
 | `treetop send <tree\|agent> <message>` | types the message into the chat of every agent in that tree (a number or `main`), or of the agent of that name, and submits it |
 | `treetop dispatch <new\|main\|N> <task>` | starts a new agent on the task in a fresh tree, the main checkout or tree N |
+| `treetop pick <ID>` | picks a ticket up: an agent on it in a fresh tree, on its branch (see [Tickets](#tickets)) |
 
 They work from any shell too.
 Each prints only what it is asked for, so a question costs the coordinator one small read rather than a crawl through every transcript.
@@ -318,6 +319,22 @@ They load in the background, your own open tickets first, the most recently upda
 It takes `mine`, `label:`, `state:`, `project:` and `cycle:` (`current` or a number), a value with spaces in double quotes, and any other words search titles: `mine label:Bug state:"In Review" login`.
 With no `state:`, only open tickets show.
 `m` switches between yours and everyone's, `r` lists them again, and `?` shows these keys.
+
+Enter picks the ticket under the cursor up, in one step:
+
+1. a fresh tree is leased on the branch the ticket system names for the ticket (Linear's `branchName`), or on that branch as it already is, here or on `origin`, when the ticket was picked up before;
+2. an agent starts there, its session named for the ticket (`END-123 fix the login redirect`), its first message the ticket's id, title, text and link;
+3. once it runs, the ticket is marked started and assigned to you.
+
+The tree's `treetop.json` records the ticket, so the TICKET column shows it, the filter finds it, and Enter on a ticket already in a tree goes to that tree rather than starting a second agent.
+A step that fails undoes the ones before it, as any start does; marking the ticket started is the exception, and a failure there only shows in the detail pane, since the agent is already working.
+`treetop pick END-123` does the same from a shell.
+
+The first message comes from `prompt` in the config when it is set, with `{id}`, `{title}`, `{description}`, `{url}` and `{branch}` filled in:
+
+```toml
+prompt = "Work on {id}: {title}\n\n{description}\n\n{url}"
+```
 
 ## Workspaces
 
