@@ -19,9 +19,11 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::agents::claude;
+use crate::agents::{Source, Status, claude};
 use crate::branch;
 use crate::child::{self, End};
+use crate::config::{self, Hooks};
+use crate::diff;
 use crate::plugin::{self, Kind as PluginKind, Plugin};
 use crate::pool::{self, Tree};
 use crate::sidecar::{self, Sidecar};
@@ -35,6 +37,9 @@ const TREEHOUSE_LIMIT: Duration = Duration::from_secs(120);
 
 /// How long one git command gets.
 const GIT_LIMIT: Duration = Duration::from_secs(30);
+
+/// How long a hook gets, such as one stopping a dev stack.
+const HOOK_LIMIT: Duration = Duration::from_secs(120);
 
 /// How long an agent's command gets to start it.
 const AGENT_LIMIT: Duration = Duration::from_secs(60);
@@ -533,6 +538,7 @@ fn start_steps(job: &mut Job, log: &mut String, undone: &mut Vec<Undo>) -> Resul
 fn start(job: &mut Job, log: &mut String) -> bool {
     let mut undone = Vec::new();
     let Err(why) = start_steps(job, log, &mut undone) else {
+        run_hook("on_dispatch", &hooks(log).on_dispatch, &job.tree.path, log);
         return true;
     };
     if !undone.is_empty() {
@@ -583,17 +589,112 @@ fn rename(tree: &Path, to: &str, log: &mut String) -> bool {
     true
 }
 
-/// Returns the tree, then drops its sidecar, which described a lease that
-/// is now over.
-fn give_back(tree: &Path, log: &mut String) -> bool {
-    if !capture(
-        treehouse("return", tree).arg("--force"),
-        TREEHOUSE_LIMIT,
-        log,
-    ) {
+/// The hooks the config names, or none when it cannot be read, which the log
+/// says.
+fn hooks(log: &mut String) -> Hooks {
+    config::load().map_or_else(
+        |err| {
+            let _ = writeln!(log, "config: {err}; running no hooks");
+            Hooks::default()
+        },
+        |config| config.hooks,
+    )
+}
+
+/// Runs a hook in `tree`. A failure goes to the log and nothing else.
+fn run_hook(name: &str, command: &[String], tree: &Path, log: &mut String) {
+    let Some((program, args)) = command.split_first() else {
+        return;
+    };
+    let record = sidecar::read(tree);
+    let field = |pick: fn(&Sidecar) -> Option<&String>| {
+        record.as_ref().and_then(pick).cloned().unwrap_or_default()
+    };
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .current_dir(tree)
+        .env("TREETOP_TREE", tree)
+        .env("TREETOP_BRANCH", field(|r| r.branch.as_ref()))
+        .env("TREETOP_TICKET", field(|r| r.ticket.as_ref()));
+    if let Err(why) = exec(&mut command, HOOK_LIMIT, log) {
+        let _ = writeln!(log, "{name} hook failed: {why}");
+    }
+}
+
+/// Stops every background agent a plugin reports running in the tree, since
+/// treehouse stops only processes standing in it, and a session that moved
+/// in with `EnterWorktree` stands elsewhere. Each plugin is asked in turn
+/// until one stops it.
+fn stop_agents(tree: &Tree, log: &mut String) {
+    let running = tree.agents.iter().filter(|a| {
+        a.source == Source::Plugin && a.is_background && a.status != Some(Status::Cold)
+    });
+    let plugins = plugin::of_kind(PluginKind::Agent);
+    for agent in running {
+        let Some(id) = &agent.job else { continue };
+        let stopped = plugins
+            .iter()
+            .find(|plugin| plugin.call("stop", json!({ "id": id })).is_ok());
+        let _ = match stopped {
+            Some(plugin) => writeln!(log, "{} stopped {} ({id})", plugin.name(), agent.name),
+            None => writeln!(log, "could not stop {} ({id})", agent.name),
+        };
+    }
+}
+
+/// Deletes `branch` once the tree is back in the pool, if its work is in the
+/// pool's base; one that is not merged is kept, and the log says so.
+fn delete_if_merged(tree: &Path, branch: &str, log: &mut String) {
+    let Some(base) = pool::main_checkout(tree).ok().and_then(|c| diff::base(&c)) else {
+        let _ = writeln!(
+            log,
+            "kept branch {branch}: no base branch to check it against"
+        );
+        return;
+    };
+    let remote = format!("origin/{base}");
+    let base_ref = [remote.as_str(), base.as_str()]
+        .into_iter()
+        .find(|r| pool::git(tree, &["rev-parse", "--verify", "--quiet", r]).is_some());
+    let Some(base_ref) = base_ref else {
+        let _ = writeln!(log, "kept branch {branch}: base {base} not found");
+        return;
+    };
+    let mut scratch = String::new();
+    let is_merged = exec(
+        git(tree).args(["merge-base", "--is-ancestor", branch, base_ref]),
+        GIT_LIMIT,
+        &mut scratch,
+    )
+    .is_ok();
+    if !is_merged {
+        let _ = writeln!(log, "kept branch {branch}: not merged into {base_ref}");
+    } else if capture(git(tree).args(["branch", "-D", branch]), GIT_LIMIT, log) {
+        let _ = writeln!(log, "deleted branch {branch}, merged into {base_ref}");
+    }
+}
+
+/// Stops the tree's agents, runs the `on_return` hook, returns the tree,
+/// deletes its branch if merged, and drops its sidecar. A tree treetop
+/// leased is returned only while the lease is still the one it took.
+fn give_back(tree: &Tree, log: &mut String) -> bool {
+    let path = &tree.path;
+    let record = sidecar::read(path);
+    stop_agents(tree, log);
+    run_hook("on_return", &hooks(log).on_return, path, log);
+    let mut command = treehouse("return", path);
+    command.arg("--force");
+    if let Some(id) = record.as_ref().and_then(|r| r.lease_id.as_deref()) {
+        command.args(["--if-lease-id", id]);
+    }
+    if !capture(&mut command, TREEHOUSE_LIMIT, log) {
         return false;
     }
-    if let Err(err) = sidecar::remove(tree) {
+    if let Some(branch) = record.as_ref().and_then(|r| r.branch.as_deref()) {
+        delete_if_merged(path, branch, log);
+    }
+    if let Err(err) = sidecar::remove(path) {
         let _ = writeln!(log, "could not remove {}: {err}", sidecar::FILE);
     }
     true
@@ -612,7 +713,7 @@ pub fn run(job: &mut Job) -> (bool, String) {
             let to = job.rename.clone().unwrap_or_default();
             rename(&job.tree.path, &to, &mut log)
         }
-        Kind::Return => give_back(&job.tree.path, &mut log),
+        Kind::Return => give_back(&job.tree, &mut log),
         Kind::Preview => capture(
             treehouse("destroy", &job.tree.path).args(INCLUDE),
             TREEHOUSE_LIMIT,

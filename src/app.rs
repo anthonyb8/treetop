@@ -564,6 +564,9 @@ impl App {
                 scroll: 0,
             });
         } else {
+            if job.kind == Kind::Return {
+                self.returned(&path);
+            }
             self.jobs
                 .insert(path, JobState::Done(job.kind, Instant::now()));
         }
@@ -573,6 +576,20 @@ impl App {
             is_ok,
             output,
         });
+    }
+
+    /// Shows the tree at `path` back in the pool at once, as the next listing
+    /// will, rather than leaving it held until that lands.
+    fn returned(&mut self, path: &PathBuf) {
+        if let Some(tree) = self.trees.iter_mut().find(|t| &t.path == path) {
+            tree.status = "available".into();
+            tree.holder = None;
+            tree.branch = None;
+            tree.agents.clear();
+            tree.processes.clear();
+            tree.work = None;
+            tree.sidecar = None;
+        }
     }
 
     fn move_by(&mut self, delta: isize) {
@@ -1601,6 +1618,18 @@ mod tests {
                 .contains("return of tree 4 failed: Error: worktree is locked")
         );
         assert!(!app.log[0].is_ok);
+    }
+
+    #[test]
+    fn a_returned_tree_turns_available_without_waiting_for_a_listing() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('r'));
+        let job = queued(press(&mut app, KeyCode::Char('y'))).remove(0);
+        app.job_finished(job, true, String::new());
+        let tree = app.trees.iter().find(|t| t.name == "4").unwrap();
+        assert_eq!(tree.status, "available");
+        assert_eq!((tree.holder.as_ref(), tree.branch.as_ref()), (None, None));
+        assert!(!tree.is_orphan());
     }
 
     #[test]

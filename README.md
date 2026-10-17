@@ -122,6 +122,21 @@ When treetop leases a tree to start an agent, it records the lease in `treetop.j
 A return removes it, so a tree handed out again never carries the last agent's record.
 `treetop status` includes it as each tree's `sidecar`.
 
+## Config
+
+`~/.config/treetop/config.toml` (or under `$XDG_CONFIG_HOME`) is optional; with no file, treetop runs as it ships.
+It holds what belongs to one setup rather than to treetop, such as stopping a dev stack when a tree is returned:
+
+```toml
+[hooks]
+on_dispatch = ["notify-send", "agent started"]
+on_return = ["harness", "stack", "down"]
+```
+
+A hook is a command and its arguments, run in the tree with `TREETOP_TREE`, `TREETOP_BRANCH` and `TREETOP_TICKET` set, and given two minutes.
+One that fails is written to the log and never stops the start or return it belongs to.
+A config file treetop cannot parse is reported in the log, and no hooks run.
+
 ## Plugins
 
 A plugin is any executable file in `~/.config/treetop/plugins` (or `$XDG_CONFIG_HOME/treetop/plugins`) that speaks JSON on stdin and stdout; `treetop plugins` lists what it finds and why it cannot use one.
@@ -156,7 +171,14 @@ treetop starts new agents with it unless `TREETOP_NEW_AGENT` names a command.
 Both run in the background, up to four trees at once, while treetop stays on screen; each row's STATUS shows queued, returning, destroying, returned, destroyed or failed.
 Their output goes to the log (`L`), and a failure also shows its last line in the status line.
 
-- **Return** first shows a dialog listing each tree's uncommitted files, unpushed commits and running processes, or "unknown changes" where git cannot read it. On `y` it runs `treehouse return --force`, which stops the processes left in the tree: that dialog replaces treehouse's own prompt before discarding changes. Anything started outside the tree, such as a container, is for whatever started it to stop.
+- **Return** first shows a dialog listing each tree's uncommitted files, unpushed commits and running processes, or "unknown changes" where git cannot read it. On `y`, for each tree at once:
+  1. it stops the tree's background agents through their plugin, since a session that moved in with `EnterWorktree` runs from elsewhere and treehouse would not stop it;
+  2. runs the `on_return` hook, if the config names one;
+  3. runs `treehouse return --force`, which stops the processes left in the tree (the dialog replaces treehouse's own prompt), with `--if-lease-id` for a tree treetop leased, so a lease someone has taken since is never returned;
+  4. deletes the branch treetop named for it when its work is in the pool's base branch, and keeps it otherwise;
+  5. removes `treetop.json`.
+
+  The row turns available as soon as its return finishes.
 - **Destroy** runs `treehouse destroy`'s dry run with every `--include-*` flag in the background and shows it in a dialog per tree. `y` runs it with `--yes`; `n` keeps the tree.
 
 `q` while an action runs waits for it to finish; `Ctrl-C` quits at once and leaves the running command to finish on its own.

@@ -15,6 +15,7 @@ mod cache;
 mod chat;
 mod child;
 mod cli;
+mod config;
 mod coordinator;
 mod diff;
 mod dispatch;
