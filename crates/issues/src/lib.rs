@@ -4,6 +4,7 @@
 //! its sources as backends and acts on what the screen asks for.
 
 mod backend;
+mod compose;
 mod draw;
 mod markdown;
 mod picker;

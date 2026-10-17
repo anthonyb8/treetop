@@ -10,6 +10,7 @@ use linear::{Detail, Issue, Team};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::backend::{Backend, READ_ONLY};
+use crate::compose::{Compose, Edit};
 use crate::picker::{self, Picked, Picker};
 use crate::views::{self, Group, View};
 use crate::worker::{Reply, Request, Worker};
@@ -65,6 +66,8 @@ pub struct Screen {
     read_only: HashSet<usize>,
     /// The picker open over the list, if one is.
     pub(crate) picker: Option<Picker>,
+    /// The comment being written, if one is.
+    pub(crate) compose: Option<Compose>,
     pub(crate) is_loading: bool,
     pub(crate) error: Option<String>,
     pub(crate) message: Option<String>,
@@ -100,6 +103,7 @@ impl Screen {
             teams: HashMap::new(),
             read_only: HashSet::new(),
             picker: None,
+            compose: None,
             is_loading: false,
             error: None,
             message: None,
@@ -269,7 +273,62 @@ impl Screen {
                 self.message = Some(said);
                 self.replace(issue);
             }
+            Reply::Commented {
+                source,
+                id,
+                body,
+                result,
+            } => match result {
+                Ok(comment) => {
+                    if let Some(detail) =
+                        self.details.get_mut(&id).filter(|_| source == self.source)
+                    {
+                        detail.comments.push(comment);
+                    }
+                    self.message = Some(format!("commented on {id}"));
+                }
+                // The text is never lost: the box opens again with it.
+                Err(err) => {
+                    self.message = Some(format!("{id}: {err}; the comment is still in the box"));
+                    if source == self.source && self.compose.is_none() {
+                        self.compose = Some(Compose::new(&id, body));
+                    }
+                }
+            },
         }
+    }
+
+    /// Pastes into the comment being written, if one is.
+    pub fn paste(&mut self, text: &str) {
+        if let Some(compose) = &mut self.compose {
+            compose.paste(text);
+        }
+    }
+
+    /// Opens the comment box on the issue under the cursor.
+    fn open_compose(&mut self) {
+        let Some(issue) = self.current() else {
+            return;
+        };
+        if self.read_only.contains(&self.source) {
+            self.message = Some(READ_ONLY.into());
+            return;
+        }
+        self.compose = Some(Compose::new(&issue.id, String::new()));
+    }
+
+    /// Posts the comment in the box on its issue.
+    fn post(&mut self, compose: Compose) {
+        let Some(issue) = self.issues.iter().find(|i| i.id == compose.issue).cloned() else {
+            self.message = Some(format!("{} is no longer listed", compose.issue));
+            return;
+        };
+        self.message = Some(format!("commenting on {}...", issue.id));
+        self.worker.send(Request::Comment {
+            source: self.source,
+            issue: Box::new(issue),
+            body: compose.text.trim_end().to_string(),
+        });
     }
 
     /// Puts `issue` in place of the one with its id, regrouped, the cursor
@@ -414,6 +473,18 @@ impl Screen {
             self.is_help = false;
             return Action::None;
         }
+        if let Some(compose) = &mut self.compose {
+            match compose.handle_key(key) {
+                Edit::Continue => {}
+                Edit::Cancel => self.compose = None,
+                Edit::Send => {
+                    if let Some(compose) = self.compose.take() {
+                        self.post(compose);
+                    }
+                }
+            }
+            return Action::None;
+        }
         if let Some(picker) = &mut self.picker {
             let Some(issue) = self.issues.get(self.selected) else {
                 self.picker = None;
@@ -495,6 +566,7 @@ impl Screen {
             KeyCode::Char('s') => self.open_picker(picker::Kind::Status),
             KeyCode::Char('l') => self.open_picker(picker::Kind::Labels),
             KeyCode::Char('a') => self.open_picker(picker::Kind::Assignee),
+            KeyCode::Char('c') => self.open_compose(),
             KeyCode::Char('w') => self.next_source(),
             KeyCode::Char('o') => {
                 if let Some(url) = self.current().and_then(|i| i.url.clone()) {
@@ -545,6 +617,17 @@ mod tests {
 
         fn team(&self) -> Result<Option<Arc<Team>>, String> {
             Ok(self.team.clone())
+        }
+
+        fn comment(&self, _issue: &Issue, body: &str) -> Result<linear::Comment, String> {
+            match &self.refuse {
+                Some(why) => Err(why.clone()),
+                None => Ok(linear::Comment {
+                    author: "Anthony".into(),
+                    body: body.to_string(),
+                    created_at: "2026-10-17T11:00:00Z".into(),
+                }),
+            }
         }
 
         fn update(&self, issue: &Issue, change: &linear::Change) -> Result<Issue, String> {
@@ -871,6 +954,56 @@ mod tests {
         assert_eq!(
             screen.message.as_deref(),
             Some("END-1: Linear: forbidden; kept as it was")
+        );
+    }
+
+    fn commented(refuse: Option<&str>) -> Screen {
+        let fake = Arc::new(Fake {
+            name: "work".into(),
+            issues: vec![issue("END-1")],
+            team: Some(team_of(&["todo"])),
+            refuse: refuse.map(str::to_string),
+            ..Fake::default()
+        });
+        let mut screen = Screen::new(vec![fake], 0, Vec::new());
+        settle(&mut screen);
+        screen.handle_key(key(KeyCode::Char('c')));
+        assert!(screen.compose.is_some());
+        screen.paste("ship it");
+        screen.handle_key(key(KeyCode::Enter));
+        assert!(screen.compose.is_none(), "sent");
+        for _ in 0..200 {
+            screen.poll();
+            if screen
+                .message
+                .as_deref()
+                .is_some_and(|m| !m.starts_with("commenting"))
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        screen
+    }
+
+    #[test]
+    fn a_comment_posted_joins_the_issues_comments() {
+        let screen = commented(None);
+        assert_eq!(screen.message.as_deref(), Some("commented on END-1"));
+        let comments = &screen.detail().unwrap().comments;
+        assert_eq!(comments.last().unwrap().body, "ship it");
+    }
+
+    #[test]
+    fn a_comment_refused_comes_back_in_the_box() {
+        let screen = commented(Some("Linear: offline"));
+        assert_eq!(screen.compose.as_ref().unwrap().text, "ship it");
+        assert!(
+            screen
+                .message
+                .as_deref()
+                .unwrap()
+                .ends_with("the comment is still in the box")
         );
     }
 

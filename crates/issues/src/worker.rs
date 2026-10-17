@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
-use linear::{Change, Detail, Issue, Team};
+use linear::{Change, Comment, Detail, Issue, Team};
 
 use crate::Filters;
 use crate::backend::Backend;
@@ -31,6 +31,11 @@ pub(crate) enum Request {
         before: Box<Issue>,
         change: Box<Change>,
     },
+    Comment {
+        source: usize,
+        issue: Box<Issue>,
+        body: String,
+    },
 }
 
 impl Request {
@@ -39,7 +44,7 @@ impl Request {
         match self {
             Request::List { .. } => Some(0),
             Request::Detail { .. } => Some(1),
-            Request::Team { .. } | Request::Update { .. } => None,
+            Request::Team { .. } | Request::Update { .. } | Request::Comment { .. } => None,
         }
     }
 }
@@ -63,6 +68,13 @@ pub(crate) enum Reply {
         source: usize,
         before: Box<Issue>,
         result: Result<Box<Issue>, String>,
+    },
+    Commented {
+        source: usize,
+        /// The issue's id, such as `END-123`.
+        id: String,
+        body: String,
+        result: Result<Comment, String>,
     },
 }
 
@@ -99,6 +111,16 @@ fn run(backends: &[Arc<dyn Backend>], request: Request) -> Option<Reply> {
             source,
             result: backends.get(source)?.update(&before, &change).map(Box::new),
             before,
+        },
+        Request::Comment {
+            source,
+            issue,
+            body,
+        } => Reply::Commented {
+            source,
+            result: backends.get(source)?.comment(&issue, &body),
+            id: issue.id,
+            body,
         },
     };
     Some(reply)

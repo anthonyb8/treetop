@@ -10,19 +10,21 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 
+use crate::compose::Compose;
 use crate::markdown;
 use crate::picker::{Kind, Picker};
 use crate::screen::{Focus, Screen};
 use crate::{Palette, line};
 
 /// The bar's keys, most used first; `?` lists them all.
-const KEYS: [(&str, &str); 12] = [
+const KEYS: [(&str, &str); 13] = [
     ("Enter", "pick up"),
     ("?", "help"),
     ("→", "read"),
     ("s", "status"),
     ("l", "labels"),
     ("a", "assign"),
+    ("c", "comment"),
     ("/", "filter"),
     ("m", "mine"),
     ("w", "source"),
@@ -32,13 +34,17 @@ const KEYS: [(&str, &str); 12] = [
 ];
 
 /// Every key, for the `?` overlay.
-const HELP: [(&str, &str); 17] = [
+const HELP: [(&str, &str); 18] = [
     ("Enter", "pick it up: an agent on it in a new tree"),
     ("→", "read it: the description and comments take the keys"),
     ("← h Esc", "back to the list"),
     ("s", "status: pick one, typing narrows the list"),
     ("l", "labels: Tab marks or unmarks each, Enter applies them"),
     ("a", "assignee: you, nobody, or a teammate"),
+    (
+        "c",
+        "comment: Markdown, Alt+Enter for a new line, Enter sends",
+    ),
     (
         "/",
         "filter: mine label:Bug state:\"In Review\" project:x cycle:current, words",
@@ -141,6 +147,8 @@ impl Screen {
             draw_help(frame, area, p);
         } else if let Some(picker) = &self.picker {
             draw_picker(frame, area, picker, p);
+        } else if let Some(compose) = &self.compose {
+            draw_compose(frame, area, compose, p);
         }
     }
 
@@ -443,6 +451,65 @@ fn draw_picker(frame: &mut Frame, area: Rect, picker: &Picker, p: &Palette) {
         lines.push(Line::styled("nothing matches", fg(p.muted)));
     }
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The comment box over the lower half: the text, wrapped, the end of a
+/// long one kept in view, and the keys.
+fn draw_compose(frame: &mut Frame, area: Rect, compose: &Compose, p: &Palette) {
+    let width = area.width.saturating_sub(8).min(100);
+    let inner_width = usize::from(width.saturating_sub(2)).max(1);
+    let mut rows: Vec<String> = Vec::new();
+    for line in compose.text.split('\n') {
+        let chars: Vec<char> = line.chars().collect();
+        if chars.is_empty() {
+            rows.push(String::new());
+        }
+        rows.extend(chars.chunks(inner_width).map(|c| c.iter().collect()));
+    }
+    let shown = rows.len().clamp(6, 14);
+    let height = u16::try_from(shown + 2)
+        .unwrap_or(u16::MAX)
+        .min(area.height);
+    let popup = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    let block = Block::bordered()
+        .border_style(fg(p.accent))
+        .title(Span::styled(
+            format!(" Comment on {} ", compose.issue),
+            fg(p.title).add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Line::styled(
+            " Enter sends  Alt+Enter new line  Esc cancels ",
+            fg(p.muted),
+        ));
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+    if compose.text.is_empty() {
+        frame.render_widget(
+            Paragraph::new("Markdown; mention people with @name")
+                .style(fg(p.muted).add_modifier(Modifier::ITALIC)),
+            inner,
+        );
+        frame.set_cursor_position((inner.x, inner.y));
+        return;
+    }
+    let first = rows.len().saturating_sub(usize::from(inner.height));
+    let lines: Vec<Line> = rows[first..].iter().map(|r| Line::raw(r.clone())).collect();
+    let last = rows.last().map_or(0, |r| r.chars().count());
+    let cursor_row = u16::try_from(rows.len() - 1 - first).unwrap_or(0);
+    frame.render_widget(Paragraph::new(lines), inner);
+    frame.set_cursor_position((
+        inner.x
+            + u16::try_from(last)
+                .unwrap_or(0)
+                .min(inner.width.saturating_sub(1)),
+        inner.y + cursor_row,
+    ));
 }
 
 fn draw_help(frame: &mut Frame, area: Rect, p: &Palette) {

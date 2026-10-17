@@ -322,7 +322,10 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             continue;
         }
         if let Event::Paste(text) = &event {
-            app.paste(text);
+            match issues.as_mut().filter(|_| app.is_issues) {
+                Some(screen) => screen.paste(text),
+                None => app.paste(text),
+            }
             continue;
         }
         let Event::Key(key) = event else {
