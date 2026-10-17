@@ -301,6 +301,21 @@ fn branch_problem(prompt: &Prompt) -> Option<String> {
     Some(format!("branch {name}: {problem}"))
 }
 
+/// The trees, as the Issues screen asks them who is working on an issue.
+impl issues::Host for App {
+    fn work_on(&self, id: &str) -> Option<issues::Work> {
+        let tree = self.tree_of_ticket(id)?;
+        Some(issues::Work {
+            tree: tree.name.clone(),
+            agent: tree
+                .agents
+                .first()
+                .map(|a| a.status.map_or("running", Status::label).to_string()),
+            needs_you: self.needs_you(tree),
+        })
+    }
+}
+
 impl App {
     pub fn new(here: Option<PathBuf>) -> Self {
         App {
@@ -1600,6 +1615,30 @@ mod tests {
         let mut app = app();
         press(&mut app, KeyCode::Tab);
         assert!(app.is_issues);
+    }
+
+    #[test]
+    fn the_issues_screen_learns_which_tree_works_on_an_issue() {
+        use issues::Host;
+        let mut app = app();
+        dispatched(&mut app, "/p/8/app", "j1");
+        let mut sidecar = *app.trees[2].sidecar.clone().unwrap();
+        sidecar.ticket = Some("END-799".into());
+        app.apply_sidecars(HashMap::from([(PathBuf::from("/p/8/app"), sidecar)]));
+        let waiting = Agent {
+            status: Some(Status::Waiting),
+            ..attachable("fix")
+        };
+        app.apply_agents(&HashMap::from([(PathBuf::from("/p/8/app"), vec![waiting])]));
+        assert_eq!(
+            app.work_on("end-799"),
+            Some(issues::Work {
+                tree: "8".into(),
+                agent: Some("waiting".into()),
+                needs_you: true,
+            })
+        );
+        assert_eq!(app.work_on("END-1"), None);
     }
 
     #[test]

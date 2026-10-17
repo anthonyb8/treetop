@@ -111,7 +111,7 @@ pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>, issues: Option<&i
     // add accents, so nothing falls back to a theme's dim default.
     frame.render_widget(Block::new().style(fg(theme().text)), frame.area());
     match issues.filter(|_| app.is_issues) {
-        Some(screen) => screen.draw(frame, frame.area(), &palette()),
+        Some(screen) => screen.draw(frame, frame.area(), &palette(), app),
         None => {
             let [body, detail, footer] = Layout::vertical([
                 Constraint::Fill(1),

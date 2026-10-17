@@ -11,6 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 
 use crate::compose::Compose;
+use crate::host::Host;
 use crate::markdown;
 use crate::picker::{Kind, Picker};
 use crate::screen::{Focus, Screen};
@@ -121,6 +122,23 @@ fn priority(issue: &Issue, p: &Palette) -> Cell<'static> {
     Cell::from(text).style(style)
 }
 
+/// Which tree is working on the issue, and its agent's state: `4 ·
+/// waiting` loud, a busy one green, the rest muted.
+fn work_cell(host: &dyn Host, id: &str, p: &Palette) -> Cell<'static> {
+    let Some(work) = host.work_on(id) else {
+        return Cell::from("");
+    };
+    let agent = work.agent.as_deref().unwrap_or("no agent");
+    let style = if work.needs_you {
+        fg(p.warning).add_modifier(Modifier::BOLD)
+    } else if agent == "busy" {
+        fg(p.success)
+    } else {
+        fg(p.muted)
+    };
+    Cell::from(format!("{} · {agent}", work.tree)).style(style)
+}
+
 fn key_bar(keys: &[(&str, &str)], width: u16, p: &Palette) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     let mut used = 0;
@@ -140,14 +158,15 @@ fn key_bar(keys: &[(&str, &str)], width: u16, p: &Palette) -> Vec<Span<'static>>
 }
 
 impl Screen {
-    pub fn draw(&self, frame: &mut Frame, area: Rect, p: &Palette) {
+    /// Draws the screen in `area`, the WORK column from what `host` knows.
+    pub fn draw(&self, frame: &mut Frame, area: Rect, p: &Palette, host: &dyn Host) {
         let [list, detail, footer] = Layout::vertical([
             Constraint::Percentage(45),
             Constraint::Fill(1),
             Constraint::Length(1),
         ])
         .areas(area);
-        self.draw_list(frame, list, p);
+        self.draw_list(frame, list, p, host);
         self.draw_detail(frame, detail, p);
         self.draw_footer(frame, footer, p);
         if self.is_help {
@@ -159,7 +178,7 @@ impl Screen {
         }
     }
 
-    fn draw_list(&self, frame: &mut Frame, area: Rect, p: &Palette) {
+    fn draw_list(&self, frame: &mut Frame, area: Rect, p: &Palette, host: &dyn Host) {
         let note = match (&self.error, self.issues.is_empty(), self.is_loading) {
             (Some(err), true, _) => Some((format!(" {err}"), fg(p.danger))),
             (None, true, true) => Some((" reading issues...".to_string(), fg(p.muted))),
@@ -176,8 +195,10 @@ impl Screen {
             );
             return;
         }
-        let header =
-            Row::new(["ID", "STATUS", "PRIORITY", "TITLE", "LABELS", "ASSIGNEE"]).style(p.header);
+        let header = Row::new([
+            "ID", "STATUS", "PRIORITY", "TITLE", "LABELS", "ASSIGNEE", "WORK",
+        ])
+        .style(p.header);
         // A grouped list puts a heading row above each group, so the cursor's
         // row on screen counts the headings above it.
         let mut rows: Vec<Row> = Vec::new();
@@ -209,6 +230,7 @@ impl Screen {
                 Cell::from(issue.title.clone()),
                 Cell::from(issue.labels.join(", ")).style(fg(p.special)),
                 Cell::from(issue.assignee.clone().unwrap_or_default()).style(fg(p.muted)),
+                work_cell(host, &issue.id, p),
             ]));
         }
         let widths = [
@@ -217,6 +239,7 @@ impl Screen {
             Constraint::Length(8),
             Constraint::Fill(1),
             Constraint::Length(18),
+            Constraint::Length(14),
             Constraint::Length(14),
         ];
         let cursor = if self.focus == Focus::List {

@@ -6,6 +6,7 @@
 mod backend;
 mod compose;
 mod draw;
+mod host;
 mod markdown;
 mod picker;
 mod screen;
@@ -16,6 +17,7 @@ use ratatui::style::{Color, Modifier, Style};
 use serde::{Deserialize, Serialize};
 
 pub use backend::{Backend, Linear, READ_ONLY};
+pub use host::{Host, NoTrees, Work};
 pub use screen::{Action, Screen};
 pub use views::{Group, View};
 

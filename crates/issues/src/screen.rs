@@ -1209,16 +1209,49 @@ mod tests {
 
     /// What `screen` draws on a terminal of 80 by 24, row by row.
     fn drawn(screen: &Screen) -> Vec<String> {
+        drawn_with(screen, &crate::NoTrees, 80)
+    }
+
+    /// What `screen` draws `width` columns wide, with `host` saying who
+    /// works on what.
+    fn drawn_with(screen: &Screen, host: &dyn crate::Host, width: u16) -> Vec<String> {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
         terminal
-            .draw(|frame| screen.draw(frame, frame.area(), &crate::Palette::default()))
+            .draw(|frame| screen.draw(frame, frame.area(), &crate::Palette::default(), host))
             .unwrap();
         let buffer = terminal.backend().buffer();
         (0..24)
-            .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect())
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
             .collect()
+    }
+
+    /// Tree 4 works on END-2, its agent waiting on you.
+    struct TreeFour;
+
+    impl crate::Host for TreeFour {
+        fn work_on(&self, id: &str) -> Option<crate::Work> {
+            (id == "END-2").then(|| crate::Work {
+                tree: "4".into(),
+                agent: Some("waiting".into()),
+                needs_you: true,
+            })
+        }
+    }
+
+    #[test]
+    fn the_work_column_says_which_tree_and_agent_work_on_an_issue() {
+        let (screen, _) = screen();
+        let rows = drawn_with(&screen, &TreeFour, 140);
+        let row = |id: &str| rows.iter().find(|r| r.starts_with(id)).unwrap().clone();
+        assert!(rows[0].contains("WORK"), "{}", rows[0]);
+        assert!(
+            row("END-2").trim_end().ends_with("4 · waiting"),
+            "{}",
+            row("END-2")
+        );
+        assert!(!row("END-1").contains('·'), "{}", row("END-1"));
     }
 
     #[test]

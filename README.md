@@ -315,7 +315,8 @@ These job files are internal to Claude Code, like its session files, so a releas
 treetop has two screens, Trees and Issues; Tab switches between them, and `treetop issues` opens straight onto Issues.
 The Issues screen shows the repository's issues from its issue source in the config (see [Config](#config)): the list on top, your own open issues first, the most recently updated at the top, and below it the issue under the cursor with its fields, its description rendered from Markdown, and its comments.
 Everything loads in the background, and an issue's description and comments are kept once read, so moving the cursor never waits on the network.
-`→` (or `l`) moves the keys to the issue to scroll it, and `←` brings them back to the list.
+Each issue picked up in a tree shows it in the WORK column, with its agent's state, `4 · waiting` in the warning colour when the agent waits on you.
+`→` moves the keys to the issue to scroll it, and `←` brings them back to the list.
 `w` switches to the next issue source, so a work and a personal workspace are one key apart, and `o` opens the issue in the browser.
 
 Number keys switch between views: `1` your open issues, `2` everyone's, `3` grouped by project, `4` grouped by status in the team's workflow order, and `5` the current cycle.
