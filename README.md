@@ -316,11 +316,17 @@ treetop has two screens, Trees and Issues; Tab switches between them, and `treet
 The Issues screen shows the repository's issues from its issue source in the config (see [Config](#config)): the list on top, your own open issues first, the most recently updated at the top, and below it the issue under the cursor with its fields, its description rendered from Markdown, and its comments.
 Everything loads in the background, and an issue's description and comments are kept once read, so moving the cursor never waits on the network.
 Each issue picked up in a tree shows it in the WORK column, with its agent's state, `4 · waiting` in the warning colour when the agent waits on you.
-`→` moves the keys to the issue to scroll it, and `←` brings them back to the list.
+Enter or `→` opens the issue under the cursor on the whole screen, to scroll with j/k, Space and PgUp, g and G, or the mouse wheel; Esc or `←` goes back to the list.
+The keys that change an issue work the same from the list and from inside it.
+An open issue lists the issues it is linked to: its parent, its sub-issues, the ones it blocks or is blocked by, related ones and duplicates, and the issues of its team its text mentions.
+Tab moves between those links and the issue's images, and Enter or a click opens the one marked: an issue opens in its place, and Esc goes back along the issues opened, then to the list.
+Images show in the text, read with the source's key, in the terminal's own graphics where it has them (Kitty, Ghostty, WezTerm, iTerm2, through tmux with `allow-passthrough on`) and in coloured blocks anywhere else.
+An image opened fills the screen; `←` and `→` go to the issue's other images, and `o` opens it in the browser.
+While an issue is open treetop takes the mouse, so selecting text there takes Shift as you drag.
 `w` switches to the next issue source, so a work and a personal workspace are one key apart, and `o` opens the issue in the browser.
 
 Number keys switch between views: `1` your open issues, `2` everyone's, `3` grouped by project, `4` grouped by status in the team's workflow order, and `5` the current cycle.
-Views of your own go on `6` to `9`, in name order, from `[views]` in the config, each a filter line that may also say `group:project` or `group:status`:
+Views of your own go on `6` to `9`, in name order, from `[views]` in the config, each a line of filters: `mine`, and `assignee:`, `label:`, `state:` (a status, or `any`), `project:` and `cycle:` (`current` or a number), a value with spaces in double quotes, other words searched for, and `group:project` or `group:status`:
 
 ```toml
 [views]
@@ -328,28 +334,32 @@ bugs = "label:Bug group:status"
 review = "mine state:\"In Review\""
 ```
 
-`/` edits the filter line, which starts from the filters in use; Enter applies it and Esc keeps the last.
-It takes `mine`, `label:`, `state:`, `project:` and `cycle:` (`current` or a number), a value with spaces in double quotes, and any other words search titles: `mine label:Bug state:"In Review" login`.
-With no `state:`, only open issues show.
+The line above the list says what it shows: whose issues, which status, and whatever else narrows them, such as `my issues · open · label Bug · “login”`.
+`/` searches: the list narrows as you type, by id, title, label and assignee, and once typing rests Linear is searched too, by title or issue number, so older issues show; Enter keeps the search and Esc clears it.
+`f` opens the filters: assignee (anyone, you, nobody, or a teammate), status (open, all, or one), label, project, cycle, and grouping, each picked from the team's own with Enter, the list following at once; `x` clears one and `c` all of them.
 `m` switches between yours and everyone's, `r` reads the list and the team again, and `?` shows these keys.
 
 `s` changes the issue's status, `l` its labels and `a` its assignee, each from a picker of the team's own states, labels and members that narrows as you type; labels are marked and unmarked with Tab and applied together with Enter, and the assignee picker offers you first, then nobody, then everyone else.
 The change shows on the row at once and is sent behind it; if Linear refuses it, the row goes back to what it was and the bar says why.
 `c` writes a comment on the issue: Markdown, Alt+Enter for a new line, Enter to post it under the issue's other comments; one Linear refuses opens again with its text, so nothing written is lost.
 
-`n` creates an issue in the source's team: its title, then the status, labels, assignee and project pickers in turn (Enter keeps what each starts on: the team's first open state, no labels, you, no project), then its description in your editor (`$VISUAL`, else `$EDITOR`, else `vi`).
-It appears at the top of the list once Linear has it; one Linear refuses is kept, and `n` starts again from it.
-`e` edits the issue under the cursor: its title in place, then its description in your editor; only what changed is sent.
+`n` opens a form for a new issue, and `e` the same form on the issue under the cursor.
+It fills the screen: the title, the status, priority, labels, assignee and project, and the description in a box below.
+Tab and Shift+Tab move between the fields; on a field set from a list, Enter or typing opens its picker.
+The description takes Markdown as it is typed, Enter for a new line, and Ctrl+E writes it in your editor (`$VISUAL`, else `$EDITOR`, else `vi`) instead.
+Ctrl+S saves: a new issue needs a title and starts in the team's first open state, assigned to you; an edit sends only what changed.
+Esc closes the form, and once something is written in it, asks for a second Esc first.
+A new issue appears at the top of the list once Linear has it, and one Linear refuses, new or edited, opens again in the form as it was written.
 
 A Linear source gets all of this; an issue source on another ticket plugin lists and reads through the plugin contract, and its edits say they cannot be made.
 
-Enter picks the issue under the cursor up, in one step:
+`p` picks the issue up, from the list or from inside it, in one step:
 
 1. a fresh tree is leased on the branch the ticket system names for the ticket (Linear's `branchName`), or on that branch as it already is, here or on `origin`, when the ticket was picked up before;
 2. an agent starts there, its session named for the ticket (`END-123 fix the login redirect`), its first message the ticket's id, title, text and link;
 3. once it runs, the ticket is marked started and assigned to you.
 
-The tree's `treetop.json` records the ticket, so the TICKET column shows it, the filter finds it, and Enter on a ticket already in a tree goes to that tree rather than starting a second agent.
+The tree's `treetop.json` records the ticket, so the TICKET column shows it, the filter finds it, and `p` on a ticket already in a tree goes to that tree rather than starting a second agent.
 A step that fails undoes the ones before it, as any start does; marking the ticket started is the exception, and a failure there only shows in the detail pane, since the agent is already working.
 `treetop pick END-123` does the same from a shell.
 

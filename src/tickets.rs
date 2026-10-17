@@ -147,6 +147,7 @@ impl Backend for ReadOnly {
         Ok(linear::Detail {
             issue: issue(self.0.get(id)?),
             comments: Vec::new(),
+            links: Vec::new(),
         })
     }
 }

@@ -20,8 +20,8 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 pub use edit::{Change, NewIssue};
-pub use filter::Filter;
-pub use model::{Comment, Cycle, Detail, Issue, Named, State, Team};
+pub use filter::{ANY_STATE, Filter, UNASSIGNED};
+pub use model::{Comment, Cycle, Detail, Issue, Link, Named, State, Team};
 
 use model::{ISSUE_FIELDS, RawIssue, RawTeam};
 
@@ -32,6 +32,12 @@ const LIMIT: Duration = Duration::from_secs(10);
 
 /// Issues one list returns, the most recently updated first.
 const PAGE: usize = 100;
+
+/// The most an image fetched may weigh.
+const IMAGE_LIMIT: u64 = 25 * 1024 * 1024;
+
+/// Another issue as a detail names it: its id, title and status.
+const LINKED: &str = "identifier title state { name }";
 
 /// What went wrong, as a caller decides what to do about it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,14 +152,45 @@ impl Client {
         Ok(raw.into_iter().map(Issue::from).collect())
     }
 
-    /// One issue, by its id or uuid, with its description and comments.
+    /// One issue, by its id or uuid, with its description, comments, and the
+    /// issues it is linked to.
     pub fn detail(&self, id: &str) -> Result<Detail, Error> {
         let query = format!(
             "query($id: String!) {{ issue(id: $id) {{ {ISSUE_FIELDS} description \
-             comments(first: 100) {{ nodes {{ body createdAt user {{ id name }} }} }} }} }}"
+             comments(first: 100) {{ nodes {{ body createdAt user {{ id name }} }} }} \
+             parent {{ {LINKED} }} children(first: 50) {{ nodes {{ {LINKED} }} }} \
+             relations(first: 50) {{ nodes {{ type relatedIssue {{ {LINKED} }} }} }} \
+             inverseRelations(first: 50) {{ nodes {{ type issue {{ {LINKED} }} }} }} }} }}"
         );
         let data = self.query(&query, json!({ "id": id }))?;
         raw_issue(data.get("issue"), id).map(RawIssue::into_detail)
+    }
+
+    /// The file at `url`, such as an image in a description. Linear's own
+    /// uploads need the key; it goes to Linear's hosts only, over HTTPS.
+    pub fn fetch(&self, url: &str) -> Result<Vec<u8>, Error> {
+        let unavailable =
+            |err: ureq::Error| Error::new(ErrorKind::Unavailable, format!("{url}: {err}"));
+        let mut request = self.agent.get(url);
+        if is_linear_host(url) {
+            request = request.header("Authorization", &self.key);
+        }
+        let mut response = request.call().map_err(unavailable)?;
+        let status = response.status();
+        if !status.is_success() {
+            let kind = match status.as_u16() {
+                401 | 403 => ErrorKind::Auth,
+                404 => ErrorKind::NotFound,
+                _ => ErrorKind::Failed,
+            };
+            return Err(Error::new(kind, format!("{url}: {status}")));
+        }
+        response
+            .body_mut()
+            .with_config()
+            .limit(IMAGE_LIMIT)
+            .read_to_vec()
+            .map_err(unavailable)
     }
 
     /// One issue, by its id, with its description.
@@ -189,10 +226,13 @@ impl Client {
             .clear();
     }
 
+    /// Linear prices a query by multiplying each list by its page size, a
+    /// list with none counting as 50, against a limit of 10,000; the one team
+    /// asked for is a list of one, or its lists would count fifty times over.
     fn read_team(&self, key: &str) -> Result<Team, Error> {
         let query = "query($key: String!) { viewer { id name } \
             issueLabels(first: 250, filter: { team: { null: true } }) { nodes { id name } } \
-            teams(filter: { key: { eqIgnoreCase: $key } }) { nodes { id key name \
+            teams(first: 1, filter: { key: { eqIgnoreCase: $key } }) { nodes { id key name \
               states { nodes { id name type position } } \
               labels(first: 250) { nodes { id name } } \
               members(first: 250) { nodes { id name } } \
@@ -297,6 +337,21 @@ impl Client {
     }
 }
 
+/// Whether `url` is Linear's own, over HTTPS: `linear.app` or a host under
+/// it, such as `uploads.linear.app`.
+fn is_linear_host(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    // Userinfo or a port would let `linear.app@elsewhere` pass.
+    if authority.contains(['@', ':']) {
+        return false;
+    }
+    let host = authority.to_ascii_lowercase();
+    host == "linear.app" || host.ends_with(".linear.app")
+}
+
 /// An issue node, or that `what` was not found.
 fn raw_issue(node: Option<&Value>, what: &str) -> Result<RawIssue, Error> {
     let node = node
@@ -397,6 +452,59 @@ mod tests {
     }
 
     #[test]
+    fn a_detail_names_its_links_from_its_own_side() {
+        // Each linked issue as the detail query asks for it, LINKED.
+        let linked = |id: &str| {
+            format!(r#"{{"identifier":"{id}","title":"t {id}","state":{{"name":"Todo"}}}}"#)
+        };
+        let with_links = ISSUE.replace(
+            r#""cycle":{"number":12,"name":null}}"#,
+            &format!(
+                r#""cycle":null,"parent":{},"children":{{"nodes":[{}]}},
+                "relations":{{"nodes":[{{"type":"related","relatedIssue":{}}},{{"type":"blocks","relatedIssue":{}}}]}},
+                "inverseRelations":{{"nodes":[{{"type":"blocks","issue":{}}},{{"type":"duplicate","issue":{}}}]}}}}"#,
+                linked("END-1"),
+                linked("END-2"),
+                linked("END-3"),
+                linked("END-4"),
+                linked("END-5"),
+                linked("END-6"),
+            ),
+        );
+        let raw: RawIssue = serde_json::from_str(&with_links).unwrap();
+        let links: Vec<(String, String)> = raw
+            .into_detail()
+            .links
+            .into_iter()
+            .map(|l| (l.kind, l.id))
+            .collect();
+        let expected = [
+            ("parent", "END-1"),
+            ("sub-issue", "END-2"),
+            ("blocked by", "END-5"),
+            ("blocks", "END-4"),
+            ("related", "END-3"),
+            ("duplicated by", "END-6"),
+        ]
+        .map(|(kind, id)| (kind.to_string(), id.to_string()));
+        assert_eq!(links, expected);
+    }
+
+    #[test]
+    fn the_key_goes_to_linears_own_hosts_only() {
+        assert!(is_linear_host("https://uploads.linear.app/a/b.png"));
+        assert!(is_linear_host("https://linear.app/x"));
+        assert!(
+            !is_linear_host("http://uploads.linear.app/a.png"),
+            "not over plain HTTP"
+        );
+        assert!(!is_linear_host("https://linear.app.evil.com/a.png"));
+        assert!(!is_linear_host("https://evillinear.app/a.png"));
+        assert!(!is_linear_host("https://linear.app@evil.com/a.png"));
+        assert!(!is_linear_host("https://i.imgur.com/a.png"));
+    }
+
+    #[test]
     fn reads_a_team_with_states_in_workflow_order_and_workspace_labels() {
         let raw: RawTeam = serde_json::from_str(
             r#"{"id":"t1","key":"END","name":"Endo","states":{"nodes":[
@@ -456,12 +564,24 @@ mod tests {
         let client = Client::new("lin_api_not_a_real_key");
         let all = Filter {
             mine: true,
+            assignee: None,
             label: Some("Bug".into()),
             state: Some("Todo".into()),
             project: Some("x".into()),
             cycle: Some("current".into()),
-            query: Some("login".into()),
+            query: Some("login END-12".into()),
         };
+        let others = [
+            Filter {
+                assignee: Some("Zoe".into()),
+                ..Filter::default()
+            },
+            Filter {
+                assignee: Some(UNASSIGNED.into()),
+                state: Some(ANY_STATE.into()),
+                ..Filter::default()
+            },
+        ];
         let change = Change {
             title: Some("t".into()),
             description: Some("d".into()),
@@ -495,14 +615,16 @@ mod tests {
         // Variables are only read after the key is checked, so the inputs
         // are checked again written into the query, where the schema
         // validates them.
+        let filter = |filter: &Filter| {
+            format!(
+                "{{ issues(filter: {}) {{ nodes {{ id }} }} }}",
+                literal(&filter.to_value(Some("END")))
+            )
+        };
         let inline = [
-            (
-                "filter",
-                format!(
-                    "{{ issues(filter: {}) {{ nodes {{ id }} }} }}",
-                    literal(&all.to_value(Some("END")))
-                ),
-            ),
+            ("filter", filter(&all)),
+            ("filter by person", filter(&others[0])),
+            ("filter of nobody's", filter(&others[1])),
             (
                 "change",
                 format!(
@@ -540,6 +662,30 @@ mod tests {
                 format!("[{}]", items.join(", "))
             }
             other => other.to_string(),
+        }
+    }
+
+    /// Every read a picker or the list makes, against a real workspace: the
+    /// key in `LINEAR_API_KEY_WORK` and the team in `LINEAR_TEST_TEAM`, else
+    /// `END`. Linear only prices a query once the key is good, so this is
+    /// what catches one too costly to run. It changes nothing. Run with
+    /// `cargo test -p linear -- --ignored reads_a_real_workspace`.
+    #[test]
+    #[ignore = "calls Linear with a real key"]
+    fn reads_a_real_workspace() {
+        let client = Client::from_env("LINEAR_API_KEY_WORK").expect("LINEAR_API_KEY_WORK is set");
+        let team = std::env::var("LINEAR_TEST_TEAM").unwrap_or_else(|_| "END".into());
+        let read = client
+            .team(&team)
+            .unwrap_or_else(|err| panic!("team {team}: {err}"));
+        assert!(!read.states.is_empty(), "a team has states");
+        let issues = client
+            .issues(Some(&team), &Filter::default())
+            .unwrap_or_else(|err| panic!("issues: {err}"));
+        if let Some(first) = issues.first() {
+            client
+                .detail(&first.id)
+                .unwrap_or_else(|err| panic!("detail of {}: {err}", first.id));
         }
     }
 

@@ -55,12 +55,26 @@ pub struct Comment {
     pub created_at: String,
 }
 
+/// Another issue an issue is linked to, and how.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    /// How it is linked, from the issue's side: `parent`, `sub-issue`,
+    /// `blocked by`, `blocks`, `related`, `duplicate of` or `duplicated by`.
+    pub kind: String,
+    /// The id people use, such as `END-123`.
+    pub id: String,
+    pub title: String,
+    pub state: String,
+}
+
 /// An issue with everything the detail pane shows.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Detail {
     pub issue: Issue,
     /// Oldest first.
     pub comments: Vec<Comment>,
+    /// The parent first, then sub-issues, then the other links.
+    pub links: Vec<Link>,
 }
 
 /// A workflow state. `kind` is Linear's type: `triage`, `backlog`,
@@ -106,7 +120,7 @@ pub struct Team {
 
 /// The issue fields every read asks for.
 pub const ISSUE_FIELDS: &str = "id identifier title url branchName priority updatedAt \
-    team { id } state { id name } assignee { id name } labels { nodes { id name } } \
+    team { id } state { id name } assignee { id name } labels(first: 20) { nodes { id name } } \
     project { id name } cycle { number name }";
 
 #[derive(Deserialize)]
@@ -163,6 +177,49 @@ pub(crate) struct RawIssue {
     cycle: Option<RawCycleRef>,
     description: Option<String>,
     comments: Option<Nodes<RawComment>>,
+    parent: Option<RawLinked>,
+    children: Option<Nodes<RawLinked>>,
+    relations: Option<Nodes<RawRelation>>,
+    inverse_relations: Option<Nodes<RawRelation>>,
+}
+
+/// Another issue, as a detail names it.
+#[derive(Deserialize)]
+struct RawLinked {
+    #[serde(default)]
+    identifier: String,
+    #[serde(default)]
+    title: String,
+    state: Option<RawName>,
+}
+
+/// A name with no id, as a linked issue's status is asked for.
+#[derive(Deserialize)]
+struct RawName {
+    #[serde(default)]
+    name: String,
+}
+
+impl RawLinked {
+    fn into_link(self, kind: &str) -> Link {
+        Link {
+            kind: kind.to_string(),
+            id: self.identifier,
+            title: self.title,
+            state: self.state.map(|s| s.name).unwrap_or_default(),
+        }
+    }
+}
+
+/// A relation, holding the issue at its other end: `relatedIssue` on the
+/// issue's own relations, `issue` on the inverse ones.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawRelation {
+    #[serde(default, rename = "type")]
+    kind: String,
+    related_issue: Option<RawLinked>,
+    issue: Option<RawLinked>,
 }
 
 #[derive(Deserialize)]
@@ -196,9 +253,57 @@ impl RawIssue {
             .map(Comment::from)
             .collect();
         comments.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        let mut links: Vec<Link> = self
+            .parent
+            .take()
+            .map(|p| p.into_link("parent"))
+            .into_iter()
+            .collect();
+        links.extend(
+            self.children
+                .take()
+                .map(|c| c.nodes)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|c| c.into_link("sub-issue")),
+        );
+        // A relation reads one way from each end: what blocks from this
+        // side is blocked by from the other.
+        let mut related: Vec<Link> = Vec::new();
+        for relation in self.relations.take().map(|r| r.nodes).unwrap_or_default() {
+            let kind = match relation.kind.as_str() {
+                "blocks" => "blocks",
+                "duplicate" => "duplicate of",
+                _ => "related",
+            };
+            related.extend(relation.related_issue.map(|i| i.into_link(kind)));
+        }
+        for relation in self
+            .inverse_relations
+            .take()
+            .map(|r| r.nodes)
+            .unwrap_or_default()
+        {
+            let kind = match relation.kind.as_str() {
+                "blocks" => "blocked by",
+                "duplicate" => "duplicated by",
+                _ => "related",
+            };
+            related.extend(relation.issue.map(|i| i.into_link(kind)));
+        }
+        let rank = |kind: &str| match kind {
+            "blocked by" => 0,
+            "blocks" => 1,
+            "related" => 2,
+            _ => 3,
+        };
+        related.sort_by_key(|l| rank(&l.kind));
+        links.extend(related);
+        links.retain(|l| !l.id.is_empty());
         Detail {
             issue: Issue::from(self),
             comments,
+            links,
         }
     }
 }

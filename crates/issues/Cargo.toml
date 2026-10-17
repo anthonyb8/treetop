@@ -7,6 +7,11 @@ publish = false
 
 [dependencies]
 linear = { path = "../linear" }
+# The formats screenshots and pasted pictures come in; no AVIF, whose encoder
+# would weigh more than the rest of treetop.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 pulldown-cmark = { version = "0.13", default-features = false }
-ratatui = "0.30.2"
+ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
+# No chafa: it links a C library, which the static release build cannot.
+ratatui-image = { version = "11.1", default-features = false, features = ["crossterm"] }
 serde.workspace = true

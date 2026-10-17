@@ -1,5 +1,6 @@
-//! A picker over a team's states, labels or members, filtered as you type.
-//! Status and assignee take one choice; labels take a set, marked with Tab.
+//! A picker over a team's states, labels, members or projects, or the
+//! priorities, filtered as you type. Labels take a set, marked with Tab; the
+//! rest take one choice.
 
 use std::collections::BTreeSet;
 
@@ -10,18 +11,26 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Status,
+    Priority,
     Labels,
     Assignee,
     Project,
+    /// One of a list of choices, not a change to an issue, such as a filter.
+    Choice,
 }
+
+/// Linear's priorities, by the number it gives each.
+const PRIORITIES: [&str; 5] = ["no priority", "urgent", "high", "medium", "low"];
 
 impl Kind {
     pub fn noun(self) -> &'static str {
         match self {
             Kind::Status => "Status",
+            Kind::Priority => "Priority",
             Kind::Labels => "Labels",
             Kind::Assignee => "Assignee",
             Kind::Project => "Project",
+            Kind::Choice => "Choice",
         }
     }
 }
@@ -79,7 +88,20 @@ impl Picker {
                     .collect(),
                 issue.state_id.clone(),
             ),
+            Kind::Priority => (
+                PRIORITIES
+                    .iter()
+                    .enumerate()
+                    .map(|(n, name)| Choice {
+                        id: Some(n.to_string()),
+                        name: (*name).to_string(),
+                    })
+                    .collect(),
+                Some(issue.priority.to_string()),
+            ),
             Kind::Labels => (named(&team.labels), None),
+            // Its choices are given, not read from the team.
+            Kind::Choice => (Vec::new(), None),
             Kind::Assignee => {
                 // You first, then nobody, then everyone else by name.
                 let me = team.me.as_ref();
@@ -129,6 +151,26 @@ impl Picker {
         }
     }
 
+    /// A picker of `choices` titled `title`, on the one whose id is
+    /// `current`.
+    pub fn of(title: &str, choices: Vec<Choice>, current: Option<String>) -> Self {
+        let cursor = choices.iter().position(|c| c.id == current).unwrap_or(0);
+        Picker {
+            kind: Kind::Choice,
+            issue: title.to_string(),
+            choices,
+            query: String::new(),
+            cursor,
+            marked: BTreeSet::new(),
+            current,
+        }
+    }
+
+    /// The choice under the cursor.
+    pub fn chosen(&self) -> Option<&Choice> {
+        self.shown().get(self.cursor).copied()
+    }
+
     /// The choices the query keeps, by name, case ignored.
     pub fn shown(&self) -> Vec<&Choice> {
         let query = self.query.to_lowercase();
@@ -148,6 +190,10 @@ impl Picker {
     fn apply(&self, issue: &Issue) -> Option<Picked> {
         let mut after = issue.clone();
         let change = match self.kind {
+            Kind::Choice => {
+                self.chosen()?;
+                Change::default()
+            }
             Kind::Labels => {
                 let ids: Vec<String> = self.marked.iter().cloned().collect();
                 after.labels = self
@@ -168,6 +214,14 @@ impl Picker {
                 after.state_id = choice.id.clone();
                 Change {
                     state_id: choice.id.clone(),
+                    ..Change::default()
+                }
+            }
+            Kind::Priority => {
+                let choice = self.shown().get(self.cursor).copied()?;
+                after.priority = choice.id.as_deref()?.parse().ok()?;
+                Change {
+                    priority: Some(after.priority),
                     ..Change::default()
                 }
             }
@@ -291,6 +345,23 @@ mod tests {
         };
         assert_eq!(change.state_id.as_deref(), Some("s2"));
         assert_eq!(after.state, "In Progress");
+    }
+
+    #[test]
+    fn priority_offers_linears_five_on_the_issues_own() {
+        let urgent = Issue {
+            priority: 1,
+            ..issue()
+        };
+        let mut picker = Picker::new(Kind::Priority, &urgent, &team());
+        assert_eq!(picker.cursor, 1);
+        typed(&mut picker, "low");
+        let Picked::Apply(change, after) =
+            picker.handle_key(KeyEvent::from(KeyCode::Enter), &urgent)
+        else {
+            panic!("Enter applies");
+        };
+        assert_eq!((change.priority, after.priority), (Some(4), 4));
     }
 
     #[test]

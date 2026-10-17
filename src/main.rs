@@ -199,6 +199,8 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
     let mut is_stale = true;
     let mut drawn_at = Instant::now();
     let mut chats = Chats::default();
+    // Whether the mouse is captured for an open issue, apart from a chat's.
+    let mut is_issue_mouse = false;
     loop {
         while let Ok(update) = refresher.updates.try_recv() {
             is_stale = true;
@@ -265,6 +267,12 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             }
             if let Some(screen) = issues.as_mut() {
                 is_stale |= screen.poll();
+                // Asked only once an image is wanted, since a terminal that
+                // never answers holds the screen up while it is asked.
+                if screen.wants_terminal_asked() {
+                    screen.ask_terminal_for_images();
+                    is_stale = true;
+                }
                 if let Some(text) = screen.take_editor() {
                     refresher.set_paused(true);
                     let edited = edit_in_editor(term, &text);
@@ -275,6 +283,21 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             }
         }
         was_issues = app.is_issues;
+        // An open issue takes the mouse, for its links and the wheel; a
+        // chat captures it on its own, and gives it back when it closes.
+        if chats.is_open() {
+            is_issue_mouse = false;
+        } else {
+            let wants = app.is_issues && issues.as_ref().is_some_and(|s| s.wants_mouse());
+            if wants != is_issue_mouse {
+                if wants {
+                    execute!(io::stdout(), EnableMouseCapture)?;
+                } else {
+                    execute!(io::stdout(), DisableMouseCapture)?;
+                }
+                is_issue_mouse = wants;
+            }
+        }
         if app.is_quitting && app.active_jobs() == 0 {
             return Ok(Exit::Quit);
         }
@@ -350,6 +373,13 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                     open.send_mouse(mouse, popup::inner(screen));
                 }
                 _ => {}
+            }
+            continue;
+        }
+        if let Event::Mouse(mouse) = &event {
+            if let Some(screen) = issues.as_mut().filter(|_| app.is_issues) {
+                screen.handle_mouse(*mouse);
+                is_stale = true;
             }
             continue;
         }

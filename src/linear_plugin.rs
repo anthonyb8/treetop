@@ -57,6 +57,7 @@ fn ticket(issue: Issue) -> Ticket {
 fn filter(filters: Filters) -> Filter {
     Filter {
         mine: filters.mine,
+        assignee: filters.assignee,
         label: filters.label,
         state: filters.state,
         project: filters.project,

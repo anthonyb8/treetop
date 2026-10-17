@@ -18,7 +18,7 @@ pub trait Backend: Send + Sync {
 
     fn list(&self, filters: &Filters) -> Result<Vec<Issue>, String>;
 
-    /// One issue with its description and comments.
+    /// One issue with its description, comments and links.
     fn detail(&self, id: &str) -> Result<Detail, String>;
 
     /// What its issues can be set to; None for a source that cannot change
@@ -40,6 +40,11 @@ pub trait Backend: Send + Sync {
 
     fn comment(&self, _issue: &Issue, _body: &str) -> Result<Comment, String> {
         Err(READ_ONLY.into())
+    }
+
+    /// The file at `url`, such as an image in a description.
+    fn fetch(&self, _url: &str) -> Result<Vec<u8>, String> {
+        Err("this source's plugin cannot fetch images".into())
     }
 }
 
@@ -84,6 +89,7 @@ impl Linear {
 fn filter(filters: &Filters) -> linear::Filter {
     linear::Filter {
         mine: filters.mine,
+        assignee: filters.assignee.clone(),
         label: filters.label.clone(),
         state: filters.state.clone(),
         project: filters.project.clone(),
@@ -135,5 +141,9 @@ impl Backend for Linear {
         self.client()?
             .comment(&issue.uuid, body)
             .map_err(|err| err.message)
+    }
+
+    fn fetch(&self, url: &str) -> Result<Vec<u8>, String> {
+        self.client()?.fetch(url).map_err(|err| err.message)
     }
 }

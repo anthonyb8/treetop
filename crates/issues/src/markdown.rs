@@ -1,6 +1,7 @@
 //! An issue's Markdown as styled lines: headings, lists, quotes, code, and
 //! inline emphasis, code and links, so a description reads as Linear shows
-//! it. Lines are left long; the pane wraps them.
+//! it. Lines are left long; the pane wraps them. Images come apart from the
+//! text, for the screen to draw as pictures.
 
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
@@ -8,8 +9,16 @@ use ratatui::text::{Line, Span};
 
 use crate::Palette;
 
+/// A run of Markdown's lines, or an image between them.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Piece {
+    Lines(Vec<Line<'static>>),
+    Image { url: String, alt: String },
+}
+
 struct Writer<'p> {
     palette: &'p Palette,
+    pieces: Vec<Piece>,
     lines: Vec<Line<'static>>,
     spans: Vec<Span<'static>>,
     /// Inline styles open, innermost last.
@@ -20,6 +29,8 @@ struct Writer<'p> {
     is_code: bool,
     /// The target of the link being written, shown after its text.
     link: Option<String>,
+    /// The image being read: its URL, and its alt text so far.
+    image: Option<(String, String)>,
 }
 
 impl Writer<'_> {
@@ -46,6 +57,15 @@ impl Writer<'_> {
     }
 
     fn push(&mut self, text: &str) {
+        // A line starts at its text, as one after an image would not.
+        let text = if self.spans.is_empty() {
+            text.trim_start()
+        } else {
+            text
+        };
+        if text.is_empty() {
+            return;
+        }
         if self.spans.is_empty() {
             let lead = self.lead();
             self.spans.extend(lead);
@@ -55,6 +75,11 @@ impl Writer<'_> {
     }
 
     fn end_line(&mut self) {
+        if let Some(last) = self.spans.last_mut()
+            && last.content.ends_with(' ')
+        {
+            last.content = last.content.trim_end().to_string().into();
+        }
         if !self.spans.is_empty() {
             self.lines.push(Line::from(std::mem::take(&mut self.spans)));
         }
@@ -67,8 +92,32 @@ impl Writer<'_> {
         }
     }
 
+    /// Ends the lines so far as a piece of their own.
+    fn cut(&mut self) {
+        self.end_line();
+        while self.lines.last().is_some_and(|l| l.width() == 0) {
+            self.lines.pop();
+        }
+        if !self.lines.is_empty() {
+            self.pieces
+                .push(Piece::Lines(std::mem::take(&mut self.lines)));
+        }
+    }
+
     fn event(&mut self, event: Event) {
         let p = self.palette;
+        if let Some((_, alt)) = &mut self.image {
+            match event {
+                Event::End(TagEnd::Image) => {
+                    let (url, alt) = self.image.take().unwrap_or_default();
+                    self.cut();
+                    self.pieces.push(Piece::Image { url, alt });
+                }
+                Event::Text(text) | Event::Code(text) => alt.push_str(&text),
+                _ => {}
+            }
+            return;
+        }
         match event {
             Event::Start(Tag::Heading { level, .. }) => {
                 self.blank();
@@ -174,11 +223,7 @@ impl Writer<'_> {
                 }
             }
             Event::Start(Tag::Image { dest_url, .. }) => {
-                self.push(&format!("[image {dest_url}]"));
-                self.styles.push(Style::new().fg(p.muted));
-            }
-            Event::End(TagEnd::Image) => {
-                self.styles.pop();
+                self.image = Some((dest_url.to_string(), String::new()));
             }
             Event::Text(text) if self.is_code => {
                 for line in text.lines() {
@@ -209,10 +254,12 @@ impl Writer<'_> {
     }
 }
 
-/// `markdown` as lines, with no blank line at either end.
-pub fn render(markdown: &str, palette: &Palette) -> Vec<Line<'static>> {
+/// `markdown` as runs of lines and the images between them, with no blank
+/// line at either end of a run.
+pub fn pieces(markdown: &str, palette: &Palette) -> Vec<Piece> {
     let mut writer = Writer {
         palette,
+        pieces: Vec::new(),
         lines: Vec::new(),
         spans: Vec::new(),
         styles: Vec::new(),
@@ -220,17 +267,62 @@ pub fn render(markdown: &str, palette: &Palette) -> Vec<Line<'static>> {
         quote: 0,
         is_code: false,
         link: None,
+        image: None,
     };
     let options = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     for event in Parser::new_ext(markdown, options) {
         writer.event(event);
     }
-    writer.end_line();
-    let mut lines = writer.lines;
-    while lines.last().is_some_and(|l| l.width() == 0) {
-        lines.pop();
+    writer.cut();
+    writer.pieces
+}
+
+/// An image's line where only text fits: a mark and its name.
+pub fn image_line(alt: &str, palette: &Palette) -> Line<'static> {
+    let name = if alt.trim().is_empty() {
+        "image"
+    } else {
+        alt.trim()
+    };
+    Line::styled(format!("▣ {name}"), Style::new().fg(palette.special))
+}
+
+/// `markdown` as lines, each image a line naming it, with no blank line at
+/// either end.
+pub fn render(markdown: &str, palette: &Palette) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for piece in pieces(markdown, palette) {
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        match piece {
+            Piece::Lines(more) => lines.extend(more),
+            Piece::Image { alt, .. } => lines.push(image_line(&alt, palette)),
+        }
     }
     lines
+}
+
+/// The images in `markdown`, by URL and alt text, in order.
+pub fn images(markdown: &str) -> Vec<(String, String)> {
+    let options = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    let mut found = Vec::new();
+    let mut open: Option<(String, String)> = None;
+    for event in Parser::new_ext(markdown, options) {
+        match event {
+            Event::Start(Tag::Image { dest_url, .. }) => {
+                open = Some((dest_url.to_string(), String::new()));
+            }
+            Event::Text(text) | Event::Code(text) => {
+                if let Some((_, alt)) = &mut open {
+                    alt.push_str(&text);
+                }
+            }
+            Event::End(TagEnd::Image) => found.extend(open.take()),
+            _ => {}
+        }
+    }
+    found
 }
 
 #[cfg(test)]
@@ -265,6 +357,54 @@ mod tests {
                 "    let x = 1;",
                 "",
                 "See the doc (https://x.dev).",
+            ]
+        );
+    }
+
+    #[test]
+    fn images_come_apart_from_the_text_around_them() {
+        let markdown = "Before.\n\n![login page](https://uploads.linear.app/a.png)\n\nAfter, \
+            with ![](https://x.dev/b.png) inline.";
+        let pieces = pieces(markdown, &Palette::default());
+        let shape: Vec<String> = pieces
+            .iter()
+            .map(|p| match p {
+                Piece::Lines(lines) => text(lines).join("|"),
+                Piece::Image { url, alt } => format!("image {alt} {url}"),
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                "Before.",
+                "image login page https://uploads.linear.app/a.png",
+                "After, with",
+                "image  https://x.dev/b.png",
+                "inline.",
+            ]
+        );
+        assert_eq!(
+            images(markdown),
+            [
+                (
+                    "https://uploads.linear.app/a.png".to_string(),
+                    "login page".to_string()
+                ),
+                ("https://x.dev/b.png".to_string(), String::new()),
+            ]
+        );
+        assert_eq!(
+            text(&render(markdown, &Palette::default())),
+            [
+                "Before.",
+                "",
+                "▣ login page",
+                "",
+                "After, with",
+                "",
+                "▣ image",
+                "",
+                "inline."
             ]
         );
     }

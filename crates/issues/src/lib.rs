@@ -6,10 +6,14 @@
 mod backend;
 mod compose;
 mod draw;
+mod form;
 mod host;
 mod markdown;
+mod panel;
 mod picker;
+mod picture;
 mod screen;
+mod targets;
 mod views;
 mod worker;
 
@@ -69,6 +73,10 @@ pub struct Filters {
     /// Only issues assigned to you.
     #[serde(default)]
     pub mine: bool,
+    /// Only issues assigned to this person, by name, or to nobody, as
+    /// `unassigned`.
+    #[serde(default)]
+    pub assignee: Option<String>,
     #[serde(default)]
     pub label: Option<String>,
     #[serde(default)]
@@ -78,7 +86,7 @@ pub struct Filters {
     /// `current` for the active cycle, else a cycle number.
     #[serde(default)]
     pub cycle: Option<String>,
-    /// Words the title contains.
+    /// Words to search for, in titles or as issue numbers.
     #[serde(default)]
     pub query: Option<String>,
 }
@@ -104,9 +112,9 @@ fn words(text: &str) -> Vec<String> {
     words
 }
 
-/// The filters a filter line asks for: `mine`, `label:`, `state:`,
-/// `project:` and `cycle:` (`current` or a number) take a value, quoted when
-/// it has spaces; every other word searches titles.
+/// The filters a filter line asks for: `mine`, `assignee:`, `label:`,
+/// `state:`, `project:` and `cycle:` (`current` or a number) take a value,
+/// quoted when it has spaces; every other word is searched for.
 pub fn parse(text: &str) -> Filters {
     let mut filters = Filters::default();
     let mut query = Vec::new();
@@ -114,6 +122,7 @@ pub fn parse(text: &str) -> Filters {
         let (key, value) = word.split_once(':').unwrap_or(("", &word));
         let value = Some(value.to_string()).filter(|v| !v.is_empty());
         match key {
+            "assignee" => filters.assignee = value,
             "label" => filters.label = value,
             "state" => filters.state = value,
             "project" => filters.project = value,
@@ -140,6 +149,7 @@ pub fn line(filters: &Filters) -> String {
         parts.push("mine".to_string());
     }
     for (key, value) in [
+        ("assignee", &filters.assignee),
         ("label", &filters.label),
         ("state", &filters.state),
         ("project", &filters.project),
