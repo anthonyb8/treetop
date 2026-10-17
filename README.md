@@ -332,7 +332,10 @@ It takes `mine`, `label:`, `state:`, `project:` and `cycle:` (`current` or a num
 With no `state:`, only open issues show.
 `m` switches between yours and everyone's, `r` reads the list and the team again, and `?` shows these keys.
 
-A Linear source gets all of this; an issue source on another ticket plugin lists and reads through the plugin contract.
+`s` changes the issue's status, `l` its labels and `a` its assignee, each from a picker of the team's own states, labels and members that narrows as you type; labels are marked and unmarked with Tab and applied together with Enter, and the assignee picker offers you first, then nobody, then everyone else.
+The change shows on the row at once and is sent behind it; if Linear refuses it, the row goes back to what it was and the bar says why.
+
+A Linear source gets all of this; an issue source on another ticket plugin lists and reads through the plugin contract, and its edits say they cannot be made.
 
 Enter picks the issue under the cursor up, in one step:
 

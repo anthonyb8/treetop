@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
-use linear::{Detail, Issue, Team};
+use linear::{Change, Detail, Issue, Team};
 
 use crate::Filters;
 use crate::backend::Backend;
@@ -24,6 +24,13 @@ pub(crate) enum Request {
     Team {
         source: usize,
     },
+    /// Change the issue, which looked like `before` until it was changed on
+    /// screen.
+    Update {
+        source: usize,
+        before: Box<Issue>,
+        change: Box<Change>,
+    },
 }
 
 impl Request {
@@ -32,7 +39,7 @@ impl Request {
         match self {
             Request::List { .. } => Some(0),
             Request::Detail { .. } => Some(1),
-            Request::Team { .. } => None,
+            Request::Team { .. } | Request::Update { .. } => None,
         }
     }
 }
@@ -51,6 +58,11 @@ pub(crate) enum Reply {
     Team {
         source: usize,
         result: Result<Option<Arc<Team>>, String>,
+    },
+    Updated {
+        source: usize,
+        before: Box<Issue>,
+        result: Result<Box<Issue>, String>,
     },
 }
 
@@ -78,6 +90,15 @@ fn run(backends: &[Arc<dyn Backend>], request: Request) -> Option<Reply> {
         Request::Team { source } => Reply::Team {
             source,
             result: backends.get(source)?.team(),
+        },
+        Request::Update {
+            source,
+            before,
+            change,
+        } => Reply::Updated {
+            source,
+            result: backends.get(source)?.update(&before, &change).map(Box::new),
+            before,
         },
     };
     Some(reply)

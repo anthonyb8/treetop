@@ -6,6 +6,7 @@
 mod backend;
 mod draw;
 mod markdown;
+mod picker;
 mod screen;
 mod views;
 mod worker;

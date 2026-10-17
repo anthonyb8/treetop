@@ -11,14 +11,18 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 
 use crate::markdown;
+use crate::picker::{Kind, Picker};
 use crate::screen::{Focus, Screen};
 use crate::{Palette, line};
 
 /// The bar's keys, most used first; `?` lists them all.
-const KEYS: [(&str, &str); 9] = [
+const KEYS: [(&str, &str); 12] = [
     ("Enter", "pick up"),
     ("?", "help"),
     ("→", "read"),
+    ("s", "status"),
+    ("l", "labels"),
+    ("a", "assign"),
     ("/", "filter"),
     ("m", "mine"),
     ("w", "source"),
@@ -28,10 +32,13 @@ const KEYS: [(&str, &str); 9] = [
 ];
 
 /// Every key, for the `?` overlay.
-const HELP: [(&str, &str); 14] = [
+const HELP: [(&str, &str); 17] = [
     ("Enter", "pick it up: an agent on it in a new tree"),
-    ("→ l", "read it: the description and comments take the keys"),
+    ("→", "read it: the description and comments take the keys"),
     ("← h Esc", "back to the list"),
+    ("s", "status: pick one, typing narrows the list"),
+    ("l", "labels: Tab marks or unmarks each, Enter applies them"),
+    ("a", "assignee: you, nobody, or a teammate"),
     (
         "/",
         "filter: mine label:Bug state:\"In Review\" project:x cycle:current, words",
@@ -132,6 +139,8 @@ impl Screen {
         self.draw_footer(frame, footer, p);
         if self.is_help {
             draw_help(frame, area, p);
+        } else if let Some(picker) = &self.picker {
+            draw_picker(frame, area, picker, p);
         }
     }
 
@@ -278,7 +287,11 @@ impl Screen {
     }
 
     fn draw_footer(&self, frame: &mut Frame, area: Rect, p: &Palette) {
-        let mut right = vec![Span::raw(format!("  {} issues", self.issues.len()))];
+        let count = match self.issues.len() {
+            1 => "1 issue".to_string(),
+            n => format!("{n} issues"),
+        };
+        let mut right = vec![Span::raw(format!("  {count}"))];
         let source = if self.source_count() > 1 {
             format!(
                 "  {} ({}/{})",
@@ -290,19 +303,13 @@ impl Screen {
             format!("  {}", self.source_name())
         };
         right.push(Span::raw(source));
-        right.push(Span::raw(format!("  {}", self.view_name())));
-        let filter = line(&self.filters);
-        right.push(Span::styled(
-            format!(
-                "  {}",
-                if filter.is_empty() {
-                    "all open"
-                } else {
-                    &filter
-                }
-            ),
-            fg(p.accent),
-        ));
+        // A view says its name; a filter line of your own says itself.
+        let narrowed = match (self.view.is_some(), line(&self.filters)) {
+            (true, _) => self.view_name().to_string(),
+            (false, filter) if filter.is_empty() => "all open".to_string(),
+            (false, filter) => filter,
+        };
+        right.push(Span::styled(format!("  {narrowed}"), fg(p.accent)));
         if self.is_loading {
             right.push(Span::styled("  loading...", fg(p.info)));
         }
@@ -358,6 +365,84 @@ fn fields(issue: &Issue, p: &Palette) -> Line<'static> {
         add(cycle.clone(), fg(p.muted));
     }
     Line::from(spans)
+}
+
+/// The picker in the middle of the screen: what is picked for which issue,
+/// the query, and the choices it keeps, the issue's own marked.
+fn draw_picker(frame: &mut Frame, area: Rect, picker: &Picker, p: &Palette) {
+    let shown = picker.shown();
+    let width = picker
+        .choices
+        .iter()
+        .map(|c| c.name.chars().count())
+        .max()
+        .unwrap_or(0)
+        .clamp(24, 60)
+        + 10;
+    let rows = shown.len().clamp(1, 16);
+    let height = u16::try_from(rows + 4).unwrap_or(u16::MAX).min(area.height);
+    let width = u16::try_from(width).unwrap_or(u16::MAX).min(area.width);
+    let popup = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    let hint = match picker.kind {
+        Kind::Labels => " Tab marks  Enter applies  Esc cancels ",
+        _ => " Enter picks  Esc cancels ",
+    };
+    let block = Block::bordered()
+        .border_style(fg(p.accent))
+        .title(Span::styled(
+            format!(" {} of {} ", picker.kind.noun(), picker.issue),
+            fg(p.title).add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Line::styled(hint, fg(p.muted)));
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("› ", fg(p.accent)),
+            Span::raw(picker.query.clone()),
+            Span::styled("_", fg(p.muted)),
+        ]),
+        Line::default(),
+    ];
+    // The cursor stays in view in a long list.
+    let first = picker.cursor.saturating_sub(rows.saturating_sub(1));
+    for (at, choice) in shown.iter().enumerate().skip(first).take(rows) {
+        let is_marked = match picker.kind {
+            Kind::Labels => choice
+                .id
+                .as_ref()
+                .is_some_and(|id| picker.marked.contains(id)),
+            _ => choice.id == picker.current,
+        };
+        let mark = match (picker.kind, is_marked) {
+            (Kind::Labels, true) => "[x] ",
+            (Kind::Labels, false) => "[ ] ",
+            (_, true) => "● ",
+            (_, false) => "  ",
+        };
+        let style = if at == picker.cursor {
+            p.cursor
+        } else {
+            Style::new()
+        };
+        lines.push(
+            Line::from(vec![
+                Span::styled(mark, fg(p.accent)),
+                Span::raw(choice.name.clone()),
+            ])
+            .style(style),
+        );
+    }
+    if shown.is_empty() {
+        lines.push(Line::styled("nothing matches", fg(p.muted)));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_help(frame: &mut Frame, area: Rect, p: &Palette) {

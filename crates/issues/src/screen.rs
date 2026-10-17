@@ -2,14 +2,15 @@
 //! program it runs in feeds it keys, polls it for what the network brought,
 //! and draws it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use linear::{Detail, Issue, Team};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::backend::Backend;
+use crate::backend::{Backend, READ_ONLY};
+use crate::picker::{self, Picked, Picker};
 use crate::views::{self, Group, View};
 use crate::worker::{Reply, Request, Worker};
 use crate::{Filters, line, parse};
@@ -60,6 +61,10 @@ pub struct Screen {
     /// The issue whose detail was last asked for, so it is asked once.
     asked: Option<String>,
     pub(crate) teams: HashMap<usize, Arc<Team>>,
+    /// Sources whose issues cannot be changed from here.
+    read_only: HashSet<usize>,
+    /// The picker open over the list, if one is.
+    pub(crate) picker: Option<Picker>,
     pub(crate) is_loading: bool,
     pub(crate) error: Option<String>,
     pub(crate) message: Option<String>,
@@ -93,6 +98,8 @@ impl Screen {
             details: HashMap::new(),
             asked: None,
             teams: HashMap::new(),
+            read_only: HashSet::new(),
+            picker: None,
             is_loading: false,
             error: None,
             message: None,
@@ -236,13 +243,83 @@ impl Screen {
                             .unwrap_or(0);
                     }
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    self.read_only.insert(source);
+                }
                 Err(err) if source == self.source => {
                     self.message = Some(format!("{}: {err}", self.source_name()));
                 }
                 Err(_) => {}
             },
+            Reply::Updated {
+                source,
+                before,
+                result,
+            } => {
+                if source != self.source {
+                    return;
+                }
+                let (issue, said) = match result {
+                    Ok(issue) => (*issue, format!("{} updated", before.id)),
+                    Err(err) => {
+                        let said = format!("{}: {err}; kept as it was", before.id);
+                        (*before, said)
+                    }
+                };
+                self.message = Some(said);
+                self.replace(issue);
+            }
         }
+    }
+
+    /// Puts `issue` in place of the one with its id, regrouped, the cursor
+    /// staying on the issue it was on.
+    fn replace(&mut self, issue: Issue) {
+        let cursor = self.current().map(|i| i.id.clone());
+        if let Some(slot) = self.issues.iter_mut().find(|i| i.id == issue.id) {
+            *slot = issue;
+        }
+        self.arrange();
+        self.selected = cursor
+            .and_then(|id| self.issues.iter().position(|i| i.id == id))
+            .unwrap_or(self.selected);
+    }
+
+    /// Opens a picker of `kind` on the issue under the cursor, once its team
+    /// is known.
+    fn open_picker(&mut self, kind: picker::Kind) {
+        let Some(issue) = self.current() else {
+            return;
+        };
+        if self.read_only.contains(&self.source) {
+            self.message = Some(READ_ONLY.into());
+            return;
+        }
+        let Some(team) = self.teams.get(&self.source) else {
+            self.message = Some(format!(
+                "reading {}'s states, labels and members; try again in a moment",
+                self.source_name()
+            ));
+            self.worker.send(Request::Team {
+                source: self.source,
+            });
+            return;
+        };
+        self.picker = Some(Picker::new(kind, issue, team));
+    }
+
+    /// Makes `change` on screen at once, and sends it.
+    fn change(&mut self, change: linear::Change, after: Issue) {
+        let Some(before) = self.current().cloned() else {
+            return;
+        };
+        self.message = Some(format!("updating {}...", before.id));
+        self.replace(after);
+        self.worker.send(Request::Update {
+            source: self.source,
+            before: Box::new(before),
+            change: Box::new(change),
+        });
     }
 
     /// Orders the list into its groups, keeping each group in Linear's
@@ -337,6 +414,21 @@ impl Screen {
             self.is_help = false;
             return Action::None;
         }
+        if let Some(picker) = &mut self.picker {
+            let Some(issue) = self.issues.get(self.selected) else {
+                self.picker = None;
+                return Action::None;
+            };
+            match picker.handle_key(key, issue) {
+                Picked::Continue => {}
+                Picked::Cancel => self.picker = None,
+                Picked::Apply(change, after) => {
+                    self.picker = None;
+                    self.change(*change, *after);
+                }
+            }
+            return Action::None;
+        }
         if let Some(text) = &mut self.editing {
             match key.code {
                 KeyCode::Enter => {
@@ -380,7 +472,7 @@ impl Screen {
             KeyCode::Up | KeyCode::Char('k') => self.move_by(-1),
             KeyCode::Home | KeyCode::Char('g') => self.move_by(isize::MIN),
             KeyCode::End | KeyCode::Char('G') => self.move_by(isize::MAX),
-            KeyCode::Right | KeyCode::Char('l') if self.current().is_some() => {
+            KeyCode::Right if self.current().is_some() => {
                 self.focus = Focus::Detail;
             }
             KeyCode::Char('/') => {
@@ -400,6 +492,9 @@ impl Screen {
                 self.load();
             }
             KeyCode::Char('r') => self.reload(),
+            KeyCode::Char('s') => self.open_picker(picker::Kind::Status),
+            KeyCode::Char('l') => self.open_picker(picker::Kind::Labels),
+            KeyCode::Char('a') => self.open_picker(picker::Kind::Assignee),
             KeyCode::Char('w') => self.next_source(),
             KeyCode::Char('o') => {
                 if let Some(url) = self.current().and_then(|i| i.url.clone()) {
@@ -431,6 +526,8 @@ mod tests {
         pub(crate) issues: Vec<Issue>,
         pub(crate) asked: Mutex<Vec<String>>,
         pub(crate) team: Option<Arc<Team>>,
+        /// Why an update is refused, when it is.
+        pub(crate) refuse: Option<String>,
     }
 
     impl Backend for Fake {
@@ -448,6 +545,23 @@ mod tests {
 
         fn team(&self) -> Result<Option<Arc<Team>>, String> {
             Ok(self.team.clone())
+        }
+
+        fn update(&self, issue: &Issue, change: &linear::Change) -> Result<Issue, String> {
+            if let Some(why) = &self.refuse {
+                return Err(why.clone());
+            }
+            let state = self.team.as_ref().and_then(|team| {
+                team.states
+                    .iter()
+                    .find(|s| Some(&s.id) == change.state_id.as_ref())
+            });
+            Ok(Issue {
+                state: state.map_or(issue.state.clone(), |s| s.name.clone()),
+                state_id: change.state_id.clone().or(issue.state_id.clone()),
+                updated_at: "2026-10-17T11:00:00Z".into(),
+                ..issue.clone()
+            })
         }
 
         fn detail(&self, id: &str) -> Result<Detail, String> {
@@ -637,6 +751,135 @@ mod tests {
         assert_eq!(screen.view_name(), "custom");
         screen.handle_key(key(KeyCode::Char('9')));
         assert!(screen.message.as_deref().unwrap().starts_with("no view 9"));
+    }
+
+    fn team_of(states: &[&str]) -> Arc<Team> {
+        Arc::new(Team {
+            id: "t".into(),
+            key: "END".into(),
+            name: "Endo".into(),
+            states: states
+                .iter()
+                .map(|id| linear::State {
+                    id: (*id).into(),
+                    name: (*id).into(),
+                    kind: "unstarted".into(),
+                    position: 0.0,
+                })
+                .collect(),
+            labels: Vec::new(),
+            members: Vec::new(),
+            projects: Vec::new(),
+            cycles: Vec::new(),
+            me: None,
+        })
+    }
+
+    fn picked_status(refuse: Option<&str>) -> Screen {
+        let fake = Arc::new(Fake {
+            name: "work".into(),
+            issues: vec![Issue {
+                state: "todo".into(),
+                state_id: Some("todo".into()),
+                ..issue("END-1")
+            }],
+            team: Some(team_of(&["todo", "doing"])),
+            refuse: refuse.map(str::to_string),
+            ..Fake::default()
+        });
+        let mut screen = Screen::new(vec![fake], 0, Vec::new());
+        settle(&mut screen);
+        screen.handle_key(key(KeyCode::Char('s')));
+        assert!(screen.picker.is_some());
+        screen.handle_key(key(KeyCode::Down));
+        screen.handle_key(key(KeyCode::Enter));
+        assert!(screen.picker.is_none());
+        assert_eq!(screen.issues[0].state, "doing", "shown at once");
+        screen
+    }
+
+    fn settle_update(screen: &mut Screen) {
+        for _ in 0..200 {
+            screen.poll();
+            if screen
+                .message
+                .as_deref()
+                .is_some_and(|m| !m.starts_with("updating"))
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// What `screen` draws on a terminal of 80 by 24, row by row.
+    fn drawn(screen: &Screen) -> Vec<String> {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| screen.draw(frame, frame.area(), &crate::Palette::default()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..24)
+            .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn the_status_picker_marks_the_issues_status_and_filters_as_you_type() {
+        let fake = Arc::new(Fake {
+            name: "work".into(),
+            issues: vec![Issue {
+                state: "todo".into(),
+                state_id: Some("todo".into()),
+                ..issue("END-1")
+            }],
+            team: Some(team_of(&["todo", "doing", "done"])),
+            ..Fake::default()
+        });
+        let mut screen = Screen::new(vec![fake], 0, Vec::new());
+        settle(&mut screen);
+        screen.handle_key(key(KeyCode::Char('s')));
+        let rows = drawn(&screen);
+        let text = rows.join("\n");
+        assert!(text.contains(" Status of END-1 "), "{text}");
+        assert!(rows.iter().any(|r| r.contains("● todo")), "{text}");
+        assert!(rows.iter().any(|r| r.contains("  doing")), "{text}");
+        screen.handle_key(key(KeyCode::Char('d')));
+        screen.handle_key(key(KeyCode::Char('o')));
+        screen.handle_key(key(KeyCode::Char('n')));
+        let text = drawn(&screen).join("\n");
+        assert!(text.contains("› don_"), "{text}");
+        assert!(!text.contains("doing"), "{text}");
+    }
+
+    #[test]
+    fn a_status_picked_shows_at_once_and_stays_when_the_source_takes_it() {
+        let mut screen = picked_status(None);
+        settle_update(&mut screen);
+        assert_eq!(screen.message.as_deref(), Some("END-1 updated"));
+        assert_eq!(screen.issues[0].state, "doing");
+        assert_eq!(screen.issues[0].updated_at, "2026-10-17T11:00:00Z");
+    }
+
+    #[test]
+    fn a_status_the_source_refuses_goes_back_and_says_why() {
+        let mut screen = picked_status(Some("Linear: forbidden"));
+        settle_update(&mut screen);
+        assert_eq!(screen.issues[0].state, "todo");
+        assert_eq!(
+            screen.message.as_deref(),
+            Some("END-1: Linear: forbidden; kept as it was")
+        );
+    }
+
+    #[test]
+    fn a_source_that_cannot_change_issues_says_so() {
+        let (mut screen, _) = screen();
+        screen.handle_key(key(KeyCode::Char('s')));
+        assert!(screen.picker.is_none());
+        assert_eq!(screen.message.as_deref(), Some(READ_ONLY));
     }
 
     #[test]
