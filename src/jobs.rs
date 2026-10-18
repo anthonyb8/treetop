@@ -19,7 +19,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::agents::{Status, claude};
+use crate::agents::claude;
 use crate::branch;
 use crate::child::{self, End};
 use crate::config::{self, Hooks};
@@ -617,6 +617,9 @@ fn start_steps(job: &mut Job, log: &mut String, undone: &mut Vec<Undo>) -> Resul
                         "dir": job.tree.path,
                         "name": launch.name,
                         "prompt": launch.task,
+                        // A pool tree is the agent's own to stay in; the main
+                        // checkout is everyone's.
+                        "isolated": !job.tree.is_main,
                     }),
                 )
                 .map_err(|err| format!("start: {}", err.message))?;
@@ -771,15 +774,12 @@ fn run_hook(name: &str, command: &[String], tree: &Path, log: &mut String) {
     }
 }
 
-/// Stops every background agent a plugin reports running in the tree,
-/// through that plugin, since treehouse stops only processes standing in it,
-/// and a session that moved in with `EnterWorktree` stands elsewhere.
+/// Stops every background agent a plugin reports in the tree, through that
+/// plugin, since treehouse stops only processes standing in it, and a
+/// session that moved in with `EnterWorktree` stands elsewhere. A cold one is
+/// stopped too, so its plugin stops keeping it awake.
 fn stop_agents(tree: &Tree, log: &mut String) {
-    let running = tree
-        .agents
-        .iter()
-        .filter(|a| a.is_background && a.status != Some(Status::Cold));
-    for agent in running {
+    for agent in tree.agents.iter().filter(|a| a.is_background) {
         let (Some(name), Some(id)) = (&agent.plugin, &agent.job) else {
             continue;
         };

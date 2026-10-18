@@ -119,11 +119,17 @@ A pid two sources both see counts once, where the more specific source saw it; a
   This gives the session's name and whether it is busy, idle or waiting on you.
   It also reports every background job in `~/.claude/jobs` with no running session as a **cold** agent, drawn `◌`: Enter attaches to it, which starts it again with its conversation kept.
   A cold agent shows in the tree whose `treetop.json` names its job, else in the tree it last worked in when that was since the tree's lease began, so one started by hand stays on its tree while a tree that has been returned and handed out again never shows the last agent.
+  It stays there however long ago it finished; only the inbox forgets a finished job after a day.
   These files are internal to Claude Code, so a release that changes them blanks this source until treetop catches up.
 - **A process** standing in the tree whose name, or the script its interpreter runs, is a known agent: `claude`, `codex`, `aider`, `opencode`, `gemini`, `goose`, `amp` or `cursor-agent`.
   `TREETOP_AGENTS=one,two` adds names. This sees any agent started inside a tree, by name only.
 
 A waiting agent is drawn in the warning colour, a busy one in green and an idle one muted; `·` means the source cannot tell.
+
+A held tree keeps its background agents awake while treetop runs, so an agent never comes apart from its tree.
+Claude Code's daemon retires a background session that has sat idle for about an hour; treetop pins each one in a held tree, as Ctrl+T in `claude agents` does, so the daemon leaves it running, and starts any that has gone cold again in the background, with its conversation and no new message, at most once every ten minutes.
+The main checkout keeps none, and a tree being returned stops keeping its agents: the return stops and unpins them.
+An agent treetop starts in a pool tree is told that the tree is its own, so it works there rather than taking a second tree with `EnterWorktree` and leaving the first empty.
 
 When treetop leases a tree to start an agent, it records the lease in `treetop.json` in the same git directory: the agent, when it leased the tree, and later its job, ticket and branch.
 A return removes it, so a tree handed out again never carries the last agent's record.
@@ -203,14 +209,16 @@ An agent plugin answers these ops:
 
 | Op | Args | Result |
 |---|---|---|
-| `start` | `dir`, `name`, `prompt` | `id`, once the agent runs |
+| `start` | `dir`, `name`, `prompt`, `isolated` (`dir` is a tree of the agent's own, to stay in) | `id`, once the agent runs |
 | `find` | `dirs` | `agents`: each with `id`, `name`, `dir`, `live`, and optionally `pid`, `status` (`busy`, `idle` or `waiting`), `background` and `attach` |
 | `attach` | `id` | `argv`, the command that opens its chat in a terminal |
 | `send` | `id`, `text` | `delivered`, for an agent that is not running |
 
 `describe` may also give `screen`, which tells treetop how to type a message into a running agent's chat: the input box is a line starting with `input` between two lines starting with `rule`, and a screen with no input box but one of `dialogs` on it is waiting on an answer.
-Claude Code's is `{"input": "❯", "rule": "─", "dialogs": ["Do you want to", "❯ 1."]}`; without one, treetop types on a timer.
-| `stop` | `id` | nothing |
+One of `away` on the screen's last few lines means the chat has left its agent for a list of other sessions, which `←` in an empty input box opens; treetop keeps `←` from it there, and opens the agent's chat again when it shows.
+Claude Code's is `{"input": "❯", "rule": "─", "dialogs": ["Do you want to", "❯ 1."], "away": ["describe a task for a new session", "enter to return"]}`; without one, treetop types on a timer.
+| `stop` | `id` | nothing; the agent stops and is no longer kept awake |
+| `keep` | `ids` | `woken`, the ids it started again; keeps the agents of held trees running, starting cold ones again |
 
 A ticket plugin answers these, with its source's settings as `config`:
 
@@ -246,7 +254,7 @@ Both run in the background, up to four trees at once, while treetop stays on scr
 The detail pane shows the end of each tree's last action's output, and a failure also shows its last line in the status line.
 
 - **Return** first shows a dialog listing each tree's uncommitted files, unpushed commits and running processes, or "unknown changes" where git cannot read it. On `y`, for each tree at once:
-  1. it stops the tree's background agents through their plugin, since a session that moved in with `EnterWorktree` runs from elsewhere and treehouse would not stop it;
+  1. it stops the tree's background agents through their plugin, since a session that moved in with `EnterWorktree` runs from elsewhere and treehouse would not stop it, and so the tree stops keeping them awake;
   2. runs the `on_return` hook, if the config names one;
   3. runs `treehouse return --force`, which stops the processes left in the tree (the dialog replaces treehouse's own prompt), with `--if-lease-id` for a tree treetop leased, so a lease someone has taken since is never returned;
   4. deletes the branch treetop named for it when its work is in the pool's base branch, or when its PR merged with the branch where it is now, which covers a squash or rebase merge; a branch with commits after the merge is kept;
@@ -278,7 +286,8 @@ treetop takes the mouse only while a chat is open; on the list, the terminal and
 From the keyboard, Ctrl+O opens Claude's transcript view, where j/k move a line and Ctrl+u/Ctrl+d half a page; PgUp and PgDn also work where a keyboard has them.
 
 A background Claude Code session (started with `claude --bg`, or backgrounded) opens with `claude attach`, which never starts a second copy.
-Ctrl+Z also leaves it; double Ctrl+C or `←` on an empty prompt opens Claude's own list of sessions inside the chat instead.
+Ctrl+Z also leaves it.
+The popup only ever shows the agent it was opened on: `←` on an empty prompt, which would open Claude's own list of sessions, does nothing, and if the chat reaches that list another way, such as double Ctrl+C, treetop opens the agent's chat again at once and says so in the status line.
 
 An agent with an `attach` command in its `agent.json` opens the same way.
 An agent running in a tmux pane, such as an interactive `claude`, belongs to that pane and cannot be opened elsewhere: Enter goes to the tree instead, which inside tmux switches to its pane.

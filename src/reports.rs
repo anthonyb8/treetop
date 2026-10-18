@@ -187,16 +187,28 @@ pub struct Reader {
 }
 
 impl Reader {
-    /// Every job worth showing: working or waiting on you, or settled within
-    /// RECENT.
+    /// Every job worth showing in the inbox: working or waiting on you, or
+    /// settled within RECENT.
     pub fn read(&mut self) -> Vec<Report> {
+        let now = SystemTime::now();
+        self.read_all()
+            .into_iter()
+            .filter(|r| {
+                !r.state.is_settled()
+                    || now.duration_since(r.updated).is_ok_and(|age| age <= RECENT)
+            })
+            .collect()
+    }
+
+    /// Every job, however long ago it settled, since a finished agent still
+    /// belongs to the tree it worked in.
+    pub fn read_all(&mut self) -> Vec<Report> {
         let Some(jobs) = crate::agents::config_dir().map(|c| c.join("jobs")) else {
             return Vec::new();
         };
         let Ok(entries) = fs::read_dir(&jobs) else {
             return Vec::new();
         };
-        let now = SystemTime::now();
         let mut seen = HashMap::new();
         for entry in entries.flatten() {
             let dir = entry.path();
@@ -224,10 +236,6 @@ impl Reader {
         self.known
             .values()
             .filter_map(|(_, report)| report.clone())
-            .filter(|r| {
-                !r.state.is_settled()
-                    || now.duration_since(r.updated).is_ok_and(|age| age <= RECENT)
-            })
             .collect()
     }
 }

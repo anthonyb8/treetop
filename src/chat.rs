@@ -65,6 +65,11 @@ const INPUT_LIMIT: Duration = Duration::from_secs(20);
 /// it again, before the message fails.
 const LAND_LIMIT: Duration = Duration::from_secs(5);
 
+/// The last lines of a chat's screen read for its hints' `away` markers,
+/// where the footer of a screen of other sessions sits, so a transcript that
+/// quotes one higher up does not count.
+const AWAY_LINES: usize = 4;
+
 /// Where a message waiting to be typed into a chat stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stage {
@@ -150,6 +155,30 @@ pub struct Chat {
     outbox: VecDeque<Outgoing>,
     /// How its screen shows it takes a message; None types on a timer.
     hints: Option<Screen>,
+}
+
+/// Whether `key` on a chat showing `text` would leave its agent: ← with no
+/// modifiers in an empty input box, for a chat whose hints say it can leave.
+fn leaves(key: KeyEvent, text: &str, hints: &Screen) -> bool {
+    !hints.away.is_empty()
+        && key.code == KeyCode::Left
+        && key.modifiers.is_empty()
+        && input(text, hints) == Input::Empty
+}
+
+/// Whether `text`, a chat's screen, is a screen of other sessions rather
+/// than its agent's chat.
+fn is_away(text: &str, hints: &Screen) -> bool {
+    text.lines()
+        .rev()
+        .filter(|line| !line.trim().is_empty())
+        .take(AWAY_LINES)
+        .any(|line| {
+            hints
+                .away
+                .iter()
+                .any(|marker| line.contains(marker.as_str()))
+        })
 }
 
 /// Where the last synchronized-output marker in `bytes` leaves the chat:
@@ -327,9 +356,25 @@ impl Chat {
         let _ = self.master.write_all(bytes);
     }
 
+    /// Passes a key on, except ← in an empty input box of a chat that
+    /// leaves its agent on it, so the chat stays the agent's.
     pub fn send_key(&mut self, key: KeyEvent) {
+        if self
+            .hints
+            .as_ref()
+            .is_some_and(|hints| leaves(key, &self.screen().contents(), hints))
+        {
+            return;
+        }
         let bytes = encode(key, self.screen().application_cursor());
         self.write(&bytes);
+    }
+
+    /// The chat has left its agent for a screen of other sessions.
+    fn is_away(&self) -> bool {
+        self.hints
+            .as_ref()
+            .is_some_and(|hints| is_away(&self.screen().contents(), hints))
     }
 
     /// Passes a mouse event on, in the mode and encoding the chat asked for.
@@ -490,6 +535,9 @@ pub struct Pumped {
     pub is_stale: bool,
     /// The open chat's program exited, which closes it: its agent and tree.
     pub ended: Option<(String, String)>,
+    /// The open chat left its agent and was opened on it again: its agent
+    /// and tree.
+    pub kept: Option<(String, String)>,
     /// Agent and tree of each message typed in and sent.
     pub delivered: Vec<(String, String)>,
     /// Agent, tree and why, of each message that could not be sent.
@@ -518,16 +566,17 @@ impl Chats {
     }
 
     /// Shows the chat running `command`: the one left running for it if
-    /// there is one, at once, else a new one.
+    /// there is one, at once, else a new one. `hints` say how its screen
+    /// shows that it takes a message, or has left its agent.
     pub fn show(
         &mut self,
         command: &[String],
-        rows: u16,
-        cols: u16,
+        (rows, cols): (u16, u16),
         agent: String,
         tree: String,
+        hints: Option<Screen>,
     ) -> Result<()> {
-        let chat = match self.background.iter().position(|c| c.command == command) {
+        let mut chat = match self.background.iter().position(|c| c.command == command) {
             Some(index) => {
                 let mut chat = self.background.remove(index);
                 if chat.screen().size() != (rows, cols) {
@@ -537,6 +586,7 @@ impl Chats {
             }
             None => Chat::open(command, rows, cols, agent, tree)?,
         };
+        chat.hints = chat.hints.take().or(hints);
         self.open = Some(chat);
         Ok(())
     }
@@ -624,11 +674,37 @@ impl Chats {
             return Pumped {
                 is_stale: false,
                 ended: None,
+                kept: None,
                 delivered,
                 failed,
             };
         };
-        let is_stale = open.pump();
+        let mut is_stale = open.pump();
+        let mut kept = None;
+        if open.is_away() && open.outbox.is_empty() {
+            is_stale = true;
+            match self.reopen() {
+                Ok(agent) => kept = Some(agent),
+                Err(agent) => {
+                    return Pumped {
+                        is_stale,
+                        ended: Some(agent),
+                        kept,
+                        delivered,
+                        failed,
+                    };
+                }
+            }
+        }
+        let Some(open) = &mut self.open else {
+            return Pumped {
+                is_stale,
+                ended: None,
+                kept,
+                delivered,
+                failed,
+            };
+        };
         open.flush_into(&mut delivered, &mut failed);
         if open.is_ended() && !open.outbox.is_empty() {
             failed.push(ended(open));
@@ -641,9 +717,31 @@ impl Chats {
         Pumped {
             is_stale,
             ended,
+            kept,
             delivered,
             failed,
         }
+    }
+
+    /// Opens the open chat on its agent again, once it has left for a
+    /// screen of other sessions, so the popup only ever shows the agent it
+    /// was opened on. Returns that agent and tree, as an error when it could
+    /// not be opened again, which closes it.
+    fn reopen(&mut self) -> Result<(String, String), (String, String)> {
+        let Some(old) = self.open.take() else {
+            return Err(Default::default());
+        };
+        let (rows, cols) = old.screen().size();
+        let who = (old.agent.clone(), old.tree.clone());
+        let hints = old.hints.clone();
+        // The old client ends first, so the agent has one chat attached.
+        let command = old.command.clone();
+        drop(old);
+        let mut chat = Chat::open(&command, rows, cols, who.0.clone(), who.1.clone())
+            .map_err(|_| who.clone())?;
+        chat.hints = hints;
+        self.open = Some(chat);
+        Ok(who)
     }
 
     /// Ends the background chats whose agent is gone, except one still
@@ -844,7 +942,49 @@ mod tests {
             input: "❯".into(),
             rule: "─".into(),
             dialogs: vec!["Do you want to".into(), "❯ 1.".into()],
+            away: vec![
+                "describe a task for a new session".into(),
+                "enter to return".into(),
+            ],
         }
+    }
+
+    /// The bottom of Claude Code's agent view, which ← in an empty input
+    /// box of `claude attach` opens, as it draws it.
+    const AGENT_VIEW: &str = "~/treetop\n ✻ dfd   Needs input · tell the agent what you'd like\n\
+         ✻ fix   Done · tests green\n\
+         ────────────────────────────────────────\n❯ describe a task for a new session\n\
+         ────────────────────────────────────────\n  enter to return · space to reply · ctrl+x to delete\n";
+
+    #[test]
+    fn the_agent_view_is_away_and_the_chat_is_not() {
+        assert!(is_away(AGENT_VIEW, &claude()));
+        assert!(!is_away(&idle(""), &claude()));
+        let quoted = format!("● press enter to return to it\n{}", idle(""));
+        assert!(
+            !is_away(&quoted, &claude()),
+            "the transcript quoting a marker above the box is still the chat"
+        );
+    }
+
+    #[test]
+    fn left_in_an_empty_input_box_is_kept_from_the_chat() {
+        let left = key(KeyCode::Left, KeyModifiers::NONE);
+        assert!(leaves(left, &idle(""), &claude()));
+        assert!(
+            !leaves(left, &idle("commit it"), &claude()),
+            "← moves through a draft"
+        );
+        assert!(!leaves(
+            key(KeyCode::Left, KeyModifiers::ALT),
+            &idle(""),
+            &claude()
+        ));
+        let no_away = Screen {
+            away: Vec::new(),
+            ..claude()
+        };
+        assert!(!leaves(left, &idle(""), &no_away));
     }
 
     /// The bottom of an idle Claude Code chat, as `claude attach` draws it,

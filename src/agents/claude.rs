@@ -12,13 +12,18 @@
 //! - `<config>/jobs/<id>/state.json`: every background job, running or not,
 //!   which `reports` reads. One with no running session is a cold agent.
 //!
+//! - `<config>/jobs/pins.json`: the jobs Claude Code's daemon never retires
+//!   for sitting idle, which its agent view toggles with Ctrl+T. `keep` adds
+//!   to it and `stop` takes away, under the lock Claude Code takes.
+//!
 //! A background session opens in a terminal with `claude attach <id>`, where
 //! the id is the short one `claude --bg` prints: the session id's first eight
-//! characters. Attaching to a cold one starts it again.
+//! characters. Attaching to a cold one starts it again, and so does `claude
+//! --bg --resume` with its session id, without a terminal or a new message.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{LazyLock, Mutex, PoisonError};
@@ -45,6 +50,18 @@ const CONFIRM_LIMIT: Duration = Duration::from_secs(20);
 
 /// How often `claude agents` is asked again while confirming.
 const CONFIRM_EVERY: Duration = Duration::from_millis(500);
+
+/// How long after waking a job it is not woken again, so a job that does not
+/// come up, or that the daemon retires again because memory is short, is not
+/// started over and over.
+const WAKE_AGAIN: Duration = Duration::from_secs(10 * 60);
+
+/// How long Claude Code's lock on `pins.json` lasts unrefreshed before it is
+/// stale, as Claude Code takes it.
+const PINS_STALE: Duration = Duration::from_secs(5);
+
+/// How long `keep` and `stop` wait for that lock.
+const PINS_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -190,7 +207,10 @@ static JOBS: LazyLock<Mutex<Reader>> = LazyLock::new(Mutex::default);
 /// last worked.
 fn cold(live: &[Seen]) -> Vec<Seen> {
     let running: HashSet<&str> = live.iter().filter_map(|s| s.id.as_deref()).collect();
-    let reports = JOBS.lock().unwrap_or_else(PoisonError::into_inner).read();
+    let reports = JOBS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .read_all();
     reports
         .into_iter()
         .filter(|report| !running.contains(report.job.as_str()))
@@ -308,13 +328,33 @@ fn required<'a>(args: &'a Value, key: &str) -> Result<&'a str, Error> {
     text(args, key).ok_or_else(|| Error::new(Code::Failed, format!("no {key} given")))
 }
 
-/// The arguments `start` runs `claude` with: in the background, named, and
-/// the prompt after `--`, so one that starts with `-` is never read as a
-/// flag.
-fn start_args<'a>(name: Option<&'a str>, prompt: Option<&'a str>) -> Vec<&'a str> {
+/// What a session started in a tree of its own is told, so it works there
+/// rather than taking a second tree with `EnterWorktree`, which would leave
+/// the first held with no agent in it.
+fn stay(dir: &Path) -> String {
+    format!(
+        "You are already isolated: {} is a pool worktree leased for you alone, \
+         on a branch of its own. It is the worktree your instructions ask you to take, \
+         so do all your work in it and run everything from it. Do not call EnterWorktree \
+         or lease another tree: that would separate you from the tree you were given.",
+        dir.display()
+    )
+}
+
+/// The arguments `start` runs `claude` with: in the background, named, told
+/// to stay in its tree when it has one of its own, and the prompt after
+/// `--`, so one that starts with `-` is never read as a flag.
+fn start_args<'a>(
+    name: Option<&'a str>,
+    stay: Option<&'a str>,
+    prompt: Option<&'a str>,
+) -> Vec<&'a str> {
     let mut args = vec!["--bg"];
     if let Some(name) = name {
         args.extend(["--name", name]);
+    }
+    if let Some(stay) = stay {
+        args.extend(["--append-system-prompt", stay]);
     }
     if let Some(prompt) = prompt {
         args.extend(["--", prompt]);
@@ -323,11 +363,13 @@ fn start_args<'a>(name: Option<&'a str>, prompt: Option<&'a str>) -> Vec<&'a str
 }
 
 /// Starts a session in `dir` and waits until it runs, stopping it again if
-/// it never does.
+/// it never does. `isolated` says `dir` is a tree of the session's own.
 fn start(args: &Value) -> Result<Value, Error> {
     let dir = PathBuf::from(required(args, "dir")?);
+    let is_isolated = args.get("isolated").and_then(Value::as_bool) == Some(true);
+    let told = is_isolated.then(|| stay(&dir));
     let out = claude(
-        &start_args(text(args, "name"), text(args, "prompt")),
+        &start_args(text(args, "name"), told.as_deref(), text(args, "prompt")),
         Some(&dir),
     )?;
     let id = attach_id(&out)
@@ -373,6 +415,150 @@ fn send(args: &Value) -> Result<Value, Error> {
     Ok(json!({ "delivered": true }))
 }
 
+/// Claude Code's lock on `pins.json`: a directory beside it, as the lock
+/// library it uses makes one, removed when this is dropped.
+struct PinsLock(PathBuf);
+
+impl PinsLock {
+    /// Takes the lock, clearing one left stale by a process that died
+    /// holding it.
+    fn take(pins: &Path) -> Result<Self, Error> {
+        let lock = pins.with_extension("json.lock");
+        let deadline = Instant::now() + PINS_WAIT;
+        loop {
+            match fs::create_dir(&lock) {
+                Ok(()) => return Ok(PinsLock(lock)),
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                    let is_stale = fs::metadata(&lock)
+                        .and_then(|m| m.modified())
+                        .is_ok_and(|at| at.elapsed().is_ok_and(|age| age > PINS_STALE));
+                    if is_stale {
+                        let _ = fs::remove_dir(&lock);
+                        continue;
+                    }
+                }
+                Err(err) => {
+                    return Err(Error::new(
+                        Code::Failed,
+                        format!("could not lock {}: {err}", pins.display()),
+                    ));
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::new(
+                    Code::Unavailable,
+                    format!("{} stayed locked", pins.display()),
+                ));
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for PinsLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir(&self.0);
+    }
+}
+
+/// Pins `ids`, or unpins them, in `<config>/jobs/pins.json`. A file that is
+/// not the list of ids Claude Code writes is left as it is.
+fn set_pinned(ids: &[&str], is_pinned: bool) -> Result<(), Error> {
+    let config = config_dir().ok_or_else(|| Error::new(Code::Unavailable, "no HOME"))?;
+    let pins = config.join("jobs").join("pins.json");
+    fs::create_dir_all(config.join("jobs"))
+        .map_err(|err| Error::new(Code::Failed, format!("{}: {err}", pins.display())))?;
+    let _lock = PinsLock::take(&pins)?;
+    let mut pinned: Vec<String> = match fs::read_to_string(&pins) {
+        Ok(text) => serde_json::from_str(&text).map_err(|err| {
+            Error::new(
+                Code::Failed,
+                format!("{} is not a list of ids: {err}", pins.display()),
+            )
+        })?,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => {
+            return Err(Error::new(
+                Code::Failed,
+                format!("{}: {err}", pins.display()),
+            ));
+        }
+    };
+    let before = pinned.clone();
+    if is_pinned {
+        let had: BTreeSet<String> = pinned.iter().cloned().collect();
+        pinned.extend(
+            ids.iter()
+                .filter(|id| !had.contains(**id))
+                .map(|id| id.to_string()),
+        );
+    } else {
+        pinned.retain(|id| !ids.contains(&id.as_str()));
+    }
+    if pinned == before {
+        return Ok(());
+    }
+    let partial = pins.with_extension("json.treetop");
+    let text = serde_json::to_string_pretty(&pinned).unwrap_or_else(|_| "[]".into());
+    fs::write(&partial, text)
+        .and_then(|()| fs::rename(&partial, &pins))
+        .map_err(|err| Error::new(Code::Failed, format!("{}: {err}", pins.display())))
+}
+
+/// When each job was last woken, so it is not woken again within WAKE_AGAIN.
+static WOKEN: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(Mutex::default);
+
+/// Keeps the jobs `ids` awake: pins them, so Claude Code's daemon does not
+/// retire them for sitting idle, and starts each one that is cold again in
+/// the background where it last worked, with its conversation and no new
+/// message.
+fn keep(args: &Value) -> Result<Value, Error> {
+    let ids: Vec<&str> = args
+        .get("ids")
+        .and_then(Value::as_array)
+        .map(|ids| ids.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if ids.is_empty() {
+        return Ok(json!({ "woken": [] }));
+    }
+    set_pinned(&ids, true)?;
+    let seen = find();
+    let mut woken = Vec::new();
+    for id in ids {
+        let Some(agent) = seen.iter().find(|s| s.id.as_deref() == Some(id)) else {
+            continue;
+        };
+        if agent.live {
+            continue;
+        }
+        {
+            let mut at = WOKEN.lock().unwrap_or_else(PoisonError::into_inner);
+            if at.get(id).is_some_and(|at| at.elapsed() < WAKE_AGAIN) {
+                continue;
+            }
+            at.insert(id.to_string(), Instant::now());
+        }
+        let Some(session) = resume_id(id) else {
+            continue;
+        };
+        let dir = Some(agent.dir.as_path()).filter(|dir| dir.is_dir());
+        if claude(&["--bg", "--resume", &session], dir).is_ok() {
+            woken.push(id);
+        }
+    }
+    Ok(json!({ "woken": woken }))
+}
+
+/// Lets job `id` rest: unpins it, and stops it if it runs.
+fn stop(args: &Value) -> Result<Value, Error> {
+    let id = required(args, "id")?;
+    set_pinned(&[id], false)?;
+    if find().iter().any(|s| s.live && s.id.as_deref() == Some(id)) {
+        claude(&["stop", id], None)?;
+    }
+    Ok(json!({}))
+}
+
 /// Answers one request as the Claude Code plugin.
 pub fn op(op: &str, args: &Value) -> Result<Value, Error> {
     match op {
@@ -380,23 +566,24 @@ pub fn op(op: &str, args: &Value) -> Result<Value, Error> {
             "protocol": PROTOCOL,
             "name": "claude",
             "kind": "agent",
-            "ops": ["start", "find", "attach", "send", "stop"],
+            "ops": ["start", "find", "attach", "send", "stop", "keep"],
             // The prompt box sits between two rules; a permission or
-            // question dialog takes its place and numbers its choices.
+            // question dialog takes its place and numbers its choices. The
+            // agent view, which `claude attach` goes back to, prompts for a
+            // new session and offers to return.
             "screen": {
                 "input": "❯",
                 "rule": "─",
                 "dialogs": ["Do you want to", "❯ 1."],
+                "away": ["describe a task for a new session", "enter to return"],
             },
         })),
         "find" => Ok(json!({ "agents": find() })),
         "start" => start(args),
         "attach" => Ok(json!({ "argv": attach(required(args, "id")?) })),
         "send" => send(args),
-        "stop" => {
-            claude(&["stop", required(args, "id")?], None)?;
-            Ok(json!({}))
-        }
+        "stop" => stop(args),
+        "keep" => keep(args),
         _ => Err(Error::new(
             Code::Unsupported,
             format!("claude does not answer {op}"),
@@ -484,10 +671,20 @@ mod tests {
     #[test]
     fn starts_in_the_background_with_the_prompt_after_a_double_dash() {
         assert_eq!(
-            start_args(Some("END-9 fix login"), Some("-fix it")),
+            start_args(Some("END-9 fix login"), None, Some("-fix it")),
             ["--bg", "--name", "END-9 fix login", "--", "-fix it"]
         );
-        assert_eq!(start_args(None, None), ["--bg"]);
+        assert_eq!(start_args(None, None, None), ["--bg"]);
+    }
+
+    #[test]
+    fn a_session_in_a_tree_of_its_own_is_told_to_stay_there() {
+        let stay = stay(Path::new("/p/7/app"));
+        assert!(stay.contains("/p/7/app") && stay.contains("Do not call EnterWorktree"));
+        assert_eq!(
+            start_args(None, Some(&stay), Some("fix it")),
+            ["--bg", "--append-system-prompt", &stay, "--", "fix it"]
+        );
     }
 
     #[test]

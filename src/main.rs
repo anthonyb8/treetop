@@ -21,6 +21,7 @@ mod diff;
 mod dispatch;
 mod github_plugin;
 mod jobs;
+mod keeper;
 mod linear_plugin;
 mod live;
 mod nomistakes_plugin;
@@ -59,6 +60,7 @@ use crate::app::{App, Choice, Outcome};
 use crate::chat::Chats;
 use crate::dispatch::Recipient;
 use crate::jobs::{Kind, Worker};
+use crate::keeper::Keeper;
 use crate::refresh::{Refresher, Update};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -107,8 +109,15 @@ fn open_chat(
     agent: String,
     tree: String,
 ) -> Result<()> {
-    let (rows, cols) = chat_size(term)?;
-    match chats.show(command, rows, cols, agent, tree) {
+    let size = chat_size(term)?;
+    let hints = app
+        .trees
+        .iter()
+        .flat_map(|t| &t.agents)
+        .find(|a| a.attach.as_deref() == Some(command))
+        .and_then(|a| a.plugin.as_deref())
+        .and_then(plugin::screen_of);
+    match chats.show(command, size, agent, tree, hints) {
         // The mouse is captured only while a chat is open, so the wheel
         // scrolls it; on the list, the terminal keeps the mouse to itself.
         Ok(()) => execute!(io::stdout(), EnableMouseCapture)?,
@@ -234,6 +243,7 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
     let mut is_stale = true;
     let mut drawn_at = Instant::now();
     let mut chats = Chats::default();
+    let mut keeper = Keeper::default();
     // Whether the mouse is captured for an open issue, apart from a chat's.
     let mut is_issue_mouse = false;
     loop {
@@ -272,6 +282,7 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                         .filter_map(|a| a.attach.as_ref())
                         .collect();
                     chats.retain(|command| live.iter().any(|c| c.as_slice() == command));
+                    keeper.keep(app.kept());
                 }
             }
         }
@@ -387,6 +398,11 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
         if let Some((agent, tree, why)) = pumped.failed.first() {
             app.message = Some(format!("not sent to {agent} in {tree}: {why}"));
             is_stale = true;
+        }
+        if let Some((agent, _)) = &pumped.kept {
+            app.message = Some(format!(
+                "kept in {agent}'s chat; Ctrl+Q goes back to the list"
+            ));
         }
         if let Some((agent, tree)) = pumped.ended {
             chat_closed(app, &agent, &tree)?;

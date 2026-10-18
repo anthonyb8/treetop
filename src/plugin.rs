@@ -75,13 +75,17 @@ pub struct Description {
 /// What an agent's chat looks like on screen, for typing a message into it.
 /// The input box is a line starting with `input` between two lines starting
 /// with `rule`; a screen with no input box and one of `dialogs` on it is
-/// waiting on an answer that a message would land in.
+/// waiting on an answer that a message would land in. One of `away` on the
+/// screen's last lines means the chat has left its agent for a screen of
+/// other sessions, which ← in an empty input box opens.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Screen {
     pub input: String,
     pub rule: String,
     #[serde(default)]
     pub dialogs: Vec<String>,
+    #[serde(default)]
+    pub away: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
