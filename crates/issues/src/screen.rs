@@ -1907,6 +1907,7 @@ mod tests {
                 tree: "4".into(),
                 agent: Some("waiting".into()),
                 needs_you: true,
+                is_ready: false,
             })
         }
     }
@@ -2239,6 +2240,7 @@ mod tests {
             id: id.into(),
             title: "Fix the callback".into(),
             state: "Todo".into(),
+            is_done: false,
         }
     }
 

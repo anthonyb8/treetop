@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::agents::Agent;
+use crate::ship::Ship;
 use crate::sidecar::Sidecar;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +46,9 @@ pub struct Tree {
     pub is_main: bool,
     /// treetop's record of the lease, when treetop leased it.
     pub sidecar: Option<Box<Sidecar>>,
+    /// Where its branch's work stands after its agent, as its ship plugins
+    /// say.
+    pub ship: Option<Box<Ship>>,
 }
 
 impl Tree {
@@ -135,6 +139,7 @@ pub fn main_tree(checkout: &Path) -> Tree {
         work: None,
         is_main: true,
         sidecar: None,
+        ship: None,
     }
 }
 
@@ -153,6 +158,7 @@ pub fn stand_in(path: PathBuf) -> Tree {
         work: None,
         is_main: false,
         sidecar: None,
+        ship: None,
     }
 }
 
@@ -205,6 +211,7 @@ pub fn parse(json: &str) -> Result<Vec<Tree>> {
             work: None,
             is_main: false,
             sidecar: None,
+            ship: None,
         })
         .collect();
     trees.sort_by(|a, b| {

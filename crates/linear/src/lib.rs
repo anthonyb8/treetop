@@ -37,7 +37,7 @@ const PAGE: usize = 100;
 const IMAGE_LIMIT: u64 = 25 * 1024 * 1024;
 
 /// Another issue as a detail names it: its id, title and status.
-const LINKED: &str = "identifier title state { name }";
+const LINKED: &str = "identifier title state { name type }";
 
 /// What went wrong, as a caller decides what to do about it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -315,18 +315,7 @@ impl Client {
             .pointer("/viewer/id")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::failed("Linear gave no user for the key"))?;
-        let state = data
-            .pointer("/issue/team/states/nodes")
-            .and_then(Value::as_array)
-            .and_then(|states| {
-                states.iter().min_by(|a, b| {
-                    let position =
-                        |s: &Value| s.get("position").and_then(Value::as_f64).unwrap_or(0.0);
-                    position(a).total_cmp(&position(b))
-                })
-            })
-            .and_then(|s| s.get("id"))
-            .and_then(Value::as_str)
+        let state = first_state(&data)
             .ok_or_else(|| Error::failed(format!("{id}'s team has no started state")))?;
         let change = Change {
             state_id: Some(state.to_string()),
@@ -335,6 +324,43 @@ impl Client {
         };
         self.update(uuid, &change).map(|_| ())
     }
+
+    /// Moves the issue to its team's first completed state, unless it is
+    /// done or cancelled already.
+    pub fn finish(&self, id: &str) -> Result<(), Error> {
+        let query = "query($id: String!) { issue(id: $id) { id state { type } team { \
+                     states(filter: { type: { eq: \"completed\" } }) { nodes { id position } } } } }";
+        let data = self.query(query, json!({ "id": id }))?;
+        let uuid = data
+            .pointer("/issue/id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, format!("no issue {id}")))?;
+        let kind = data.pointer("/issue/state/type").and_then(Value::as_str);
+        if matches!(kind, Some("completed" | "canceled")) {
+            return Ok(());
+        }
+        let state = first_state(&data)
+            .ok_or_else(|| Error::failed(format!("{id}'s team has no completed state")))?;
+        let change = Change {
+            state_id: Some(state.to_string()),
+            ..Change::default()
+        };
+        self.update(uuid, &change).map(|_| ())
+    }
+}
+
+/// The id of the first state, by position, of those an issue's team gave.
+fn first_state(data: &Value) -> Option<&str> {
+    data.pointer("/issue/team/states/nodes")
+        .and_then(Value::as_array)
+        .and_then(|states| {
+            states.iter().min_by(|a, b| {
+                let position = |s: &Value| s.get("position").and_then(Value::as_f64).unwrap_or(0.0);
+                position(a).total_cmp(&position(b))
+            })
+        })
+        .and_then(|s| s.get("id"))
+        .and_then(Value::as_str)
 }
 
 /// Whether `url` is Linear's own, over HTTPS: `linear.app` or a host under
@@ -454,8 +480,16 @@ mod tests {
     #[test]
     fn a_detail_names_its_links_from_its_own_side() {
         // Each linked issue as the detail query asks for it, LINKED.
+        // END-5 is done, so it holds nothing up.
         let linked = |id: &str| {
-            format!(r#"{{"identifier":"{id}","title":"t {id}","state":{{"name":"Todo"}}}}"#)
+            let kind = if id == "END-5" {
+                "completed"
+            } else {
+                "unstarted"
+            };
+            format!(
+                r#"{{"identifier":"{id}","title":"t {id}","state":{{"name":"Todo","type":"{kind}"}}}}"#
+            )
         };
         let with_links = ISSUE.replace(
             r#""cycle":{"number":12,"name":null}}"#,
@@ -472,12 +506,16 @@ mod tests {
             ),
         );
         let raw: RawIssue = serde_json::from_str(&with_links).unwrap();
-        let links: Vec<(String, String)> = raw
-            .into_detail()
+        let detail = raw.into_detail();
+        let done: Vec<&str> = detail
             .links
-            .into_iter()
-            .map(|l| (l.kind, l.id))
+            .iter()
+            .filter(|l| l.is_done)
+            .map(|l| l.id.as_str())
             .collect();
+        assert_eq!(done, ["END-5"]);
+        let links: Vec<(String, String)> =
+            detail.links.into_iter().map(|l| (l.kind, l.id)).collect();
         let expected = [
             ("parent", "END-1"),
             ("sub-issue", "END-2"),
@@ -607,6 +645,7 @@ mod tests {
             ("create", client.create(&new).err()),
             ("comment", client.comment("u", "hi").err()),
             ("start", client.start("END-1").err()),
+            ("finish", client.finish("END-1").err()),
         ];
         for (name, err) in results {
             let err = err.unwrap_or_else(|| panic!("{name} succeeded with a bad key"));

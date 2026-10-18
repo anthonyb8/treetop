@@ -257,6 +257,11 @@ impl Watcher {
         self.refs_watched = true;
     }
 
+    /// The shared refs changed since the last `take`: a commit, fetch or push.
+    pub fn is_refs_changed(&self) -> bool {
+        self.is_refs_changed
+    }
+
     /// Brings the watches in line with the held trees and says which trees'
     /// git counts need reading, given the counts read so far. A tree with no
     /// counts yet, a polled one, and every tree at the backstop get a full

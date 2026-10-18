@@ -166,11 +166,19 @@ fn live_sessions(config: &Path) -> Vec<Seen> {
             let session: Session = serde_json::from_str(&fs::read_to_string(path).ok()?).ok()?;
             // A session that has had no message yet has no transcript; until
             // it does, it works where its process runs.
-            let cwd = transcript(&projects, &session.session_id)
-                .and_then(|path| tail(&path))
+            let transcript = transcript(&projects, &session.session_id);
+            let cwd = transcript
+                .as_deref()
+                .and_then(tail)
                 .and_then(|tail| last_cwd(&tail))
                 .or_else(|| fs::read_link(format!("/proc/{}/cwd", session.pid)).ok())?;
+            // It last worked when its transcript last grew.
+            let active_at = transcript
+                .and_then(|path| fs::metadata(path).and_then(|m| m.modified()).ok())
+                .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|since| since.as_secs());
             live_session(&session, live::stat(session.pid).map(|s| s.start), cwd)
+                .map(|seen| Seen { active_at, ..seen })
         })
         .collect()
 }

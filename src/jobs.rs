@@ -26,6 +26,7 @@ use crate::config::{self, Hooks};
 use crate::diff;
 use crate::plugin::{self, Kind as PluginKind, Plugin};
 use crate::pool::{self, Tree};
+use crate::ship::{self, Ship};
 use crate::sidecar::{self, Sidecar};
 use crate::tickets::{self, Source};
 
@@ -58,6 +59,15 @@ pub enum Kind {
     Rename,
     /// Sends the job's `message` to a cold agent through its plugin.
     Send,
+    /// Reads what failed on the tree's PR from its ship plugin, for its agent.
+    Fix,
+    /// Follows up the merge of the tree's PR in its ticket's project: marks
+    /// the ticket done where its source says to, and finds the tickets it
+    /// leaves with nothing blocking them.
+    Land,
+    /// Starts a ship run of the tree's branch, or finds the command that
+    /// shows the one under way.
+    Ship,
 }
 
 impl Kind {
@@ -70,6 +80,9 @@ impl Kind {
             Kind::Destroy => "destroying",
             Kind::Rename => "renaming",
             Kind::Send => "sending",
+            Kind::Fix => "reading",
+            Kind::Land => "following up",
+            Kind::Ship => "shipping",
         }
     }
 
@@ -82,6 +95,9 @@ impl Kind {
             Kind::Destroy => "destroyed",
             Kind::Rename => "renamed",
             Kind::Send => "sent",
+            Kind::Fix => "read",
+            Kind::Land => "followed up",
+            Kind::Ship => "run started",
         }
     }
 
@@ -93,6 +109,9 @@ impl Kind {
             Kind::Destroy => "destroy",
             Kind::Rename => "branch rename",
             Kind::Send => "message",
+            Kind::Fix => "failure read",
+            Kind::Land => "merge follow-up",
+            Kind::Ship => "ship run",
         }
     }
 }
@@ -178,6 +197,29 @@ pub struct Job {
     /// The command that opens the chat of the agent a Start started, once it
     /// has.
     pub attach: Option<Vec<String>>,
+    /// The ticket whose merge a Land follows up.
+    pub landing: Option<Pick>,
+    /// The tickets a Land found ready, once it has.
+    pub ready: Vec<String>,
+    /// What a Ship asks of which ship plugin.
+    pub shipping: Option<ShipCall>,
+}
+
+/// A ship plugin's run of a tree's branch: started, or shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShipCall {
+    pub plugin: String,
+    pub action: ShipAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShipAction {
+    /// Start a run, its intent from the tree's ticket in the ticket source
+    /// of the repository checked out here, else from its task.
+    Run { checkout: PathBuf },
+    /// Find the command that shows the run under way, into the job's
+    /// `attach`.
+    Attach,
 }
 
 impl Job {
@@ -190,6 +232,9 @@ impl Job {
             rename: None,
             message: None,
             attach: None,
+            landing: None,
+            ready: Vec::new(),
+            shipping: None,
         }
     }
 }
@@ -463,6 +508,7 @@ fn start_steps(job: &mut Job, log: &mut String, undone: &mut Vec<Undo>) -> Resul
         .is_some_and(|(pick, name)| has_branch(&pick.checkout, name));
     let mut record = Sidecar::leased_now();
     record.ticket = launch.ticket.as_ref().map(|pick| pick.id.clone());
+    record.task = Some(launch.task.trim().to_string()).filter(|t| !t.is_empty());
     if launch.is_new_tree {
         let mut command = Command::new("treehouse");
         command.args(["get", "--lease", "--json", "--lease-holder", "treetop"]);
@@ -752,34 +798,51 @@ fn stop_agents(tree: &Tree, log: &mut String) {
 }
 
 /// Deletes `branch` once the tree is back in the pool, if its work is in the
-/// pool's base; one that is not merged is kept, and the log says so.
-fn delete_if_merged(tree: &Path, branch: &str, log: &mut String) {
-    let Some(base) = pool::main_checkout(tree).ok().and_then(|c| diff::base(&c)) else {
-        let _ = writeln!(
-            log,
-            "kept branch {branch}: no base branch to check it against"
-        );
+/// pool's base, or its PR merged with the branch where it is now, which
+/// covers a squash or rebase merge git cannot see; one that is not merged is
+/// kept, and the log says so.
+fn delete_if_merged(tree: &Path, branch: &str, pr: Option<&Ship>, log: &mut String) {
+    let base_ref = pool::main_checkout(tree)
+        .ok()
+        .and_then(|c| diff::base(&c))
+        .and_then(|base| {
+            [format!("origin/{base}"), base]
+                .into_iter()
+                .find(|r| pool::git(tree, &["rev-parse", "--verify", "--quiet", r]).is_some())
+        });
+    let in_base = base_ref.as_deref().is_some_and(|base_ref| {
+        let mut scratch = String::new();
+        exec(
+            git(tree).args(["merge-base", "--is-ancestor", branch, base_ref]),
+            GIT_LIMIT,
+            &mut scratch,
+        )
+        .is_ok()
+    });
+    let merged = pr.filter(|p| p.stage == ship::Stage::Merged);
+    let how = if let (true, Some(base_ref)) = (in_base, &base_ref) {
+        format!("merged into {base_ref}")
+    } else if let Some(pr) = merged {
+        let number = pr.number().unwrap_or_else(|| "its PR".into());
+        let tip = pool::git(tree, &["rev-parse", "--verify", "--quiet", branch]);
+        if tip.as_deref().map(str::trim) != pr.head.as_deref() {
+            let _ = writeln!(
+                log,
+                "kept branch {branch}: it has commits after {number} merged"
+            );
+            return;
+        }
+        format!("merged as {number}")
+    } else {
+        let why = match &base_ref {
+            Some(base_ref) => format!("not merged into {base_ref}"),
+            None => "no base branch to check it against".into(),
+        };
+        let _ = writeln!(log, "kept branch {branch}: {why}");
         return;
     };
-    let remote = format!("origin/{base}");
-    let base_ref = [remote.as_str(), base.as_str()]
-        .into_iter()
-        .find(|r| pool::git(tree, &["rev-parse", "--verify", "--quiet", r]).is_some());
-    let Some(base_ref) = base_ref else {
-        let _ = writeln!(log, "kept branch {branch}: base {base} not found");
-        return;
-    };
-    let mut scratch = String::new();
-    let is_merged = exec(
-        git(tree).args(["merge-base", "--is-ancestor", branch, base_ref]),
-        GIT_LIMIT,
-        &mut scratch,
-    )
-    .is_ok();
-    if !is_merged {
-        let _ = writeln!(log, "kept branch {branch}: not merged into {base_ref}");
-    } else if capture(git(tree).args(["branch", "-D", branch]), GIT_LIMIT, log) {
-        let _ = writeln!(log, "deleted branch {branch}, merged into {base_ref}");
+    if capture(git(tree).args(["branch", "-D", branch]), GIT_LIMIT, log) {
+        let _ = writeln!(log, "deleted branch {branch}, {how}");
     }
 }
 
@@ -791,6 +854,126 @@ pub fn send_cold(message: &Message) -> Result<(), String> {
         .call("send", json!({ "id": message.id, "text": message.text }))
         .map(|_| ())
         .map_err(|err| err.to_string())
+}
+
+/// Writes what failed on the tree's PR to `log`, as the ship plugin that
+/// reported it tells it; the log is the text its agent is sent.
+fn read_failure(tree: &Tree, log: &mut String) -> bool {
+    let Some(ship) = &tree.ship else {
+        let _ = writeln!(log, "tree {} has no PR", tree.name);
+        return false;
+    };
+    let Some(plugin) = plugin::named(PluginKind::Ship, &ship.plugin) else {
+        let _ = writeln!(log, "no ship plugin {}", ship.plugin);
+        return false;
+    };
+    match ship::logs(&plugin, &tree.path, &ship.branch) {
+        Ok(text) => {
+            log.push_str(&text);
+            true
+        }
+        Err(err) => {
+            let _ = writeln!(log, "{}: {err}", ship.plugin);
+            false
+        }
+    }
+}
+
+/// What a ship run of the tree's branch sets out to do: its ticket's title
+/// and text, else the task its agent was given.
+fn intent(tree: &Path, checkout: &Path) -> Result<String, String> {
+    let record = sidecar::read(tree);
+    if let Some(id) = record.as_ref().and_then(|r| r.ticket.as_deref()) {
+        let ticket = Source::of(checkout)?.get(id)?;
+        let text = ticket.description.unwrap_or_default();
+        return Ok(format!("{}: {}\n\n{text}", ticket.id, ticket.title)
+            .trim()
+            .to_string());
+    }
+    record
+        .and_then(|r| r.task)
+        .ok_or_else(|| "the tree has neither a ticket nor a task to give as the intent".into())
+}
+
+/// Starts a ship run of the tree's branch through its plugin, or reads the
+/// command that shows the one under way into the job's `attach`.
+fn ship_run(job: &mut Job, log: &mut String) -> bool {
+    let (Some(call), Some(branch)) = (job.shipping.clone(), job.tree.branch.clone()) else {
+        let _ = writeln!(log, "tree {} has no branch to ship", job.tree.name);
+        return false;
+    };
+    let Some(plugin) = plugin::named(PluginKind::Ship, &call.plugin) else {
+        let _ = writeln!(log, "no ship plugin {}", call.plugin);
+        return false;
+    };
+    let dir = job.tree.path.clone();
+    let answer = match call.action {
+        ShipAction::Attach => plugin
+            .call("attach", json!({ "dir": dir, "branch": branch }))
+            .map_err(|err| err.to_string())
+            .and_then(|reply| {
+                serde_json::from_value::<Vec<String>>(reply["argv"].clone())
+                    .map_err(|err| format!("no command to show the run: {err}"))
+            })
+            .map(|argv| {
+                let _ = writeln!(log, "{} shows the run with {}", call.plugin, argv.join(" "));
+                job.attach = Some(argv);
+            }),
+        ShipAction::Run { checkout } => intent(&dir, &checkout).and_then(|intent| {
+            let _ = writeln!(log, "intent: {}", intent.lines().next().unwrap_or_default());
+            plugin
+                .call(
+                    "run",
+                    json!({ "dir": dir, "branch": branch, "intent": intent }),
+                )
+                .map(|_| {
+                    let _ = writeln!(log, "{} started a run of {branch}", call.plugin);
+                })
+                .map_err(|err| err.to_string())
+        }),
+    };
+    match answer {
+        Ok(()) => true,
+        Err(why) => {
+            let _ = writeln!(log, "{}: {why}", call.plugin);
+            false
+        }
+    }
+}
+
+/// Marks the merged ticket done where its source says to, then finds the
+/// tickets it leaves ready, into the job's `ready`.
+fn land(job: &mut Job, log: &mut String) -> bool {
+    let Some(pick) = &job.landing else {
+        return false;
+    };
+    let source = match Source::of(&pick.checkout) {
+        Ok(source) => source,
+        Err(why) => {
+            let _ = writeln!(log, "{why}");
+            return false;
+        }
+    };
+    if source.finishes() {
+        let _ = match source.finish(&pick.id) {
+            Ok(()) => writeln!(log, "marked {} done", pick.id),
+            Err(why) => writeln!(log, "could not mark {} done: {why}", pick.id),
+        };
+    }
+    match source.ready_after(&pick.id) {
+        Ok(ready) => {
+            let _ = match ready.as_slice() {
+                [] => writeln!(log, "{} merged; it leaves nothing ready", pick.id),
+                ready => writeln!(log, "{} merged; ready now: {}", pick.id, ready.join(", ")),
+            };
+            job.ready = ready;
+            true
+        }
+        Err(why) => {
+            let _ = writeln!(log, "could not read what {} blocks: {why}", pick.id);
+            false
+        }
+    }
 }
 
 /// Stops the tree's agents, runs the `on_return` hook, returns the tree,
@@ -810,7 +993,7 @@ fn give_back(tree: &Tree, log: &mut String) -> bool {
         return false;
     }
     if let Some(branch) = record.as_ref().and_then(|r| r.branch.as_deref()) {
-        delete_if_merged(path, branch, log);
+        delete_if_merged(path, branch, tree.ship.as_deref(), log);
     }
     if let Err(err) = sidecar::remove(path) {
         let _ = writeln!(log, "could not remove {}: {err}", sidecar::FILE);
@@ -842,6 +1025,9 @@ pub fn run(job: &mut Job) -> (bool, String) {
             None => false,
         },
         Kind::Return => give_back(&job.tree, &mut log),
+        Kind::Fix => read_failure(&job.tree, &mut log),
+        Kind::Land => land(job, &mut log),
+        Kind::Ship => ship_run(job, &mut log),
         Kind::Preview => capture(
             treehouse("destroy", &job.tree.path).args(INCLUDE),
             TREEHOUSE_LIMIT,
@@ -906,6 +1092,145 @@ mod tests {
             &mut log,
         );
         assert_eq!(hung, Err("sh took over 0s".to_string()));
+    }
+
+    /// A repository whose base is `main`, with one commit on it, checked
+    /// out on `main`.
+    fn repository(test: &str) -> PathBuf {
+        let repo = std::env::temp_dir().join(format!("treetop-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("treehouse.toml"), "base_branch = \"main\"\n").unwrap();
+        commit_in(&repo, &[&["init", "-q", "-b", "main"]], "first");
+        repo
+    }
+
+    /// Runs each of `steps` in `repo`, then commits everything as `message`.
+    fn commit_in(repo: &Path, steps: &[&[&str]], message: &str) {
+        let mut log = String::new();
+        for args in steps {
+            assert!(capture(git(repo).args(*args), GIT_LIMIT, &mut log), "{log}");
+        }
+        let commit = [
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-am",
+            message,
+        ];
+        assert!(
+            capture(git(repo).args(commit), GIT_LIMIT, &mut log),
+            "{log}"
+        );
+    }
+
+    fn tip(repo: &Path, branch: &str) -> String {
+        pool::git(repo, &["rev-parse", branch])
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    fn merged_as(branch: &str, head: &str) -> Ship {
+        Ship {
+            branch: branch.into(),
+            stage: ship::Stage::Merged,
+            label: "#12 merged".into(),
+            url: Some("https://github.com/o/r/pull/12".into()),
+            head: Some(head.into()),
+            detail: Vec::new(),
+            plugin: "github".into(),
+        }
+    }
+
+    fn has_branch_in(repo: &Path, branch: &str) -> bool {
+        pool::git(repo, &["rev-parse", "--verify", "--quiet", branch]).is_some()
+    }
+
+    /// A PR squash-merged on GitHub leaves its branch out of the base's
+    /// history, so git alone calls it unmerged; its PR says otherwise.
+    #[test]
+    fn returning_a_squash_merged_tree_deletes_its_branch() {
+        let repo = repository("squash");
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        commit_in(
+            &repo,
+            &[&["switch", "-q", "-c", "me/fix"], &["add", "a.txt"]],
+            "add a",
+        );
+        let head = tip(&repo, "me/fix");
+        commit_in(
+            &repo,
+            &[
+                &["switch", "-q", "main"],
+                &["merge", "--squash", "-q", "me/fix"],
+            ],
+            "add a (#12)",
+        );
+        let mut log = String::new();
+        delete_if_merged(&repo, "me/fix", Some(&merged_as("me/fix", &head)), &mut log);
+        assert!(!has_branch_in(&repo, "me/fix"), "{log}");
+        assert!(
+            log.contains("deleted branch me/fix, merged as #12"),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn a_branch_with_work_after_its_merge_or_no_merged_pr_is_kept() {
+        let repo = repository("kept");
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        commit_in(
+            &repo,
+            &[&["switch", "-q", "-c", "me/more"], &["add", "a.txt"]],
+            "add a",
+        );
+        let merged_head = tip(&repo, "me/more");
+        std::fs::write(repo.join("a.txt"), "a and more\n").unwrap();
+        commit_in(&repo, &[], "more after the merge");
+        commit_in(&repo, &[&["switch", "-q", "main"]], "elsewhere");
+        let mut log = String::new();
+        delete_if_merged(
+            &repo,
+            "me/more",
+            Some(&merged_as("me/more", &merged_head)),
+            &mut log,
+        );
+        assert!(has_branch_in(&repo, "me/more"), "{log}");
+        assert!(
+            log.contains("kept branch me/more: it has commits after #12 merged"),
+            "{log}"
+        );
+        let mut closed = merged_as("me/more", &tip(&repo, "me/more"));
+        closed.stage = ship::Stage::Closed;
+        delete_if_merged(&repo, "me/more", Some(&closed), &mut log);
+        delete_if_merged(&repo, "me/more", None, &mut log);
+        assert!(has_branch_in(&repo, "me/more"), "{log}");
+    }
+
+    #[test]
+    fn a_branch_git_sees_in_the_base_is_deleted_as_before() {
+        let repo = repository("ancestor");
+        commit_in(&repo, &[&["switch", "-q", "-c", "me/done"]], "done");
+        commit_in(
+            &repo,
+            &[
+                &["switch", "-q", "main"],
+                &["merge", "-q", "--ff-only", "me/done"],
+            ],
+            "after",
+        );
+        let mut log = String::new();
+        delete_if_merged(&repo, "me/done", None, &mut log);
+        assert!(!has_branch_in(&repo, "me/done"), "{log}");
+        assert!(
+            log.contains("deleted branch me/done, merged into main"),
+            "{log}"
+        );
     }
 
     #[test]

@@ -39,6 +39,21 @@ pub struct Ticket {
     /// The branch the ticket system names for it.
     #[serde(default)]
     pub branch: Option<String>,
+    /// The tickets it is linked to; `get` may give them, `list` leaves them
+    /// out.
+    #[serde(default)]
+    pub links: Vec<Link>,
+}
+
+/// Another ticket a ticket is linked to.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Link {
+    pub id: String,
+    /// `blocks`, `blocked by` or `related`, from the ticket's side.
+    pub kind: String,
+    /// It is done or cancelled, so it holds nothing up.
+    #[serde(default)]
+    pub done: bool,
 }
 
 /// The repository's ticket source: its name, its plugin and the settings the
@@ -79,6 +94,36 @@ impl Source {
     /// Marks the ticket started and assigned to the key's user.
     pub fn start(&self, id: &str) -> Result<(), String> {
         self.call("start", json!({ "id": id })).map(|_| ())
+    }
+
+    /// Marks the ticket done.
+    pub fn finish(&self, id: &str) -> Result<(), String> {
+        self.call("finish", json!({ "id": id })).map(|_| ())
+    }
+
+    /// The source says `finish = true`: a ticket is marked done once its
+    /// tree's PR merges.
+    pub fn finishes(&self) -> bool {
+        self.config.get("finish").and_then(Value::as_bool) == Some(true)
+    }
+
+    /// The tickets `id` blocks that are ready now that it is done: not done
+    /// themselves, and with every other ticket blocking them done.
+    pub fn ready_after(&self, id: &str) -> Result<Vec<String>, String> {
+        let done = self.get(id)?;
+        let mut ready = Vec::new();
+        for blocked in done.links.iter().filter(|l| l.kind == "blocks" && !l.done) {
+            let ticket = self.get(&blocked.id)?;
+            let is_free = ticket
+                .links
+                .iter()
+                .filter(|l| l.kind == "blocked by" && l.id != id)
+                .all(|l| l.done);
+            if is_free {
+                ready.push(ticket.id);
+            }
+        }
+        Ok(ready)
     }
 
     pub fn list(&self, filters: &Filters) -> Result<Vec<Ticket>, String> {
@@ -229,5 +274,50 @@ mod tests {
             prompt(Some("Work on {id}. Use /pickup {id}."), &ticket),
             "Work on END-812. Use /pickup END-812."
         );
+    }
+
+    /// A source on a ticket plugin that knows END-1, which blocks END-2
+    /// (blocked by nothing else), END-3 (blocked by END-9, still open) and
+    /// END-4 (done already).
+    fn linked_source(test: &str) -> Source {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("treetop-tickets-{}-{test}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tracker");
+        let reply = |links: &str| {
+            format!(
+                r#"{{\"ok\":true,\"result\":{{\"id\":\"$id\",\"title\":\"t\",\"links\":[{links}]}}}}"#
+            )
+        };
+        let script = format!(
+            "#!/bin/sh\nid=$(sed 's/.*\"id\": *\"\\([^\"]*\\)\".*/\\1/')\ncase $id in\n\
+             END-1) echo \"{}\" ;;\nEND-2) echo \"{}\" ;;\nEND-3) echo \"{}\" ;;\nesac\n",
+            reply(
+                r#"{\"id\":\"END-2\",\"kind\":\"blocks\"},{\"id\":\"END-3\",\"kind\":\"blocks\"},{\"id\":\"END-4\",\"kind\":\"blocks\",\"done\":true},{\"id\":\"END-7\",\"kind\":\"related\"}"#
+            ),
+            reply(r#"{\"id\":\"END-1\",\"kind\":\"blocked by\"}"#),
+            reply(
+                r#"{\"id\":\"END-1\",\"kind\":\"blocked by\"},{\"id\":\"END-9\",\"kind\":\"blocked by\"}"#
+            ),
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Source {
+            name: "test".into(),
+            plugin: Plugin::External {
+                name: "tracker".into(),
+                path,
+            },
+            config: json!({ "finish": true }),
+        }
+    }
+
+    #[test]
+    fn a_merge_readies_what_it_alone_blocked() {
+        let source = linked_source("ready");
+        assert_eq!(source.ready_after("END-1").unwrap(), ["END-2"]);
+        assert!(source.finishes());
     }
 }

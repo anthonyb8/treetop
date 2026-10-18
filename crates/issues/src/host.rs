@@ -11,6 +11,9 @@ pub struct Work {
     pub agent: Option<String>,
     /// The agent is waiting on you.
     pub needs_you: bool,
+    /// Nobody works on it yet, and a merge has just left nothing blocking
+    /// it: `tree` and `agent` say nothing.
+    pub is_ready: bool,
 }
 
 pub trait Host {

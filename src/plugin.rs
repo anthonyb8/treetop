@@ -1,5 +1,5 @@
 //! Plugins: executables that speak JSON on stdin and stdout, so treetop can
-//! start agents and read tickets without knowing whose they are. Every file
+//! start agents, read tickets and follow PRs without knowing whose they are. Every file
 //! in the plugin directory that can be executed is one.
 //!
 //! One process per call: treetop writes one request and closes stdin, then
@@ -42,6 +42,9 @@ pub enum Kind {
     Agent,
     /// Lists tickets, reads one, names its branch and marks it started.
     Tickets,
+    /// Says where each branch's work stands after its agent: its PR, its
+    /// checks and review, or a pipeline it is going through.
+    Ship,
 }
 
 impl Kind {
@@ -49,6 +52,7 @@ impl Kind {
         match self {
             Kind::Agent => "agent",
             Kind::Tickets => "tickets",
+            Kind::Ship => "ship",
         }
     }
 }
@@ -148,7 +152,7 @@ struct Reply {
 pub fn timeout(op: &str) -> Duration {
     match op {
         "describe" | "find" => Duration::from_secs(3),
-        "list" | "get" => Duration::from_secs(10),
+        "list" | "get" | "status" | "attach" => Duration::from_secs(10),
         _ => Duration::from_secs(30),
     }
 }

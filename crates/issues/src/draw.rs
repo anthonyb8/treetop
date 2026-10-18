@@ -194,6 +194,9 @@ fn work_cell(host: &dyn Host, id: &str, p: &Palette) -> Cell<'static> {
     let Some(work) = host.work_on(id) else {
         return Cell::from("");
     };
+    if work.is_ready {
+        return Cell::from("ready").style(fg(p.success).add_modifier(Modifier::BOLD));
+    }
     let agent = work.agent.as_deref().unwrap_or("no agent");
     let style = if work.needs_you {
         fg(p.warning).add_modifier(Modifier::BOLD)

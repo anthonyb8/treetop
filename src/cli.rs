@@ -22,6 +22,7 @@ use crate::live;
 use crate::plugin;
 use crate::pool::{self, Tree};
 use crate::reports::{self, Report};
+use crate::ship;
 use crate::sidecar;
 use crate::tickets::{Filters, Source};
 use crate::watch::Check;
@@ -29,7 +30,7 @@ use crate::watch::Check;
 const USAGE: &str = "usage:
   treetop                          open the pool view
   treetop issues                   open it on the Issues screen
-  treetop status                   every tree, agent and report, as JSON
+  treetop status                   every tree, agent, report and PR, as JSON
   treetop send <tree|agent> <msg>  type a message into an agent's chat and send it
   treetop dispatch <new|main|N> <task>
                                    start a new agent on a task in a fresh tree,
@@ -149,6 +150,53 @@ fn read_agents(trees: &mut [Tree]) {
     }
 }
 
+/// Fills in where each held tree's PR stands, as the repository's ship
+/// plugins say; a plugin that cannot say leaves it out.
+fn read_ship(checkout: &Path, trees: &mut [Tree]) {
+    let (plugins, _) = ship::plugins(checkout);
+    let Ok(ship::Answer { mut ships, .. }) = ship::status(&plugins, checkout, &ship::asked(trees))
+    else {
+        return;
+    };
+    for tree in trees.iter_mut() {
+        tree.ship = ships.remove(&tree.path).map(Box::new);
+    }
+}
+
+/// The tickets the merged trees' tickets leave with nothing blocking them,
+/// and nobody working on them yet.
+fn ready_after_merges(checkout: &Path, trees: &[Tree]) -> Vec<String> {
+    let merged: Vec<&str> = trees
+        .iter()
+        .filter(|t| {
+            t.ship
+                .as_ref()
+                .is_some_and(|s| s.stage == ship::Stage::Merged)
+        })
+        .filter_map(|t| t.sidecar.as_ref()?.ticket.as_deref())
+        .collect();
+    let Some(source) = (!merged.is_empty())
+        .then(|| Source::of(checkout).ok())
+        .flatten()
+    else {
+        return Vec::new();
+    };
+    let worked_on = |id: &String| {
+        trees
+            .iter()
+            .any(|t| t.sidecar.as_ref().and_then(|s| s.ticket.as_ref()) == Some(id))
+    };
+    let mut ready: Vec<String> = merged
+        .into_iter()
+        .filter_map(|id| source.ready_after(id).ok())
+        .flatten()
+        .filter(|id| !worked_on(id))
+        .collect();
+    ready.sort();
+    ready.dedup();
+    ready
+}
+
 fn minutes_since(at: SystemTime, now: SystemTime) -> u64 {
     now.duration_since(at).map_or(0, |age| age.as_secs() / 60)
 }
@@ -167,7 +215,7 @@ fn report_json(report: &Report, trees: &[Tree], now: SystemTime) -> Value {
 /// and reports, then the reports from outside the pool. Available trees
 /// with nothing in them are only counted. The coordinator is left out of
 /// what it reads about.
-fn status_json(trees: &[Tree], reports: &[Report], now: SystemTime) -> Value {
+fn status_json(trees: &[Tree], reports: &[Report], ready: &[String], now: SystemTime) -> Value {
     let reports: Vec<&Report> = reports
         .iter()
         .filter(|r| r.name != coordinator::NAME)
@@ -209,6 +257,7 @@ fn status_json(trees: &[Tree], reports: &[Report], now: SystemTime) -> Value {
             "agents": agents,
             "reports": tree_reports,
             "sidecar": tree.sidecar,
+            "ship": tree.ship,
         }));
     }
     let elsewhere: Vec<Value> = reports
@@ -224,6 +273,7 @@ fn status_json(trees: &[Tree], reports: &[Report], now: SystemTime) -> Value {
         "trees": listed,
         "available_trees": available,
         "reports_outside_the_pool": elsewhere,
+        "ready": ready,
     })
 }
 
@@ -239,8 +289,10 @@ fn status(checkout: &Path) -> Result<()> {
     for tree in &mut trees {
         tree.work = work.remove(&tree.path).flatten();
     }
+    read_ship(checkout, &mut trees);
+    let ready = ready_after_merges(checkout, &trees);
     let reports = reports::Reader::default().read();
-    let status = status_json(&trees, &reports, SystemTime::now());
+    let status = status_json(&trees, &reports, &ready, SystemTime::now());
     println!("{}", serde_json::to_string_pretty(&status)?);
     Ok(())
 }
@@ -452,6 +504,7 @@ mod tests {
             attach: Some(vec!["claude".into(), "attach".into(), job.into()]),
             job: Some(job.into()),
             plugin: None,
+            active_at: None,
         }
     }
 
@@ -484,7 +537,7 @@ mod tests {
     #[test]
     fn status_lists_what_is_held_counts_the_rest_and_leaves_out_the_coordinator() {
         let (trees, reports) = pool();
-        let status = status_json(&trees, &reports, SystemTime::UNIX_EPOCH);
+        let status = status_json(&trees, &reports, &[], SystemTime::UNIX_EPOCH);
         let listed: Vec<&str> = status["trees"]
             .as_array()
             .unwrap()

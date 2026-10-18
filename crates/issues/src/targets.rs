@@ -32,6 +32,7 @@ pub fn targets(detail: &Detail) -> Vec<Target> {
                         id: mentioned,
                         title: String::new(),
                         state: String::new(),
+                        is_done: false,
                     });
                 }
             }
@@ -87,6 +88,7 @@ mod tests {
             id: id.into(),
             title: format!("{id} title"),
             state: "Todo".into(),
+            is_done: false,
         }
     }
 

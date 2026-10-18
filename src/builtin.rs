@@ -10,11 +10,18 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::agents::claude;
+use crate::github_plugin;
 use crate::linear_plugin;
+use crate::nomistakes_plugin;
 use crate::plugin::{Code, Error, Kind, PROTOCOL};
 
 /// Every built-in by name, with its kind.
-pub const KINDS: [(&str, Kind); 2] = [("claude", Kind::Agent), ("linear", Kind::Tickets)];
+pub const KINDS: [(&str, Kind); 4] = [
+    ("claude", Kind::Agent),
+    ("linear", Kind::Tickets),
+    ("github", Kind::Ship),
+    ("no-mistakes", Kind::Ship),
+];
 
 /// Answers `op` with `args` as the built-in `name`, with `config`, its table
 /// from the config file.
@@ -22,6 +29,8 @@ pub fn handle(name: &str, op: &str, args: &Value, config: &Value) -> Result<Valu
     match name {
         "claude" => claude::op(op, args),
         "linear" => linear_plugin::op(op, args, config),
+        "github" => github_plugin::op(op, args),
+        "no-mistakes" => nomistakes_plugin::op(op, args),
         _ => Err(Error::new(
             Code::NotFound,
             format!("no built-in plugin {name}"),

@@ -41,6 +41,7 @@ fn parse(text: &str) -> Option<Agent> {
         attach: holder.attach.filter(|command| !command.is_empty()),
         job: None,
         plugin: None,
+        active_at: None,
     })
 }
 

@@ -30,6 +30,7 @@
 //!
 //! [repos."~/endo/app"]
 //! issues = "work"
+//! ship = ["no-mistakes", "github"] # its ship plugins; github alone by default
 //! ```
 
 use std::collections::BTreeMap;
@@ -79,6 +80,9 @@ pub struct Repo {
     /// The name of its issue source.
     #[serde(default)]
     pub issues: Option<String>,
+    /// Its ship plugins, in order; None for the default.
+    #[serde(default)]
+    pub ship: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -138,6 +142,15 @@ impl Config {
             .get_key_value(name)
             .map(|(name, source)| (name.as_str(), source))
             .ok_or_else(|| format!("no issue source named {name}"))
+    }
+
+    /// The ship plugins the repository checked out at `checkout` names,
+    /// None when it names none and gets the default.
+    pub fn ship_for(&self, checkout: &Path) -> Option<Vec<String>> {
+        self.repos
+            .iter()
+            .find(|(path, _)| expand(path) == checkout)
+            .and_then(|(_, repo)| repo.ship.clone())
     }
 }
 
@@ -202,6 +215,21 @@ mod tests {
                 .starts_with("/anywhere has no issue source")
         );
         assert!(Config::default().source_for(Path::new("/x")).is_err());
+    }
+
+    #[test]
+    fn a_repository_names_its_ship_plugins_or_gets_none() {
+        let config = parse(
+            "[repos.\"/home/me/app\"]\nship = [\"no-mistakes\", \"github\"]\n\
+             [repos.\"/home/me/quiet\"]\nship = []\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.ship_for(Path::new("/home/me/app")),
+            Some(vec!["no-mistakes".to_string(), "github".to_string()])
+        );
+        assert_eq!(config.ship_for(Path::new("/home/me/quiet")), Some(vec![]));
+        assert_eq!(config.ship_for(Path::new("/home/me/other")), None);
     }
 
     #[test]

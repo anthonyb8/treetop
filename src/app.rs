@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
@@ -12,9 +12,11 @@ use crate::agents::{Agent, Status};
 use crate::coordinator;
 use crate::diff::Layout;
 use crate::dispatch::{Edit, Prompt, Purpose, Recipient, Target};
-use crate::jobs::{Job, Kind, Launch, Message};
+use crate::jobs::{Job, Kind, Launch, Message, Pick, ShipAction, ShipCall};
+use crate::plugin::Plugin;
 use crate::pool::{self, Process, Tree, Work};
 use crate::reports::{Report, State};
+use crate::ship::{Answer, Stage};
 use crate::sidecar::Sidecar;
 
 /// Where a tree's latest job stands, shown in its STATUS cell.
@@ -139,6 +141,17 @@ pub struct Pending {
     pub trees: Vec<Tree>,
 }
 
+/// A ship run of a tree's branch, waiting on y/n, since it pushes and opens
+/// a PR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shipping {
+    pub tree: Tree,
+    /// The ship plugin that runs it.
+    pub plugin: String,
+    /// Where its intent comes from, as the dialog says it.
+    pub intent: String,
+}
+
 /// A tree's destroy preview, waiting on y/n.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Review {
@@ -173,6 +186,8 @@ pub enum Outcome {
         port: u16,
         tree: String,
     },
+    /// Open `url`, such as a tree's PR, in the browser.
+    OpenUrl(String),
     /// Open `command`, agent `agent`'s chat in tree `tree`, in a popup over
     /// treetop until Ctrl+Q or until it exits.
     Chat {
@@ -266,6 +281,26 @@ pub struct App {
     new_trees: usize,
     /// Whose branches new agents start on, as `branch::user` gives it.
     pub user: String,
+    /// The repository's ship plugins, in its order; with none, the PR
+    /// column is left out.
+    pub ship_plugins: Vec<Plugin>,
+    /// A ship run waiting on y/n in its dialog.
+    pub shipping: Option<Shipping>,
+    /// Why the ship plugins could not say where the PRs stand, at the last
+    /// ask.
+    pub ship_error: Option<String>,
+    /// Each tree's stage at the last ask, so a change can be announced; None
+    /// until the first ask, which announces nothing.
+    last_stages: Option<HashMap<PathBuf, Stage>>,
+    /// A PR's failure read for its agent, ready to send.
+    failure: Option<Outcome>,
+    /// Issues a merge has left with nothing blocking them, by id, until
+    /// a tree takes one up.
+    pub ready: BTreeSet<String>,
+    /// Trees whose merge has been followed up, so it happens once.
+    landed: BTreeSet<PathBuf>,
+    /// Follow-ups of merges, to hand to the worker.
+    landings: Vec<Job>,
 }
 
 /// How long a started agent may take to show up before treetop stops
@@ -313,7 +348,14 @@ fn branch_problem(prompt: &Prompt) -> Option<String> {
 /// The trees, as the Issues screen asks them who is working on an issue.
 impl issues::Host for App {
     fn work_on(&self, id: &str) -> Option<issues::Work> {
-        let tree = self.tree_of_ticket(id)?;
+        let Some(tree) = self.tree_of_ticket(id) else {
+            return self.ready.contains(id).then(|| issues::Work {
+                tree: String::new(),
+                agent: None,
+                needs_you: false,
+                is_ready: true,
+            });
+        };
         Some(issues::Work {
             tree: tree.name.clone(),
             agent: tree
@@ -321,6 +363,7 @@ impl issues::Host for App {
                 .first()
                 .map(|a| a.status.map_or("running", Status::label).to_string()),
             needs_you: self.needs_you(tree),
+            is_ready: false,
         })
     }
 }
@@ -342,8 +385,9 @@ impl App {
         self.jobs.values().filter(|s| s.is_active()).count()
     }
 
-    /// The trees the list shows, filtered, those waiting on you first and
-    /// the rest in pool order.
+    /// The trees the list shows, filtered: those waiting on you first, then
+    /// the main checkout, then the rest, each part with the most recently
+    /// active agent first, and trees with no activity in pool order last.
     pub fn visible(&self) -> Vec<&Tree> {
         let needle = self.filter.to_lowercase();
         let mut visible: Vec<&Tree> = self
@@ -356,6 +400,7 @@ impl App {
                         t.branch.as_ref(),
                         t.holder.as_ref(),
                         t.sidecar.as_ref().and_then(|s| s.ticket.as_ref()),
+                        t.ship.as_ref().map(|s| &s.label),
                     ]
                     .into_iter()
                     .flatten()
@@ -363,8 +408,34 @@ impl App {
                     .any(|field| field.to_lowercase().contains(&needle))
             })
             .collect();
-        visible.sort_by_key(|t| !self.needs_you(t));
+        visible.sort_by_cached_key(|t| {
+            (
+                !self.needs_you(t),
+                !t.is_main,
+                std::cmp::Reverse(self.active_at(t)),
+            )
+        });
         visible
+    }
+
+    /// How many of the visible trees at the top wait on you, which the list
+    /// sets apart from the rest.
+    pub fn waiting_rows(&self, visible: &[&Tree]) -> usize {
+        visible.iter().take_while(|t| self.needs_you(t)).count()
+    }
+
+    /// When the tree's agents last worked: their latest report, or what
+    /// their source says, in seconds since the epoch.
+    pub fn active_at(&self, tree: &Tree) -> Option<u64> {
+        let reported = self
+            .says(tree)
+            .and_then(|item| item.report.updated.duration_since(UNIX_EPOCH).ok())
+            .map(|since| since.as_secs());
+        tree.agents
+            .iter()
+            .filter_map(|a| a.active_at)
+            .chain(reported)
+            .max()
     }
 
     pub fn current(&self) -> Option<&Tree> {
@@ -448,6 +519,7 @@ impl App {
                 tree.agents = old.agents.clone();
                 tree.sidecar = old.sidecar.clone().filter(|_| tree.is_held());
                 tree.work = old.work.filter(|_| tree.is_held());
+                tree.ship = old.ship.clone().filter(|_| tree.is_held());
             }
         }
         self.trees = trees;
@@ -472,6 +544,25 @@ impl App {
     /// Records a finished job. A successful preview becomes a review; a failure
     /// stays on its row and its last line goes to the status line.
     pub fn job_finished(&mut self, job: Job, is_ok: bool, output: String) {
+        // A merge's follow-up only says what it found: a failure shows in
+        // the detail pane, since the work itself is done.
+        if job.kind == Kind::Land {
+            if let (true, Some(pick)) = (is_ok && !job.ready.is_empty(), &job.landing) {
+                self.message = Some(format!(
+                    "{} merged · {} ready",
+                    pick.id,
+                    job.ready.join(", ")
+                ));
+                self.ready.extend(job.ready.iter().cloned());
+            }
+            self.log.push(LogEntry {
+                tree: job.tree.name,
+                kind: job.kind,
+                is_ok,
+                output,
+            });
+            return;
+        }
         // A dispatch to a new tree ran under a stand-in until it had one.
         let path = job.tree.path.clone();
         if job.key != path {
@@ -545,6 +636,29 @@ impl App {
                     });
                 }
             }
+        } else if job.kind == Kind::Ship {
+            self.jobs
+                .insert(path.clone(), JobState::Done(job.kind, Instant::now()));
+            let plugin = job.shipping.as_ref().map_or("ship", |c| c.plugin.as_str());
+            match job.attach.clone() {
+                Some(command) => {
+                    self.started_chat = Some(Outcome::Chat {
+                        command,
+                        agent: plugin.to_string(),
+                        tree: job.tree.name.clone(),
+                    });
+                }
+                None => {
+                    self.message = Some(format!(
+                        "{plugin} started a run on tree {}; s on it shows the run",
+                        job.tree.name
+                    ));
+                }
+            }
+        } else if job.kind == Kind::Fix {
+            self.jobs
+                .insert(path.clone(), JobState::Done(job.kind, Instant::now()));
+            self.send_failure(&path, &output);
         } else if job.kind == Kind::Preview {
             self.jobs.remove(&path);
             self.reviews.push_back(Review {
@@ -603,6 +717,7 @@ impl App {
             tree.processes.clear();
             tree.work = None;
             tree.sidecar = None;
+            tree.ship = None;
         }
     }
 
@@ -915,12 +1030,245 @@ impl App {
             .map(|r| Item::new(r, &self.trees))
     }
 
-    /// The tree waits on you: its agent asked something, or sits at a prompt.
+    /// The tree waits on you: its agent asked something or sits at a
+    /// prompt, or its PR failed its checks, was asked for changes, or stopped
+    /// at a gate.
     pub fn needs_you(&self, tree: &Tree) -> bool {
         tree.agents
             .iter()
             .any(|a| a.status == Some(Status::Waiting) && a.name != coordinator::NAME)
             || self.says(tree).is_some_and(|i| i.state == State::Blocked)
+            || tree.ship.as_ref().is_some_and(|s| s.stage.needs_you())
+    }
+
+    /// Trees whose PR has merged, for the summary.
+    pub fn merged(&self) -> usize {
+        self.trees
+            .iter()
+            .filter(|t| t.ship.as_ref().is_some_and(|s| s.stage == Stage::Merged))
+            .count()
+    }
+
+    /// Takes where each tree's PR stands. A tree absent from the map has
+    /// nothing to say. Returns what to announce: each tree whose PR has come
+    /// to need you since the last ask.
+    pub fn apply_ship(&mut self, answer: Result<Answer, String>) -> Vec<String> {
+        let mut ships = match answer {
+            Ok(answer) => {
+                self.ship_error = Some(answer.failures.join("; ")).filter(|f| !f.is_empty());
+                answer.ships
+            }
+            Err(why) => {
+                self.ship_error = Some(why);
+                return Vec::new();
+            }
+        };
+        let cursor = self
+            .current()
+            .filter(|_| self.last_stages.is_some())
+            .map(|t| t.path.clone());
+        for tree in &mut self.trees {
+            tree.ship = ships.remove(&tree.path).map(Box::new);
+        }
+        self.reselect(cursor);
+        let stages: HashMap<PathBuf, Stage> = self
+            .trees
+            .iter()
+            .filter_map(|t| Some((t.path.clone(), t.ship.as_ref()?.stage)))
+            .collect();
+        let news = match &self.last_stages {
+            None => Vec::new(),
+            Some(last) => self
+                .trees
+                .iter()
+                .filter_map(|tree| {
+                    let ship = tree.ship.as_ref()?;
+                    let is_new = last.get(&tree.path) != Some(&ship.stage);
+                    (ship.stage.needs_you() && is_new).then(|| {
+                        format!(
+                            "tree {}: {} on {}",
+                            tree.name,
+                            ship.label,
+                            tree.branch.as_deref().unwrap_or(&ship.branch)
+                        )
+                    })
+                })
+                .collect(),
+        };
+        self.last_stages = Some(stages);
+        self.follow_merges();
+        news
+    }
+
+    /// Queues the follow-up of each merge seen for the first time, for a
+    /// tree that records its ticket. It runs under a stand-in, so the tree
+    /// stays free for a return.
+    fn follow_merges(&mut self) {
+        let merged: Vec<(Tree, String)> = self
+            .trees
+            .iter()
+            .filter(|t| t.ship.as_ref().is_some_and(|s| s.stage == Stage::Merged))
+            .filter(|t| !self.landed.contains(&t.path))
+            .filter_map(|t| Some((t.clone(), t.sidecar.as_ref()?.ticket.clone()?)))
+            .collect();
+        for (tree, ticket) in merged {
+            self.landed.insert(tree.path.clone());
+            self.landings.push(Job {
+                key: PathBuf::from(format!("(merge of {})", tree.path.display())),
+                landing: Some(Pick {
+                    id: ticket,
+                    checkout: self.checkout.clone(),
+                }),
+                ..Job::new(Kind::Land, tree)
+            });
+        }
+    }
+
+    /// The merge follow-ups to hand to the worker, once.
+    pub fn ready_landings(&mut self) -> Vec<Job> {
+        std::mem::take(&mut self.landings)
+    }
+
+    /// Queues reading what failed on the PR of the tree under the cursor,
+    /// to send to its agents once read.
+    fn read_failure(&mut self) -> Outcome {
+        let Some(tree) = self.current() else {
+            return Outcome::Continue;
+        };
+        let (name, path) = (tree.name.clone(), tree.path.clone());
+        let failing = tree.ship.as_ref().filter(|s| s.stage.needs_you());
+        self.message = if failing.is_none() {
+            Some(format!("nothing has failed on tree {name}'s PR"))
+        } else if !tree
+            .agents
+            .iter()
+            .any(|a| Recipient::of(a, &tree.name).is_some())
+        {
+            Some(format!("no agent in tree {name} to send the failure to"))
+        } else if self.jobs.get(&path).is_some_and(|s| s.is_active()) {
+            Some(format!("tree {name} already has an action queued"))
+        } else {
+            let job = Job::new(Kind::Fix, tree.clone());
+            self.jobs.insert(path, JobState::Queued(Kind::Fix));
+            return Outcome::Queue(vec![job]);
+        };
+        Outcome::Continue
+    }
+
+    /// Sends `text`, what failed on the PR of the tree at `path`, to the
+    /// agents working there, led by a line saying what it is.
+    fn send_failure(&mut self, path: &PathBuf, text: &str) {
+        let Some(tree) = self.trees.iter().find(|t| &t.path == path) else {
+            return;
+        };
+        let Some(ship) = &tree.ship else { return };
+        let to: Vec<Recipient> = tree
+            .agents
+            .iter()
+            .filter_map(|a| Recipient::of(a, &tree.name))
+            .collect();
+        if to.is_empty() {
+            self.message = Some(format!(
+                "tree {}'s agent is gone; the failure was not sent",
+                tree.name
+            ));
+            return;
+        }
+        self.message = Some(format!("sending {}'s failure to its agent...", ship.label));
+        self.failure = Some(Outcome::Send {
+            to,
+            text: crate::ship::message(ship, text),
+        });
+    }
+
+    /// The failure read for an agent, once, to send.
+    pub fn ready_failure(&mut self) -> Option<Outcome> {
+        self.failure.take()
+    }
+
+    /// The PR column shows: the repository has ship plugins.
+    pub fn is_shipping(&self) -> bool {
+        !self.ship_plugins.is_empty()
+    }
+
+    /// `s`: shows the ship run under way on the tree under the cursor, or
+    /// asks to start one.
+    fn ship(&mut self) -> Outcome {
+        let Some(tree) = self.current() else {
+            return Outcome::Continue;
+        };
+        let name = tree.name.clone();
+        if tree.is_main || !tree.is_held() || tree.branch.is_none() {
+            self.message = Some(format!("tree {name} has no branch of an agent's to ship"));
+            return Outcome::Continue;
+        }
+        if self.jobs.get(&tree.path).is_some_and(|s| s.is_active()) {
+            self.message = Some(format!("tree {name} already has an action queued"));
+            return Outcome::Continue;
+        }
+        let under_way = tree
+            .ship
+            .as_ref()
+            .filter(|s| matches!(s.stage, Stage::Running | Stage::Gate))
+            .and_then(|s| crate::ship::by_name(&self.ship_plugins, &s.plugin))
+            .filter(|p| {
+                p.description()
+                    .is_ok_and(|d| d.ops.iter().any(|o| o == "attach"))
+            });
+        if let Some(plugin) = under_way {
+            let job = Job {
+                shipping: Some(ShipCall {
+                    plugin: plugin.name().to_string(),
+                    action: ShipAction::Attach,
+                }),
+                ..Job::new(Kind::Ship, tree.clone())
+            };
+            self.jobs
+                .insert(tree.path.clone(), JobState::Queued(Kind::Ship));
+            return Outcome::Queue(vec![job]);
+        }
+        let Some(plugin) = crate::ship::answering(&self.ship_plugins, "run") else {
+            let names: Vec<&str> = self.ship_plugins.iter().map(Plugin::name).collect();
+            self.message = Some(format!(
+                "no ship plugin here starts a run ({}); name one such as no-mistakes under [repos] ship",
+                names.join(", ")
+            ));
+            return Outcome::Continue;
+        };
+        let record = tree.sidecar.as_deref();
+        let intent = match (
+            record.and_then(|r| r.ticket.as_deref()),
+            record.and_then(|r| r.task.as_deref()),
+        ) {
+            (Some(ticket), _) => format!("{ticket}'s title and text"),
+            (None, Some(task)) => task.to_string(),
+            (None, None) => {
+                self.message = Some(format!(
+                    "tree {name} has neither a ticket nor a task to give a run as its intent"
+                ));
+                return Outcome::Continue;
+            }
+        };
+        self.shipping = Some(Shipping {
+            tree: tree.clone(),
+            plugin: plugin.name().to_string(),
+            intent,
+        });
+        Outcome::Continue
+    }
+
+    /// Opens the PR of the tree under the cursor.
+    fn open_pr(&mut self) -> Outcome {
+        let Some(tree) = self.current() else {
+            return Outcome::Continue;
+        };
+        match tree.ship.as_ref().and_then(|s| s.url.clone()) {
+            Some(url) => Outcome::OpenUrl(url),
+            None => {
+                self.message = Some(format!("tree {} has no PR to open", tree.name));
+                Outcome::Continue
+            }
+        }
     }
 
     /// Trees waiting on you, for the summary.
@@ -1391,6 +1739,22 @@ impl App {
             }
             return Outcome::Continue;
         }
+        if let Some(shipping) = self.shipping.take() {
+            if !matches!(key.code, KeyCode::Char('y' | 'Y')) {
+                return Outcome::Continue;
+            }
+            let path = shipping.tree.path.clone();
+            self.jobs.insert(path, JobState::Queued(Kind::Ship));
+            return Outcome::Queue(vec![Job {
+                shipping: Some(ShipCall {
+                    plugin: shipping.plugin,
+                    action: ShipAction::Run {
+                        checkout: self.checkout.clone(),
+                    },
+                }),
+                ..Job::new(Kind::Ship, shipping.tree)
+            }]);
+        }
         if let Some(pending) = self.pending.take() {
             return match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
@@ -1461,6 +1825,9 @@ impl App {
                 }
             }
             KeyCode::Char('o') => return self.browse(),
+            KeyCode::Char('O') => return self.open_pr(),
+            KeyCode::Char('f') => return self.read_failure(),
+            KeyCode::Char('s') => return self.ship(),
             KeyCode::Char('c') => self.open_coordinator(),
             KeyCode::Char('n') => self.open_dispatch(),
             KeyCode::Char('d') => self.open_diff(),
@@ -1485,6 +1852,7 @@ mod tests {
 
     use super::*;
     use crate::pool::parse;
+    use crate::ship::Ship;
     use ratatui::crossterm::event::KeyEvent;
 
     fn app() -> App {
@@ -1752,6 +2120,7 @@ mod tests {
                 tree: "8".into(),
                 agent: Some("waiting".into()),
                 needs_you: true,
+                is_ready: false,
             })
         );
         assert_eq!(app.work_on("END-1"), None);
@@ -1933,6 +2302,7 @@ mod tests {
             attach: None,
             job: None,
             plugin: None,
+            active_at: None,
         }
     }
 
@@ -2595,5 +2965,282 @@ mod tests {
         trees.remove(1);
         app.set_trees(trees);
         assert_eq!(app.current().unwrap().name, "8");
+    }
+
+    fn ship(branch: &str, stage: Stage, label: &str) -> Ship {
+        Ship {
+            branch: branch.into(),
+            stage,
+            label: label.into(),
+            url: Some("https://github.com/o/r/pull/12".into()),
+            head: Some("abc".into()),
+            detail: Vec::new(),
+            plugin: "github".into(),
+        }
+    }
+
+    fn ships(entries: &[(&str, Ship)]) -> Result<Answer, String> {
+        Ok(Answer {
+            ships: entries
+                .iter()
+                .map(|(path, ship)| (PathBuf::from(path), ship.clone()))
+                .collect(),
+            failures: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn a_failing_pr_needs_you_sorts_first_and_rings_once() {
+        let mut app = app();
+        let review = ship("feature/end-2-b", Stage::Review, "#12 review");
+        let failing = ship("feature/end-2-b", Stage::CiFailed, "#12 ✗ ci");
+        assert!(app.apply_ship(ships(&[("/p/8/app", review)])).is_empty());
+        assert_eq!(app.needing_you(), 0);
+        let news = app.apply_ship(ships(&[("/p/8/app", failing.clone())]));
+        assert_eq!(news, ["tree 8: #12 ✗ ci on feature/end-2-b"]);
+        assert_eq!(app.needing_you(), 1);
+        assert_eq!(app.visible()[0].name, "8", "it sorts first");
+        assert!(
+            app.apply_ship(ships(&[("/p/8/app", failing)])).is_empty(),
+            "the same stage rings once"
+        );
+    }
+
+    #[test]
+    fn the_first_ask_announces_nothing_and_an_error_keeps_what_was_known() {
+        let mut app = app();
+        let changes = ship("feature/end-2-b", Stage::Changes, "#12 changes");
+        assert!(app.apply_ship(ships(&[("/p/8/app", changes)])).is_empty());
+        assert_eq!(app.needing_you(), 1);
+        assert!(app.apply_ship(Err("gh is not installed".into())).is_empty());
+        assert_eq!(app.ship_error.as_deref(), Some("gh is not installed"));
+        assert_eq!(app.needing_you(), 1);
+        // One plugin that cannot say is said, though another could.
+        let mut answer = ships(&[]).unwrap();
+        answer.failures = vec!["github: auth: run gh auth login".into()];
+        app.apply_ship(Ok(answer));
+        assert_eq!(
+            app.ship_error.as_deref(),
+            Some("github: auth: run gh auth login")
+        );
+        app.apply_ship(ships(&[]));
+        assert_eq!(app.ship_error, None);
+    }
+
+    #[test]
+    fn merged_trees_are_counted_filtered_and_their_pr_opens() {
+        let mut app = app();
+        let merged = ship("feature/end-1-a", Stage::Merged, "#12 merged");
+        app.apply_ship(ships(&[("/p/4/app", merged)]));
+        assert_eq!(app.merged(), 1);
+        app.filter = "merged".into();
+        let visible: Vec<&str> = app.visible().iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(visible, ["4"]);
+        assert_eq!(
+            press(&mut app, KeyCode::Char('O')),
+            Outcome::OpenUrl("https://github.com/o/r/pull/12".into())
+        );
+        app.filter.clear();
+        press(&mut app, KeyCode::End);
+        assert_eq!(press(&mut app, KeyCode::Char('O')), Outcome::Continue);
+        assert_eq!(app.message.as_deref(), Some("tree 8 has no PR to open"));
+    }
+
+    #[test]
+    fn a_listing_keeps_a_held_trees_pr_and_a_return_drops_it() {
+        let mut app = app();
+        let merged = ship("feature/end-1-a", Stage::Merged, "#12 merged");
+        app.apply_ship(ships(&[("/p/4/app", merged)]));
+        app.set_trees(
+            app.trees
+                .clone()
+                .into_iter()
+                .map(|mut t| {
+                    t.ship = None;
+                    t
+                })
+                .collect(),
+        );
+        assert!(app.trees[0].ship.is_some());
+        app.returned(&PathBuf::from("/p/4/app"));
+        assert!(app.trees[0].ship.is_none());
+    }
+
+    #[test]
+    fn f_reads_a_failure_and_sends_it_to_the_trees_agent() {
+        let mut app = app();
+        assert_eq!(press(&mut app, KeyCode::Char('f')), Outcome::Continue);
+        assert_eq!(
+            app.message.as_deref(),
+            Some("nothing has failed on tree 4's PR")
+        );
+        let failing = ship("feature/end-1-a", Stage::CiFailed, "#12 ✗ ci");
+        app.apply_ship(ships(&[("/p/4/app", failing)]));
+        press(&mut app, KeyCode::Char('f'));
+        assert_eq!(
+            app.message.as_deref(),
+            Some("no agent in tree 4 to send the failure to")
+        );
+        app.apply_agents(&HashMap::from([(
+            PathBuf::from("/p/4/app"),
+            vec![attachable("0908e7f3")],
+        )]));
+        let job = queued(press(&mut app, KeyCode::Char('f'))).remove(0);
+        assert_eq!((job.kind, job.tree.name.as_str()), (Kind::Fix, "4"));
+        assert_eq!(
+            press(&mut app, KeyCode::Char('f')),
+            Outcome::Continue,
+            "one read at a time"
+        );
+        app.job_finished(job, true, "Failing checks: test".into());
+        let Some(Outcome::Send { to, text }) = app.ready_failure() else {
+            panic!("expected a send");
+        };
+        assert_eq!(to.len(), 1);
+        assert_eq!(
+            text,
+            "CI failed on #12. Fix it and push.\n\nFailing checks: test"
+        );
+        assert!(app.ready_failure().is_none(), "sent once");
+    }
+
+    #[test]
+    fn a_merge_is_followed_up_once_and_names_what_it_leaves_ready() {
+        let mut app = app();
+        app.checkout = PathBuf::from("/p/main");
+        let mut record = Sidecar::leased_now();
+        record.ticket = Some("END-1".into());
+        app.apply_sidecars(HashMap::from([(PathBuf::from("/p/4/app"), record)]));
+        let merged = ship("feature/end-1-a", Stage::Merged, "#12 merged");
+        app.apply_ship(ships(&[("/p/8/app", merged.clone())]));
+        assert!(app.ready_landings().is_empty(), "tree 8 records no ticket");
+        app.apply_ship(ships(&[("/p/4/app", merged.clone())]));
+        let mut landings = app.ready_landings();
+        assert_eq!(landings.len(), 1);
+        let mut job = landings.remove(0);
+        assert_eq!(job.kind, Kind::Land);
+        assert_eq!(
+            job.landing,
+            Some(Pick {
+                id: "END-1".into(),
+                checkout: PathBuf::from("/p/main"),
+            })
+        );
+        assert_ne!(job.key, job.tree.path, "the tree stays free for a return");
+        app.apply_ship(ships(&[("/p/4/app", merged)]));
+        assert!(app.ready_landings().is_empty(), "once");
+        job.ready = vec!["END-2".into()];
+        app.job_finished(job, true, "END-1 merged; ready now: END-2".into());
+        assert_eq!(app.message.as_deref(), Some("END-1 merged · END-2 ready"));
+        assert!(app.jobs.is_empty());
+        use issues::Host;
+        assert_eq!(
+            app.work_on("END-2"),
+            Some(issues::Work {
+                tree: String::new(),
+                agent: None,
+                needs_you: false,
+                is_ready: true,
+            })
+        );
+    }
+
+    #[test]
+    fn s_asks_before_a_ship_run_and_shows_one_under_way() {
+        let mut app = app();
+        app.checkout = PathBuf::from("/p/main");
+        app.ship_plugins = vec![Plugin::Builtin("github")];
+        press(&mut app, KeyCode::Char('s'));
+        assert!(app.shipping.is_none());
+        assert!(
+            app.message
+                .as_deref()
+                .unwrap()
+                .starts_with("no ship plugin here starts a run (github)")
+        );
+        app.ship_plugins = vec![Plugin::Builtin("no-mistakes"), Plugin::Builtin("github")];
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(
+            app.message.as_deref(),
+            Some("tree 4 has neither a ticket nor a task to give a run as its intent")
+        );
+        let mut record = Sidecar::leased_now();
+        record.task = Some("fix the login redirect".into());
+        app.apply_sidecars(HashMap::from([(PathBuf::from("/p/4/app"), record)]));
+        press(&mut app, KeyCode::Char('s'));
+        let shipping = app.shipping.clone().unwrap();
+        assert_eq!(
+            (shipping.plugin.as_str(), shipping.intent.as_str()),
+            ("no-mistakes", "fix the login redirect")
+        );
+        assert_eq!(press(&mut app, KeyCode::Char('n')), Outcome::Continue);
+        assert!(app.shipping.is_none() && app.jobs.is_empty(), "n cancels");
+        press(&mut app, KeyCode::Char('s'));
+        let job = queued(press(&mut app, KeyCode::Char('y'))).remove(0);
+        assert_eq!(job.kind, Kind::Ship);
+        assert_eq!(
+            job.shipping.unwrap().action,
+            ShipAction::Run {
+                checkout: PathBuf::from("/p/main")
+            }
+        );
+
+        let mut app = app_on_a_run();
+        let job = queued(press(&mut app, KeyCode::Char('s'))).remove(0);
+        assert_eq!(job.shipping.as_ref().unwrap().action, ShipAction::Attach);
+        let mut job = job;
+        job.attach = Some(vec![
+            "no-mistakes".into(),
+            "attach".into(),
+            "--run".into(),
+            "r1".into(),
+        ]);
+        app.job_finished(job, true, String::new());
+        assert!(matches!(
+            app.ready_chat(),
+            Some(Outcome::Chat { agent, tree, .. }) if agent == "no-mistakes" && tree == "4"
+        ));
+    }
+
+    /// Tree 4 with a no-mistakes run waiting at a gate.
+    fn app_on_a_run() -> App {
+        let mut app = app();
+        app.ship_plugins = vec![Plugin::Builtin("no-mistakes"), Plugin::Builtin("github")];
+        let mut gate = ship("feature/end-1-a", Stage::Gate, "nm review ⏸");
+        gate.plugin = "no-mistakes".into();
+        app.apply_ship(ships(&[("/p/4/app", gate)]));
+        app
+    }
+
+    #[test]
+    fn trees_sort_waiting_first_then_main_then_by_their_agents_last_work() {
+        let names =
+            |app: &App| -> Vec<String> { app.visible().iter().map(|t| t.name.clone()).collect() };
+        let mut app = app_with_main();
+        assert_eq!(names(&app), ["main", "4", "7", "8"], "pool order to begin");
+        dispatched(&mut app, "/p/4/app", "old");
+        dispatched(&mut app, "/p/8/app", "new");
+        app.apply_reports(vec![
+            report("old", State::Working, "/p/4/app", 500),
+            report("new", State::Working, "/p/8/app", 10),
+        ]);
+        assert_eq!(names(&app), ["main", "8", "4", "7"]);
+        assert_eq!(app.waiting_rows(&app.visible()), 0);
+        let quiet = Agent {
+            active_at: Some(1_000),
+            ..agent("quiet")
+        };
+        app.apply_agents(&HashMap::from([(PathBuf::from("/p/4/app"), vec![quiet])]));
+        assert_eq!(
+            names(&app),
+            ["main", "4", "8", "7"],
+            "an agent's own time counts"
+        );
+        app.apply_reports(vec![
+            report("old", State::Working, "/p/4/app", 500),
+            report("new", State::Blocked, "/p/8/app", 10),
+        ]);
+        assert_eq!(names(&app), ["8", "main", "4", "7"]);
+        assert_eq!(app.waiting_rows(&app.visible()), 1);
     }
 }

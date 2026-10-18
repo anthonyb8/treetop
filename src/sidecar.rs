@@ -33,6 +33,10 @@ pub struct Sidecar {
     /// The agent's id, as its plugin knows it.
     pub job: Option<String>,
     pub ticket: Option<String>,
+    /// The task the agent was dispatched with, which a ship run gives as
+    /// its intent where there is no ticket.
+    #[serde(default)]
+    pub task: Option<String>,
     pub branch: Option<String>,
     /// treehouse's identity for the lease, when it gave one.
     pub lease_id: Option<String>,
@@ -48,6 +52,7 @@ impl Sidecar {
             agent: None,
             job: None,
             ticket: None,
+            task: None,
             branch: None,
             lease_id: None,
             leased_at: SystemTime::now()

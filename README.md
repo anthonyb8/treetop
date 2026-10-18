@@ -5,6 +5,7 @@ See which coding agent works in each tree, whether it is waiting on you and what
 Ask a coordinator agent about every other agent at once, send an agent a task in a fresh tree, a tree you pick or the main checkout, and read what each agent reports back on its tree's row.
 Switch between the pools of every repository you use it in without leaving it.
 Mark trees, then return them to the pool or destroy them, with git's view of each tree on screen so nothing unpushed goes by accident.
+Follow each tree's pull request through CI and review to the merge, send a failure back to its agent in one key, and see which issues a merge leaves ready.
 
 treetop only talks to treehouse through its CLI (`treehouse status --json`, `get --lease`, `lease`, `return`, `destroy`), so a treehouse upgrade keeps working without a fork.
 
@@ -45,6 +46,9 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | Space | mark or unmark the tree under the cursor |
 | `/` | filter by number, branch, holder or agent; Enter keeps it, Esc clears it |
 | `o` | open the lowest port the tree serves, `http://localhost:<port>`, in the browser, or copy it to the clipboard where there is no desktop |
+| `O` | open the tree's PR the same way (see [After the agent](#after-the-agent)) |
+| `f` | send what failed on the tree's PR, a check's log or a review's requested changes, to its agent |
+| `s` | start a ship run of the tree's branch, such as no-mistakes', after a dialog; on a run under way, show it |
 | `b` | rename the branch of the tree under the cursor |
 | `w` | switch to another workspace: the pool of another repository treetop has been opened in |
 | Tab | switch to the Issues screen, and back (see [Issues](#issues)) |
@@ -60,7 +64,10 @@ CHANGED counts uncommitted files and UNPUSHED counts commits on no remote; `?` m
 PROCS counts processes running inside the tree, and PORTS the TCP ports they listen on: the lowest, and how many more.
 `o` opens the lowest in the browser on a desktop; on a server reached over SSH it copies the URL to the clipboard of the computer you are typing at, through the terminal (OSC 52; inside tmux, `set-clipboard on`).
 AGENT names the coding agent working in the tree, from the sources under [Agents](#agents); `no agent` on a held tree marks one nobody is working in.
-SAYS is its agent's latest word (see [What agents say](#what-agents-say)), and trees waiting on you sort to the top.
+SAYS is its agent's latest word (see [What agents say](#what-agents-say)).
+Trees waiting on you sort to the top, set apart from the rest by a blank line; below it come the main checkout, then the other trees with the most recently active agent first, so trees nobody has worked in for a while sink to the bottom.
+An agent's last activity is its latest report, or when its Claude Code transcript last grew.
+PR is where the tree's branch stands after its agent: its pull request's number and stage, or the step of a pipeline it is going through (see [After the agent](#after-the-agent)).
 The pane below shows the tree under the cursor in full: its path and holder, its agents, ports and processes, everything its agent last said with its latest steps, and the outcome of its last action with the end of its output.
 The first row, `main`, is the repository's main checkout, so agents working in place show too; it is never returned or destroyed, and the summary's tree counts leave it out.
 
@@ -155,6 +162,24 @@ team = "ANT"
 issues = "work"
 ```
 
+A source with `finish = true` has a ticket marked done once its tree's PR merges; it is off by default, since Linear's own GitHub integration often does that already:
+
+```toml
+[issues.personal]
+key_env = "LINEAR_API_KEY_PERSONAL"
+team = "ANT"
+finish = true
+```
+
+A repository's PRs come from its ship plugins, named under `[repos]` in the order they are asked (see [After the agent](#after-the-agent)).
+With no `ship`, a repository uses GitHub's alone, and `ship = []` leaves the PR column out:
+
+```toml
+[repos."~/endo/app"]
+issues = "work"
+ship = ["no-mistakes", "github"]
+```
+
 `treetop tickets` lists the repository's open tickets from its source, `--mine` those assigned to you, and any other words search their titles; it is the quickest check that a key and team are right.
 The Linear plugin calls `https://api.linear.app/graphql` over HTTPS from treetop itself, so the key never appears in a process list.
 
@@ -169,9 +194,9 @@ treetop runs it once per call, writes one request and closes stdin, then reads o
 {"ok": false, "error": {"code": "not_found", "message": "no job 0908e7f3"}}
 ```
 
-- `describe` says what the plugin is: its `protocol`, which must be 1, its `name`, its `kind` (`agent` or `tickets`) and the `ops` it answers.
+- `describe` says what the plugin is: its `protocol`, which must be 1, its `name`, its `kind` (`agent`, `tickets` or `ship`) and the `ops` it answers.
 - An error's `code` is one of `not_found`, `unsupported`, `auth`, `conflict`, `unavailable` or `failed`; any other reads as `failed`. A non-zero exit or a reply that is not JSON fails with what the plugin wrote to stderr.
-- Each call has a timeout: 3 s for `describe` and `find`, 10 s for `list` and `get`, 30 s for anything else. The plugin runs in its own process group, which is killed at the timeout, so it must not leave a child holding its stdout once it exits.
+- Each call has a timeout: 3 s for `describe` and `find`, 10 s for `list`, `get`, `status` and `attach`, 30 s for anything else. The plugin runs in its own process group, which is killed at the timeout, so it must not leave a child holding its stdout once it exits.
 - Fields are only ever added within a protocol, so a plugin should ignore the ones it does not know.
 
 An agent plugin answers these ops:
@@ -192,12 +217,27 @@ A ticket plugin answers these, with its source's settings as `config`:
 | Op | Args | Result |
 |---|---|---|
 | `list` | `filters`: `mine`, `label`, `state`, `project`, `cycle` (`current` or a number) and `query`, each optional | `tickets`: each with `id`, `title`, `state`, `labels`, and optionally `assignee`, `project`, `cycle`, `url` and `branch` |
-| `get` | `id` | the ticket, with its `description` |
+| `get` | `id` | the ticket, with its `description`, and optionally `links`: each `{ "id", "kind", "done" }`, `kind` being `blocks`, `blocked by` or `related` |
 | `branch` | `id` | `branch`, the name its system gives the ticket's branch |
 | `start` | `id` | nothing; marks it started and assigns it to the key's user |
+| `finish` | `id` | nothing; marks it done, where its source sets `finish = true` |
+
+A ship plugin says where each tree's branch stands after its agent:
+
+| Op | Args | Result |
+|---|---|---|
+| `status` | `dir`, the main checkout, and `trees`: each `{ "dir", "branch" }` | `branches`: one per branch it has something to say about, each with `branch`, `stage`, and optionally `label`, `url`, `head` and `detail` |
+| `logs` | `dir`, the tree, and `branch` | `text`: what failed and the end of its output, for the tree's agent |
+| `run` | `dir`, `branch` and `intent` | once the run is under way, which goes on after the call returns |
+| `attach` | `dir` and `branch` | `argv`, the command that shows the run under way in a terminal |
+
+`stage` is one of `running`, `gate`, `failed`, `draft`, `checks`, `ci_failed`, `changes`, `review`, `approved`, `merged`, `closed` or `idle`; any other reads as `running`.
+`gate`, `failed`, `ci_failed` and `changes` need you.
+`label` is the few characters the PR column shows, such as `#12 ✗ ci`, `detail` the lines the detail pane adds, and `head` the commit the PR or run is on.
+`idle` means it has nothing current to say, such as a pipeline whose run ended, so the next plugin's answer shows.
 
 Claude Code's plugin is built in, and `treetop plugin claude` serves it on stdin and stdout like any other; a plugin of your own named `claude` replaces it.
-Linear's is built in the same way, as `treetop plugin linear`.
+Linear's is built in the same way, as `treetop plugin linear`, and so are two ship plugins, `treetop plugin github` and `treetop plugin no-mistakes`.
 treetop starts new agents with it unless `TREETOP_NEW_AGENT` names a command.
 
 ## What the actions run
@@ -209,7 +249,7 @@ The detail pane shows the end of each tree's last action's output, and a failure
   1. it stops the tree's background agents through their plugin, since a session that moved in with `EnterWorktree` runs from elsewhere and treehouse would not stop it;
   2. runs the `on_return` hook, if the config names one;
   3. runs `treehouse return --force`, which stops the processes left in the tree (the dialog replaces treehouse's own prompt), with `--if-lease-id` for a tree treetop leased, so a lease someone has taken since is never returned;
-  4. deletes the branch treetop named for it when its work is in the pool's base branch, and keeps it otherwise;
+  4. deletes the branch treetop named for it when its work is in the pool's base branch, or when its PR merged with the branch where it is now, which covers a squash or rebase merge; a branch with commits after the merge is kept;
   5. removes `treetop.json`.
 
   The row turns available as soon as its return finishes.
@@ -266,7 +306,7 @@ It sees and steers the other agents through three treetop commands, which it may
 
 | Command | Does |
 |---|---|
-| `treetop status` | prints JSON: each held tree's branch, uncommitted and unpushed counts and ports, its agents and their state, and each background agent's latest report (the question it is waiting on, its answer once done, else what it is doing now); idle trees are only counted |
+| `treetop status` | prints JSON: each held tree's branch, uncommitted and unpushed counts and ports, its agents and their state, each background agent's latest report (the question it is waiting on, its answer once done, else what it is doing now), and its PR's stage as `ship`; idle trees are only counted, and `ready` lists the issues the merged trees' issues leave ready |
 | `treetop send <tree\|agent> <message>` | types the message into the chat of every agent in that tree (a number or `main`), or of the agent of that name, and submits it |
 | `treetop dispatch <new\|main\|N> <task>` | starts a new agent on the task in a fresh tree, the main checkout or tree N |
 | `treetop pick <ID>` | picks a ticket up: an agent on it in a fresh tree, on its branch (see [Issues](#issues)) |
@@ -310,6 +350,33 @@ The coordinator's own reports are left off its row, since it is talked to throug
 When an agent comes to need you, or finishes, treetop rings the terminal bell, and inside tmux shows it in the status line for five seconds, so it is heard from any window; the coordinator finishing an answer rings it too.
 The summary counts the trees that need you, and, as "elsewhere", agents outside the pool waiting on you, which have no row.
 These job files are internal to Claude Code, like its session files, so a release that changes them blanks SAYS until treetop catches up.
+
+## After the agent
+
+Once an agent is done, its tree's work still has a PR to get through: checks, review, the merge.
+The PR column follows it, from the repository's ship plugins, so treetop knows no forge, CI or gate of its own.
+
+- **GitHub**, built in and the default, reads every PR of the repository with one `gh pr list` and matches them to the trees' branches, the newest PR winning where a branch has several.
+  It uses your own `gh` login, so treetop holds no token, and it only reads: it never pushes, opens, merges or reviews a PR.
+  The column shows `#12 draft`, `#12 ci …` while checks run, `#12 ✗ ci`, `#12 changes`, `#12 review`, `#12 approved`, `#12 merged` or `#12 closed`; the detail pane adds the link, the checks and the review.
+  With no `gh`, no login or no GitHub remote, the column stays empty and the detail pane says why.
+- **no-mistakes**, built in and used only where `ship` names it, reads the branch's pipeline run with `no-mistakes axi status` in its tree, whoever started it: `s`, the agent, or a `git push` through the gate.
+  While the run is under way the column shows its step, `nm review …`, or `nm review ⏸` when it waits at a gate; a run that failed on the commit the tree is still on shows `nm ✗ review`.
+  Once the run ends, the next plugin's answer shows, so `ship = ["no-mistakes", "github"]` follows a tree from its gate to its merge.
+
+treetop asks every minute, at once when a push lands in the repository's refs, and after `f` or `s`, but never twice within 15 seconds; a plugin it cannot reach is asked every five minutes instead.
+A failed check, a review asking for changes, a gate and a failed run need you: the tree sorts to the top, the summary counts it, and the bell rings once as it comes to need you.
+
+`f` sends what failed to the tree's agents, as `m` sends a message: a line saying what it is, such as `CI failed on #12. Fix it and push.`, then the failing checks with the end of each failed Actions run's log, or the review's requested changes and its comments on lines, or the pipeline step's log.
+A cold agent gets it through its plugin, which starts it again.
+
+`s` starts a ship run of the tree's branch through the first of the repository's ship plugins that can, after a dialog naming the branch, the plugin and the intent, since the run pushes the branch and opens its PR.
+The intent is the tree's issue, its title and text, else the task its agent was dispatched with, which `treetop.json` records as `task`.
+On a tree whose run is under way, `s` opens the run in the popup instead, `no-mistakes attach` for no-mistakes, which is where a gate is answered; Ctrl+Q comes back.
+
+A merged tree says so in the return dialog, and `/merged` filters the list to merged trees to mark and return together.
+When a tree that records its issue merges, treetop follows it up in the background: it marks the issue done where its source sets `finish = true`, then reads the issues it blocks, and names each one with nothing else blocking it and nobody working on it in the status line, `END-1 merged · END-2 ready`.
+Those show `ready` in the Issues screen's WORK column, where `p` picks one up.
 
 ## Issues
 

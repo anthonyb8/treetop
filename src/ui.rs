@@ -11,7 +11,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 
 use crate::agents::{Agent, Status};
-use crate::app::{App, DiffView, Item, JobState, LogEntry, Opening, Pending, Picker, Review};
+use crate::app::{
+    App, DiffView, Item, JobState, LogEntry, Opening, Pending, Picker, Review, Shipping,
+};
 use crate::chat::Chat;
 use crate::coordinator;
 use crate::diff::{Change, FileDiff, Layout as DiffLayout, Row as DiffRow, Side, ViewRow};
@@ -19,6 +21,7 @@ use crate::dispatch::{Prompt, Purpose, Target};
 use crate::pool::{Tree, Work};
 use crate::popup;
 use crate::reports::{self, State};
+use crate::ship::Stage;
 use crate::theme::theme;
 
 /// The bar's keys, most useful first: on a narrow bar the keys at the end
@@ -38,7 +41,7 @@ const KEYS: [(&str, &str); 11] = [
 ];
 
 /// Every key on the list, for the `?` overlay.
-const HELP: [(&str, &str); 19] = [
+const HELP: [(&str, &str); 22] = [
     (
         "Enter",
         "open the agent: its chat, a cold one started again, else its tree",
@@ -55,8 +58,17 @@ const HELP: [(&str, &str); 19] = [
         "return the marked trees, or this one; D in the dialog destroys",
     ),
     ("Space", "mark or unmark"),
-    ("/", "filter by tree, branch, holder or agent"),
+    (
+        "/",
+        "filter by tree, branch, holder, agent or PR, such as merged",
+    ),
     ("o", "open the lowest port the tree serves"),
+    ("O", "open the tree's PR"),
+    ("f", "send what failed on the tree's PR to its agent"),
+    (
+        "s",
+        "start a ship run of the tree's branch, or show the one under way",
+    ),
     ("b", "rename the tree's branch"),
     ("w", "switch workspace"),
     ("Tab", "the repository's issues"),
@@ -156,6 +168,8 @@ pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>, issues: Option<&i
         // The trees' own dialogs wait until the trees are back on screen.
     } else if let Some(review) = app.reviews.front() {
         draw_review(frame, review, app.reviews.len() - 1);
+    } else if let Some(shipping) = &app.shipping {
+        draw_shipping(frame, shipping);
     } else if let Some(pending) = &app.pending {
         draw_confirm(frame, pending);
     } else if app.is_help {
@@ -201,6 +215,12 @@ fn summary(app: &App, is_compact: bool) -> Vec<Span<'static>> {
             spans.push(Span::styled(
                 format!("  {n} need you"),
                 fg(t.danger).add_modifier(Modifier::BOLD),
+            ));
+        }
+        if let n @ 1.. = app.merged() {
+            spans.push(Span::styled(
+                format!("  {n} merged"),
+                fg(t.special).add_modifier(Modifier::BOLD),
             ));
         }
         if let n @ 1.. = app.elsewhere() {
@@ -331,6 +351,29 @@ fn agent_cell(app: &App, tree: &Tree) -> Cell<'static> {
     Cell::from(format!("{glyph} {}{more}", first.name)).style(style)
 }
 
+/// How a PR's stage reads: what needs you is loud, a failure the loudest,
+/// and a merge in the colour GitHub gives it.
+fn stage_style(stage: Stage) -> Style {
+    let t = theme();
+    let bold = Modifier::BOLD;
+    match stage {
+        Stage::CiFailed | Stage::Failed => fg(t.danger).add_modifier(bold),
+        Stage::Changes | Stage::Gate => fg(t.warning).add_modifier(bold),
+        Stage::Merged => fg(t.special).add_modifier(bold),
+        Stage::Approved => fg(t.success),
+        Stage::Review | Stage::Checks | Stage::Running => fg(t.info),
+        Stage::Draft | Stage::Closed | Stage::Idle => fg(t.muted),
+    }
+}
+
+/// The tree's PR as its ship plugin labels it, empty for none.
+fn pr_cell(tree: &Tree) -> Cell<'static> {
+    match &tree.ship {
+        Some(ship) => Cell::from(ship.label.clone()).style(stage_style(ship.stage)),
+        None => Cell::from(""),
+    }
+}
+
 /// The lowest port the tree serves and how many more, `-` for none.
 fn ports_cell(tree: &Tree) -> Cell<'static> {
     let ports = tree.ports();
@@ -357,7 +400,7 @@ fn row(app: &App, tree: &Tree) -> Row<'static> {
         None => Cell::from("(detached)").style(fg(t.muted)),
     };
     let procs = (!tree.processes.is_empty() || tree.is_held()).then_some(tree.processes.len());
-    Row::new(vec![
+    let mut cells = vec![
         Cell::from(mark),
         Cell::from(tree.name.clone()),
         status_cell(app, tree),
@@ -375,8 +418,11 @@ fn row(app: &App, tree: &Tree) -> Row<'static> {
         ports_cell(tree),
         work_cell(tree, |w| w.changed, t.danger),
         work_cell(tree, |w| w.unpushed, t.special),
-    ])
-    .style(if app.is_cached {
+    ];
+    if app.is_shipping() {
+        cells.push(pr_cell(tree));
+    }
+    Row::new(cells).style(if app.is_cached {
         Style::new().add_modifier(Modifier::ITALIC)
     } else {
         Style::new()
@@ -385,17 +431,25 @@ fn row(app: &App, tree: &Tree) -> Row<'static> {
 
 fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
     let t = theme();
-    let header = Row::new([
+    let mut titles = vec![
         "", "#", "STATUS", "TICKET", "BRANCH", "AGENT", "SAYS", "PROCS", "PORTS", "CHANGED",
         "UNPUSHED",
-    ])
-    .style(t.header);
-    let rows: Vec<Row> = app
-        .visible()
-        .into_iter()
-        .map(|tree| row(app, tree))
-        .collect();
-    let widths = [
+    ];
+    if app.is_shipping() {
+        titles.push("PR");
+    }
+    let header = Row::new(titles).style(t.header);
+    let visible = app.visible();
+    let mut rows: Vec<Row> = visible.iter().map(|tree| row(app, tree)).collect();
+    // A blank line sets the trees waiting on you apart from the rest; the
+    // cursor skips it, so a row below it sits one further down the table.
+    let waiting = app.waiting_rows(&visible);
+    let gap = waiting > 0 && waiting < visible.len();
+    if gap {
+        rows.insert(waiting, Row::new(Vec::<Cell>::new()));
+    }
+    let selected = app.selected + usize::from(gap && app.selected >= waiting);
+    let mut widths = vec![
         Constraint::Length(1),
         Constraint::Length(4),
         Constraint::Length(13),
@@ -408,10 +462,13 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
         Constraint::Length(8),
         Constraint::Length(9),
     ];
+    if app.is_shipping() {
+        widths.push(Constraint::Length(14));
+    }
     let table = Table::new(rows, widths)
         .header(header)
         .row_highlight_style(t.cursor);
-    let mut state = TableState::default().with_selected(Some(app.selected));
+    let mut state = TableState::default().with_selected(Some(selected));
     frame.render_stateful_widget(table, area, &mut state);
 }
 
@@ -460,7 +517,7 @@ fn detail_lines(app: &App, tree: &Tree) -> Vec<Line<'static>> {
         .as_ref()
         .map(|h| format!("  held by {h}"))
         .unwrap_or_default();
-    vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled(
                 tree.path.display().to_string(),
@@ -481,7 +538,32 @@ fn detail_lines(app: &App, tree: &Tree) -> Vec<Line<'static>> {
             Span::styled("processes ", fg(t.muted)),
             Span::raw(procs),
         ]),
-    ]
+    ];
+    if app.is_shipping() && tree.is_held() && !tree.is_main {
+        lines.push(pr_line(app, tree));
+    }
+    lines
+}
+
+/// The tree's PR: its label, its link and what its plugin says about it;
+/// why nobody could say, when nobody could.
+fn pr_line(app: &App, tree: &Tree) -> Line<'static> {
+    let t = theme();
+    let mut spans = vec![Span::styled("pr        ", fg(t.muted))];
+    match (&tree.ship, &app.ship_error) {
+        (Some(ship), _) => {
+            spans.push(Span::styled(ship.label.clone(), stage_style(ship.stage)));
+            if let Some(url) = &ship.url {
+                spans.push(Span::raw(format!("  {url}")));
+            }
+            for line in &ship.detail {
+                spans.push(Span::styled(format!("  ·  {line}"), fg(t.muted)));
+            }
+        }
+        (None, Some(why)) => spans.push(Span::styled(format!("unknown: {why}"), fg(t.muted))),
+        (None, None) => spans.push(Span::styled("none", fg(t.muted))),
+    }
+    Line::from(spans)
 }
 
 /// Each agent with its status, where it was seen and its pid.
@@ -1052,7 +1134,57 @@ fn risk(tree: &Tree) -> Vec<Span<'static>> {
             fg(t.warning),
         ));
     }
+    if let Some(ship) = tree.ship.as_ref().filter(|s| s.stage == Stage::Merged) {
+        let number = ship.number().unwrap_or_else(|| "its PR".into());
+        spans.push(Span::styled(
+            format!(", merged as {number}"),
+            stage_style(Stage::Merged),
+        ));
+    }
     spans
+}
+
+/// Asks before a ship run, which pushes the branch and opens its PR.
+fn draw_shipping(frame: &mut Frame, shipping: &Shipping) {
+    let t = theme();
+    let tree = &shipping.tree;
+    let width: u16 = 80;
+    let room = usize::from(width.saturating_sub(4 + 9));
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(" branch   ", fg(t.muted)),
+            Span::raw(tree.branch.clone().unwrap_or_default()),
+        ]),
+        Line::from(vec![
+            Span::styled(" through  ", fg(t.muted)),
+            Span::raw(shipping.plugin.clone()),
+        ]),
+    ];
+    for (i, row) in word_wrap(&shipping.intent.replace('\n', " "), room)
+        .into_iter()
+        .take(4)
+        .enumerate()
+    {
+        let label = if i == 0 { " intent   " } else { "          " };
+        lines.push(Line::from(vec![
+            Span::styled(label, fg(t.muted)),
+            Span::raw(row),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::raw(
+        " The run validates the branch, then pushes it and opens its PR.",
+    ));
+    lines.push(Line::raw(" y starts it; any other key cancels."));
+    let height = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2);
+    let area = popup::centered(frame.area(), width, height);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(dialog(format!(" Ship tree {}? ", tree.name), t.warning)),
+        area,
+    );
 }
 
 fn draw_confirm(frame: &mut Frame, pending: &Pending) {

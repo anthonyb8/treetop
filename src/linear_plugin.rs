@@ -10,12 +10,12 @@
 //! team = "END"                      # the team whose issues `list` shows
 //! ```
 
-use linear::{Client, ErrorKind, Filter, Issue};
+use linear::{Client, Detail, ErrorKind, Filter, Issue};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::plugin::{Code, Error, PROTOCOL};
-use crate::tickets::{Filters, Ticket};
+use crate::tickets::{Filters, Link, Ticket};
 
 #[derive(Debug, Deserialize)]
 struct Settings {
@@ -51,6 +51,25 @@ fn ticket(issue: Issue) -> Ticket {
         url: issue.url,
         description: issue.description,
         branch: issue.branch,
+        links: Vec::new(),
+    }
+}
+
+/// A ticket with the tickets it blocks, is blocked by and relates to.
+fn linked(detail: Detail) -> Ticket {
+    let links = detail
+        .links
+        .iter()
+        .filter(|l| matches!(l.kind.as_str(), "blocks" | "blocked by" | "related"))
+        .map(|l| Link {
+            id: l.id.clone(),
+            kind: l.kind.clone(),
+            done: l.is_done,
+        })
+        .collect();
+    Ticket {
+        links,
+        ..ticket(detail.issue)
     }
 }
 
@@ -94,7 +113,7 @@ pub fn op(op: &str, args: &Value, config: &Value) -> Result<Value, Error> {
             "protocol": PROTOCOL,
             "name": "linear",
             "kind": "tickets",
-            "ops": ["list", "get", "branch", "start"],
+            "ops": ["list", "get", "branch", "start", "finish"],
         }));
     }
     let settings: Settings = serde_json::from_value(config.clone()).map_err(|err| {
@@ -106,8 +125,8 @@ pub fn op(op: &str, args: &Value, config: &Value) -> Result<Value, Error> {
     match op {
         "list" => list(&client, &settings, args),
         "get" => {
-            let issue = client.issue(required(args, "id")?).map_err(contract)?;
-            Ok(json!(ticket(issue)))
+            let detail = client.detail(required(args, "id")?).map_err(contract)?;
+            Ok(json!(linked(detail)))
         }
         "branch" => {
             let issue = client.issue(required(args, "id")?).map_err(contract)?;
@@ -115,6 +134,10 @@ pub fn op(op: &str, args: &Value, config: &Value) -> Result<Value, Error> {
         }
         "start" => {
             client.start(required(args, "id")?).map_err(contract)?;
+            Ok(json!({}))
+        }
+        "finish" => {
+            client.finish(required(args, "id")?).map_err(contract)?;
             Ok(json!({}))
         }
         _ => Err(Error::new(

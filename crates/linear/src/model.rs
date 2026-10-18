@@ -65,6 +65,8 @@ pub struct Link {
     pub id: String,
     pub title: String,
     pub state: String,
+    /// Its status is done or cancelled, so it holds nothing up.
+    pub is_done: bool,
 }
 
 /// An issue with everything the detail pane shows.
@@ -193,11 +195,14 @@ struct RawLinked {
     state: Option<RawName>,
 }
 
-/// A name with no id, as a linked issue's status is asked for.
+/// A name with no id, as a linked issue's status is asked for, with the
+/// status's type.
 #[derive(Deserialize)]
 struct RawName {
     #[serde(default)]
     name: String,
+    #[serde(default, rename = "type")]
+    kind: String,
 }
 
 impl RawLinked {
@@ -206,6 +211,10 @@ impl RawLinked {
             kind: kind.to_string(),
             id: self.identifier,
             title: self.title,
+            is_done: self
+                .state
+                .as_ref()
+                .is_some_and(|s| matches!(s.kind.as_str(), "completed" | "canceled")),
             state: self.state.map(|s| s.name).unwrap_or_default(),
         }
     }

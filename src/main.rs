@@ -19,14 +19,17 @@ mod config;
 mod coordinator;
 mod diff;
 mod dispatch;
+mod github_plugin;
 mod jobs;
 mod linear_plugin;
 mod live;
+mod nomistakes_plugin;
 mod plugin;
 mod pool;
 mod popup;
 mod refresh;
 mod reports;
+mod ship;
 mod sidecar;
 mod theme;
 mod tickets;
@@ -54,6 +57,7 @@ use ratatui::layout::Rect;
 
 use crate::app::{App, Choice, Outcome};
 use crate::chat::Chats;
+use crate::dispatch::Recipient;
 use crate::jobs::{Kind, Worker};
 use crate::refresh::{Refresher, Update};
 
@@ -167,6 +171,37 @@ fn edit_in_editor(term: &mut Term, text: &str) -> Result<String, String> {
     }
 }
 
+/// Types `text` into each recipient's chat behind the screen, or has its
+/// plugin deliver it to one that is not running.
+fn send(
+    term: &Term,
+    app: &mut App,
+    chats: &mut Chats,
+    worker: &Worker,
+    to: Vec<Recipient>,
+    text: &str,
+) -> Result<()> {
+    let size = chat_size(term)?;
+    for recipient in to {
+        if let Some(job) = app.send_cold(&recipient, text) {
+            worker.push(job);
+            continue;
+        }
+        let agent = recipient.agent.clone();
+        let hints = recipient.plugin.as_deref().and_then(plugin::screen_of);
+        if let Err(err) = chats.deliver(
+            &recipient.command,
+            text,
+            size,
+            (recipient.agent, recipient.tree),
+            hints,
+        ) {
+            app.message = Some(format!("could not reach {agent}: {err:#}"));
+        }
+    }
+    Ok(())
+}
+
 /// Why `run` stopped showing a pool.
 enum Exit {
     Quit,
@@ -220,6 +255,15 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                     }
                 }
                 Update::Sidecars(sidecars) => app.apply_sidecars(sidecars),
+                Update::Ship(answer) => {
+                    let news = app.apply_ship(answer);
+                    if !news.is_empty() {
+                        announce(&news)?;
+                    }
+                    for job in app.ready_landings() {
+                        worker.push(job);
+                    }
+                }
                 Update::Agents(agents) => {
                     app.apply_agents(&agents);
                     let live: Vec<&Vec<String>> = agents
@@ -237,12 +281,19 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                 jobs::Event::Started(job) => app.job_started(&job),
                 jobs::Event::Finished { job, is_ok, output } => {
                     let is_preview = job.kind == Kind::Preview;
+                    if job.kind == Kind::Ship {
+                        refresher.refresh_ship();
+                    }
                     app.job_finished(job, is_ok, output);
                     if !is_preview {
                         refresher.refresh();
                     }
                 }
             }
+        }
+        if let Some(Outcome::Send { to, text }) = app.ready_failure() {
+            send(term, app, &mut chats, &worker, to, &text)?;
+            refresher.refresh_ship();
         }
         while let Ok((path, diff)) = diffs.results.try_recv() {
             is_stale = true;
@@ -447,6 +498,10 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                 agent,
                 tree,
             } => open_chat(term, app, &mut chats, &command, agent, tree)?,
+            Outcome::OpenUrl(url) => {
+                app.message =
+                    Some(actions::open_url(&url).unwrap_or_else(|err| format!("{err:#}")));
+            }
             Outcome::Browse { port, tree } => {
                 app.message =
                     Some(actions::browse(port, &tree).unwrap_or_else(|err| format!("{err:#}")));
@@ -462,26 +517,7 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                 *term = enter_screen()?;
                 refresher.refresh();
             }
-            Outcome::Send { to, text } => {
-                let size = chat_size(term)?;
-                for recipient in to {
-                    if let Some(job) = app.send_cold(&recipient, &text) {
-                        worker.push(job);
-                        continue;
-                    }
-                    let agent = recipient.agent.clone();
-                    let hints = recipient.plugin.as_deref().and_then(plugin::screen_of);
-                    if let Err(err) = chats.deliver(
-                        &recipient.command,
-                        &text,
-                        size,
-                        (recipient.agent, recipient.tree),
-                        hints,
-                    ) {
-                        app.message = Some(format!("could not reach {agent}: {err:#}"));
-                    }
-                }
-            }
+            Outcome::Send { to, text } => send(term, app, &mut chats, &worker, to, &text)?,
             Outcome::Queue(jobs) => {
                 for job in jobs {
                     worker.push(job);
@@ -517,6 +553,7 @@ fn show(term: &mut Term, start: PathBuf, mut checkout: PathBuf, is_issues: bool)
         app.is_in_tmux = tmux::is_inside();
         app.checkout = checkout.clone();
         app.user = branch::user();
+        app.ship_plugins = ship::plugins(&checkout).0;
         app.is_issues = std::mem::take(&mut is_issues);
         if let Some(mut cached) = cache::read(&checkout) {
             cached.insert(0, pool::main_tree(&checkout));

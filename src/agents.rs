@@ -97,6 +97,9 @@ pub struct Agent {
     /// The agent plugin that reported it, which `send` and `stop` go
     /// through; None for one seen another way.
     pub plugin: Option<String>,
+    /// When it last worked, in seconds since the epoch, where its source
+    /// can tell.
+    pub active_at: Option<u64>,
 }
 
 /// An agent and the directory it works in, before it is placed in a tree.
@@ -122,6 +125,7 @@ fn from_plugin(plugin: &str, seen: Seen) -> Sighting {
         attach: seen.attach.filter(|command| !command.is_empty()),
         job: seen.id,
         plugin: Some(plugin.to_string()),
+        active_at: seen.active_at,
     };
     (seen.dir, agent)
 }
@@ -248,6 +252,7 @@ mod tests {
             attach: None,
             job: None,
             plugin: None,
+            active_at: None,
         }
     }
 
