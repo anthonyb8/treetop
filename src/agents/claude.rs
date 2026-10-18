@@ -102,6 +102,7 @@ fn live_session(session: &Session, start: Option<u64>, dir: PathBuf) -> Option<S
         status: session.status.clone(),
         background: is_background,
         attach: short.map(attach),
+        active_at: None,
     })
 }
 
@@ -186,7 +187,13 @@ fn cold(live: &[Seen]) -> Vec<Seen> {
         .into_iter()
         .filter(|report| !running.contains(report.job.as_str()))
         .filter_map(|report| {
+            let active_at = report
+                .updated
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|since| since.as_secs());
             Some(Seen {
+                active_at,
                 attach: Some(attach(&report.job)),
                 id: Some(report.job),
                 name: report.name,

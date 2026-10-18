@@ -128,21 +128,31 @@ fn from_plugin(plugin: &str, seen: Seen) -> Sighting {
 
 /// What every agent plugin sees in `dirs`. A plugin that fails or answers
 /// in a shape treetop cannot read adds nothing.
-fn from_plugins(dirs: &[PathBuf]) -> Vec<Sighting> {
+/// The agents plugins report, and when each cold one last worked, by its
+/// job.
+fn from_plugins(dirs: &[PathBuf]) -> (Vec<Sighting>, HashMap<String, u64>) {
     #[derive(Deserialize)]
     struct Found {
         #[serde(default)]
         agents: Vec<Seen>,
     }
-    plugin::of_kind(Kind::Agent)
+    let mut active = HashMap::new();
+    let sightings = plugin::of_kind(Kind::Agent)
         .iter()
         .filter_map(|plugin| {
             let result = plugin.call("find", json!({ "dirs": dirs })).ok()?;
             let found: Found = serde_json::from_value(result).ok()?;
             Some((plugin.name().to_string(), found.agents))
         })
-        .flat_map(|(name, agents)| agents.into_iter().map(move |seen| from_plugin(&name, seen)))
-        .collect()
+        .flat_map(|(name, agents)| agents.into_iter().map(move |seen| (name.clone(), seen)))
+        .map(|(name, seen)| {
+            if let (Some(id), Some(at), false) = (&seen.id, seen.active_at, seen.live) {
+                active.insert(id.clone(), at);
+            }
+            from_plugin(&name, seen)
+        })
+        .collect();
+    (sightings, active)
 }
 
 /// The agents working in each tree. `processes` is the fast clock's latest
@@ -156,30 +166,60 @@ pub fn find(
 ) -> HashMap<PathBuf, Vec<Agent>> {
     let dirs: Vec<PathBuf> = trees.iter().map(|t| t.path.clone()).collect();
     let mut sightings = holder::find(trees);
-    sightings.extend(from_plugins(&dirs));
+    let (seen, active) = from_plugins(&dirs);
+    sightings.extend(seen);
     sightings.extend(procs::find(processes));
-    place(trees, sightings, sidecars)
+    place(trees, sightings, sidecars, &active)
+}
+
+/// When the tree's current lease began, in seconds since the epoch: as
+/// treetop recorded it, else as treehouse did. The main checkout is never
+/// handed out, so it has been its own all along; an available tree has no
+/// lease.
+fn lease_began(tree: &Tree, sidecars: &HashMap<PathBuf, Sidecar>) -> Option<u64> {
+    if tree.is_main {
+        return Some(0);
+    }
+    if !tree.is_held() {
+        return None;
+    }
+    sidecars
+        .get(&tree.path)
+        .map(|s| s.leased_at)
+        .or_else(|| tree.leased_at.as_deref().and_then(pool::seconds))
 }
 
 /// Puts each sighting in the tree its directory is in. A pid seen by two
 /// sources counts once, where the more specific one saw it: a Claude Code
 /// session that started in one tree and moved to another still stands in the
-/// first, but works in the second. A cold agent counts only in the tree
-/// whose sidecar names its job: a tree that has been returned and handed out
-/// again is not still the old agent's.
+/// first, but works in the second. A cold agent counts in the tree whose
+/// sidecar names its job, else in the tree it last worked in, if that was
+/// since the tree's lease began, by `active`, when each last worked: a tree
+/// that has been returned and handed out again is not still the old agent's.
 fn place(
     trees: &[Tree],
     sightings: Vec<Sighting>,
     sidecars: &HashMap<PathBuf, Sidecar>,
+    active: &HashMap<String, u64>,
 ) -> HashMap<PathBuf, Vec<Agent>> {
     let mut seen = HashSet::new();
     let mut by_tree: HashMap<PathBuf, Vec<Agent>> = HashMap::new();
     for (dir, agent) in sightings {
         let tree = if agent.status == Some(Status::Cold) {
-            trees.iter().find(|t| {
+            let named = trees.iter().find(|t| {
                 agent.job.is_some()
                     && sidecars.get(&t.path).and_then(|s| s.job.as_ref()) == agent.job.as_ref()
-            })
+            });
+            // A tree whose sidecar names another job is that job's.
+            let worked_in = pool::holding(trees, &dir).filter(|t| {
+                let is_another_jobs = sidecars.get(&t.path).is_some_and(|s| s.job.is_some());
+                let last = agent.job.as_ref().and_then(|job| active.get(job));
+                !is_another_jobs
+                    && last
+                        .zip(lease_began(t, sidecars))
+                        .is_some_and(|(at, began)| *at >= began)
+            });
+            named.or(worked_in)
         } else {
             pool::holding(trees, &dir)
         };
@@ -238,7 +278,7 @@ mod tests {
                 agent("codex", 12, Source::Process),
             ),
         ];
-        let by_tree = place(&trees, sightings, &HashMap::new());
+        let by_tree = place(&trees, sightings, &HashMap::new(), &HashMap::new());
         let names = |path: &str| -> Vec<String> {
             by_tree[Path::new(path)]
                 .iter()
@@ -273,6 +313,7 @@ mod tests {
                     status: Some("busy".into()),
                     background: true,
                     attach: None,
+                    active_at: None,
                 },
             )
         };
@@ -287,6 +328,7 @@ mod tests {
             &trees,
             vec![cold("moved", "aaaa1111"), cold("stale", "bbbb2222")],
             &sidecars,
+            &HashMap::new(),
         );
         let agents = &by_tree[Path::new("/p/9/app")];
         assert_eq!(agents.len(), 1);
@@ -294,5 +336,59 @@ mod tests {
         assert_eq!(agents[0].status, Some(Status::Cold));
         assert_eq!(agents[0].pid, None, "a cold agent has no process");
         assert!(!by_tree.contains_key(Path::new("/p/4/app")));
+    }
+
+    #[test]
+    fn a_cold_agent_stays_in_the_tree_it_worked_in_since_its_lease_began() {
+        // Tree 4 was leased by someone other than treetop, so it has no
+        // sidecar; the main checkout is never handed out again.
+        let trees = parse(
+            r#"[
+          {"name":"4","status":"leased","branch":"b","lease_holder":"claude:b","path":"/p/4/app","leased_at":"2026-10-17T12:00:00.5-04:00","processes":[]},
+          {"name":"5","status":"available","branch":"","lease_holder":null,"path":"/p/5/app","leased_at":null,"processes":[]}
+        ]"#,
+        )
+        .unwrap();
+        let cold = |name: &str, job: &str, dir: &str| {
+            from_plugin(
+                "claude",
+                Seen {
+                    id: Some(job.into()),
+                    name: name.into(),
+                    dir: PathBuf::from(dir),
+                    live: false,
+                    pid: None,
+                    status: None,
+                    background: true,
+                    attach: None,
+                    active_at: None,
+                },
+            )
+        };
+        let at = |time: &str| pool::seconds(time).unwrap();
+        let active = HashMap::from([
+            ("now0000".to_string(), at("2026-10-17T16:30:00Z")),
+            ("then000".to_string(), at("2026-10-17T15:59:00Z")),
+            ("idle000".to_string(), at("2026-10-17T16:30:00Z")),
+        ]);
+        let by_tree = place(
+            &trees,
+            vec![
+                cold("this lease's", "now0000", "/p/4/app/src"),
+                cold("an earlier lease's", "then000", "/p/4/app"),
+                cold("in a returned tree", "idle000", "/p/5/app"),
+            ],
+            &HashMap::new(),
+            &active,
+        );
+        let names: Vec<&str> = by_tree[Path::new("/p/4/app")]
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect();
+        assert_eq!(names, ["this lease's"]);
+        assert!(
+            !by_tree.contains_key(Path::new("/p/5/app")),
+            "a returned tree keeps none"
+        );
     }
 }

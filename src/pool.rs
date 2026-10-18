@@ -74,6 +74,38 @@ impl Tree {
 
 /// The tree `dir` is in. A tree can sit inside another, as a worktree under
 /// the main checkout does, so the deepest one that contains it wins.
+/// Seconds since the epoch of `time`, an RFC 3339 time as treehouse writes
+/// it: `2026-10-17T12:00:00.929051246-04:00`, or ending in `Z`.
+pub fn seconds(time: &str) -> Option<u64> {
+    let number = |range: std::ops::Range<usize>| time.get(range)?.parse::<i64>().ok();
+    let (y, m, d) = (number(0..4)?, number(5..7)?, number(8..10)?);
+    let (h, min, s) = (number(11..13)?, number(14..16)?, number(17..19)?);
+    // After the seconds, a fraction, then the offset from UTC.
+    let rest = time
+        .get(19..)?
+        .trim_start_matches(|c: char| c == '.' || c.is_ascii_digit());
+    let offset = match rest {
+        "Z" | "z" => 0,
+        _ => {
+            let sign = match rest.chars().next()? {
+                '+' => 1,
+                '-' => -1,
+                _ => return None,
+            };
+            let hours: i64 = rest.get(1..3)?.parse().ok()?;
+            let minutes: i64 = rest.get(4..6)?.parse().ok()?;
+            sign * (hours * 3_600 + minutes * 60)
+        }
+    };
+    // Days from the civil date, after Howard Hinnant's days_from_civil.
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
+    let days = era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
+    u64::try_from(days * 86_400 + h * 3_600 + min * 60 + s - offset).ok()
+}
+
 pub fn holding<'a>(trees: &'a [Tree], dir: &Path) -> Option<&'a Tree> {
     trees
         .iter()

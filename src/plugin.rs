@@ -300,6 +300,11 @@ pub struct Seen {
     /// The command that opens its chat in a terminal.
     #[serde(default)]
     pub attach: Option<Vec<String>>,
+    /// When it last worked, in seconds since the epoch. A cold agent treetop
+    /// did not start stays in its tree only if it worked there since the
+    /// tree's lease began.
+    #[serde(default)]
+    pub active_at: Option<u64>,
 }
 
 fn running() -> bool {
