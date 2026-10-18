@@ -13,6 +13,7 @@ use crate::coordinator;
 use crate::diff::Layout;
 use crate::dispatch::{Edit, Prompt, Purpose, Recipient, Target};
 use crate::jobs::{Job, Kind, Launch, Message};
+use crate::keeper::Kept;
 use crate::pool::{self, Process, Tree, Work};
 use crate::reports::{Report, State};
 use crate::sidecar::Sidecar;
@@ -340,6 +341,31 @@ impl App {
     /// Jobs still queued or running.
     pub fn active_jobs(&self) -> usize {
         self.jobs.values().filter(|s| s.is_active()).count()
+    }
+
+    /// The background agents held trees keep awake. The main checkout is
+    /// never one, and a tree with an action queued, running or just done
+    /// keeps none, so a tree being returned does not wake what its return
+    /// just stopped.
+    pub fn kept(&self) -> Vec<Kept> {
+        self.trees
+            .iter()
+            .filter(|t| t.is_held() && !t.is_main)
+            .filter(|t| {
+                self.jobs
+                    .get(&t.path)
+                    .is_none_or(|state| matches!(state, JobState::Failed(_)))
+            })
+            .flat_map(|t| &t.agents)
+            .filter(|a| a.is_background)
+            .filter_map(|a| {
+                Some(Kept {
+                    plugin: a.plugin.clone()?,
+                    id: a.job.clone()?,
+                    is_cold: a.status == Some(Status::Cold),
+                })
+            })
+            .collect()
     }
 
     /// The trees the list shows, filtered, those waiting on you first and
@@ -1638,6 +1664,58 @@ mod tests {
         assert_eq!(
             app.message.as_deref(),
             Some("tree 4 already has an action queued")
+        );
+    }
+
+    #[test]
+    fn a_held_tree_keeps_its_background_agents_until_it_is_being_returned() {
+        let mut app = app();
+        let background = |name: &str, job: &str, status: Status| Agent {
+            name: name.into(),
+            pid: None,
+            status: Some(status),
+            source: crate::agents::Source::Plugin,
+            is_background: true,
+            attach: None,
+            job: Some(job.into()),
+            plugin: Some("claude".into()),
+        };
+        let interactive = Agent {
+            is_background: false,
+            job: None,
+            ..background("claude", "", Status::Idle)
+        };
+        app.trees
+            .insert(0, pool::main_tree(std::path::Path::new("/p/main")));
+        app.apply_agents(&HashMap::from([
+            (
+                PathBuf::from("/p/main"),
+                vec![background("coordinator", "0000main", Status::Cold)],
+            ),
+            (
+                PathBuf::from("/p/4/app"),
+                vec![background("fix", "00000004", Status::Cold), interactive],
+            ),
+            (
+                PathBuf::from("/p/8/app"),
+                vec![background("docs", "00000008", Status::Idle)],
+            ),
+        ]));
+        let kept = |app: &App| -> Vec<(String, bool)> {
+            app.kept().into_iter().map(|k| (k.id, k.is_cold)).collect()
+        };
+        assert_eq!(
+            kept(&app),
+            [("00000004".into(), true), ("00000008".into(), false)]
+        );
+
+        app.selected = app.visible().iter().position(|t| t.name == "4").unwrap();
+        press(&mut app, KeyCode::Char('r'));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(
+            kept(&app),
+            [("00000008".into(), false)],
+            "a tree being returned does not wake what its return stops"
         );
     }
 
