@@ -184,6 +184,37 @@ fn stopping_a_cold_agent_unpins_it_without_starting_it() {
 }
 
 #[test]
+fn removing_an_agent_deletes_it_so_nothing_finds_it_again() {
+    let root = scratch("remove");
+    let tree = root.join("tree");
+    finished_job(&root, "0ddddddd", &tree, DAY);
+    running(&root, "0eeeeeee", &tree);
+    fs::write(
+        root.join("claude/jobs/pins.json"),
+        r#"["0ddddddd", "0eeeeeee", "0fffffff"]"#,
+    )
+    .unwrap();
+
+    let described = call(&root, "describe", json!({}));
+    assert!(
+        described["ops"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("remove")),
+        "{described}"
+    );
+    call(&root, "remove", json!({ "id": "0ddddddd" }));
+    call(&root, "remove", json!({ "id": "0eeeeeee" }));
+
+    assert_eq!(pins(&root), ["0fffffff"], "no longer kept awake");
+    let asked: Vec<String> = calls(&root)
+        .iter()
+        .map(|c| c.split_once(' ').unwrap().1.to_string())
+        .collect();
+    assert_eq!(asked, ["rm 0ddddddd", "rm 0eeeeeee"], "cold or running");
+}
+
+#[test]
 fn an_agent_started_in_a_tree_of_its_own_is_told_to_stay_in_it() {
     let root = scratch("isolated");
     let tree = root.join("tree");

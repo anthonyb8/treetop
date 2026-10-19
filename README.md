@@ -123,7 +123,7 @@ A pid two sources both see counts once, where the more specific source saw it; a
 - **Agent plugins** (see [Plugins](#plugins)), each asked what agents it sees. Claude Code's is built in: Claude Code's `EnterWorktree` moves a session into a tree without changing its process's working directory, so the plugin reads its running sessions from `~/.claude/sessions` (or `$CLAUDE_CONFIG_DIR`), checks each pid is the one that started the session, and takes the tree from the latest `cwd` in the session's transcript.
   This gives the session's name and whether it is busy, idle or waiting on you.
   It also reports every background job in `~/.claude/jobs` with no running session as a **cold** agent, drawn `◌`: Enter attaches to it, which starts it again with its conversation kept.
-  A cold agent shows in the tree whose `treetop.json` names its job, else in the tree it last worked in when that was since the tree's lease began, so one started by hand stays on its tree while a tree that has been returned and handed out again never shows the last agent.
+  An agent a plugin reports, running or cold, shows in the tree whose `treetop.json` names its job, else in the tree it last worked in when that was since the tree's lease began, so one started by hand stays on its tree while a tree that has been returned and handed out again never shows the last lease's agent, even one still running.
   It stays there however long ago it finished; only the inbox forgets a finished job after a day.
   These files are internal to Claude Code, so a release that changes them blanks this source until treetop catches up.
 - **A process** standing in the tree whose name, or the script its interpreter runs, is a known agent: `claude`, `codex`, `aider`, `opencode`, `gemini`, `goose`, `amp` or `cursor-agent`.
@@ -223,6 +223,7 @@ An agent plugin answers these ops:
 One of `away` on the screen's last few lines means the chat has left its agent for a list of other sessions, which `←` in an empty input box opens; treetop keeps `←` from it there, and opens the agent's chat again when it shows.
 Claude Code's is `{"input": "❯", "rule": "─", "dialogs": ["Do you want to", "❯ 1."], "away": ["describe a task for a new session", "enter to return"]}`; without one, treetop types on a timer.
 | `stop` | `id` | nothing; the agent stops and is no longer kept awake |
+| `remove` | `id` | nothing; the agent is deleted, running or not, so it is found nowhere again; Claude Code's is `claude rm` |
 | `keep` | `ids` | `woken`, the ids it started again; keeps the agents of held trees running, starting cold ones again |
 
 A ticket plugin answers these, with its source's settings as `config`:
@@ -259,7 +260,7 @@ Both run in the background, up to four trees at once, while treetop stays on scr
 The detail pane shows the end of each tree's last action's output, and a failure also shows its last line in the status line.
 
 - **Return** first shows a dialog listing each tree's uncommitted files, unpushed commits and running processes, or "unknown changes" where git cannot read it. On `y`, for each tree at once:
-  1. it stops the tree's background agents through their plugin, since a session that moved in with `EnterWorktree` runs from elsewhere and treehouse would not stop it, and so the tree stops keeping them awake;
+  1. it removes the tree's background agents through their plugin, running or cold, so none is found in the tree when it is leased again; a session that moved in with `EnterWorktree` runs from elsewhere, so treehouse would not stop it, and removing it can hand the tree back already, through the `WorktreeRemove` hook, which the return then takes as done; an agent its plugin cannot remove is stopped instead, so the tree stops keeping it awake;
   2. runs the `on_return` hook, if the config names one;
   3. runs `treehouse return --force`, which stops the processes left in the tree (the dialog replaces treehouse's own prompt), with `--if-lease-id` for a tree treetop leased, so a lease someone has taken since is never returned;
   4. deletes the branch treetop named for it when its work is in the pool's base branch, or when its PR merged with the branch where it is now, which covers a squash or rebase merge; a branch with commits after the merge is kept;

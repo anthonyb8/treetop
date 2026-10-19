@@ -559,6 +559,16 @@ fn stop(args: &Value) -> Result<Value, Error> {
     Ok(json!({}))
 }
 
+/// Deletes a background session, running or not, so nothing finds it again:
+/// `claude rm`. A session that entered a tree with `EnterWorktree` hands that
+/// tree back through the `WorktreeRemove` hook as it goes.
+fn remove(args: &Value) -> Result<Value, Error> {
+    let id = required(args, "id")?;
+    set_pinned(&[id], false)?;
+    claude(&["rm", id], None)?;
+    Ok(json!({}))
+}
+
 /// Answers one request as the Claude Code plugin.
 pub fn op(op: &str, args: &Value) -> Result<Value, Error> {
     match op {
@@ -566,7 +576,7 @@ pub fn op(op: &str, args: &Value) -> Result<Value, Error> {
             "protocol": PROTOCOL,
             "name": "claude",
             "kind": "agent",
-            "ops": ["start", "find", "attach", "send", "stop", "keep"],
+            "ops": ["start", "find", "attach", "send", "stop", "remove", "keep"],
             // The prompt box sits between two rules; a permission or
             // question dialog takes its place and numbers its choices. The
             // agent view, which `claude attach` goes back to, prompts for a
@@ -583,6 +593,7 @@ pub fn op(op: &str, args: &Value) -> Result<Value, Error> {
         "attach" => Ok(json!({ "argv": attach(required(args, "id")?) })),
         "send" => send(args),
         "stop" => stop(args),
+        "remove" => remove(args),
         "keep" => keep(args),
         _ => Err(Error::new(
             Code::Unsupported,

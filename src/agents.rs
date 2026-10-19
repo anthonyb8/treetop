@@ -150,7 +150,7 @@ fn from_plugins(dirs: &[PathBuf]) -> (Vec<Sighting>, HashMap<String, u64>) {
         })
         .flat_map(|(name, agents)| agents.into_iter().map(move |seen| (name.clone(), seen)))
         .map(|(name, seen)| {
-            if let (Some(id), Some(at), false) = (&seen.id, seen.active_at, seen.live) {
+            if let (Some(id), Some(at)) = (&seen.id, seen.active_at) {
                 active.insert(id.clone(), at);
             }
             from_plugin(&name, seen)
@@ -177,9 +177,10 @@ pub fn find(
 }
 
 /// When the tree's current lease began, in seconds since the epoch: as
-/// treetop recorded it, else as treehouse did. The main checkout is never
-/// handed out, so it has been its own all along; an available tree has no
-/// lease.
+/// treehouse says, else as treetop recorded it. treetop writes a sidecar on
+/// trees it did not lease too, such as one it parks, so the sidecar's time
+/// can be long after the lease began. The main checkout is never handed out,
+/// so it has been its own all along; an available tree has no lease.
 fn lease_began(tree: &Tree, sidecars: &HashMap<PathBuf, Sidecar>) -> Option<u64> {
     if tree.is_main {
         return Some(0);
@@ -187,19 +188,21 @@ fn lease_began(tree: &Tree, sidecars: &HashMap<PathBuf, Sidecar>) -> Option<u64>
     if !tree.is_held() {
         return None;
     }
-    sidecars
-        .get(&tree.path)
-        .map(|s| s.leased_at)
-        .or_else(|| tree.leased_at.as_deref().and_then(pool::seconds))
+    tree.leased_at
+        .as_deref()
+        .and_then(pool::seconds)
+        .or_else(|| sidecars.get(&tree.path).map(|s| s.leased_at))
 }
 
 /// Puts each sighting in the tree its directory is in. A pid seen by two
 /// sources counts once, where the more specific one saw it: a Claude Code
 /// session that started in one tree and moved to another still stands in the
-/// first, but works in the second. A cold agent counts in the tree whose
-/// sidecar names its job, else in the tree it last worked in, if that was
-/// since the tree's lease began, by `active`, when each last worked: a tree
-/// that has been returned and handed out again is not still the old agent's.
+/// first, but works in the second. An agent a plugin reports, running or
+/// cold, counts in the tree whose sidecar names its job, else in the tree it
+/// last worked in, if that was since the tree's lease began, by `active`,
+/// when each last worked: a tree that has been returned and handed out again
+/// is not still the old agent's, even while that agent runs on. Its process
+/// is then not counted there by another source either.
 fn place(
     trees: &[Tree],
     sightings: Vec<Sighting>,
@@ -209,7 +212,11 @@ fn place(
     let mut seen = HashSet::new();
     let mut by_tree: HashMap<PathBuf, Vec<Agent>> = HashMap::new();
     for (dir, agent) in sightings {
-        let tree = if agent.status == Some(Status::Cold) {
+        let is_timed = agent
+            .job
+            .as_ref()
+            .is_some_and(|job| active.contains_key(job));
+        let tree = if agent.status == Some(Status::Cold) || is_timed {
             let named = trees.iter().find(|t| {
                 agent.job.is_some()
                     && sidecars.get(&t.path).and_then(|s| s.job.as_ref()) == agent.job.as_ref()
@@ -228,6 +235,10 @@ fn place(
             pool::holding(trees, &dir)
         };
         let Some(tree) = tree else {
+            // A process kept from a tree is kept from it whoever saw it.
+            if let Some(pid) = agent.pid {
+                seen.insert(pid);
+            }
             continue;
         };
         if agent.pid.is_none_or(|pid| seen.insert(pid)) {
@@ -395,5 +406,93 @@ mod tests {
             !by_tree.contains_key(Path::new("/p/5/app")),
             "a returned tree keeps none"
         );
+    }
+
+    #[test]
+    fn a_running_agent_from_a_trees_earlier_lease_is_not_the_new_leases() {
+        // Tree 4 was returned while a session that had entered it kept
+        // running, then leased again for other work.
+        let trees = parse(
+            r#"[
+          {"name":"4","status":"leased","branch":"b","lease_holder":"claude:b","path":"/p/4/app","leased_at":"2026-10-17T12:00:00-04:00","processes":[]}
+        ]"#,
+        )
+        .unwrap();
+        let running = |name: &str, job: &str, pid: u32| {
+            from_plugin(
+                "claude",
+                Seen {
+                    id: Some(job.into()),
+                    name: name.into(),
+                    dir: PathBuf::from("/p/4/app"),
+                    live: true,
+                    pid: Some(pid),
+                    status: Some("idle".into()),
+                    background: true,
+                    attach: None,
+                    active_at: None,
+                },
+            )
+        };
+        let at = |time: &str| pool::seconds(time).unwrap();
+        let active = HashMap::from([
+            ("old0000".to_string(), at("2026-10-17T15:00:00Z")),
+            ("new0000".to_string(), at("2026-10-17T16:05:00Z")),
+        ]);
+        // The process scan sees the old one too, standing where it began.
+        let mut stray = agent("old, by its process", 41, Source::Process);
+        stray.status = None;
+        let by_tree = place(
+            &trees,
+            vec![
+                running("earlier lease's", "old0000", 41),
+                running("this lease's", "new0000", 42),
+                (PathBuf::from("/p/4/app"), stray),
+            ],
+            &HashMap::new(),
+            &active,
+        );
+        let names: Vec<&str> = by_tree[Path::new("/p/4/app")]
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect();
+        assert_eq!(names, ["this lease's"]);
+    }
+
+    #[test]
+    fn a_sidecar_written_after_the_lease_does_not_move_its_start() {
+        // treetop wrote tree 4's sidecar this morning, parking a tree it
+        // did not lease; the lease began weeks before, as treehouse says.
+        let trees = parse(
+            r#"[
+          {"name":"4","status":"leased","branch":"b","lease_holder":"me","path":"/p/4/app","leased_at":"2026-09-24T15:23:37-04:00","processes":[]}
+        ]"#,
+        )
+        .unwrap();
+        let at = |time: &str| pool::seconds(time).unwrap();
+        let sidecars = HashMap::from([(
+            PathBuf::from("/p/4/app"),
+            Sidecar {
+                leased_at: at("2026-10-19T12:52:06Z"),
+                ..Sidecar::leased_now()
+            },
+        )]);
+        let etl = from_plugin(
+            "claude",
+            Seen {
+                id: Some("83f4be50".into()),
+                name: "etl".into(),
+                dir: PathBuf::from("/p/4/app"),
+                live: true,
+                pid: Some(43),
+                status: Some("idle".into()),
+                background: true,
+                attach: None,
+                active_at: None,
+            },
+        );
+        let active = HashMap::from([("83f4be50".to_string(), at("2026-10-18T17:14:24Z"))]);
+        let by_tree = place(&trees, vec![etl], &sidecars, &active);
+        assert_eq!(by_tree[Path::new("/p/4/app")][0].name, "etl");
     }
 }

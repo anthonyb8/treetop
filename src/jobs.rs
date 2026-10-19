@@ -774,27 +774,53 @@ fn run_hook(name: &str, command: &[String], tree: &Path, log: &mut String) {
     }
 }
 
-/// Stops every background agent a plugin reports in the tree, through that
+/// Ends every background agent a plugin reports in the tree, through that
 /// plugin, since treehouse stops only processes standing in it, and a
-/// session that moved in with `EnterWorktree` stands elsewhere. A cold one is
-/// stopped too, so its plugin stops keeping it awake.
-fn stop_agents(tree: &Tree, log: &mut String) {
+/// session that moved in with `EnterWorktree` stands elsewhere. Each is
+/// removed where its plugin can, so it is not found in the tree once the
+/// tree is leased again, else stopped, cold ones too, so its plugin stops
+/// keeping it awake.
+fn end_agents(tree: &Tree, log: &mut String) {
     for agent in tree.agents.iter().filter(|a| a.is_background) {
         let (Some(name), Some(id)) = (&agent.plugin, &agent.job) else {
             continue;
         };
-        let stopped = plugin::named(PluginKind::Agent, name)
-            .ok_or_else(|| format!("no agent plugin {name}"))
-            .and_then(|plugin| {
-                plugin
-                    .call("stop", json!({ "id": id }))
-                    .map_err(|err| err.to_string())
-            });
-        let _ = match stopped {
+        let Some(plugin) = plugin::named(PluginKind::Agent, name) else {
+            let _ = writeln!(
+                log,
+                "could not end {} ({id}): no agent plugin {name}",
+                agent.name
+            );
+            continue;
+        };
+        let can_remove = plugin
+            .description()
+            .is_ok_and(|d| d.ops.iter().any(|op| op == "remove"));
+        if can_remove {
+            match plugin.call("remove", json!({ "id": id })) {
+                Ok(_) => {
+                    let _ = writeln!(log, "{name} removed {} ({id})", agent.name);
+                    continue;
+                }
+                Err(err) => {
+                    let _ = writeln!(
+                        log,
+                        "could not remove {} ({id}): {err}; stopping it",
+                        agent.name
+                    );
+                }
+            }
+        }
+        let _ = match plugin.call("stop", json!({ "id": id })) {
             Ok(_) => writeln!(log, "{name} stopped {} ({id})", agent.name),
-            Err(why) => writeln!(log, "could not stop {} ({id}): {why}", agent.name),
+            Err(err) => writeln!(log, "could not stop {} ({id}): {err}", agent.name),
         };
     }
+}
+
+/// Whether the tree at `path` is back in its pool, as treehouse says.
+fn is_returned(path: &Path) -> bool {
+    pool::status(path).is_ok_and(|(trees, _)| trees.iter().any(|t| t.path == path && !t.is_held()))
 }
 
 /// Deletes `branch` once the tree is back in the pool, if its work is in the
@@ -982,15 +1008,20 @@ fn land(job: &mut Job, log: &mut String) -> bool {
 fn give_back(tree: &Tree, log: &mut String) -> bool {
     let path = &tree.path;
     let record = sidecar::read(path);
-    stop_agents(tree, log);
+    end_agents(tree, log);
     run_hook("on_return", &hooks(log).on_return, path, log);
     let mut command = treehouse("return", path);
     command.arg("--force");
     if let Some(id) = record.as_ref().and_then(|r| r.lease_id.as_deref()) {
         command.args(["--if-lease-id", id]);
     }
+    // Removing an agent that entered the tree with `EnterWorktree` can hand
+    // the tree back already, through its `WorktreeRemove` hook.
     if !capture(&mut command, TREEHOUSE_LIMIT, log) {
-        return false;
+        if !is_returned(path) {
+            return false;
+        }
+        let _ = writeln!(log, "the tree was already back in the pool");
     }
     if let Some(branch) = record.as_ref().and_then(|r| r.branch.as_deref()) {
         delete_if_merged(path, branch, tree.ship.as_deref(), log);
