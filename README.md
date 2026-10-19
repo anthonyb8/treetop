@@ -402,7 +402,7 @@ An image opened fills the screen; `←` and `→` go to the issue's other images
 While an issue is open treetop takes the mouse, so selecting text there takes Shift as you drag.
 `w` switches to the next issue source, so a work and a personal workspace are one key apart, and `o` opens the issue in the browser.
 
-Number keys switch between views: `1` your open issues, `2` everyone's, `3` grouped by project, `4` grouped by status in the team's workflow order, and `5` the current cycle.
+Number keys switch between views: `1` your open issues and `2` everyone's, both grouped by status as Linear groups them, `3` grouped by project, `4` grouped by status in the team's workflow order, and `5` the current cycle.
 Views of your own go on `6` to `9`, in name order, from `[views]` in the config, each a line of filters: `mine`, and `assignee:`, `label:`, `state:` (a status, or `any`), `project:` and `cycle:` (`current` or a number), a value with spaces in double quotes, other words searched for, and `group:project` or `group:status`:
 
 ```toml
@@ -414,6 +414,7 @@ review = "mine state:\"In Review\""
 The line above the list says what it shows: whose issues, which status, and whatever else narrows them, such as `my issues · open · label Bug · “login”`.
 `/` searches: the list narrows as you type, by id, title, label and assignee, and once typing rests Linear is searched too, by title or issue number, so older issues show; Enter keeps the search and Esc clears it.
 `f` opens the filters: assignee (anyone, you, nobody, or a teammate), status (open, all, or one), label, project, cycle, and grouping, each picked from the team's own with Enter, the list following at once; `x` clears one and `c` all of them.
+In a grouped list, `z` folds the group under the cursor to its heading and `z` or Enter on the heading opens it again, as Linear folds a status; `Z` folds every group, or opens them all.
 `m` switches between yours and everyone's, `r` reads the list and the team again, and `?` shows these keys.
 
 `s` changes the issue's status, `l` its labels and `a` its assignee, each from a picker of the team's own states, labels and members that narrows as you type; labels are marked and unmarked with Tab and applied together with Enter, and the assignee picker offers you first, then nobody, then everyone else.

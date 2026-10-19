@@ -3,7 +3,7 @@
 //! and draws it.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -71,6 +71,8 @@ pub struct Screen {
     /// The view on screen, None once the filter line has changed it.
     pub(crate) view: Option<usize>,
     pub(crate) group: Group,
+    /// The groups folded to their heading, by heading, as Linear folds them.
+    pub(crate) folded: BTreeSet<String>,
     /// The search, while it is being typed, and when it was last typed in.
     pub(crate) search: Option<String>,
     search_at: Option<Instant>,
@@ -205,6 +207,7 @@ impl Screen {
             is_from_outside: false,
             is_without_source: false,
             choosing: None,
+            folded: BTreeSet::new(),
             retry: None,
             editor_text: None,
             is_loading: false,
@@ -281,6 +284,11 @@ impl Screen {
     /// may not be on the list.
     pub fn current(&self) -> Option<&Issue> {
         let Some(id) = self.trail.last() else {
+            // A folded group shows only its heading: no issue is under the
+            // cursor, so nothing is changed or picked up unseen.
+            if self.is_folded(self.selected) {
+                return None;
+            }
             return self.issues.get(self.selected);
         };
         self.issues
@@ -929,6 +937,62 @@ impl Screen {
         is_first.then_some(this.1)
     }
 
+    /// The heading of the group issue `at` is in, in a grouped list.
+    pub(crate) fn group_of(&self, at: usize) -> Option<String> {
+        if self.group == Group::None {
+            return None;
+        }
+        let team = self.teams.get(&self.source).map(Arc::as_ref);
+        Some(views::place(self.issues.get(at)?, self.group, team).1)
+    }
+
+    /// Issue `at` is in a folded group, which shows only its heading.
+    pub(crate) fn is_folded(&self, at: usize) -> bool {
+        self.group_of(at)
+            .is_some_and(|group| self.folded.contains(&group))
+    }
+
+    /// The cursor can rest on issue `at`: it shows, or it is the first of a
+    /// folded group and stands for its heading.
+    fn is_stop(&self, at: usize) -> bool {
+        !self.is_folded(at) || self.heading(at).is_some()
+    }
+
+    /// Folds the group under the cursor to its heading, or unfolds it.
+    fn toggle_fold(&mut self) {
+        let Some(group) = self.group_of(self.selected) else {
+            self.message = Some("z folds a group: 4 groups the list by status".into());
+            return;
+        };
+        if !self.folded.remove(&group) {
+            while self.selected > 0 && self.group_of(self.selected - 1).as_ref() == Some(&group) {
+                self.selected -= 1;
+            }
+            self.folded.insert(group);
+        }
+        self.scroll = 0;
+    }
+
+    /// Folds every group, or unfolds them all when every one is folded.
+    fn toggle_all_folds(&mut self) {
+        let groups: BTreeSet<String> = (0..self.issues.len())
+            .filter_map(|at| self.group_of(at))
+            .collect();
+        if groups.is_empty() {
+            self.message = Some("Z folds the groups: 4 groups the list by status".into());
+            return;
+        }
+        if groups.is_subset(&self.folded) {
+            self.folded.retain(|g| !groups.contains(g));
+        } else {
+            self.folded.extend(groups);
+            while self.selected > 0 && !self.is_stop(self.selected) {
+                self.selected -= 1;
+            }
+        }
+        self.scroll = 0;
+    }
+
     /// Shows view `at`, listing it afresh.
     fn show_view(&mut self, at: usize) {
         let Some(view) = self.views.get(at) else {
@@ -954,9 +1018,24 @@ impl Screen {
             .map_or("custom", |v| v.name.as_str())
     }
 
+    /// Moves the cursor `delta` rows, a folded group counting as one row: a
+    /// step goes to the next row there is, a jump as far as it can.
     fn move_by(&mut self, delta: isize) {
         let last = self.issues.len().saturating_sub(1);
-        let selected = self.selected.saturating_add_signed(delta).min(last);
+        let mut selected = self.selected.saturating_add_signed(delta).min(last);
+        if delta.unsigned_abs() == 1 {
+            while selected != self.selected && !self.is_stop(selected) {
+                match selected.checked_add_signed(delta).filter(|n| *n <= last) {
+                    Some(next) => selected = next,
+                    None => selected = self.selected,
+                }
+            }
+        } else {
+            let back = if delta > 0 { -1 } else { 1 };
+            while !self.is_stop(selected) && selected != self.selected {
+                selected = selected.saturating_add_signed(back);
+            }
+        }
         if selected != self.selected {
             self.selected = selected;
             self.scroll = 0;
@@ -1128,6 +1207,9 @@ impl Screen {
                         self.choosing = None;
                         return Action::Attach(Box::new(issue));
                     }
+                    if self.is_folded(self.selected) {
+                        self.toggle_fold();
+                    }
                     return Action::None;
                 }
                 KeyCode::Esc | KeyCode::Tab => {
@@ -1143,6 +1225,11 @@ impl Screen {
             KeyCode::Up | KeyCode::Char('k') => self.move_by(-1),
             KeyCode::Home | KeyCode::Char('g') => self.move_by(isize::MIN),
             KeyCode::End | KeyCode::Char('G') => self.move_by(isize::MAX),
+            KeyCode::Enter | KeyCode::Right if self.is_folded(self.selected) => {
+                self.toggle_fold();
+            }
+            KeyCode::Char('z') => self.toggle_fold(),
+            KeyCode::Char('Z') => self.toggle_all_folds(),
             KeyCode::Enter | KeyCode::Right if self.current().is_some() => {
                 self.focus = Focus::Issue;
                 self.is_from_outside = false;
@@ -1343,8 +1430,11 @@ impl Screen {
                 }
             }
             KeyCode::Char('p') => {
-                if let Some(issue) = self.current() {
-                    return Action::Pick(Box::new(issue.clone()));
+                if let Some(issue) = self.current().cloned() {
+                    // Picking up leaves the screen, so a tree's choice ends
+                    // unanswered rather than answering the next Enter.
+                    self.choosing = None;
+                    return Action::Pick(Box::new(issue));
                 }
             }
             _ => {}
@@ -1664,6 +1754,24 @@ mod tests {
         assert!(screen.choosing.is_none());
     }
 
+    /// Choosing an issue for tree 4, then picking another up instead, used
+    /// to leave the choice open, so the next Enter on any issue chose it.
+    #[test]
+    fn picking_an_issue_up_ends_choosing_one_for_a_tree() {
+        let (mut screen, _) = screen();
+        screen.choose_issue("the issue tree 4 works on".into());
+        assert!(
+            matches!(screen.handle_key(key(KeyCode::Char('p'))), Action::Pick(i) if i.id == "END-1")
+        );
+        assert!(screen.choosing.is_none());
+        screen.open();
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Enter)),
+            Action::None,
+            "Enter reads the issue rather than choosing it"
+        );
+    }
+
     #[test]
     fn m_lists_mine_or_everyones() {
         let (mut screen, fake) = screen();
@@ -1817,6 +1925,61 @@ mod tests {
         assert_eq!(screen.view_name(), "custom");
         screen.handle_key(key(KeyCode::Char('9')));
         assert!(screen.message.as_deref().unwrap().starts_with("no view 9"));
+    }
+
+    #[test]
+    fn a_status_group_folds_to_its_heading_and_the_cursor_steps_over_it() {
+        let in_state = |id: &str, state: &str| Issue {
+            state: state.into(),
+            state_id: Some(state.into()),
+            ..issue(id)
+        };
+        let fake = Arc::new(Fake {
+            name: "work".into(),
+            issues: vec![
+                in_state("END-1", "todo"),
+                in_state("END-2", "todo"),
+                in_state("END-3", "doing"),
+            ],
+            team: Some(team_of(&["todo", "doing"])),
+            ..Fake::default()
+        });
+        let mut screen = Screen::new(vec![fake], 0, Vec::new());
+        settle(&mut screen);
+        assert_eq!(
+            screen.heading(0).as_deref(),
+            Some("todo"),
+            "mine groups by status"
+        );
+        screen.handle_key(key(KeyCode::Char('g')));
+        screen.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(screen.current().unwrap().id, "END-2");
+        screen.handle_key(key(KeyCode::Char('z')));
+        assert_eq!(screen.current(), None, "a folded group is its heading");
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Char('p'))),
+            Action::None,
+            "nothing hidden is picked up"
+        );
+        let drawn = drawn(&screen).join("\n");
+        assert!(drawn.contains("▸"), "{drawn}");
+        assert!(!drawn.contains("END-1"), "{drawn}");
+        screen.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            screen.current().unwrap().id,
+            "END-3",
+            "one step past the fold"
+        );
+        screen.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(screen.current(), None, "back onto the folded heading");
+        screen.handle_key(key(KeyCode::Enter));
+        assert_eq!(screen.current().unwrap().id, "END-1", "Enter unfolds it");
+        screen.handle_key(key(KeyCode::Char('Z')));
+        assert_eq!(screen.folded.len(), 2, "Z folds every group");
+        screen.handle_key(key(KeyCode::Char('G')));
+        assert_eq!(screen.selected, 2, "the last heading");
+        screen.handle_key(key(KeyCode::Char('Z')));
+        assert!(screen.folded.is_empty(), "and unfolds them all");
     }
 
     fn team_of(states: &[&str]) -> Arc<Team> {

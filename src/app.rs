@@ -1629,7 +1629,18 @@ impl App {
     pub fn attach(&mut self, id: String) -> Option<(PathBuf, Sidecar)> {
         let (path, name) = self.attaching.take()?;
         self.is_issues = false;
-        let tree = self.trees.iter_mut().find(|t| t.path == path)?;
+        // A tree returned while its issue was chosen is free, or someone
+        // else's by now, and an issue on it would mislead.
+        let Some(tree) = self
+            .trees
+            .iter_mut()
+            .find(|t| t.path == path && t.is_held() && !t.is_main)
+        else {
+            self.message = Some(format!(
+                "tree {name} has been returned; {id} was not recorded on it"
+            ));
+            return None;
+        };
         let mut record = tree
             .sidecar
             .as_deref()
@@ -1661,6 +1672,7 @@ impl App {
     /// picked up twice; the cursor goes to its tree instead.
     pub fn pick(&mut self, id: String) -> Outcome {
         self.is_issues = false;
+        self.attaching = None;
         if let Some(path) = self.tree_of_ticket(&id).map(|t| t.path.clone()) {
             self.filter.clear();
             self.reselect(Some(path));
@@ -2170,6 +2182,41 @@ mod tests {
             app.choose_issue_for.as_deref(),
             Some("8"),
             "I chooses again"
+        );
+    }
+
+    /// `i` on a tree with no issue, then picking another issue up instead
+    /// of choosing one, then returning the tree: the next issue chosen
+    /// went to that returned tree, now free.
+    #[test]
+    fn an_issue_is_never_chosen_for_a_tree_left_behind() {
+        let mut app = app();
+        app.checkout = PathBuf::from("/p/main");
+        dispatched(&mut app, "/p/8/app", "j1");
+        app.selected = app.visible().iter().position(|t| t.name == "8").unwrap();
+        press(&mut app, KeyCode::Char('i'));
+        assert_eq!(app.choose_issue_for.as_deref(), Some("8"));
+        assert!(matches!(app.pick("END-9".into()), Outcome::Queue(_)));
+        app.returned(&PathBuf::from("/p/8/app"));
+        assert_eq!(
+            app.attach("END-7".into()),
+            None,
+            "picking up ended the choice"
+        );
+        let tree = app.trees.iter().find(|t| t.name == "8").unwrap();
+        assert!(tree.sidecar.is_none(), "the free tree carries no issue");
+    }
+
+    #[test]
+    fn an_issue_chosen_for_a_tree_returned_meanwhile_goes_nowhere() {
+        let mut app = app();
+        app.selected = app.visible().iter().position(|t| t.name == "8").unwrap();
+        press(&mut app, KeyCode::Char('I'));
+        app.returned(&PathBuf::from("/p/8/app"));
+        assert_eq!(app.attach("END-7".into()), None);
+        assert_eq!(
+            app.message.as_deref(),
+            Some("tree 8 has been returned; END-7 was not recorded on it")
         );
     }
 

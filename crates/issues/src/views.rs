@@ -50,11 +50,12 @@ impl View {
     }
 }
 
-/// Mine, all, by project, by status and the current cycle, on keys 1 to 5.
+/// Mine and all, grouped by status as Linear shows them, by project, by
+/// status and the current cycle, on keys 1 to 5.
 pub fn builtin() -> Vec<View> {
     [
-        ("mine", "mine"),
-        ("all", ""),
+        ("mine", "mine group:status"),
+        ("all", "group:status"),
         ("by project", "group:project"),
         ("by status", "group:status"),
         ("this cycle", "cycle:current"),

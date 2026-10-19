@@ -27,10 +27,11 @@ use crate::screen::{Focus, Screen};
 use crate::targets::Target;
 
 /// The bar's keys, most used first; `?` lists them all.
-const KEYS: [(&str, &str); 16] = [
+const KEYS: [(&str, &str); 17] = [
     ("Enter", "read"),
     ("p", "pick up"),
     ("?", "help"),
+    ("z", "fold"),
     ("s", "status"),
     ("l", "labels"),
     ("a", "assign"),
@@ -91,7 +92,7 @@ fn form_keys(field: Field) -> &'static [(&'static str, &'static str)] {
 }
 
 /// Every key, for the `?` overlay.
-const HELP: [(&str, &str); 23] = [
+const HELP: [(&str, &str); 24] = [
     (
         "Enter →",
         "read it: the whole issue, its description and comments",
@@ -117,6 +118,10 @@ const HELP: [(&str, &str); 23] = [
     (
         "f",
         "filters: assignee, status, label, project, cycle, grouping",
+    ),
+    (
+        "z Z",
+        "fold the status or project group under the cursor, or every group",
     ),
     (
         "1 to 5",
@@ -248,7 +253,7 @@ impl Screen {
             self.draw_footer(frame, footer, p);
         } else {
             let [list, detail, footer] = Layout::vertical([
-                Constraint::Percentage(45),
+                Constraint::Percentage(60),
                 Constraint::Fill(1),
                 Constraint::Length(1),
             ])
@@ -297,14 +302,21 @@ impl Screen {
         let mut rows: Vec<Row> = Vec::new();
         let mut cursor_row = 0;
         for (at, issue) in self.issues.iter().enumerate() {
+            let is_folded = self.is_folded(at);
             if let Some(heading) = self.heading(at) {
                 let count = self.issues[at..]
                     .iter()
                     .enumerate()
                     .take_while(|(n, _)| *n == 0 || self.heading(at + n).is_none())
                     .count();
+                // A folded group's heading is its only row, so the cursor
+                // anywhere in it sits on the heading.
+                if is_folded && self.group_of(self.selected).as_ref() == Some(&heading) {
+                    cursor_row = rows.len();
+                }
+                let glyph = if is_folded { "▸" } else { "▾" };
                 rows.push(Row::new(vec![
-                    Cell::from("▾").style(fg(p.accent)),
+                    Cell::from(glyph).style(fg(p.accent)),
                     Cell::from(""),
                     Cell::from(""),
                     Cell::from(Line::from(vec![
@@ -312,6 +324,9 @@ impl Screen {
                         Span::styled(format!("  {count}"), fg(p.muted)),
                     ])),
                 ]));
+            }
+            if is_folded {
+                continue;
             }
             if at == self.selected {
                 cursor_row = rows.len();
@@ -455,7 +470,22 @@ impl Screen {
             .border_style(fg(p.border))
             .padding(Padding::horizontal(1));
         let Some(issue) = self.current() else {
-            frame.render_widget(block, area);
+            let folded = self
+                .group_of(self.selected)
+                .filter(|_| self.is_folded(self.selected));
+            match folded {
+                Some(group) => {
+                    let count = (0..self.issues.len())
+                        .filter(|at| self.group_of(*at).as_ref() == Some(&group))
+                        .count();
+                    let text = format!("{group}: {count} issue(s), folded; z or Enter opens it");
+                    frame.render_widget(
+                        Paragraph::new(Line::styled(text, fg(p.muted))).block(block),
+                        area,
+                    );
+                }
+                None => frame.render_widget(block, area),
+            }
             return;
         };
         let block = block.title(Span::styled(
