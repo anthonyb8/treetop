@@ -548,6 +548,7 @@ impl Screen {
         let max = height.saturating_sub(inner.height);
         self.preview_max.set(max);
         self.preview_height.set(inner.height);
+        self.preview_area.set(area);
         let scroll = self.preview_scroll(&issue.id);
         let block = if max > 0 {
             block.title_bottom(Line::styled(

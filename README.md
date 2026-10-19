@@ -400,7 +400,8 @@ An open issue lists the issues it is linked to: its parent, its sub-issues, the 
 Tab moves between those links and the issue's images, and Enter or a click opens the one marked: an issue opens in its place, and Esc goes back along the issues opened, then to the list.
 Images show in the text, read with the source's key, in the terminal's own graphics where it has them (Kitty, Ghostty, WezTerm, iTerm2, through tmux with `allow-passthrough on`) and in coloured blocks anywhere else.
 An image opened fills the screen; `←` and `→` go to the issue's other images, and `o` opens it in the browser.
-While an issue is open treetop takes the mouse, so selecting text there takes Shift as you drag.
+The preview below the list scrolls with the mouse wheel over it, `J` and `K` a line, and `PgDn` and `PgUp` a page, so an issue can be read without opening it; the wheel over the list moves through the issues.
+On the Issues screen treetop takes the mouse, so selecting text there takes Shift as you drag.
 `w` switches to the next issue source, so a work and a personal workspace are one key apart, and `o` opens the issue in the browser.
 
 Number keys switch between views: `1` your open issues and `2` everyone's, both grouped by status as Linear groups them, `3` grouped by project, `4` grouped by status in the team's workflow order, and `5` the current cycle.

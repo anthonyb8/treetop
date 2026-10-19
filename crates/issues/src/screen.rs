@@ -91,6 +91,8 @@ pub struct Screen {
     /// The furthest the preview scrolls, and how tall it is, as last drawn.
     pub(crate) preview_max: Cell<u16>,
     pub(crate) preview_height: Cell<u16>,
+    /// Where the preview was last drawn, so the wheel over it scrolls it.
+    pub(crate) preview_area: Cell<Rect>,
     /// The issues opened from the open one's links, by id, the one on
     /// screen last; Esc goes back along them.
     pub(crate) trail: Vec<String>,
@@ -197,6 +199,7 @@ impl Screen {
             preview: (String::new(), 0),
             preview_max: Cell::new(0),
             preview_height: Cell::new(0),
+            preview_area: Cell::new(Rect::default()),
             view_height: Cell::new(0),
             trail: Vec::new(),
             target: None,
@@ -274,10 +277,11 @@ impl Screen {
     /// Whether the screen wants the mouse: while an issue is open, to click
     /// its links and scroll it with the wheel.
     pub fn wants_mouse(&self) -> bool {
-        self.focus == Focus::Issue
-            && self.form.is_none()
+        self.form.is_none()
             && self.picker.is_none()
             && self.compose.is_none()
+            && (self.focus == Focus::Issue
+                || (self.panel.is_none() && self.search.is_none() && !self.is_help))
     }
 
     /// The id of the issue on screen: the last one opened from a link, else
@@ -1425,6 +1429,22 @@ impl Screen {
         if !self.wants_mouse() {
             return Action::None;
         }
+        // On the list the wheel scrolls the preview when over it, and moves
+        // through the issues anywhere else.
+        if self.focus == Focus::List {
+            let is_preview = self
+                .preview_area
+                .get()
+                .contains(Position::new(mouse.column, mouse.row));
+            match (mouse.kind, is_preview) {
+                (MouseEventKind::ScrollDown, true) => self.scroll_preview(3),
+                (MouseEventKind::ScrollUp, true) => self.scroll_preview(-3),
+                (MouseEventKind::ScrollDown, false) => self.move_by(1),
+                (MouseEventKind::ScrollUp, false) => self.move_by(-1),
+                _ => {}
+            }
+            return Action::None;
+        }
         if self.viewer.is_some() {
             if matches!(mouse.kind, MouseEventKind::Down(_)) {
                 self.viewer = None;
@@ -2054,6 +2074,32 @@ mod tests {
             screen.current().unwrap().id,
             second,
             "J and K scroll; j and k still move"
+        );
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_preview_over_it_and_moves_the_list_elsewhere() {
+        let (mut screen, _) = screen();
+        drawn(&screen);
+        assert!(screen.wants_mouse(), "the list takes the wheel");
+        let first = screen.current().unwrap().id.clone();
+        screen.preview_max.set(10);
+        let preview = screen.preview_area.get();
+        let wheel = |kind, row| MouseEvent {
+            kind,
+            column: preview.x + 2,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        screen.handle_mouse(wheel(MouseEventKind::ScrollDown, preview.y + 2));
+        assert_eq!(screen.preview_scroll(&first), 3);
+        screen.handle_mouse(wheel(MouseEventKind::ScrollUp, preview.y + 2));
+        assert_eq!(screen.preview_scroll(&first), 0);
+        screen.handle_mouse(wheel(MouseEventKind::ScrollDown, 3));
+        assert_ne!(
+            screen.current().unwrap().id,
+            first,
+            "over the list it moves"
         );
     }
 
