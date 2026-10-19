@@ -14,6 +14,7 @@ use crate::agents::{Agent, Status};
 use crate::app::{
     App, DiffView, Item, JobState, LogEntry, Opening, Pending, Picker, Review, Shipping,
 };
+use crate::assistant::{self, CardState};
 use crate::chat::Chat;
 use crate::coordinator;
 use crate::diff::{Change, FileDiff, Layout as DiffLayout, Row as DiffRow, Side, ViewRow};
@@ -26,12 +27,14 @@ use crate::theme::theme;
 
 /// The bar's keys, most useful first: on a narrow bar the keys at the end
 /// are the ones left out, and `?` lists them all.
-const KEYS: [(&str, &str); 11] = [
+const KEYS: [(&str, &str); 13] = [
     ("Enter", "open"),
     ("?", "help"),
     ("n", "new"),
     ("m", "message"),
-    ("c", "coordinator"),
+    (":", "ask"),
+    ("→", "type"),
+    ("c", "chat"),
     ("d", "diff"),
     ("i", "issue"),
     ("r", "return"),
@@ -40,8 +43,18 @@ const KEYS: [(&str, &str); 11] = [
     ("q", "quit"),
 ];
 
+/// The bar's keys while the assistant's box is typed in.
+const BOX_KEYS: [(&str, &str); 6] = [
+    ("Enter", "send"),
+    ("Tab", "use the suggestion, complete @"),
+    ("↑ ↓", "suggestions"),
+    ("@17", "an agent"),
+    ("/", "start, pick, return, open"),
+    ("Esc", "back"),
+];
+
 /// Every key on the list, for the `?` overlay.
-const HELP: [(&str, &str); 24] = [
+const HELP: [(&str, &str); 27] = [
     (
         "Enter",
         "open the agent: its chat, a cold one started again, else its tree",
@@ -55,7 +68,22 @@ const HELP: [(&str, &str); 24] = [
         "new agent in a fresh tree, on a branch named for the task",
     ),
     ("m", "message the agents in the marked trees, or this one"),
-    ("c", "ask the coordinator; send nothing to open its chat"),
+    (
+        "c",
+        "talk to the assistant in its chat; send nothing to open the chat",
+    ),
+    (
+        ":",
+        "type to the assistant in its pane's box; @17 or @name sends to that agent instead",
+    ),
+    (
+        "a",
+        "show or hide the assistant: its briefing and the cards it proposes",
+    ),
+    (
+        "→",
+        "type in the assistant's box, as : does; Tab uses its suggestion, ↑ ↓ the others",
+    ),
     ("d", "diff of the tree against its base"),
     (
         "r",
@@ -139,14 +167,32 @@ pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>, issues: Option<&i
     match issues.filter(|_| app.is_issues) {
         Some(screen) => screen.draw(frame, frame.area(), &palette(), app),
         None => {
-            let [body, detail, footer] = Layout::vertical([
-                Constraint::Fill(1),
-                Constraint::Length(DETAIL_HEIGHT),
-                Constraint::Length(1),
-            ])
-            .areas(frame.area());
+            let [main, footer] =
+                Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
+            // The assistant takes a column on a wide terminal, and a band
+            // under the list on a narrow one.
+            let (list, pane) = if app.is_assistant_hidden {
+                (main, None)
+            } else if main.width >= ASSISTANT_WIDE {
+                let width = (main.width / 3).min(ASSISTANT_MOST);
+                let [list, pane] =
+                    Layout::horizontal([Constraint::Fill(1), Constraint::Length(width)])
+                        .areas(main);
+                (list, Some(pane))
+            } else {
+                let [list, pane] =
+                    Layout::vertical([Constraint::Fill(1), Constraint::Length(ASSISTANT_HEIGHT)])
+                        .areas(main);
+                (list, Some(pane))
+            };
+            let [body, detail] =
+                Layout::vertical([Constraint::Fill(1), Constraint::Length(DETAIL_HEIGHT)])
+                    .areas(list);
             draw_table(frame, app, body);
             draw_detail(frame, app, detail);
+            if let Some(pane) = pane {
+                draw_assistant(frame, app, pane);
+            }
             draw_footer(frame, app, footer);
         }
     }
@@ -721,7 +767,12 @@ fn footer_left(app: &App, width: u16) -> Line<'static> {
         ));
     }
     let used = u16::try_from(narrowing.iter().map(Span::width).sum::<usize>()).unwrap_or(width);
-    let mut spans = fitting_keys(&KEYS, width.saturating_sub(used));
+    let keys: &[(&str, &str)] = if app.box_text.is_some() {
+        &BOX_KEYS
+    } else {
+        &KEYS
+    };
+    let mut spans = fitting_keys(keys, width.saturating_sub(used));
     spans.extend(narrowing);
     Line::from(spans)
 }
@@ -792,6 +843,232 @@ fn says_cell(app: &App, tree: &Tree) -> Cell<'static> {
 
 /// Rows the detail pane takes, borders included.
 const DETAIL_HEIGHT: u16 = 12;
+
+/// The terminal width from which the assistant pane is a column beside the
+/// list rather than a band under it.
+const ASSISTANT_WIDE: u16 = 160;
+
+/// The most columns the assistant's column takes.
+const ASSISTANT_MOST: u16 = 60;
+
+/// Rows the assistant's band takes under the list, borders included.
+const ASSISTANT_HEIGHT: u16 = 12;
+
+/// How long ago `at`, seconds since the epoch, was, as short as it reads.
+fn ago(at: u64) -> String {
+    let secs = assistant::now().saturating_sub(at);
+    match secs {
+        0..60 => "just now".into(),
+        60..3_600 => format!("{}m ago", secs / 60),
+        3_600..86_400 => format!("{}h ago", secs / 3_600),
+        _ => format!("{}d ago", secs / 86_400),
+    }
+}
+
+/// The assistant pane: what you last asked and its answer, its briefing,
+/// the cards it proposes, the one under the cursor marked while the pane has
+/// the keys, and at the bottom the box you type to it in.
+fn draw_assistant(frame: &mut Frame, app: &App, area: Rect) {
+    let t = theme();
+    let state = &app.assistant;
+    let is_typing = app.box_text.is_some();
+    let border = if is_typing { t.accent } else { t.border };
+    let mut block = Block::bordered()
+        .border_style(fg(border))
+        .padding(ratatui::widgets::Padding::horizontal(1))
+        .title(Span::styled(
+            " Assistant ",
+            fg(t.title).add_modifier(Modifier::BOLD),
+        ));
+    if state.is_thinking() {
+        block = block.title(Line::styled(" thinking... ", fg(t.info)).right_aligned());
+    } else if let Some(briefing) = &state.briefing {
+        block = block.title(
+            Line::styled(format!(" updated {} ", ago(briefing.at)), fg(t.muted)).right_aligned(),
+        );
+    }
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let wrapped_rows = |lines: &[Line<'static>]| {
+        let text = Paragraph::new(lines.to_vec()).wrap(Wrap { trim: false });
+        u16::try_from(text.line_count(inner.width)).unwrap_or(u16::MAX)
+    };
+    // The box at the bottom, a rule above it, and while it is typed in, who
+    // it will reach under its `@` words.
+    let hint = app.box_hint();
+    let box_height = 2 + u16::from(hint.is_some());
+    let [content, box_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(box_height)]).areas(inner);
+    draw_assistant_box(frame, app, box_area, hint);
+    // What you asked, and its answer once it comes.
+    let mut talk: Vec<Line<'static>> = Vec::new();
+    if let Some(asked) = &state.asked {
+        talk.push(Line::from(vec![
+            Span::styled("You  ", fg(t.accent).add_modifier(Modifier::BOLD)),
+            Span::raw(asked.text.clone()),
+        ]));
+        if state.is_thinking() {
+            talk.push(Line::styled(
+                "thinking...",
+                fg(t.info).add_modifier(Modifier::ITALIC),
+            ));
+        } else if let Some(reply) = &state.reply {
+            talk.extend(issues::markdown::render(&reply.text, &palette()));
+        }
+        talk.push(Line::styled(
+            "─".repeat(usize::from(inner.width)),
+            fg(t.border),
+        ));
+    }
+    let talk_height = wrapped_rows(&talk).min(content.height / 2);
+    // The suggestions: every open one, the one the box shows marked, and
+    // what became of the ones sent since the last briefing, each a line and
+    // its reason under it.
+    let mut cards: Vec<Line<'static>> = Vec::new();
+    let mut open = 0;
+    for card in &state.cards {
+        let is_open = card.state == CardState::Open;
+        let is_here = is_open && open == app.hint;
+        let (mark, style) = match card.state {
+            CardState::Open if is_here => ("› ", fg(t.accent)),
+            CardState::Open => ("  ", Style::new()),
+            CardState::Taken => ("✓ ", fg(t.muted)),
+            CardState::Dropped => ("· ", fg(t.muted).add_modifier(Modifier::CROSSED_OUT)),
+            CardState::Failed => ("✗ ", fg(t.danger)),
+        };
+        cards.push(Line::from(vec![Span::styled(
+            format!("{mark}{}", card.summary()),
+            style,
+        )]));
+        let under = match (&card.outcome, card.state) {
+            (Some(outcome), state) if state != CardState::Open => outcome.clone(),
+            _ => card.why.clone(),
+        };
+        if !under.is_empty() {
+            cards.push(Line::styled(format!("  {under}"), fg(t.muted)));
+        }
+        if is_open {
+            open += 1;
+        }
+    }
+    if !cards.is_empty() {
+        let hint = if is_typing {
+            "Tab puts › in the box, ↑ ↓ others"
+        } else {
+            "→ then Tab to use one"
+        };
+        cards.splice(
+            0..0,
+            [
+                Line::default(),
+                Line::from(vec![
+                    Span::styled("Suggested", fg(t.title).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("   {hint}"), fg(t.muted)),
+                ]),
+            ],
+        );
+    }
+    let left = content.height.saturating_sub(talk_height);
+    let cards_height = wrapped_rows(&cards).min(left / 2);
+    let briefing = match &state.briefing {
+        Some(briefing) => issues::markdown::render(&briefing.markdown, &palette()),
+        None => vec![
+            Line::styled("No briefing yet.", fg(t.muted).add_modifier(Modifier::BOLD)),
+            Line::default(),
+            Line::styled(
+                "The assistant writes here where your agents stand: what needs you, \
+                 what is done, what is working. Under it go its suggestions, each a \
+                 next step, which the box below shows for Tab to put in and Enter to send.",
+                fg(t.muted),
+            ),
+            Line::default(),
+            Line::styled(
+                "→ types in the box: \"what needs me?\" for a start, or @17 to message an \
+                 agent. It also wakes on its own when an agent needs you or finishes, \
+                 or a PR changes.",
+                fg(t.muted),
+            ),
+        ],
+    };
+    // The cards follow the briefing; a long briefing gives up the rows the
+    // cards need, and is cut at the bottom.
+    let briefing_height = wrapped_rows(&briefing).min(left.saturating_sub(cards_height));
+    let [talk_area, briefing_area, cards_area, _] = Layout::vertical([
+        Constraint::Length(talk_height),
+        Constraint::Length(briefing_height),
+        Constraint::Length(cards_height),
+        Constraint::Fill(1),
+    ])
+    .areas(content);
+    for (lines, area) in [
+        (talk, talk_area),
+        (briefing, briefing_area),
+        (cards, cards_area),
+    ] {
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    }
+}
+
+/// The box at the bottom of the assistant pane: what is being typed, with
+/// the cursor in it, or how to start typing.
+fn draw_assistant_box(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    hint: Option<Result<String, String>>,
+) {
+    let t = theme();
+    let mut lines = vec![Line::styled(
+        "─".repeat(usize::from(area.width)),
+        fg(t.border),
+    )];
+    if let Some(hint) = hint {
+        lines.push(match hint {
+            Ok(reached) => Line::styled(format!("→ {reached}"), fg(t.info)),
+            Err(why) => Line::styled(why, fg(t.danger)),
+        });
+    }
+    let row = area.y + u16::try_from(lines.len()).unwrap_or(0);
+    // An empty box shows the suggestion Tab would put in it.
+    let ghost = app
+        .assistant
+        .open_cards()
+        .get(app.hint)
+        .map(|card| card.box_text());
+    match &app.box_text {
+        Some(text) if text.is_empty() && ghost.is_some() => {
+            lines.push(Line::from(vec![
+                Span::styled("› ", fg(t.accent).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    ghost.unwrap_or_default(),
+                    fg(t.muted).add_modifier(Modifier::ITALIC),
+                ),
+                Span::styled("  Tab", fg(t.accent)),
+            ]));
+            frame.set_cursor_position((area.x + 2, row));
+        }
+        Some(text) => {
+            // The end of a long line stays in view, where the cursor is.
+            let room = usize::from(area.width.saturating_sub(3)).max(1);
+            let skip = text.chars().count().saturating_sub(room);
+            let shown: String = text.chars().skip(skip).collect();
+            let x = u16::try_from(shown.chars().count() + 2).unwrap_or(0);
+            lines.push(Line::from(vec![
+                Span::styled("› ", fg(t.accent).add_modifier(Modifier::BOLD)),
+                Span::raw(shown),
+            ]));
+            frame.set_cursor_position((area.x + x.min(area.width.saturating_sub(1)), row));
+        }
+        None => lines.push(Line::from(vec![
+            Span::styled("› ", fg(t.muted)),
+            Span::styled(
+                "→ to type here · @17 messages an agent · /return 33",
+                fg(t.muted).add_modifier(Modifier::ITALIC),
+            ),
+        ])),
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
 
 /// The tree under the cursor in full: where it is, its agents, what it
 /// serves and runs, what its agent last said with its latest steps, and its
@@ -1013,8 +1290,12 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
     let area = popup::centered(screen, width, text_height + chrome);
     let (title, placeholder) = match (prompt.target(), &prompt.purpose) {
         (Some(Target::Coordinator), _) => (
-            " Ask the coordinator ".to_string(),
-            "ask about the agents or give it work; send nothing to just open its chat",
+            " Talk to the assistant ".to_string(),
+            "a message for its chat, or send nothing to open the chat",
+        ),
+        (Some(Target::Ask), _) => (
+            " Ask the assistant ".to_string(),
+            "what to do or find out; it answers in its pane, with cards to take",
         ),
         (Some(Target::NewTree), _) => (
             " New agent in a fresh tree ".to_string(),
@@ -1554,7 +1835,7 @@ fn draw_opening(frame: &mut Frame, app: &App, opening: &Opening) {
 }
 
 fn opening_note(agent: &str) -> String {
-    if agent == coordinator::NAME {
+    if coordinator::is_assistant(agent) {
         "opening the coordinator...".into()
     } else {
         format!("opening {agent}...")
@@ -1566,7 +1847,7 @@ fn opening_note(agent: &str) -> String {
 fn chat_frame(frame: &mut Frame, app: &App, agent: &str, tree: &str) -> Rect {
     let t = theme();
     let area = popup::area(frame.area());
-    let title = if agent == coordinator::NAME {
+    let title = if coordinator::is_assistant(agent) {
         vec![Span::styled(" coordinator ", t.badge)]
     } else {
         let branch = app

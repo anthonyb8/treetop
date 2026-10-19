@@ -45,6 +45,9 @@ pub enum Action {
     Attach(Box<Issue>),
     /// Open this URL in the browser.
     Open(String),
+    /// Ask the program's assistant something, about what this says is on
+    /// screen.
+    Ask(String),
 }
 
 /// What fills the screen: the list, with the issue under the cursor
@@ -1496,6 +1499,16 @@ impl Screen {
     /// list and from inside the issue.
     fn on_issue(&mut self, key: KeyEvent) -> Action {
         match key.code {
+            KeyCode::Char(':') => {
+                let context = match self.current() {
+                    Some(issue) => format!(
+                        "the Issues screen, on {} \"{}\" ({})",
+                        issue.id, issue.title, issue.state
+                    ),
+                    None => "the Issues screen".to_string(),
+                };
+                return Action::Ask(context);
+            }
             KeyCode::Char('q') => return Action::Quit,
             KeyCode::Char('?') => self.is_help = true,
             KeyCode::Char('s') => self.open_picker(picker::Kind::Status),
@@ -1851,6 +1864,15 @@ mod tests {
             screen.handle_key(key(KeyCode::Enter)),
             Action::None,
             "Enter reads the issue rather than choosing it"
+        );
+    }
+
+    #[test]
+    fn colon_asks_the_assistant_about_the_issue_under_the_cursor() {
+        let (mut screen, _) = screen();
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Char(':'))),
+            Action::Ask("the Issues screen, on END-1 \"END-1 title\" ()".into())
         );
     }
 

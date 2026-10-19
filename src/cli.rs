@@ -1,7 +1,9 @@
 //! treetop's commands that print and exit rather than open the screen:
-//! `status`, `send` and `dispatch`. They are how the coordinator sees and
-//! steers the other agents, and work as well from any shell. Each reads only
-//! what it needs, so a call costs the coordinator one small JSON read.
+//! `status`, `send` and `dispatch`, and the assistant's `brief`, `propose`
+//! and `cards`. They are how the coordinator sees the other agents and puts
+//! what it makes of them on screen, and work as well from any shell. Each
+//! reads only what it needs, so a call costs the coordinator one small JSON
+//! read.
 
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -12,6 +14,7 @@ use serde_json::{Value, json};
 
 use crate::agents;
 use crate::app::report_state;
+use crate::assistant::{self, Action};
 use crate::builtin;
 use crate::cache;
 use crate::chat::Chats;
@@ -37,6 +40,11 @@ const USAGE: &str = "usage:
                                    the main checkout or tree N
   treetop tickets [--mine] [words] this repository's open tickets, from its ticket source
   treetop pick <ID>                pick a ticket up: an agent on it in a fresh tree
+  treetop brief                    put the Markdown on stdin up as the assistant's briefing
+  treetop say                      put the Markdown on stdin up as the assistant's answer
+  treetop propose <send|dispatch|pick|return|open> <args> --why <text>
+                                   add a card to the assistant pane, which one key takes
+  treetop cards                    the assistant's cards and what became of each, as JSON
   treetop plugins                  every plugin, built in or found, and what each is
   treetop plugin <name>            answer one request on stdin as a built-in plugin";
 
@@ -114,6 +122,10 @@ pub fn run(args: &[String], checkout: &Path) -> Result<()> {
         }
         [command, rest @ ..] if command == "tickets" => tickets(checkout, rest),
         [command, id] if command == "pick" => pick(checkout, id),
+        [command] if command == "brief" => brief(checkout),
+        [command] if command == "say" => say(checkout),
+        [command, action, rest @ ..] if command == "propose" => propose(checkout, action, rest),
+        [command] if command == "cards" => cards(checkout),
         _ => bail!("{USAGE}"),
     }
 }
@@ -218,7 +230,7 @@ fn report_json(report: &Report, trees: &[Tree], now: SystemTime) -> Value {
 fn status_json(trees: &[Tree], reports: &[Report], ready: &[String], now: SystemTime) -> Value {
     let reports: Vec<&Report> = reports
         .iter()
-        .filter(|r| r.name != coordinator::NAME)
+        .filter(|r| !coordinator::is_assistant(&r.name))
         .collect();
     let holding = |report: &Report| reports::tree_of(report, trees).map(|tree| tree.path.clone());
     let mut listed = Vec::new();
@@ -227,7 +239,7 @@ fn status_json(trees: &[Tree], reports: &[Report], ready: &[String], now: System
         let agents: Vec<Value> = tree
             .agents
             .iter()
-            .filter(|a| a.name != coordinator::NAME)
+            .filter(|a| !coordinator::is_assistant(&a.name))
             .map(|a| {
                 json!({
                     "name": a.name,
@@ -280,6 +292,65 @@ fn status_json(trees: &[Tree], reports: &[Report], ready: &[String], now: System
     })
 }
 
+/// The assistant's state file for `checkout`.
+fn assistant_path(checkout: &Path) -> Result<PathBuf> {
+    assistant::path(checkout)
+        .ok_or_else(|| anyhow::anyhow!("no home directory to keep the assistant's state in"))
+}
+
+/// Puts the Markdown on stdin up as the briefing.
+fn brief(checkout: &Path) -> Result<()> {
+    let mut markdown = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut markdown)?;
+    if markdown.trim().is_empty() {
+        bail!("usage: treetop brief < briefing.md (the briefing is read from stdin)");
+    }
+    assistant::update(&assistant_path(checkout)?, |state| {
+        state.brief(&markdown, assistant::now());
+    })?;
+    Ok(())
+}
+
+/// Puts the Markdown on stdin up as the assistant's answer to what was asked.
+fn say(checkout: &Path) -> Result<()> {
+    let mut markdown = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut markdown)?;
+    if markdown.trim().is_empty() {
+        bail!("usage: treetop say < answer.md (the answer is read from stdin)");
+    }
+    assistant::update(&assistant_path(checkout)?, |state| {
+        state.say(&markdown, assistant::now());
+    })?;
+    Ok(())
+}
+
+/// Adds a card: `propose <action> <args...> --why <text>`.
+fn propose(checkout: &Path, action: &str, rest: &[String]) -> Result<()> {
+    let Some(action) = Action::parse(action) else {
+        bail!("treetop propose takes send, dispatch, pick, return or open, not {action}");
+    };
+    let (words, why) = match rest.iter().position(|w| w == "--why") {
+        Some(at) => (&rest[..at], rest[at + 1..].join(" ")),
+        None => (rest, String::new()),
+    };
+    let id = assistant::update(&assistant_path(checkout)?, |state| {
+        state.propose(action, words, &why, assistant::now())
+    })?
+    .map_err(|usage| anyhow::anyhow!(usage))?;
+    println!("{id}");
+    Ok(())
+}
+
+/// Prints the cards, newest first, with what became of each.
+fn cards(checkout: &Path) -> Result<()> {
+    let state = assistant::read_from(&assistant_path(checkout)?);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({ "cards": state.cards }))?
+    );
+    Ok(())
+}
+
 fn status(checkout: &Path) -> Result<()> {
     let mut trees = listing(checkout)?;
     read_agents(&mut trees);
@@ -307,7 +378,7 @@ fn recipients(trees: &[Tree], reports: &[Report], target: &str) -> Vec<Recipient
     let chats = |tree: &Tree, is_named: &dyn Fn(&str) -> bool| -> Vec<Recipient> {
         tree.agents
             .iter()
-            .filter(|a| a.name != coordinator::NAME && is_named(&a.name))
+            .filter(|a| !coordinator::is_assistant(&a.name) && is_named(&a.name))
             .filter_map(|a| Recipient::of(a, &tree.name))
             .collect()
     };
@@ -323,7 +394,7 @@ fn recipients(trees: &[Tree], reports: &[Report], target: &str) -> Vec<Recipient
     }
     reports
         .iter()
-        .filter(|r| r.name != coordinator::NAME && r.name.eq_ignore_ascii_case(target))
+        .filter(|r| !coordinator::is_assistant(&r.name) && r.name.eq_ignore_ascii_case(target))
         .max_by_key(|r| r.updated)
         .map(|r| {
             let tree = reports::tree_of(r, trees);

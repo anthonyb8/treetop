@@ -9,6 +9,7 @@
 mod actions;
 mod agents;
 mod app;
+mod assistant;
 mod branch;
 mod builtin;
 mod cache;
@@ -286,6 +287,7 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                 }
             }
         }
+        is_stale |= app.read_assistant();
         while let Ok(event) = worker.events.try_recv() {
             is_stale = true;
             match event {
@@ -301,6 +303,9 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                     }
                 }
             }
+        }
+        if let Some(Outcome::Send { to, text }) = app.ready_wake() {
+            send(term, app, &mut chats, &worker, to, &text)?;
         }
         if let Some(Outcome::Send { to, text }) = app.ready_failure() {
             send(term, app, &mut chats, &worker, to, &text)?;
@@ -489,6 +494,10 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                 }
                 issues::Action::Quit => app.quit(),
                 issues::Action::Pick(issue) => app.pick(issue.id),
+                issues::Action::Ask(context) => {
+                    app.open_ask(Some(context));
+                    Outcome::Continue
+                }
                 issues::Action::Attach(issue) => {
                     if let Some((tree, record)) = app.attach(issue.id)
                         && let Err(err) = sidecar::write(&tree, &record)
@@ -573,6 +582,10 @@ fn show(term: &mut Term, start: PathBuf, mut checkout: PathBuf, is_issues: bool)
         let mut app = App::new(here.take());
         app.is_in_tmux = tmux::is_inside();
         app.checkout = checkout.clone();
+        app.assistant_path = assistant::path(&checkout);
+        app.wakes = config::load()
+            .map(|c| c.assistant.wake)
+            .unwrap_or_else(|_| config::WAKES.map(String::from).into());
         app.user = branch::user();
         app.ship_plugins = ship::plugins(&checkout).0;
         app.is_issues = std::mem::take(&mut is_issues);

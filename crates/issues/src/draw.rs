@@ -74,7 +74,7 @@ fn form_keys(field: Field) -> &'static [(&'static str, &'static str)] {
 }
 
 /// Every key, for the `?` overlay.
-const HELP: [(&str, &str); 25] = [
+const HELP: [(&str, &str); 26] = [
     (
         "Enter →",
         "read it: the whole issue, its description and comments",
@@ -125,6 +125,10 @@ const HELP: [(&str, &str); 25] = [
     ("j k ↑ ↓", "move, or scroll the issue you are reading"),
     ("Space PgUp", "a page down or up in the issue"),
     ("g G", "top, bottom"),
+    (
+        ":",
+        "ask the assistant about this issue; it answers in its pane",
+    ),
     ("Tab", "back to the trees"),
     ("q", "quit"),
 ];

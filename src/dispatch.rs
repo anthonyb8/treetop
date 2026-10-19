@@ -13,6 +13,9 @@ pub enum Target {
     /// The one agent that oversees the rest, started in the main checkout on
     /// first use; see `coordinator`.
     Coordinator,
+    /// One line for the coordinator, answered on screen as the assistant:
+    /// in its briefing and cards, not in its chat.
+    Ask,
     /// A new agent in a tree the pool hands out when the job runs, so two
     /// quick dispatches never share one.
     NewTree,

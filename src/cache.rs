@@ -25,11 +25,14 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     })
 }
 
+/// A name for the workspace checked out at `checkout` that stays the same
+/// across runs, for the files kept per workspace.
+pub fn key(checkout: &Path) -> String {
+    format!("{:016x}", fnv1a(checkout.as_os_str().as_encoded_bytes()))
+}
+
 fn file(dir: &Path, checkout: &Path) -> PathBuf {
-    dir.join(format!(
-        "{:016x}.json",
-        fnv1a(checkout.as_os_str().as_encoded_bytes())
-    ))
+    dir.join(format!("{}.json", key(checkout)))
 }
 
 fn read_from(dir: &Path, checkout: &Path) -> Option<Vec<Tree>> {

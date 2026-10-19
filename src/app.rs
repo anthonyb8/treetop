@@ -9,6 +9,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 
 use crate::agents::{Agent, Status};
+use crate::assistant::{self, Action, CardState};
 use crate::coordinator;
 use crate::diff::Layout;
 use crate::dispatch::{Edit, Prompt, Purpose, Recipient, Target};
@@ -208,6 +209,26 @@ pub enum Outcome {
     },
 }
 
+/// How long the assistant's events gather after the first, so a burst goes
+/// as one message.
+const WAKE_BATCH: Duration = Duration::from_secs(30);
+
+/// The least time between two wakes of the assistant.
+const WAKE_GAP: Duration = Duration::from_secs(120);
+
+/// What the assistant is sent when events wake it.
+fn wake_message(events: &[String]) -> String {
+    let mut text = String::from("Events since your last turn:\n");
+    for event in events {
+        text.push_str(&format!("- {event}\n"));
+    }
+    text.push_str(
+        "Run `treetop status`, then update the briefing with `treetop brief` and add any \
+         cards with `treetop propose`. Say nothing else.",
+    );
+    text
+}
+
 #[derive(Default)]
 pub struct App {
     pub trees: Vec<Tree>,
@@ -228,6 +249,34 @@ pub struct App {
     /// The Issues screen is shown in place of the trees; the program
     /// around the app owns it and gives it the keys.
     pub is_issues: bool,
+    /// What the assistant keeps on screen, as last read from its file.
+    pub assistant: assistant::State,
+    /// Where that file is: the workspace's, set once the screen opens; None
+    /// keeps the assistant in memory, as in tests.
+    pub assistant_path: Option<PathBuf>,
+    /// When the assistant's file was last read changed, so it is read again
+    /// only when it changes.
+    assistant_read: Option<std::time::SystemTime>,
+    /// The assistant pane is hidden, with `a`.
+    pub is_assistant_hidden: bool,
+    /// The suggestion the empty box shows, an index into the open cards,
+    /// which `↑`/`↓` move through and Tab takes.
+    pub hint: usize,
+    /// The suggestion Tab put in the box, taken when the box is sent.
+    accepted: Option<String>,
+    /// What `:` is asked about: what was on screen when it opened.
+    ask_context: Option<String>,
+    /// The pane's box, while it is being typed in: a question for the
+    /// assistant, or `@17 ...` for an agent.
+    pub box_text: Option<String>,
+    /// The events that wake the assistant, of `config::WAKES`.
+    pub wakes: Vec<String>,
+    /// Events waiting to go to the assistant, a line each.
+    wake_events: Vec<String>,
+    /// When the first of them came, which the batch waits on.
+    wake_first: Option<Instant>,
+    /// When the assistant was last woken, which the next waits on.
+    wake_sent: Option<Instant>,
     /// The issue to open on the Issues screen as it comes on, by id, taken
     /// once by the program around the app.
     pub open_issue: Option<String>,
@@ -680,7 +729,7 @@ impl App {
             self.jobs
                 .insert(path.clone(), JobState::Done(job.kind, Instant::now()));
             self.message = Some(if is_coordinator {
-                "the coordinator started on your message; c, Enter opens its chat".to_string()
+                "the assistant started on your message; it answers in its pane".to_string()
             } else if job.tree.is_main {
                 "dispatched to the main checkout; Enter on it opens its chat".to_string()
             } else {
@@ -703,7 +752,7 @@ impl App {
             match (self.opening.as_mut(), job.attach.clone()) {
                 (None, _) => {
                     self.message = Some(if is_coordinator {
-                        "the coordinator started; c, Enter opens its chat".to_string()
+                        "the assistant started; c, Enter opens its chat".to_string()
                     } else {
                         format!(
                             "agent started in tree {}; Enter on it opens its chat",
@@ -1087,8 +1136,65 @@ impl App {
                 })
                 .collect(),
         };
+        if let Some(last) = &self.last_states {
+            let events: Vec<String> = items
+                .iter()
+                .filter(|item| !coordinator::is_assistant(&item.report.name))
+                .filter_map(|item| {
+                    let was = last.get(&item.report.job).copied();
+                    let (wake, said) = match item.state {
+                        State::Blocked if was != Some(State::Blocked) => ("needs_you", "needs you"),
+                        State::Done if was.is_some_and(|w| w != State::Done) => ("done", "is done"),
+                        _ => return None,
+                    };
+                    // A report's tree is its agent's, else the one its
+                    // directory is in.
+                    let tree = item
+                        .tree
+                        .or_else(|| pool::holding(&self.trees, item.report.dir.as_deref()?))
+                        .map_or("a tree".to_string(), |t| format!("tree {}", t.name));
+                    let first = item.text().lines().next().unwrap_or_default().to_string();
+                    Some((
+                        wake,
+                        format!("{tree} ({}) {said}: {first}", item.report.name),
+                    ))
+                })
+                .filter(|(wake, _)| self.wakes.iter().any(|w| w == wake))
+                .map(|(_, line)| line)
+                .collect();
+            self.wake(events);
+        }
         self.last_states = Some(states);
         news
+    }
+
+    /// Holds `events` for the assistant, to go in the next batch.
+    fn wake(&mut self, events: Vec<String>) {
+        if events.is_empty() {
+            return;
+        }
+        self.wake_first.get_or_insert_with(Instant::now);
+        self.wake_events.extend(events);
+    }
+
+    /// The batch of events to send the assistant, once the first has waited
+    /// WAKE_BATCH and the last batch WAKE_GAP. Events with no assistant to
+    /// tell are let go: nothing is started for them.
+    pub fn ready_wake(&mut self) -> Option<Outcome> {
+        let first = self.wake_first?;
+        let is_due = first.elapsed() >= WAKE_BATCH
+            && self.wake_sent.is_none_or(|at| at.elapsed() >= WAKE_GAP);
+        if !is_due {
+            return None;
+        }
+        self.wake_first = None;
+        let events = std::mem::take(&mut self.wake_events);
+        let to = self.coordinator()?;
+        self.wake_sent = Some(Instant::now());
+        Some(Outcome::Send {
+            to: vec![to],
+            text: wake_message(&events),
+        })
     }
 
     /// Every report, what needs you first, then what finished, then what is
@@ -1113,7 +1219,7 @@ impl App {
     pub fn says(&self, tree: &Tree) -> Option<Item<'_>> {
         self.reports
             .iter()
-            .filter(|r| r.name != coordinator::NAME)
+            .filter(|r| !coordinator::is_assistant(&r.name))
             .filter(|r| {
                 crate::reports::tree_of(r, &self.trees).is_some_and(|t| t.path == tree.path)
             })
@@ -1127,7 +1233,7 @@ impl App {
     pub fn needs_you(&self, tree: &Tree) -> bool {
         tree.agents
             .iter()
-            .any(|a| a.status == Some(Status::Waiting) && a.name != coordinator::NAME)
+            .any(|a| a.status == Some(Status::Waiting) && !coordinator::is_assistant(&a.name))
             || self.says(tree).is_some_and(|i| i.state == State::Blocked)
             || tree.ship.as_ref().is_some_and(|s| s.stage.needs_you())
     }
@@ -1186,6 +1292,21 @@ impl App {
                 })
                 .collect(),
         };
+        if let Some(last) = &self.last_stages
+            && self.wakes.iter().any(|w| w == "pr")
+        {
+            let events: Vec<String> = self
+                .trees
+                .iter()
+                .filter_map(|tree| {
+                    let ship = tree.ship.as_ref()?;
+                    let is_new = last.get(&tree.path) != Some(&ship.stage);
+                    let matters = ship.stage.needs_you() || ship.stage == Stage::Merged;
+                    (is_new && matters).then(|| format!("tree {} PR: {}", tree.name, ship.label))
+                })
+                .collect();
+            self.wake(events);
+        }
         self.last_stages = Some(stages);
         self.follow_merges();
         news
@@ -1372,7 +1493,7 @@ impl App {
         self.items()
             .iter()
             .filter(|i| i.tree.is_none() && i.state == State::Blocked)
-            .filter(|i| i.report.name != coordinator::NAME)
+            .filter(|i| !coordinator::is_assistant(&i.report.name))
             .count()
     }
 
@@ -1415,6 +1536,462 @@ impl App {
     /// Opens the compose box for a new agent in a fresh tree.
     fn open_dispatch(&mut self) {
         self.prompt = Some(Prompt::dispatch(Target::NewTree, self.user.clone()));
+    }
+
+    /// Reads the assistant's file again if it changed since the last read;
+    /// returns whether it did.
+    pub fn read_assistant(&mut self) -> bool {
+        let Some(path) = self.assistant_path.clone() else {
+            return false;
+        };
+        let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        if modified == self.assistant_read {
+            return false;
+        }
+        self.assistant_read = modified;
+        self.assistant = assistant::read_from(&path);
+        self.hint = 0;
+        true
+    }
+
+    /// Records what became of card `id`, on screen and in the file.
+    fn settle_card(&mut self, id: &str, state: CardState, outcome: String) {
+        self.assistant.settle(id, state, Some(outcome.clone()));
+        if let Some(path) = &self.assistant_path {
+            let written = assistant::update(path, |s| s.settle(id, state, Some(outcome)));
+            if let Err(err) = written {
+                self.message = Some(format!("could not record the card: {err}"));
+            }
+        }
+        self.hint = 0;
+    }
+
+    /// The tree a card names: its number, `main`, or an agent's name.
+    fn card_tree(&self, place: &str) -> Option<Tree> {
+        self.trees
+            .iter()
+            .find(|t| {
+                t.name == place
+                    || (place == "main" && t.is_main)
+                    || t.agents.iter().any(|a| a.name == place)
+            })
+            .cloned()
+    }
+
+    /// The agents of `tree` that a message can be typed to.
+    fn recipients(tree: &Tree) -> Vec<Recipient> {
+        tree.agents
+            .iter()
+            .filter_map(|a| Recipient::of(a, &tree.name))
+            .collect()
+    }
+
+    /// Runs a `/` command of the box, an action a suggestion proposes, through
+    /// what its key would do: what it did, and what for the program to do
+    /// next; or why it cannot.
+    fn run_action(&mut self, action: Action, args: &[String]) -> Result<(String, Outcome), String> {
+        let arg = |at: usize| args.get(at).cloned().unwrap_or_default();
+        match action {
+            Action::Send => {
+                let tree = self
+                    .card_tree(&arg(0))
+                    .ok_or_else(|| format!("no tree {}", arg(0)))?;
+                let to = Self::recipients(&tree);
+                if to.is_empty() {
+                    return Err(format!("tree {} has no agent to tell", tree.name));
+                }
+                Ok((
+                    format!("sent to tree {}", tree.name),
+                    Outcome::Send { to, text: arg(1) },
+                ))
+            }
+            Action::Dispatch => {
+                let then = match arg(0).as_str() {
+                    "new" => self.dispatch(arg(1), None),
+                    place => {
+                        let tree = self
+                            .card_tree(place)
+                            .ok_or_else(|| format!("no tree {place}"))?;
+                        self.start(tree, Launch::agent(arg(1), false))
+                    }
+                };
+                let place = match arg(0).as_str() {
+                    "new" => "a new tree".to_string(),
+                    "main" => "the main checkout".to_string(),
+                    n => format!("tree {n}"),
+                };
+                Ok((format!("starting in {place}"), then))
+            }
+            Action::Pick => Ok((format!("picking up {}", arg(0)), self.pick(arg(0)))),
+            Action::Return => {
+                let tree = self
+                    .card_tree(&arg(0))
+                    .ok_or_else(|| format!("no tree {}", arg(0)))?;
+                // The return dialog is asked of this tree alone, the marks
+                // kept for afterwards.
+                let marked = std::mem::take(&mut self.marked);
+                let cursor = self.selected;
+                self.reselect(Some(tree.path.clone()));
+                let trees = self.targets(Kind::Return);
+                self.marked = marked;
+                self.selected = cursor;
+                if trees.is_empty() {
+                    return Err(self
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| format!("tree {} cannot be returned", tree.name)));
+                }
+                self.pending = Some(Pending { trees });
+                Ok(("return asked".into(), Outcome::Continue))
+            }
+            Action::Open => Ok(("opened".into(), Outcome::OpenUrl(arg(0)))),
+        }
+    }
+
+    /// Records how the suggestion the box was sent from went, if it was.
+    fn settle_accepted(&mut self, result: &Result<String, String>) {
+        if let Some(id) = self.accepted.take() {
+            match result {
+                Ok(said) => self.settle_card(&id, CardState::Taken, said.clone()),
+                Err(why) => self.settle_card(&id, CardState::Failed, why.clone()),
+            }
+        }
+    }
+
+    /// Runs the box's `/` command `text`: `/start <new|main|N> <task>`,
+    /// `/pick <issue>`, `/return <tree>` or `/open <url>`.
+    fn run_command(&mut self, text: &str) -> Outcome {
+        let mut words = text.trim_start_matches('/').split_whitespace();
+        let name = words.next().unwrap_or_default();
+        let rest: Vec<String> = words.map(str::to_string).collect();
+        let action = match Action::parse(name) {
+            Some(action) if action != Action::Send => action,
+            _ => {
+                self.message = Some(
+                    "commands: /start <new|main|N> <task>, /pick <issue>, /return <tree>, /open <url>; @17 messages an agent"
+                        .into(),
+                );
+                self.box_text = Some(text.to_string());
+                return Outcome::Continue;
+            }
+        };
+        // `/start` without a place starts in a new tree.
+        let args: Vec<String> = match action {
+            Action::Dispatch => {
+                let place = rest.first().map(String::as_str).unwrap_or_default();
+                let is_place = place == "new"
+                    || place == "main"
+                    || place.chars().all(|c| c.is_ascii_digit()) && !place.is_empty();
+                if is_place {
+                    vec![place.to_string(), rest[1..].join(" ")]
+                } else {
+                    vec!["new".to_string(), rest.join(" ")]
+                }
+            }
+            _ => vec![rest.join(" ")],
+        };
+        if args.iter().any(|a| a.trim().is_empty()) {
+            self.message = Some(format!("/{name} needs what to act on"));
+            self.box_text = Some(format!("{text} "));
+            return Outcome::Continue;
+        }
+        match self.run_action(action, &args) {
+            Ok((said, then)) => {
+                self.settle_accepted(&Ok(said.clone()));
+                self.message = Some(said);
+                then
+            }
+            Err(why) => {
+                self.settle_accepted(&Err(why.clone()));
+                self.message = Some(why);
+                Outcome::Continue
+            }
+        }
+    }
+
+    /// Opens the box for one line to the assistant, about `context`, what
+    /// was under the cursor.
+    pub fn open_ask(&mut self, context: Option<String>) {
+        self.ask_context = context;
+        self.prompt = Some(Prompt::dispatch(Target::Ask, self.user.clone()));
+    }
+
+    /// Sends `text` to the assistant to answer on screen: in its briefing
+    /// and cards, not in its chat.
+    fn ask(&mut self, text: String) -> Outcome {
+        let context = self.ask_context.take();
+        if text.is_empty() {
+            return Outcome::Continue;
+        }
+        let at = assistant::now();
+        self.assistant.ask(&text, at);
+        if let Some(path) = &self.assistant_path {
+            let _ = assistant::update(path, |s| s.ask(&text, at));
+        }
+        let mut message = text;
+        if let Some(context) = context {
+            message.push_str(&format!("\n\n(On screen: {context}.)"));
+        }
+        message.push_str(
+            "\n\nAnswer on screen: first answer this with `treetop say`, in at most \
+             three short lines that do not repeat the briefing, then update the briefing \
+             with `treetop brief` and propose what to do with `treetop propose` as it \
+             calls for. Say nothing else in chat.",
+        );
+        self.is_assistant_hidden = false;
+        self.converse(message)
+    }
+
+    /// The tree an `@` in the box names: its number, `main`, or the start of
+    /// an agent's name, which must be one tree's; else why not.
+    pub fn address(&self, word: &str) -> Result<Tree, String> {
+        let token = word.trim_start_matches('@');
+        if token.is_empty() {
+            return Err("@ takes a tree number or an agent's name".into());
+        }
+        if let Some(tree) = self
+            .trees
+            .iter()
+            .find(|t| t.name == token || (token == "main" && t.is_main))
+        {
+            return Ok(tree.clone());
+        }
+        // `@fix-log` names "fix the login redirect": each part of the word
+        // starts a word of the name, in order.
+        let pieces: Vec<String> = token
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|p| !p.is_empty())
+            .map(str::to_lowercase)
+            .collect();
+        let names = |name: &str| {
+            let words: Vec<String> = name
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|w| !w.is_empty())
+                .map(str::to_lowercase)
+                .collect();
+            let mut at = 0;
+            pieces.iter().all(|piece| {
+                match words[at..]
+                    .iter()
+                    .position(|w| w.starts_with(piece.as_str()))
+                {
+                    Some(found) => {
+                        at += found + 1;
+                        true
+                    }
+                    None => false,
+                }
+            })
+        };
+        let matching: Vec<&Tree> = self
+            .trees
+            .iter()
+            .filter(|t| {
+                t.agents
+                    .iter()
+                    .any(|a| !coordinator::is_assistant(&a.name) && names(&a.name))
+            })
+            .collect();
+        match matching.as_slice() {
+            [one] => Ok((*one).clone()),
+            [] => Err(format!("no tree or agent {word}")),
+            many => Err(format!(
+                "{word} is in trees {}: use the number",
+                many.iter()
+                    .map(|t| t.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
+
+    /// The box's leading `@` words and the message after them.
+    fn split_box(text: &str) -> (Vec<&str>, &str) {
+        let mut rest = text.trim_start();
+        let mut targets = Vec::new();
+        while let Some(word) = rest
+            .split_whitespace()
+            .next()
+            .filter(|w| w.starts_with('@'))
+        {
+            targets.push(word);
+            rest = rest[rest.find(word).unwrap_or(0) + word.len()..].trim_start();
+        }
+        (targets, rest)
+    }
+
+    /// What the box will reach, said under it while it is typed: the trees
+    /// its `@` words name, or why one names none; None for the assistant.
+    pub fn box_hint(&self) -> Option<Result<String, String>> {
+        let text = self.box_text.as_deref()?;
+        let (targets, _) = Self::split_box(text);
+        if targets.is_empty() {
+            return None;
+        }
+        let mut reached = Vec::new();
+        for word in targets {
+            let tree = match self.address(word) {
+                Ok(tree) => tree,
+                Err(why) => return Some(Err(why)),
+            };
+            let agent = tree
+                .agents
+                .iter()
+                .find(|a| !coordinator::is_assistant(&a.name))
+                .map_or("no agent".to_string(), |a| a.name.clone());
+            reached.push(format!("tree {} · {agent}", tree.name));
+        }
+        Some(Ok(reached.join(", ")))
+    }
+
+    /// What is under the cursor, for the assistant: the tree and its agent.
+    fn cursor_context(&self) -> Option<String> {
+        self.current().map(|tree| {
+            let agent = tree.agents.first().map(|a| format!(", agent {}", a.name));
+            format!("tree {}{}", tree.name, agent.unwrap_or_default())
+        })
+    }
+
+    /// Opens the pane's box, about `context`, what was under the cursor.
+    fn open_box(&mut self, context: Option<String>) {
+        self.box_text = Some(String::new());
+        self.ask_context = context;
+        self.is_assistant_hidden = false;
+        self.hint = 0;
+        self.accepted = None;
+    }
+
+    /// Keys while the pane's box is typed in. Enter sends it: to the agents
+    /// its `@` words name, else to the assistant; Tab completes an `@`.
+    fn handle_box_key(&mut self, key: KeyEvent) -> Outcome {
+        let Some(text) = &mut self.box_text else {
+            return Outcome::Continue;
+        };
+        let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => {
+                self.box_text = None;
+                self.ask_context = None;
+                self.accepted = None;
+            }
+            KeyCode::Left if text.is_empty() => {
+                self.box_text = None;
+                self.ask_context = None;
+            }
+            // The empty box flips through the suggestions.
+            KeyCode::Up | KeyCode::Down if text.is_empty() => {
+                let count = self.assistant.open_cards().len();
+                if count > 0 {
+                    self.hint = match key.code {
+                        KeyCode::Up => (self.hint + count - 1) % count,
+                        _ => (self.hint + 1) % count,
+                    };
+                }
+            }
+            KeyCode::Tab if text.is_empty() => {
+                let shown = self
+                    .assistant
+                    .open_cards()
+                    .get(self.hint)
+                    .map(|c| (c.id.clone(), c.box_text()));
+                if let Some((id, typed)) = shown {
+                    self.box_text = Some(typed);
+                    self.accepted = Some(id);
+                }
+            }
+            KeyCode::Char('c') if is_ctrl => return self.quit(),
+            KeyCode::Char('u') if is_ctrl => text.clear(),
+            KeyCode::Char('w') if is_ctrl => {
+                let kept = text.trim_end().len();
+                let cut = text[..kept]
+                    .rfind(char::is_whitespace)
+                    .map_or(0, |at| at + 1);
+                text.truncate(cut);
+            }
+            KeyCode::Backspace => {
+                text.pop();
+            }
+            KeyCode::Tab => self.complete_address(),
+            KeyCode::Enter => {
+                let text = self.box_text.take().unwrap_or_default();
+                return self.send_box(text.trim());
+            }
+            KeyCode::Char(c) if !is_ctrl => text.push(c),
+            _ => {}
+        }
+        Outcome::Continue
+    }
+
+    /// Completes the `@` word being typed to its tree's number, when it
+    /// names one tree.
+    fn complete_address(&mut self) {
+        let Some(text) = self.box_text.clone() else {
+            return;
+        };
+        let Some(word) = text
+            .split_whitespace()
+            .last()
+            .filter(|w| w.starts_with('@'))
+        else {
+            return;
+        };
+        if text.ends_with(char::is_whitespace) {
+            return;
+        }
+        match self.address(word) {
+            Ok(tree) => {
+                let kept = &text[..text.len() - word.len()];
+                self.box_text = Some(format!("{kept}@{} ", tree.name));
+            }
+            Err(why) => self.message = Some(why),
+        }
+    }
+
+    /// Sends what the box holds.
+    fn send_box(&mut self, text: &str) -> Outcome {
+        if text.is_empty() {
+            self.ask_context = None;
+            self.accepted = None;
+            return Outcome::Continue;
+        }
+        if text.starts_with('/') {
+            self.ask_context = None;
+            return self.run_command(text);
+        }
+        let (targets, message) = Self::split_box(text);
+        if targets.is_empty() {
+            self.accepted = None;
+            return self.ask(text.to_string());
+        }
+        self.ask_context = None;
+        let trees: Result<Vec<Tree>, String> = targets.iter().map(|w| self.address(w)).collect();
+        let trees = match trees {
+            Ok(trees) => trees,
+            Err(why) => {
+                self.message = Some(why);
+                self.box_text = Some(text.to_string());
+                return Outcome::Continue;
+            }
+        };
+        if message.is_empty() {
+            self.message = Some(format!("write the message after {}", targets.join(" ")));
+            self.box_text = Some(format!("{text} "));
+            return Outcome::Continue;
+        }
+        let to: Vec<Recipient> = trees.iter().flat_map(Self::recipients).collect();
+        if to.is_empty() {
+            let why = "no agent there with a chat to type into".to_string();
+            self.settle_accepted(&Err(why.clone()));
+            self.message = Some(why);
+            return Outcome::Continue;
+        }
+        let names: Vec<String> = trees.iter().map(|t| t.name.clone()).collect();
+        self.settle_accepted(&Ok(format!("sent to tree {}", names.join(", "))));
+        self.message = Some(format!("sending to tree {}...", names.join(", ")));
+        Outcome::Send {
+            to,
+            text: message.to_string(),
+        }
     }
 
     /// Opens the compose box to the coordinator.
@@ -1530,6 +2107,7 @@ impl App {
             }
             Purpose::Dispatch { target } => match target {
                 Target::Coordinator => self.converse(text),
+                Target::Ask => self.ask(text),
                 Target::NewTree => self.dispatch(text, branch),
             },
         }
@@ -1549,7 +2127,7 @@ impl App {
                     tree: to.tree,
                 };
             }
-            self.message = Some("sending to the coordinator...".into());
+            self.message = Some("sending to the assistant...".into());
             return Outcome::Send { to: vec![to], text };
         }
         let Some(main) = self.trees.iter().find(|t| t.is_main).cloned() else {
@@ -1810,6 +2388,9 @@ impl App {
             }
             return Outcome::Continue;
         }
+        if self.box_text.is_some() {
+            return self.handle_box_key(key);
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return match key.code {
                 KeyCode::Char('c') => Outcome::Quit,
@@ -1910,6 +2491,9 @@ impl App {
                 }
             }
             KeyCode::Tab => self.is_issues = true,
+            KeyCode::Char(':') => self.open_box(self.cursor_context()),
+            KeyCode::Char('a') => self.is_assistant_hidden = !self.is_assistant_hidden,
+            KeyCode::Right if !self.is_assistant_hidden => self.open_box(self.cursor_context()),
             KeyCode::Char('i') => self.show_issue(),
             KeyCode::Char('I') => self.choose_issue(),
             KeyCode::Char('m') => self.open_message(),
@@ -2992,6 +3576,158 @@ mod tests {
     }
 
     #[test]
+    fn events_wake_the_assistant_in_one_batch_never_its_own() {
+        let mut app = app();
+        app.wakes = crate::config::WAKES.map(String::from).into();
+        let coordinator = Agent {
+            name: coordinator::NAME.into(),
+            ..attachable("c00rd1na")
+        };
+        app.apply_agents(&HashMap::from([(
+            PathBuf::from("/p/4/app"),
+            vec![coordinator],
+        )]));
+        let mine = |state| Report {
+            name: coordinator::NAME.into(),
+            ..report("c00rd1na", state, "/p/4/app", 3)
+        };
+        app.apply_reports(vec![
+            report("ask", State::Working, "/p/8/app", 2),
+            mine(State::Working),
+        ]);
+        app.apply_reports(vec![
+            report("ask", State::Blocked, "/p/8/app", 2),
+            mine(State::Done),
+        ]);
+        assert_eq!(app.ready_wake(), None, "a batch waits for more");
+        app.wake_first = Some(Instant::now() - WAKE_BATCH);
+        let Some(Outcome::Send { to, text }) = app.ready_wake() else {
+            panic!("the batch goes to the assistant");
+        };
+        assert_eq!(to[0].agent, coordinator::NAME);
+        assert!(
+            text.contains("- tree 8 (job ask) needs you: ask says\n"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("c00rd1na"),
+            "its own answer does not wake it: {text}"
+        );
+        assert!(text.contains("treetop brief"), "{text}");
+        app.apply_reports(vec![
+            report("ask", State::Done, "/p/8/app", 2),
+            mine(State::Done),
+        ]);
+        app.wake_first = Some(Instant::now() - WAKE_BATCH);
+        assert_eq!(app.ready_wake(), None, "the next wake waits out the gap");
+        app.wake_sent = Some(Instant::now() - WAKE_GAP);
+        assert!(app.ready_wake().is_some());
+    }
+
+    #[test]
+    fn colon_types_to_the_assistant_about_the_tree_under_the_cursor() {
+        let mut app = app_with_main();
+        let at = app.visible().iter().position(|t| t.name == "4").unwrap();
+        app.selected = at;
+        press(&mut app, KeyCode::Char(':'));
+        assert_eq!(
+            app.box_text.as_deref(),
+            Some(""),
+            "the pane's box, not a popup"
+        );
+        assert!(app.prompt.is_none());
+        type_in(&mut app, "what is 4 waiting on?");
+        let job = queued(press(&mut app, KeyCode::Enter)).remove(0);
+        let task = job.launch.unwrap().task;
+        assert!(
+            task.starts_with("what is 4 waiting on?\n\n(On screen: tree 4.)"),
+            "{task}"
+        );
+        assert!(task.contains("`treetop say`"), "{task}");
+        assert!(app.box_text.is_none());
+        assert!(app.assistant.is_thinking(), "the pane says it is thinking");
+        assert_eq!(
+            app.assistant.asked.as_ref().unwrap().text,
+            "what is 4 waiting on?"
+        );
+        app.assistant.say("It waits on your review.", u64::MAX);
+        assert!(!app.assistant.is_thinking());
+    }
+
+    #[test]
+    fn an_at_in_the_box_sends_straight_to_that_agent() {
+        let mut app = app();
+        let fix = Agent {
+            name: "fix the login redirect".into(),
+            ..attachable("fix")
+        };
+        let seed = Agent {
+            name: "seed insights".into(),
+            ..attachable("seed")
+        };
+        app.apply_agents(&HashMap::from([
+            (PathBuf::from("/p/8/app"), vec![fix]),
+            (PathBuf::from("/p/4/app"), vec![seed]),
+        ]));
+        press(&mut app, KeyCode::Char(':'));
+        type_in(&mut app, "@fix-log");
+        assert_eq!(
+            app.box_hint(),
+            Some(Ok("tree 8 · fix the login redirect".into())),
+            "who it reaches, as it is typed"
+        );
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(
+            app.box_text.as_deref(),
+            Some("@8 "),
+            "Tab completes to the tree"
+        );
+        type_in(&mut app, "@4 rebase first");
+        let Outcome::Send { to, text } = press(&mut app, KeyCode::Enter) else {
+            panic!("sent to both agents, not the assistant");
+        };
+        let trees: Vec<&str> = to.iter().map(|r| r.tree.as_str()).collect();
+        assert_eq!((trees, text.as_str()), (vec!["8", "4"], "rebase first"));
+        press(&mut app, KeyCode::Char(':'));
+        type_in(&mut app, "@nobody hi");
+        assert!(matches!(app.box_hint(), Some(Err(_))));
+        assert_eq!(press(&mut app, KeyCode::Enter), Outcome::Continue);
+        assert_eq!(app.box_text.as_deref(), Some("@nobody hi"), "kept to fix");
+        assert_eq!(app.message.as_deref(), Some("no tree or agent @nobody"));
+    }
+
+    #[test]
+    fn an_old_coordinator_is_not_the_assistant_so_a_new_one_starts() {
+        let mut app = app_with_main();
+        let old = Agent {
+            name: "treetop-coordinator".into(),
+            ..attachable("0897cd3f")
+        };
+        let main = app.trees.iter().find(|t| t.is_main).unwrap().path.clone();
+        app.apply_agents(&HashMap::from([(main, vec![old])]));
+        assert_eq!(
+            app.coordinator(),
+            None,
+            "it answers in chat and acts itself"
+        );
+        press(&mut app, KeyCode::Char(':'));
+        type_in(&mut app, "what needs me?");
+        let job = queued(press(&mut app, KeyCode::Enter)).remove(0);
+        let launch = job.launch.unwrap();
+        assert!(launch.is_coordinator);
+        assert_eq!(launch.name.as_deref(), Some(coordinator::NAME));
+    }
+
+    #[test]
+    fn with_waking_turned_off_events_wait_to_be_asked() {
+        let mut app = app();
+        app.apply_reports(vec![report("ask", State::Working, "/p/8/app", 2)]);
+        app.apply_reports(vec![report("ask", State::Blocked, "/p/8/app", 2)]);
+        assert!(app.wake_events.is_empty());
+        assert_eq!(app.ready_wake(), None);
+    }
+
+    #[test]
     fn c_talks_to_the_coordinator_and_starts_it_in_the_main_checkout() {
         let mut app = app_with_main();
         press(&mut app, KeyCode::Char('c'));
@@ -3095,6 +3831,116 @@ mod tests {
             attach: Some(vec!["claude".into(), "attach".into(), name.into()]),
             ..agent(name)
         }
+    }
+
+    /// The app with tree 8's agent attachable and cards proposed for it.
+    fn with_cards(cards: &[(Action, &str)]) -> App {
+        let mut app = app();
+        app.apply_agents(&HashMap::from([(
+            PathBuf::from("/p/8/app"),
+            vec![attachable("fix")],
+        )]));
+        for (at, (action, words)) in cards.iter().enumerate() {
+            let words: Vec<String> = words.split_whitespace().map(str::to_string).collect();
+            app.assistant
+                .propose(*action, &words, "because", at as u64)
+                .unwrap();
+        }
+        app
+    }
+
+    #[test]
+    fn the_box_shows_a_suggestion_and_tab_puts_it_in_to_send() {
+        // Newest first: the link, the message, then the return.
+        let mut app = with_cards(&[
+            (Action::Return, "8"),
+            (Action::Send, "8 Rebase first, then push."),
+            (Action::Open, "https://github.com/x/y/pull/9"),
+        ]);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.box_text.as_deref(), Some(""), "the arrow types");
+        assert_eq!(app.hint, 0);
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.hint, 2, "up goes round to the last");
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.hint, 1);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.box_text.as_deref(), Some("@8 Rebase first, then push."));
+        let Outcome::Send { to, text } = press(&mut app, KeyCode::Enter) else {
+            panic!("the suggestion goes to tree 8's agent");
+        };
+        assert_eq!(
+            (to[0].tree.as_str(), text.as_str()),
+            ("8", "Rebase first, then push.")
+        );
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Outcome::OpenUrl("https://github.com/x/y/pull/9".into())
+        );
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.box_text.as_deref(), Some("/return 8"));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.pending.as_ref().expect("the return dialog").trees[0].name,
+            "8"
+        );
+        let said: Vec<(CardState, Option<&str>)> = app
+            .assistant
+            .cards
+            .iter()
+            .map(|c| (c.state, c.outcome.as_deref()))
+            .collect();
+        assert_eq!(
+            said,
+            [
+                (CardState::Taken, Some("opened")),
+                (CardState::Taken, Some("sent to tree 8")),
+                (CardState::Taken, Some("return asked")),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_edited_suggestion_goes_as_edited_and_counts_as_taken() {
+        let mut app = with_cards(&[(Action::Send, "8 Rebase first.")]);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Tab);
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        type_in(&mut app, "now, then push.");
+        let Outcome::Send { text, .. } = press(&mut app, KeyCode::Enter) else {
+            panic!("sent");
+        };
+        assert_eq!(text, "Rebase now, then push.");
+        assert_eq!(app.assistant.cards[0].state, CardState::Taken);
+    }
+
+    #[test]
+    fn slash_commands_in_the_box_run_as_their_keys_do() {
+        let mut app = app_with_main();
+        press(&mut app, KeyCode::Char(':'));
+        type_in(&mut app, "/start fix the flaky login test");
+        let job = queued(press(&mut app, KeyCode::Enter)).remove(0);
+        let launch = job.launch.unwrap();
+        assert!(launch.is_new_tree, "no place is a new tree");
+        assert_eq!(launch.task, "fix the flaky login test");
+        press(&mut app, KeyCode::Char(':'));
+        type_in(&mut app, "/return 99");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.message.as_deref(), Some("no tree 99"));
+        press(&mut app, KeyCode::Char(':'));
+        type_in(&mut app, "/frobnicate");
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            app.message
+                .as_deref()
+                .unwrap()
+                .starts_with("commands: /start")
+        );
+        assert_eq!(app.box_text.as_deref(), Some("/frobnicate"), "kept to fix");
     }
 
     #[test]

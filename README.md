@@ -2,7 +2,7 @@
 
 An htop-style view of a [treehouse](https://github.com/kunchenguid/treehouse) worktree pool.
 See which coding agent works in each tree, whether it is waiting on you and what the tree serves, and jump to the agent in one key.
-Ask a coordinator agent about every other agent at once, send an agent a task in a fresh tree, a tree you pick or the main checkout, and read what each agent reports back on its tree's row.
+Keep an assistant beside the list that briefs you on every agent and suggests each next step for you to send from its box, send an agent a task in a fresh tree, a tree you pick or the main checkout, and read what each agent reports back on its tree's row.
 Switch between the pools of every repository you use it in without leaving it.
 Mark trees, then return them to the pool or destroy them, with git's view of each tree on screen so nothing unpushed goes by accident.
 Follow each tree's pull request through CI and review to the merge, send a failure back to its agent in one key, and see which issues a merge leaves ready.
@@ -41,7 +41,10 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | `t` | go to the tree itself, even when its agent has a chat: its tmux pane or a window in it, else a shell there (see [Entering a tree](#entering-a-tree)) |
 | `n` | start a new agent in a fresh tree, on a branch named for the task (see [New agents](#new-agents)) |
 | `m` | write a message to the agents in the marked trees, or the tree under the cursor |
-| `c` | ask the coordinator; send nothing to open its chat (see [The coordinator](#the-coordinator)) |
+| `:` | type in the assistant's box: a question for it, or `@17 ...` for that tree's agent (see [The assistant](#the-assistant)) |
+| `c` | talk to the assistant in its chat; send nothing to open the chat |
+| `a` | show or hide the assistant pane |
+| `→` | type in the assistant's box, as `:` does; Tab puts its suggestion in, `↑`/`↓` show the others |
 | `d` | open the side-by-side diff of the tree under the cursor in a popup |
 | `r` | return the marked trees, or the one under the cursor, to the pool; `D` in its dialog destroys them from disk instead, after reviewing treehouse's preview of each |
 | Space | mark or unmark the tree under the cursor |
@@ -154,6 +157,13 @@ on_return = ["harness", "stack", "down"]
 A hook is a command and its arguments, run in the tree with `TREETOP_TREE`, `TREETOP_BRANCH` and `TREETOP_TICKET` set, and given two minutes.
 One that fails is written to the log and never stops the start or return it belongs to.
 A config file treetop cannot parse is reported in the log, and no hooks run.
+
+The assistant wakes on `needs_you`, `done` and `pr` events unless told otherwise; an empty list leaves it to be asked (see [The assistant](#the-assistant)):
+
+```toml
+[assistant]
+wake = ["needs_you", "pr"]
+```
 
 Issues come from named sources, each a ticket plugin and the settings it is given; Linear's plugin is built in and the default.
 A repository picks its source by its main checkout's path under `[repos]`, and one without an entry has none, so an unrelated repository shows no one's issues.
@@ -298,37 +308,67 @@ The popup only ever shows the agent it was opened on: `←` on an empty prompt, 
 An agent with an `attach` command in its `agent.json` opens the same way.
 An agent running in a tmux pane, such as an interactive `claude`, belongs to that pane and cannot be opened elsewhere: Enter goes to the tree instead, which inside tmux switches to its pane.
 
-## The coordinator and dispatch
+## The assistant and dispatch
 
-treetop is where agents are sent out, and the coordinator is who you ask about them.
+treetop is where agents are sent out, and the assistant is who keeps track of them for you.
 
 `n` opens the compose box in the middle of the screen for a new agent in a fresh tree from the pool, leased with `treehouse get --lease` when the job runs, so two quick dispatches never share one.
-`c` opens it to the coordinator instead: one Claude Code session in the main checkout that oversees every other agent (see below); a message goes to it as `m` sends one, and nothing typed opens its chat.
+`:` opens it to the assistant, with one line to answer on screen (see below), and `c` to its chat, for a conversation; nothing typed after `c` opens the chat.
 
 Enter sends it, Alt+Enter breaks the line, Esc cancels, Ctrl+U clears the text and Ctrl+W a word; a paste keeps its line breaks.
 The text wraps and the box grows with it.
 
-### The coordinator
+### The assistant
 
-The coordinator is `claude --bg --name treetop-coordinator`, started in the main checkout the first time you send it something, with a system prompt that makes it the pool's overseer rather than a coder.
-A message to it is sent the way `m` sends one: typed into its chat behind the screen, while you stay on the list, and the status line says when it is in.
-Enter with nothing typed opens its chat in the same popup as any agent's, which is where its answers are read.
-If none is running, one starts with your message as its first prompt; with nothing typed, it starts idle and its chat opens.
+The assistant keeps a pane on the Trees screen: a briefing of where the agents stand, what needs you, what is done and what is working, a line each, and under it suggestions, each a next step it proposes.
+The pane is a column beside the list on a terminal 160 columns wide or more, and a band under it otherwise; `a` hides or shows it.
+`→` or `:` puts the cursor in the box at the bottom of the pane, so typing goes straight to the assistant (below).
+
+A suggestion is what you would type in the box to do it, and the empty box shows the first in grey: Tab puts it in, to send with Enter or change first, and `↑`/`↓` show the others.
+The box takes the same as you type:
+
+| In the box | Does |
+|---|---|
+| `@17 <message>` | sends the message to tree 17's agent, as `m` does |
+| `/start <new\|main\|N> <task>` | starts an agent on the task in a fresh tree, the main checkout or tree N, as `n` does; with no place, a fresh tree |
+| `/pick <issue>` | picks the issue up into a fresh tree, as the Issues screen's `p` does |
+| `/return <tree>` | opens the tree's return dialog, as `r` does, which still lists its unpushed work and asks |
+| `/open <url>` | opens the link, or copies it where there is no browser |
+| anything else | goes to the assistant |
+
+treetop carries these out itself, so a suggestion can do nothing a key could not.
+A suggestion sent says how it went, `sent to tree 17` or the error, until the next briefing clears it; one left alone is replaced by the next briefing's.
+
+The assistant wakes on its own: when an agent comes to need you or finishes, or a tree's PR fails, is asked for changes or merges, treetop sends it what happened, gathered for 30 seconds after the first event and at most once every 2 minutes, and it updates the briefing and its suggestions.
+Its own answers never wake it, and with no assistant running nothing is started for them.
+`wake` under `[assistant]` in the config says which events wake it; an empty list leaves it to be asked.
+
+Enter sends what is typed in the box to the assistant, with the tree under the cursor as context.
+Your question shows at the top of the pane, and its answer under it, a few lines it writes with `treetop say`, above the briefing; the pane says it is thinking until then.
+A message that starts with `@` goes to an agent instead, not the assistant: `@17 put it in branding/` types it into tree 17's agent's chat, as `m` would.
+`@` takes a tree number, `main`, or the start of an agent's words, `@fix-log` for "fix the login redirect"; the line above the box says who it will reach as you type, Tab completes it to the tree's number, and several `@`s send to each.
+Esc closes the box; on the Issues screen, `:` opens the compose box instead, with the issue under the cursor as context.
+
+It is `claude --bg --name treetop-assistant`, started in the main checkout the first time you send it something, with a system prompt that makes it the pool's assistant rather than a coder.
+A message to it is sent the way `m` sends one, typed into its chat behind the screen.
 treetop finds it again by its name: while it runs, and for a day after it stops, through `claude attach`, which starts it again with its conversation kept.
 After that a new one starts.
+A coordinator from before the assistant, named `treetop-coordinator`, is never taken for it, since it answers in chat and acts itself; it is left off the rows, and a new assistant starts beside it.
 
-It sees and steers the other agents through three treetop commands, which it may run without asking:
+It sees the other agents, and writes to the screen, through treetop commands it may run without asking; it no longer sends, starts or returns anything itself, and proposes suggestions instead:
 
 | Command | Does |
 |---|---|
 | `treetop status` | prints JSON: each held tree's branch, uncommitted and unpushed counts and ports, its agents and their state, each background agent's latest report (the question it is waiting on, its answer once done, else what it is doing now), and its PR's stage as `ship`; idle trees are only counted, and `ready` lists the issues the merged trees' issues leave ready |
-| `treetop send <tree\|agent> <message>` | types the message into the chat of every agent in that tree (a number or `main`), or of the agent of that name, and submits it |
-| `treetop dispatch <new\|main\|N> <task>` | starts a new agent on the task in a fresh tree, the main checkout or tree N |
-| `treetop pick <ID>` | picks a ticket up: an agent on it in a fresh tree, on its branch (see [Issues](#issues)) |
+| `treetop tickets [--mine] [words]` | prints the repository's open issues |
+| `treetop say` | puts the Markdown on stdin up as its answer to what you asked in the box |
+| `treetop brief` | puts the Markdown on stdin up as the briefing |
+| `treetop propose <send\|dispatch\|pick\|return\|open> <args> --why <text>` | adds a suggestion, shown in the box as one of the five above, and prints its id |
+| `treetop cards` | prints the suggestions and what became of each, taken or failed |
 
-They work from any shell too.
-Each prints only what it is asked for, so a question costs the coordinator one small read rather than a crawl through every transcript.
-It is told to run `treetop status` before answering anything about the agents, to lead with what is waiting on you, and to say what it will send or dispatch and wait for a yes unless you have told it to go ahead.
+The briefing and suggestions live in `$XDG_STATE_HOME/treetop/assistant-<workspace>.json`, one per workspace; deleting it clears the pane.
+`treetop send`, `dispatch` and `pick` remain, for you and any other agent, from any shell.
+Each command prints only what it is asked for, so a question costs the assistant one small read rather than a crawl through every transcript.
 
 ### New agents
 
@@ -360,9 +400,9 @@ A report belongs to the tree whose `treetop.json` names its job, or where its ag
 An agent sitting at a question dialog or permission prompt needs you too, though its report still says working, since only its chat can answer it.
 Trees waiting on you come first in the list, and the cursor stays on its tree as rows move.
 Finished and stopped reports go after a day; working and waiting ones stay.
-The coordinator's own reports are left off its row, since it is talked to through `c`.
+The assistant's own reports are left off its row, since it speaks through its pane and `c`.
 
-When an agent comes to need you, or finishes, treetop rings the terminal bell, and inside tmux shows it in the status line for five seconds, so it is heard from any window; the coordinator finishing an answer rings it too.
+When an agent comes to need you, or finishes, treetop rings the terminal bell, and inside tmux shows it in the status line for five seconds, so it is heard from any window; the assistant finishing an answer rings it too.
 The summary counts the trees that need you, and, as "elsewhere", agents outside the pool waiting on you, which have no row.
 These job files are internal to Claude Code, like its session files, so a release that changes them blanks SAYS until treetop catches up.
 
@@ -468,7 +508,7 @@ treetop never scans treehouse's own directories for pools, keeping to treehouse'
 
 A switch waits while an action is running in the pool on screen.
 The chats left open in the old pool are ended, which leaves their agents running.
-Each workspace has its own coordinator; a stopped one is only ever taken up again in the pool it works in.
+Each workspace has its own assistant, with its own pane; a stopped one is only ever taken up again in the pool it works in.
 
 ## Entering a tree
 

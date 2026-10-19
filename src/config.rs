@@ -85,8 +85,33 @@ pub struct Repo {
     pub ship: Option<Vec<String>>,
 }
 
+/// What wakes the assistant: an agent coming to need you, an agent
+/// finishing, and a PR changing in a way that matters.
+pub const WAKES: [&str; 3] = ["needs_you", "done", "pr"];
+
+fn every_wake() -> Vec<String> {
+    WAKES.map(String::from).into()
+}
+
+/// The assistant's settings.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Assistant {
+    /// The events that wake it, of WAKES; none leaves it to be asked.
+    #[serde(default = "every_wake")]
+    pub wake: Vec<String>,
+}
+
+impl Default for Assistant {
+    fn default() -> Self {
+        Assistant { wake: every_wake() }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub assistant: Assistant,
     #[serde(default)]
     pub hooks: Hooks,
     #[serde(default)]
