@@ -25,6 +25,7 @@ use crate::picker::{Kind, Picker};
 use crate::picture::{self, Picture};
 use crate::screen::{Focus, Screen};
 use crate::targets::Target;
+use crate::views::Group;
 
 /// The bar's keys, most used first; `?` lists them all.
 const KEYS: [(&str, &str); 6] = [
@@ -278,9 +279,22 @@ impl Screen {
             );
             return;
         }
-        let header = Row::new([
-            "ID", "STATUS", "PRIORITY", "TITLE", "LABELS", "ASSIGNEE", "WORK",
-        ])
+        // Grouped by status, each heading already says it, so the column
+        // would only repeat it.
+        let has_status = self.group != Group::Status;
+        let columns = |mut cells: Vec<Cell<'static>>| {
+            if !has_status && cells.len() > 1 {
+                cells.remove(1);
+            }
+            cells
+        };
+        let header = Row::new(columns(
+            [
+                "ID", "STATUS", "PRIORITY", "TITLE", "LABELS", "ASSIGNEE", "WORK",
+            ]
+            .map(Cell::from)
+            .to_vec(),
+        ))
         .style(p.header);
         // A grouped list puts a heading row above each group, so the cursor's
         // row on screen counts the headings above it.
@@ -300,7 +314,7 @@ impl Screen {
                     cursor_row = rows.len();
                 }
                 let glyph = if is_folded { "▸" } else { "▾" };
-                rows.push(Row::new(vec![
+                rows.push(Row::new(columns(vec![
                     Cell::from(glyph).style(fg(p.accent)),
                     Cell::from(""),
                     Cell::from(""),
@@ -308,7 +322,7 @@ impl Screen {
                         Span::styled(heading, fg(p.title).add_modifier(Modifier::BOLD)),
                         Span::styled(format!("  {count}"), fg(p.muted)),
                     ])),
-                ]));
+                ])));
             }
             if is_folded {
                 continue;
@@ -316,7 +330,7 @@ impl Screen {
             if at == self.selected {
                 cursor_row = rows.len();
             }
-            rows.push(Row::new(vec![
+            rows.push(Row::new(columns(vec![
                 Cell::from(issue.id.clone()).style(fg(p.accent)),
                 Cell::from(issue.state.clone()).style(fg(p.info)),
                 priority(issue, p),
@@ -324,9 +338,9 @@ impl Screen {
                 Cell::from(issue.labels.join(", ")).style(fg(p.special)),
                 Cell::from(issue.assignee.clone().unwrap_or_default()).style(fg(p.muted)),
                 work_cell(host, &issue.id, p),
-            ]));
+            ])));
         }
-        let widths = [
+        let mut widths = vec![
             Constraint::Length(10),
             Constraint::Length(14),
             Constraint::Length(8),
@@ -335,6 +349,9 @@ impl Screen {
             Constraint::Length(14),
             Constraint::Length(14),
         ];
+        if !has_status {
+            widths.remove(1);
+        }
         let table = Table::new(rows, widths)
             .header(header)
             .row_highlight_style(p.cursor);

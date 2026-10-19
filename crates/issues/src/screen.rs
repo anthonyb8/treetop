@@ -1999,9 +1999,12 @@ mod tests {
         assert_eq!(order, ["END-2", "END-1"], "closest to done first");
         assert_eq!(screen.heading(0).as_deref(), Some("In Progress"));
         assert_eq!(screen.heading(1).as_deref(), Some("Todo"));
+        let header = |screen: &Screen| drawn(screen)[1].clone();
+        assert!(!header(&screen).contains("STATUS"), "the headings say it");
         screen.handle_key(key(KeyCode::Char('6')));
         settle(&mut screen);
         assert_eq!(screen.view_name(), "bugs");
+        assert!(header(&screen).contains("STATUS"), "{}", header(&screen));
         assert_eq!(screen.heading(0), None, "no grouping");
         screen.handle_key(key(KeyCode::Char('m')));
         assert_eq!(screen.view_name(), "custom");
