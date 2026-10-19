@@ -61,7 +61,8 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 In a true-colour terminal (`COLORTERM=truecolor`) treetop draws in gruvbox-material (medium), as Neovim does: lualine's sections for the bars and the table header, `CursorLine` for the selected row, `WinSeparator` for borders. Elsewhere it uses the terminal's 16 ANSI colours.
 
 The columns are what a destroy would lose.
-CHANGED counts uncommitted files and UNPUSHED counts commits on no remote; `?` means git could not read a held tree, which deserves a look before it goes.
+GIT says what is not safe yet, in a Powerlevel10k prompt's symbols: `⇡2` commits on no remote, `+1` staged, `!3` unstaged and `?4` untracked files, each only when there are some, so a clean tree is blank.
+`─` means git could not read a held tree, which deserves a look before it goes.
 PROCS counts processes running inside the tree, and PORTS the TCP ports they listen on: the lowest, and how many more.
 `o` opens the lowest in the browser on a desktop; on a server reached over SSH it copies the URL to the clipboard of the computer you are typing at, through the terminal (OSC 52; inside tmux, `set-clipboard on`).
 AGENT names the coding agent working in the tree, from the sources under [Agents](#agents); `no agent` on a held tree marks one nobody is working in.

@@ -157,15 +157,15 @@ pub fn stat(pid: u32) -> Option<Stat> {
 }
 
 fn work_in(dir: &Path, check: Check) -> Option<Work> {
-    let changed = match check {
-        Check::Full => pool::git(dir, &["status", "--porcelain"])?.lines().count(),
-        Check::Unpushed(changed) => changed,
+    let files = match check {
+        Check::Full => Work::of_status(&pool::git(dir, &["status", "--porcelain"])?),
+        Check::Unpushed(known) => known,
     };
     let unpushed = pool::git(dir, &["rev-list", "--count", "HEAD", "--not", "--remotes"])?
         .trim()
         .parse()
         .ok()?;
-    Some(Work { changed, unpushed })
+    Some(Work { unpushed, ..files })
 }
 
 /// Git state for each tree in `checks`, read as far as its check says, in

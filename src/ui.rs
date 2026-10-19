@@ -287,12 +287,38 @@ fn count_cell(value: Option<usize>, color: Color) -> Cell<'static> {
     }
 }
 
-/// A git count for one tree: `-` where there is nothing to count (an
-/// available tree), `?` where git could not read a held one.
-fn work_cell(tree: &Tree, count: fn(Work) -> usize, color: Color) -> Cell<'static> {
+/// A tree's git state as a Powerlevel10k prompt writes it: `⇡` commits on
+/// no remote, `+` staged, `!` unstaged and `?` untracked files, each only
+/// when there are some. Nothing for a clean tree.
+fn git_spans(work: Work) -> Vec<Span<'static>> {
+    let t = theme();
+    [
+        ("⇡", work.unpushed, t.success),
+        ("+", work.staged, t.warning),
+        ("!", work.unstaged, t.warning),
+        ("?", work.untracked, t.info),
+    ]
+    .into_iter()
+    .filter(|(_, count, _)| *count > 0)
+    .enumerate()
+    .flat_map(|(at, (symbol, count, color))| {
+        let gap = if at == 0 { "" } else { " " };
+        [
+            Span::raw(gap),
+            Span::styled(format!("{symbol}{count}"), fg(color)),
+        ]
+    })
+    .collect()
+}
+
+/// The tree's git state, blank when clean or available, and `─`, as
+/// Powerlevel10k writes an unknown count, where git could not read a held
+/// tree.
+fn git_cell(tree: &Tree) -> Cell<'static> {
     match tree.work {
-        None if tree.is_held() => Cell::from("?").style(fg(theme().warning)),
-        work => count_cell(work.map(count), color),
+        None if tree.is_held() => Cell::from("─").style(fg(theme().warning)),
+        None => Cell::from(""),
+        Some(work) => Cell::from(Line::from(git_spans(work))),
     }
 }
 
@@ -420,8 +446,7 @@ fn row(app: &App, tree: &Tree) -> Row<'static> {
         says_cell(app, tree),
         count_cell(procs, t.warning),
         ports_cell(tree),
-        work_cell(tree, |w| w.changed, t.danger),
-        work_cell(tree, |w| w.unpushed, t.special),
+        git_cell(tree),
     ];
     if app.is_shipping() {
         cells.push(pr_cell(tree));
@@ -436,8 +461,7 @@ fn row(app: &App, tree: &Tree) -> Row<'static> {
 fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
     let t = theme();
     let mut titles = vec![
-        "", "#", "STATUS", "TICKET", "BRANCH", "AGENT", "SAYS", "PROCS", "PORTS", "CHANGED",
-        "UNPUSHED",
+        "", "#", "STATUS", "TICKET", "BRANCH", "AGENT", "SAYS", "PROCS", "PORTS", "GIT",
     ];
     if app.is_shipping() {
         titles.push("PR");
@@ -463,8 +487,7 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
         Constraint::Fill(3),
         Constraint::Length(6),
         Constraint::Length(11),
-        Constraint::Length(8),
-        Constraint::Length(9),
+        Constraint::Length(14),
     ];
     if app.is_shipping() {
         widths.push(Constraint::Length(14));
@@ -1126,10 +1149,10 @@ fn risk(tree: &Tree) -> Vec<Span<'static>> {
             "  unknown changes: git cannot read it",
             fg(t.warning),
         )),
-        Some(w) if w.changed + w.unpushed > 0 => spans.push(Span::styled(
-            format!("  {} changed, {} unpushed", w.changed, w.unpushed),
-            fg(t.danger).add_modifier(Modifier::BOLD),
-        )),
+        Some(w) if w.changed + w.unpushed > 0 => {
+            spans.push(Span::raw("  "));
+            spans.extend(git_spans(w));
+        }
         Some(_) => spans.push(Span::styled("  clean", fg(t.success))),
     }
     if !tree.processes.is_empty() {
@@ -1615,6 +1638,44 @@ mod tests {
             ["tell the", "agent", "what"]
         );
         assert_eq!(word_wrap("abcdefghij", 4), ["abcd", "efgh", "ij"]);
+    }
+
+    #[test]
+    fn git_reads_as_a_prompt_writes_it_and_clean_is_blank() {
+        let text = |work: Work| {
+            git_spans(work)
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        };
+        let mixed = Work {
+            changed: 3,
+            staged: 1,
+            unstaged: 2,
+            untracked: 1,
+            unpushed: 4,
+        };
+        assert_eq!(text(mixed), "⇡4 +1 !2 ?1");
+        let spans = git_spans(mixed);
+        assert_eq!(
+            spans[1].style.fg,
+            Some(theme().success),
+            "⇡ as p10k colours it"
+        );
+        assert_eq!(
+            spans[7].style.fg,
+            Some(theme().info),
+            "? as p10k colours it"
+        );
+        assert_eq!(
+            text(Work {
+                untracked: 2,
+                changed: 2,
+                ..Work::default()
+            }),
+            "?2"
+        );
+        assert_eq!(text(Work::default()), "", "clean is blank");
     }
 
     #[test]

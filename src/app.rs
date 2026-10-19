@@ -2313,6 +2313,7 @@ mod tests {
         let work = Work {
             changed: 2,
             unpushed: 1,
+            ..Work::default()
         };
         app.apply_work(&HashMap::from([(path, Some(work))]));
         let listing = app
@@ -2344,7 +2345,7 @@ mod tests {
                     t.path.clone(),
                     Some(Work {
                         changed,
-                        unpushed: 0,
+                        ..Work::default()
                     }),
                 )
             })

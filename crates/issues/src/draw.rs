@@ -27,41 +27,22 @@ use crate::screen::{Focus, Screen};
 use crate::targets::Target;
 
 /// The bar's keys, most used first; `?` lists them all.
-const KEYS: [(&str, &str); 17] = [
+const KEYS: [(&str, &str); 6] = [
     ("Enter", "read"),
     ("p", "pick up"),
-    ("?", "help"),
     ("z", "fold"),
-    ("s", "status"),
-    ("l", "labels"),
-    ("a", "assign"),
-    ("c", "comment"),
-    ("e", "edit"),
-    ("n", "new"),
     ("/", "search"),
-    ("f", "filters"),
-    ("m", "mine"),
-    ("w", "source"),
-    ("o", "open"),
     ("Tab", "trees"),
-    ("q", "quit"),
+    ("?", "help"),
 ];
 
 /// The bar's keys inside an open issue.
-const ISSUE_KEYS: [(&str, &str); 13] = [
+const ISSUE_KEYS: [(&str, &str); 5] = [
     ("Esc", "back"),
-    ("Tab", "links, images"),
-    ("Enter", "open it"),
-    ("j k", "scroll"),
+    ("Tab", "links"),
     ("p", "pick up"),
-    ("e", "edit"),
-    ("s", "status"),
-    ("l", "labels"),
-    ("a", "assign"),
-    ("c", "comment"),
     ("o", "open"),
     ("?", "help"),
-    ("q", "quit"),
 ];
 
 /// The bar's keys over an image on the whole screen.

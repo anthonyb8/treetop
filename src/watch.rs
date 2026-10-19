@@ -51,8 +51,8 @@ enum Watched {
 pub enum Check {
     /// Uncommitted files and unpushed commits.
     Full,
-    /// Only unpushed commits, keeping this many uncommitted files.
-    Unpushed(usize),
+    /// Only unpushed commits, keeping these counts of uncommitted files.
+    Unpushed(Work),
 }
 
 pub struct Watcher {
@@ -350,9 +350,9 @@ fn plan(
                 || signals.changed.contains(&tree.path)
                 || signals.polled.contains(&tree.path);
             let check = match last {
-                Some(work) if !is_full => signals
-                    .is_refs_changed
-                    .then_some(Check::Unpushed(work.changed))?,
+                Some(work) if !is_full => {
+                    signals.is_refs_changed.then_some(Check::Unpushed(work))?
+                }
                 _ => Check::Full,
             };
             Some((tree.path.clone(), check))
@@ -380,7 +380,7 @@ mod tests {
     fn work(changed: usize) -> Option<Work> {
         Some(Work {
             changed,
-            unpushed: 0,
+            ..Work::default()
         })
     }
 
@@ -447,8 +447,8 @@ mod tests {
         assert_eq!(
             checks(&signals)[..2],
             [
-                ("/p/1".into(), Check::Unpushed(5)),
-                ("/p/2".into(), Check::Unpushed(0))
+                ("/p/1".into(), Check::Unpushed(work(5).unwrap())),
+                ("/p/2".into(), Check::Unpushed(work(0).unwrap()))
             ]
         );
     }

@@ -22,10 +22,35 @@ pub struct Process {
 }
 
 /// Uncommitted files and commits on no remote: the work a destroy loses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The files are counted as a Powerlevel10k prompt counts them, so a file
+/// both staged and changed since is staged and unstaged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Work {
+    /// Every file `git status` lists.
     pub changed: usize,
+    pub staged: usize,
+    pub unstaged: usize,
+    pub untracked: usize,
     pub unpushed: usize,
+}
+
+impl Work {
+    /// The files `git status --porcelain` lists, by kind; no commits.
+    pub fn of_status(porcelain: &str) -> Work {
+        let mut work = Work::default();
+        for line in porcelain.lines().filter(|l| l.len() >= 2) {
+            work.changed += 1;
+            let mut codes = line.chars();
+            let (index, tree) = (codes.next(), codes.next());
+            if index == Some('?') {
+                work.untracked += 1;
+                continue;
+            }
+            work.staged += usize::from(index.is_some_and(|c| c != ' '));
+            work.unstaged += usize::from(tree.is_some_and(|c| c != ' '));
+        }
+        work
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -309,6 +334,23 @@ mod tests {
        "path":"/p/4/app","leased_at":"2026-09-24T15:23:37-04:00",
        "processes":[{"pid":42,"name":"node"}],"flavor":null,"detached":null,"lease_id":"l1"}
     ]"#;
+
+    #[test]
+    fn status_lines_count_as_a_prompt_counts_them() {
+        let work =
+            Work::of_status("M  staged.rs\n M edited.rs\nMM both.rs\n?? new.rs\nA  added.rs\n");
+        assert_eq!(
+            work,
+            Work {
+                changed: 5,
+                staged: 3,
+                unstaged: 2,
+                untracked: 1,
+                unpushed: 0,
+            }
+        );
+        assert_eq!(Work::of_status(""), Work::default());
+    }
 
     #[test]
     fn parses_and_orders_by_pool_number() {
