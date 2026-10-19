@@ -189,6 +189,11 @@ pub enum Outcome {
     },
     /// Open `url`, such as a tree's PR, in the browser.
     OpenUrl(String),
+    /// Write `record` as the treetop.json of the tree at `path`.
+    Record {
+        path: PathBuf,
+        record: Sidecar,
+    },
     /// Open `command`, agent `agent`'s chat in tree `tree`, in a popup over
     /// treetop until Ctrl+Q or until it exits.
     Chat {
@@ -302,6 +307,8 @@ pub struct App {
     landed: BTreeSet<PathBuf>,
     /// Follow-ups of merges, to hand to the worker.
     landings: Vec<Job>,
+    /// The Parked group is open, showing the trees set aside.
+    pub is_parked_open: bool,
 }
 
 /// How long a started agent may take to show up before treetop stops
@@ -411,9 +418,16 @@ impl App {
             .collect()
     }
 
+    /// The tree is set aside, under Parked.
+    pub fn is_parked(tree: &Tree) -> bool {
+        tree.sidecar.as_ref().is_some_and(|s| s.parked)
+    }
+
     /// The trees the list shows, filtered: those waiting on you first, then
     /// the main checkout, then the rest, each part with the most recently
     /// active agent first, and trees with no activity in pool order last.
+    /// Parked trees come last, and only while Parked is open or a filter
+    /// looks for them; one that waits on you comes first all the same.
     pub fn visible(&self) -> Vec<&Tree> {
         let needle = self.filter.to_lowercase();
         let mut visible: Vec<&Tree> = self
@@ -434,14 +448,65 @@ impl App {
                     .any(|field| field.to_lowercase().contains(&needle))
             })
             .collect();
+        visible.retain(|t| {
+            self.is_parked_open || !needle.is_empty() || !Self::is_parked(t) || self.needs_you(t)
+        });
         visible.sort_by_cached_key(|t| {
+            let needs_you = self.needs_you(t);
             (
-                !self.needs_you(t),
+                !needs_you,
+                !needs_you && Self::is_parked(t),
                 !t.is_main,
                 std::cmp::Reverse(self.active_at(t)),
             )
         });
         visible
+    }
+
+    /// Where Parked starts among the visible trees, and how many trees it
+    /// holds, shown or not; None when no tree is parked.
+    pub fn parked_rows(&self, visible: &[&Tree]) -> Option<(usize, usize)> {
+        let count = self
+            .trees
+            .iter()
+            .filter(|t| Self::is_parked(t) && !self.needs_you(t))
+            .count();
+        let start = visible
+            .iter()
+            .position(|t| Self::is_parked(t) && !self.needs_you(t))
+            .unwrap_or(visible.len());
+        (count > 0).then_some((start, count))
+    }
+
+    /// `z`: sets the tree under the cursor aside under Parked, or brings it
+    /// back. Only a leased tree can be parked.
+    fn toggle_park(&mut self) -> Outcome {
+        let Some(tree) = self.current() else {
+            return Outcome::Continue;
+        };
+        if tree.is_main || !tree.is_held() {
+            self.message = Some(format!("tree {} is not leased: nothing to park", tree.name));
+            return Outcome::Continue;
+        }
+        let path = tree.path.clone();
+        let name = tree.name.clone();
+        let mut record = tree
+            .sidecar
+            .as_deref()
+            .cloned()
+            .unwrap_or_else(Sidecar::leased_now);
+        record.parked = !record.parked;
+        self.message = Some(if record.parked {
+            format!("parked tree {name}; Z opens Parked")
+        } else {
+            format!("tree {name} is back from Parked")
+        });
+        if let Some(tree) = self.trees.iter_mut().find(|t| t.path == path) {
+            tree.sidecar = Some(Box::new(record.clone()));
+        }
+        let last = self.visible().len().saturating_sub(1);
+        self.selected = self.selected.min(last);
+        Outcome::Record { path, record }
     }
 
     /// How many of the visible trees at the top wait on you, which the list
@@ -1872,6 +1937,12 @@ impl App {
             KeyCode::Char('O') => return self.open_pr(),
             KeyCode::Char('f') => return self.read_failure(),
             KeyCode::Char('s') => return self.ship(),
+            KeyCode::Char('z') => return self.toggle_park(),
+            KeyCode::Char('Z') => {
+                self.is_parked_open = !self.is_parked_open;
+                let last = self.visible().len().saturating_sub(1);
+                self.selected = self.selected.min(last);
+            }
             KeyCode::Char('c') => self.open_coordinator(),
             KeyCode::Char('n') => self.open_dispatch(),
             KeyCode::Char('d') => self.open_diff(),
@@ -3380,5 +3451,62 @@ mod tests {
         ]);
         assert_eq!(names(&app), ["8", "main", "4", "7"]);
         assert_eq!(app.waiting_rows(&app.visible()), 1);
+    }
+
+    #[test]
+    fn z_parks_a_tree_out_of_sight_and_z_again_brings_it_back() {
+        let names =
+            |app: &App| -> Vec<String> { app.visible().iter().map(|t| t.name.clone()).collect() };
+        let mut app = app();
+        assert_eq!(names(&app), ["4", "7", "8"]);
+        let Outcome::Record { path, record } = press(&mut app, KeyCode::Char('z')) else {
+            panic!("z records the park");
+        };
+        assert_eq!(path, PathBuf::from("/p/4/app"));
+        assert!(record.parked);
+        assert_eq!(
+            app.message.as_deref(),
+            Some("parked tree 4; Z opens Parked")
+        );
+        assert_eq!(names(&app), ["7", "8"], "folded away");
+        assert_eq!(app.parked_rows(&app.visible()), Some((2, 1)));
+        app.filter = "end-1".into();
+        assert_eq!(names(&app), ["4"], "a filter still finds it");
+        app.filter.clear();
+        press(&mut app, KeyCode::Char('Z'));
+        assert_eq!(names(&app), ["7", "8", "4"], "Parked opens below the rest");
+        press(&mut app, KeyCode::End);
+        let Outcome::Record { record, .. } = press(&mut app, KeyCode::Char('z')) else {
+            panic!("z records it back");
+        };
+        assert!(!record.parked);
+        assert_eq!(app.parked_rows(&app.visible()), None);
+        press(&mut app, KeyCode::Home);
+        assert_eq!(press(&mut app, KeyCode::Char('j')), Outcome::Continue);
+        assert!(
+            matches!(press(&mut app, KeyCode::Char('z')), Outcome::Continue),
+            "an available tree has nothing to park"
+        );
+    }
+
+    #[test]
+    fn a_parked_tree_that_needs_you_comes_to_the_top() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('z'));
+        let mut sidecars = HashMap::new();
+        sidecars.insert(PathBuf::from("/p/4/app"), {
+            let mut record = Sidecar::leased_now();
+            record.parked = true;
+            record.job = Some("ask".into());
+            record
+        });
+        app.apply_sidecars(sidecars);
+        app.apply_reports(vec![report("ask", State::Blocked, "/p/4/app", 1)]);
+        assert_eq!(app.visible()[0].name, "4");
+        assert_eq!(
+            app.parked_rows(&app.visible()),
+            None,
+            "it is not counted as set aside"
+        );
     }
 }

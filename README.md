@@ -45,6 +45,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | `d` | open the side-by-side diff of the tree under the cursor in a popup |
 | `r` | return the marked trees, or the one under the cursor, to the pool; `D` in its dialog destroys them from disk instead, after reviewing treehouse's preview of each |
 | Space | mark or unmark the tree under the cursor |
+| `z` | park the tree under the cursor, setting it aside under Parked, or bring it back; `Z` opens or folds Parked |
 | `/` | filter by number, branch, holder or agent; Enter keeps it, Esc clears it |
 | `o` | open the lowest port the tree serves, `http://localhost:<port>`, in the browser, or copy it to the clipboard where there is no desktop |
 | `O` | open the tree's PR the same way (see [After the agent](#after-the-agent)) |
@@ -69,6 +70,8 @@ AGENT names the coding agent working in the tree, from the sources under [Agents
 SAYS is its agent's latest word (see [What agents say](#what-agents-say)).
 Trees waiting on you sort to the top, set apart from the rest by a blank line; below it come the main checkout, then the other trees with the most recently active agent first, so trees nobody has worked in for a while sink to the bottom.
 An agent's last activity is its latest report, or when its Claude Code transcript last grew.
+Trees held for later but not worked on now can be parked with `z`: they go under a Parked heading at the bottom, folded, and `Z` opens it.
+A parked tree that comes to need you still sorts to the top, a filter still finds parked trees, and returning a tree clears it, since parking is kept in its `treetop.json` as `parked`.
 PR is where the tree's branch stands after its agent: its pull request's number and stage, or the step of a pipeline it is going through (see [After the agent](#after-the-agent)).
 The pane below shows the tree under the cursor in full: its path and holder, its agents, ports and processes, everything its agent last said with its latest steps, and the outcome of its last action with the end of its output.
 The first row, `main`, is the repository's main checkout, so agents working in place show too; it is never returned or destroyed, and the summary's tree counts leave it out.

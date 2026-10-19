@@ -514,6 +514,11 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                 agent,
                 tree,
             } => open_chat(term, app, &mut chats, &command, agent, tree)?,
+            Outcome::Record { path, record } => {
+                if let Err(err) = sidecar::write(&path, &record) {
+                    app.message = Some(format!("could not record it: {err}"));
+                }
+            }
             Outcome::OpenUrl(url) => {
                 app.message =
                     Some(actions::open_url(&url).unwrap_or_else(|err| format!("{err:#}")));

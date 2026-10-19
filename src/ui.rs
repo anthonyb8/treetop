@@ -41,7 +41,7 @@ const KEYS: [(&str, &str); 11] = [
 ];
 
 /// Every key on the list, for the `?` overlay.
-const HELP: [(&str, &str); 23] = [
+const HELP: [(&str, &str); 24] = [
     (
         "Enter",
         "open the agent: its chat, a cold one started again, else its tree",
@@ -62,6 +62,10 @@ const HELP: [(&str, &str); 23] = [
         "return the marked trees, or this one; D in the dialog destroys",
     ),
     ("Space", "mark or unmark"),
+    (
+        "z Z",
+        "park the tree, or bring it back; open or fold Parked",
+    ),
     (
         "/",
         "filter by tree, branch, holder, agent or PR, such as merged",
@@ -469,14 +473,21 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
     let header = Row::new(titles).style(t.header);
     let visible = app.visible();
     let mut rows: Vec<Row> = visible.iter().map(|tree| row(app, tree)).collect();
-    // A blank line sets the trees waiting on you apart from the rest; the
-    // cursor skips it, so a row below it sits one further down the table.
+    // A blank line sets the trees waiting on you apart from the rest, and a
+    // heading sets Parked apart below them. The cursor skips both, so each
+    // pushes the rows below it one further down the table.
     let waiting = app.waiting_rows(&visible);
     let gap = waiting > 0 && waiting < visible.len();
+    let parked = app.parked_rows(&visible);
+    if let Some((start, count)) = parked {
+        rows.insert(start, parked_heading(app.is_parked_open, count));
+    }
     if gap {
         rows.insert(waiting, Row::new(Vec::<Cell>::new()));
     }
-    let selected = app.selected + usize::from(gap && app.selected >= waiting);
+    let selected = app.selected
+        + usize::from(gap && app.selected >= waiting)
+        + usize::from(parked.is_some_and(|(start, _)| app.selected >= start));
     let mut widths = vec![
         Constraint::Length(1),
         Constraint::Length(4),
@@ -497,6 +508,27 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
         .row_highlight_style(t.cursor);
     let mut state = TableState::default().with_selected(Some(selected));
     frame.render_stateful_widget(table, area, &mut state);
+}
+
+/// The heading over the trees set aside: folded, it is all that shows of
+/// them.
+fn parked_heading(is_open: bool, count: usize) -> Row<'static> {
+    let t = theme();
+    let (glyph, hint) = if is_open {
+        ("▾", "Z folds it")
+    } else {
+        ("▸", "Z opens it")
+    };
+    Row::new(vec![
+        Cell::from(glyph).style(fg(t.accent)),
+        Cell::from(""),
+        Cell::from(Line::from(vec![
+            Span::styled("Parked", fg(t.title).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  {count}"), fg(t.muted)),
+        ])),
+        Cell::from(""),
+        Cell::from(hint).style(fg(t.muted)),
+    ])
 }
 
 fn pane_block() -> Block<'static> {

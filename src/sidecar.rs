@@ -42,6 +42,10 @@ pub struct Sidecar {
     pub lease_id: Option<String>,
     /// When treetop leased the tree, in seconds since the epoch.
     pub leased_at: u64,
+    /// Set aside: held for later but not being worked on now, so the list
+    /// folds it away under Parked.
+    #[serde(default)]
+    pub parked: bool,
 }
 
 impl Sidecar {
@@ -53,6 +57,7 @@ impl Sidecar {
             job: None,
             ticket: None,
             task: None,
+            parked: false,
             branch: None,
             lease_id: None,
             leased_at: SystemTime::now()
