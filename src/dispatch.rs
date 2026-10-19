@@ -1,6 +1,7 @@
 //! The compose box where you write to agents: a word with the coordinator
-//! (`c`), a task for a new agent in a fresh tree (`n`), a line for agents
-//! already working (`m`), or a branch's new name (`b`). Kept free of terminal
+//! (`c`, `:`), a task for a new agent in a fresh tree (`n`) or in the tree
+//! under the cursor (`N`), a line for agents already working (`m`), or a
+//! branch's new name (`b`). Kept free of terminal
 //! I/O, like `app`.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -13,8 +14,8 @@ pub enum Target {
     /// The one agent that oversees the rest, started in the main checkout on
     /// first use; see `coordinator`.
     Coordinator,
-    /// One line for the coordinator, answered on screen as the assistant:
-    /// in its briefing and cards, not in its chat.
+    /// One line for the coordinator about what is on screen, or for the
+    /// agents its leading `@` words name.
     Ask,
     /// A new agent in a tree the pool hands out when the job runs, so two
     /// quick dispatches never share one.
@@ -75,6 +76,9 @@ pub enum Purpose {
     Message { to: Vec<Recipient> },
     /// The text is the new name of this tree's branch.
     Rename { tree: Box<Tree> },
+    /// The text is the task of a new agent in this tree, leased first if
+    /// it is free.
+    Start { tree: Box<Tree> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,17 +134,31 @@ impl Prompt {
         }
     }
 
-    pub fn target(&self) -> Option<Target> {
-        match &self.purpose {
-            Purpose::Dispatch { target } => Some(*target),
-            Purpose::Message { .. } | Purpose::Rename { .. } => None,
+    /// A new agent in `tree`, which is leased for it if it is free.
+    pub fn start(tree: Tree, user: String) -> Self {
+        Prompt {
+            user,
+            ..Prompt::new(Purpose::Start {
+                tree: Box::new(tree),
+            })
         }
     }
 
-    /// The target gets a branch named for it: a new agent's tree does, the
-    /// coordinator's main checkout keeps its own.
+    pub fn target(&self) -> Option<Target> {
+        match &self.purpose {
+            Purpose::Dispatch { target } => Some(*target),
+            Purpose::Message { .. } | Purpose::Rename { .. } | Purpose::Start { .. } => None,
+        }
+    }
+
+    /// The target gets a branch named for it: a new agent's tree does, and
+    /// a free tree leased for one; the coordinator's main checkout and a tree
+    /// someone holds keep their own.
     pub fn names_branch(&self) -> bool {
-        self.target() == Some(Target::NewTree)
+        match &self.purpose {
+            Purpose::Start { tree } => !tree.is_held() && !tree.is_main,
+            _ => self.target() == Some(Target::NewTree),
+        }
     }
 
     /// The branch the agent will start on, as the box shows it: the edited
@@ -308,6 +326,22 @@ mod tests {
         type_in(&mut prompt, "fix it");
         prompt.edit(KeyEvent::from(KeyCode::Down));
         assert!(!prompt.is_editing_branch);
+        assert_eq!(prompt.branch_name(), None);
+    }
+
+    #[test]
+    fn a_free_tree_gets_a_branch_and_a_held_one_keeps_its_own() {
+        let free = crate::pool::stand_in(std::path::PathBuf::from("/p/5/app"));
+        assert!(!free.is_held());
+        let mut prompt = Prompt::start(free.clone(), "anthony".into());
+        type_in(&mut prompt, "Fix login");
+        assert_eq!(prompt.branch_name().as_deref(), Some("anthony/fix-login"));
+        let held = Tree {
+            status: "leased".into(),
+            ..free
+        };
+        let mut prompt = Prompt::start(held, "anthony".into());
+        type_in(&mut prompt, "Fix login");
         assert_eq!(prompt.branch_name(), None);
     }
 

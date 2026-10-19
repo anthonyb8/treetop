@@ -8,7 +8,7 @@ mod compose;
 mod draw;
 mod form;
 mod host;
-pub mod markdown;
+mod markdown;
 mod panel;
 mod picker;
 mod picture;

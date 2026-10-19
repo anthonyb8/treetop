@@ -127,7 +127,7 @@ const HELP: [(&str, &str); 26] = [
     ("g G", "top, bottom"),
     (
         ":",
-        "ask the assistant about this issue; it answers in its pane",
+        "ask the assistant about this issue; it answers in its chat",
     ),
     ("Tab", "back to the trees"),
     ("q", "quit"),

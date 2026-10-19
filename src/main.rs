@@ -9,7 +9,6 @@
 mod actions;
 mod agents;
 mod app;
-mod assistant;
 mod branch;
 mod builtin;
 mod cache;
@@ -19,6 +18,7 @@ mod cli;
 mod config;
 mod coordinator;
 mod diff;
+mod dismissed;
 mod dispatch;
 mod github_plugin;
 mod jobs;
@@ -287,7 +287,6 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                 }
             }
         }
-        is_stale |= app.read_assistant();
         while let Ok(event) = worker.events.try_recv() {
             is_stale = true;
             match event {
@@ -303,9 +302,6 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                     }
                 }
             }
-        }
-        if let Some(Outcome::Send { to, text }) = app.ready_wake() {
-            send(term, app, &mut chats, &worker, to, &text)?;
         }
         if let Some(Outcome::Send { to, text }) = app.ready_failure() {
             send(term, app, &mut chats, &worker, to, &text)?;
@@ -582,10 +578,10 @@ fn show(term: &mut Term, start: PathBuf, mut checkout: PathBuf, is_issues: bool)
         let mut app = App::new(here.take());
         app.is_in_tmux = tmux::is_inside();
         app.checkout = checkout.clone();
-        app.assistant_path = assistant::path(&checkout);
-        app.wakes = config::load()
-            .map(|c| c.assistant.wake)
-            .unwrap_or_else(|_| config::WAKES.map(String::from).into());
+        app.dismissed_path = dismissed::path(&checkout);
+        if let Some(path) = &app.dismissed_path {
+            app.dismissed = dismissed::read_from(path);
+        }
         app.user = branch::user();
         app.ship_plugins = ship::plugins(&checkout).0;
         app.is_issues = std::mem::take(&mut is_issues);
