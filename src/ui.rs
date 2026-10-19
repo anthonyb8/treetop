@@ -12,7 +12,8 @@ use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wr
 
 use crate::agents::{Agent, Status};
 use crate::app::{
-    App, DiffView, Item, JobState, LogEntry, Opening, Pending, Picker, Review, Shipping,
+    App, DiffView, Item, JobState, LogEntry, Note, NoteKind, Opening, Pending, Picker, Review,
+    Shipping,
 };
 use crate::assistant::{self, CardState};
 use crate::chat::Chat;
@@ -27,9 +28,11 @@ use crate::theme::theme;
 
 /// The bar's keys, most useful first: on a narrow bar the keys at the end
 /// are the ones left out, and `?` lists them all.
-const KEYS: [(&str, &str); 13] = [
+const KEYS: [(&str, &str); 15] = [
     ("Enter", "open"),
     ("?", "help"),
+    ("e", "answer"),
+    ("x", "dismiss"),
     ("n", "new"),
     ("m", "message"),
     (":", "ask"),
@@ -43,6 +46,17 @@ const KEYS: [(&str, &str); 13] = [
     ("q", "quit"),
 ];
 
+/// The bar's keys while a reply is typed in a notification.
+const REPLY_KEYS: [(&str, &str); 2] = [("Enter", "send to the agent"), ("Esc", "cancel")];
+
+/// The bar's keys while the notifications have them.
+const NOTE_KEYS: [(&str, &str); 4] = [
+    ("e", "answer"),
+    ("x", "dismiss"),
+    ("↑ ↓", "the others"),
+    ("Esc", "back to the list"),
+];
+
 /// The bar's keys while the assistant's box is typed in.
 const BOX_KEYS: [(&str, &str); 6] = [
     ("Enter", "send"),
@@ -54,7 +68,7 @@ const BOX_KEYS: [(&str, &str); 6] = [
 ];
 
 /// Every key on the list, for the `?` overlay.
-const HELP: [(&str, &str); 27] = [
+const HELP: [(&str, &str); 30] = [
     (
         "Enter",
         "open the agent: its chat, a cold one started again, else its tree",
@@ -107,6 +121,15 @@ const HELP: [(&str, &str); 27] = [
     ),
     ("b", "rename the tree's branch"),
     ("w", "switch workspace"),
+    (
+        "e",
+        "answer the top notification: type the reply in it, Enter sends it to the agent",
+    ),
+    ("x", "dismiss the top notification, and see the next"),
+    (
+        "v",
+        "the tree details under the list, in place of the notifications",
+    ),
     ("Tab", "the repository's issues"),
     (
         "i",
@@ -189,7 +212,11 @@ pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>, issues: Option<&i
                 Layout::vertical([Constraint::Fill(1), Constraint::Length(DETAIL_HEIGHT)])
                     .areas(list);
             draw_table(frame, app, body);
-            draw_detail(frame, app, detail);
+            if app.is_details_shown {
+                draw_detail(frame, app, detail);
+            } else {
+                draw_notifications(frame, app, detail);
+            }
             if let Some(pane) = pane {
                 draw_assistant(frame, app, pane);
             }
@@ -769,6 +796,10 @@ fn footer_left(app: &App, width: u16) -> Line<'static> {
     let used = u16::try_from(narrowing.iter().map(Span::width).sum::<usize>()).unwrap_or(width);
     let keys: &[(&str, &str)] = if app.box_text.is_some() {
         &BOX_KEYS
+    } else if app.note_reply.is_some() {
+        &REPLY_KEYS
+    } else if app.note.is_some() {
+        &NOTE_KEYS
     } else {
         &KEYS
     };
@@ -839,6 +870,170 @@ fn says_cell(app: &App, tree: &Tree) -> Cell<'static> {
         Span::styled(format!("{glyph} "), style),
         Span::styled(first, text_style),
     ]))
+}
+
+/// How many notifications show as edges under the top one.
+const NOTE_LAYERS: usize = 2;
+
+/// How a notification reads: its mark, what happened, and its colour.
+fn note_style(kind: NoteKind) -> (&'static str, &'static str, Color) {
+    let t = theme();
+    match kind {
+        NoteKind::NeedsYou => ("●", "needs you", t.warning),
+        NoteKind::Pr => ("◆", "PR", t.info),
+        NoteKind::Done => ("✓", "done", t.success),
+    }
+}
+
+/// The notifications under the list, stacked: the top one whole, the ones
+/// behind it as edges, so dismissing it shows the next.
+fn draw_notifications(frame: &mut Frame, app: &App, area: Rect) {
+    let t = theme();
+    let notes = app.notifications();
+    // The one showing: the one the keys are on, else the top one.
+    let at = app.note.unwrap_or(0).min(notes.len().saturating_sub(1));
+    let Some(top) = notes.get(at) else {
+        let block = Block::bordered()
+            .border_style(fg(t.border))
+            .title(Span::styled(" Notifications ", fg(t.muted)))
+            .title_bottom(Line::styled(" v tree details ", fg(t.muted)).right_aligned());
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        frame.render_widget(
+            Paragraph::new(
+                " Nothing new. An agent's question, its answer, and news of a PR land here.",
+            )
+            .style(fg(t.muted))
+            .wrap(Wrap { trim: false }),
+            inner,
+        );
+        return;
+    };
+    // The ones behind show as an edge each, inset, under the top one.
+    let after = notes.len() - at - 1;
+    let behind = after.min(NOTE_LAYERS);
+    let layers = u16::try_from(behind).unwrap_or(0);
+    let card = Rect {
+        height: area.height.saturating_sub(layers),
+        ..area
+    };
+    for layer in 1..=layers {
+        let inset = layer * 2;
+        let width = area.width.saturating_sub(inset * 2);
+        let y = card.y + card.height + layer - 1;
+        let mut edge = format!("╰{}╯", "─".repeat(usize::from(width.saturating_sub(2))));
+        if layer == 1 {
+            let more = format!(" {after} more ");
+            let at = 2.min(edge.chars().count());
+            let head: String = edge.chars().take(at).collect();
+            let tail: String = edge.chars().skip(at + more.chars().count()).collect();
+            edge = format!("{head}{more}{tail}");
+        }
+        frame.render_widget(
+            Paragraph::new(Line::styled(edge, fg(t.border))),
+            Rect::new(area.x + inset, y, width, 1),
+        );
+    }
+    let place = (notes.len() > 1).then(|| format!("{} of {}", at + 1, notes.len()));
+    let reply = app.note_reply.as_deref().filter(|_| app.note.is_some());
+    draw_notification(frame, top, card, app.note.is_some(), place, reply);
+}
+
+/// One notification in full, in a box of its own.
+fn draw_notification(
+    frame: &mut Frame,
+    note: &Note,
+    area: Rect,
+    has_keys: bool,
+    position: Option<String>,
+    reply: Option<&str>,
+) {
+    let t = theme();
+    let (mark, what, color) = note_style(note.kind);
+    let place = note
+        .tree
+        .as_deref()
+        .map_or(String::new(), |tree| format!(" tree {tree} ·"));
+    let age = note
+        .at
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .filter(|d| d.as_secs() > 0)
+        .map_or(String::new(), |d| format!(" · {}", ago(d.as_secs())));
+    let block = Block::bordered()
+        .border_style(fg(if has_keys { t.accent } else { t.border }))
+        .padding(ratatui::widgets::Padding::horizontal(1))
+        .title(Line::from(vec![
+            Span::styled(
+                format!(" {mark} {what} "),
+                fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("·{place} {}{age} ", note.who), fg(t.title)),
+        ]))
+        .title_bottom(
+            Line::styled(
+                if reply.is_some() {
+                    " Enter sends it to the agent · Esc cancels "
+                } else if has_keys {
+                    " e answer · x dismiss · ↑ ↓ the others · Esc back "
+                } else {
+                    " ↓ to go through them · e answer · x dismiss · v details "
+                },
+                fg(if has_keys { t.accent } else { t.muted }),
+            )
+            .right_aligned(),
+        );
+    let block = match position {
+        Some(position) => {
+            block.title(Line::styled(format!(" {position} "), fg(t.muted)).right_aligned())
+        }
+        None => block,
+    };
+    let block = if has_keys {
+        block.border_type(ratatui::widgets::BorderType::Thick)
+    } else {
+        block
+    };
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let Some(reply) = reply else {
+        frame.render_widget(
+            Paragraph::new(note.text.clone()).wrap(Wrap { trim: false }),
+            inner,
+        );
+        return;
+    };
+    // The reply is typed on the card's last line, under what it answers.
+    let [text_area, reply_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(inner);
+    frame.render_widget(
+        Paragraph::new(note.text.clone()).wrap(Wrap { trim: false }),
+        text_area,
+    );
+    let room = usize::from(reply_area.width.saturating_sub(3)).max(1);
+    let skip = reply.chars().count().saturating_sub(room);
+    let shown: String = reply.chars().skip(skip).collect();
+    let x = u16::try_from(shown.chars().count() + 2).unwrap_or(0);
+    let line = if reply.is_empty() {
+        Line::from(vec![
+            Span::styled("› ", fg(t.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("reply to {}", note.who),
+                fg(t.muted).add_modifier(Modifier::ITALIC),
+            ),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("› ", fg(t.accent).add_modifier(Modifier::BOLD)),
+            Span::raw(shown),
+        ])
+    };
+    frame.render_widget(Paragraph::new(line), reply_area);
+    let x = if reply.is_empty() { 2 } else { x };
+    frame.set_cursor_position((
+        reply_area.x + x.min(reply_area.width.saturating_sub(1)),
+        reply_area.y,
+    ));
 }
 
 /// Rows the detail pane takes, borders included.

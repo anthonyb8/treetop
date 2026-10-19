@@ -44,6 +44,9 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | `:` | type in the assistant's box: a question for it, or `@17 ...` for that tree's agent (see [The assistant](#the-assistant)) |
 | `c` | talk to the assistant in its chat; send nothing to open the chat |
 | `a` | show or hide the assistant pane |
+| `e` | answer the top notification in place, with a reply line in it, or open the agent's chat when it sits at a dialog |
+| `x` | dismiss the top notification, and see the next |
+| `v` | show the tree details under the list in place of the notifications, and back |
 | `→` | type in the assistant's box, as `:` does; Tab puts its suggestion in, `↑`/`↓` show the others |
 | `d` | open the side-by-side diff of the tree under the cursor in a popup |
 | `r` | return the marked trees, or the one under the cursor, to the pool; `D` in its dialog destroys them from disk instead, after reviewing treehouse's preview of each |
@@ -267,7 +270,7 @@ treetop starts new agents with it unless `TREETOP_NEW_AGENT` names a command.
 ## What the actions run
 
 Both run in the background, up to four trees at once, while treetop stays on screen; each row's STATUS shows queued, returning, destroying, returned, destroyed or failed.
-The detail pane shows the end of each tree's last action's output, and a failure also shows its last line in the status line.
+The tree details (`v`) show the end of each tree's last action's output, and a failure also shows its last line in the status line.
 
 - **Return** first shows a dialog listing each tree's uncommitted files, unpushed commits and running processes, or "unknown changes" where git cannot read it. On `y`, for each tree at once:
   1. it removes the tree's background agents through their plugin, running or cold, so none is found in the tree when it is leased again; a session that moved in with `EnterWorktree` runs from elsewhere, so treehouse would not stop it, and removing it can hand the tree back already, through the `WorktreeRemove` hook, which the return then takes as done; an agent its plugin cannot remove is stopped instead, so the tree stops keeping it awake;
@@ -403,6 +406,18 @@ Finished and stopped reports go after a day; working and waiting ones stay.
 The assistant's own reports are left off its row, since it speaks through its pane and `c`.
 
 When an agent comes to need you, or finishes, treetop rings the terminal bell, and inside tmux shows it in the status line for five seconds, so it is heard from any window; the assistant finishing an answer rings it too.
+
+### Notifications
+
+Under the list, what the agents said stacks up as notifications: an agent waiting on you, then a PR that needs you or merged, then an answer from the last day, the newest first within each.
+The top one shows whole, its tree, agent and age in its border, and the ones behind it show as edges under it with how many there are.
+`↓` past the last tree moves into them, and the border turns thick: `↑`/`↓` step through the stack, `e` or Enter answers the one showing, `x` dismisses it, and `↑` from the first or Esc goes back to the list.
+From the list, `e` and `x` act on the top one.
+`e` answers it in place: a reply line opens in the notification, Enter sends what you type to its agent and dismisses it, answered, so the next shows, and Esc cancels; for an agent sitting at a dialog, which only its chat can answer, its chat opens instead.
+`x` dismisses it, and the next one shows; a newer word from the same agent notifies again.
+Dismissals are kept in the assistant's state file, so they stay dismissed when treetop opens again.
+Only this workspace's trees notify; agents elsewhere are counted in the summary.
+`v` shows the tree under the cursor in full in their place: where it is, its agents, ports, processes, PR and last action; `v` again goes back.
 The summary counts the trees that need you, and, as "elsewhere", agents outside the pool waiting on you, which have no row.
 These job files are internal to Claude Code, like its session files, so a release that changes them blanks SAYS until treetop catches up.
 

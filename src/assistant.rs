@@ -167,7 +167,13 @@ pub struct State {
     /// The number the next card's id takes, so an id is never reused.
     #[serde(default)]
     pub next: u64,
+    /// The notifications dismissed, by key, the latest last.
+    #[serde(default)]
+    pub dismissed: Vec<String>,
 }
+
+/// How many dismissed notifications are remembered: plenty for a day's.
+const DISMISSED_KEPT: usize = 500;
 
 pub fn now() -> u64 {
     SystemTime::now()
@@ -224,6 +230,15 @@ impl State {
         });
         self.cards
             .retain(|card| card.state == CardState::Open && at.saturating_sub(card.at) < CARD_LIFE);
+    }
+
+    /// Remembers that notification `key` was dismissed.
+    pub fn dismiss(&mut self, key: &str) {
+        if !self.dismissed.iter().any(|k| k == key) {
+            self.dismissed.push(key.to_string());
+        }
+        let over = self.dismissed.len().saturating_sub(DISMISSED_KEPT);
+        self.dismissed.drain(..over);
     }
 
     /// Records what you asked, which the reply then answers.
