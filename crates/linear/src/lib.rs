@@ -336,7 +336,7 @@ impl Client {
             .and_then(Value::as_str)
             .ok_or_else(|| Error::new(ErrorKind::NotFound, format!("no issue {id}")))?;
         let kind = data.pointer("/issue/state/type").and_then(Value::as_str);
-        if matches!(kind, Some("completed" | "canceled")) {
+        if matches!(kind, Some("completed" | "canceled" | "duplicate")) {
             return Ok(());
         }
         let state = first_state(&data)

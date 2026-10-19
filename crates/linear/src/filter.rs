@@ -62,7 +62,7 @@ impl Filter {
             Some(state) => out.insert("state".into(), json!({ "name": { "eqIgnoreCase": state } })),
             None => out.insert(
                 "state".into(),
-                json!({ "type": { "nin": ["completed", "canceled"] } }),
+                json!({ "type": { "nin": ["completed", "canceled", "duplicate"] } }),
             ),
         };
         if let Some(project) = &self.project {
@@ -114,7 +114,7 @@ mod tests {
             none,
             json!({
                 "team": { "key": { "eqIgnoreCase": "END" } },
-                "state": { "type": { "nin": ["completed", "canceled"] } },
+                "state": { "type": { "nin": ["completed", "canceled", "duplicate"] } },
             })
         );
         let all = Filter {

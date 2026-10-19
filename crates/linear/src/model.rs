@@ -214,7 +214,7 @@ impl RawLinked {
             is_done: self
                 .state
                 .as_ref()
-                .is_some_and(|s| matches!(s.kind.as_str(), "completed" | "canceled")),
+                .is_some_and(|s| matches!(s.kind.as_str(), "completed" | "canceled" | "duplicate")),
             state: self.state.map(|s| s.name).unwrap_or_default(),
         }
     }

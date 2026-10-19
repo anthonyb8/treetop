@@ -73,6 +73,9 @@ pub struct Screen {
     pub(crate) group: Group,
     /// The groups folded to their heading, by heading, as Linear folds them.
     pub(crate) folded: BTreeSet<String>,
+    /// Closed status groups opened by hand, which stay open; the rest fold
+    /// as they appear.
+    pub(crate) opened: BTreeSet<String>,
     /// The search, while it is being typed, and when it was last typed in.
     pub(crate) search: Option<String>,
     search_at: Option<Instant>,
@@ -220,6 +223,7 @@ impl Screen {
             is_without_source: false,
             choosing: None,
             folded: BTreeSet::new(),
+            opened: BTreeSet::new(),
             retry: None,
             editor_text: None,
             is_loading: false,
@@ -935,6 +939,18 @@ impl Screen {
         let group = self.group;
         self.issues
             .sort_by_cached_key(|issue| views::place(issue, group, team.as_deref()));
+        // Done, cancelled and duplicate issues are rarely wanted, so their
+        // groups come folded, as Linear folds them, until opened by hand.
+        if let (Group::Status, Some(team)) = (group, team) {
+            for state in team.states.iter().filter(|s| views::is_closed(s)) {
+                if !self.opened.contains(&state.name) {
+                    self.folded.insert(state.name.clone());
+                }
+            }
+        }
+        while self.selected > 0 && !self.is_stop(self.selected) {
+            self.selected -= 1;
+        }
     }
 
     /// The heading the issue at `at` starts, when it is the first of its
@@ -977,10 +993,13 @@ impl Screen {
             self.message = Some("z folds a group: 4 groups the list by status".into());
             return;
         };
-        if !self.folded.remove(&group) {
+        if self.folded.remove(&group) {
+            self.opened.insert(group);
+        } else {
             while self.selected > 0 && self.group_of(self.selected - 1).as_ref() == Some(&group) {
                 self.selected -= 1;
             }
+            self.opened.remove(&group);
             self.folded.insert(group);
         }
         self.scroll = 0;
@@ -1977,9 +1996,9 @@ mod tests {
         settle(&mut screen);
         assert_eq!(screen.view_name(), "by status");
         let order: Vec<&str> = screen.issues.iter().map(|i| i.id.as_str()).collect();
-        assert_eq!(order, ["END-1", "END-2"], "Todo comes before In Progress");
-        assert_eq!(screen.heading(0).as_deref(), Some("Todo"));
-        assert_eq!(screen.heading(1).as_deref(), Some("In Progress"));
+        assert_eq!(order, ["END-2", "END-1"], "closest to done first");
+        assert_eq!(screen.heading(0).as_deref(), Some("In Progress"));
+        assert_eq!(screen.heading(1).as_deref(), Some("Todo"));
         screen.handle_key(key(KeyCode::Char('6')));
         settle(&mut screen);
         assert_eq!(screen.view_name(), "bugs");
@@ -2000,9 +2019,9 @@ mod tests {
         let fake = Arc::new(Fake {
             name: "work".into(),
             issues: vec![
-                in_state("END-1", "todo"),
-                in_state("END-2", "todo"),
-                in_state("END-3", "doing"),
+                in_state("END-1", "doing"),
+                in_state("END-2", "doing"),
+                in_state("END-3", "todo"),
             ],
             team: Some(team_of(&["todo", "doing"])),
             ..Fake::default()
@@ -2011,7 +2030,7 @@ mod tests {
         settle(&mut screen);
         assert_eq!(
             screen.heading(0).as_deref(),
-            Some("todo"),
+            Some("doing"),
             "mine groups by status"
         );
         screen.handle_key(key(KeyCode::Char('g')));
@@ -2103,6 +2122,65 @@ mod tests {
         );
     }
 
+    #[test]
+    fn statuses_stack_closest_to_done_first_and_closed_ones_come_folded() {
+        let in_state = |id: &str, state: &str| Issue {
+            state: state.into(),
+            state_id: Some(state.into()),
+            ..issue(id)
+        };
+        let fake = Arc::new(Fake {
+            name: "work".into(),
+            issues: vec![
+                in_state("END-1", "backlog"),
+                in_state("END-2", "done"),
+                in_state("END-3", "todo"),
+                in_state("END-4", "staging"),
+                in_state("END-5", "duplicate"),
+                in_state("END-6", "review"),
+            ],
+            team: Some(team_of(&[
+                "backlog",
+                "todo",
+                "review",
+                "staging",
+                "done",
+                "canceled",
+                "duplicate",
+            ])),
+            ..Fake::default()
+        });
+        let mut screen = Screen::new(vec![fake], 0, Vec::new());
+        settle(&mut screen);
+        let headings: Vec<String> = (0..screen.issues.len())
+            .filter_map(|at| screen.heading(at))
+            .collect();
+        assert_eq!(
+            headings,
+            ["staging", "review", "todo", "backlog", "done", "duplicate"]
+        );
+        assert_eq!(
+            screen.folded,
+            ["canceled", "done", "duplicate"].map(String::from).into(),
+            "closed groups come folded"
+        );
+        screen.handle_key(key(KeyCode::Char('G')));
+        assert_eq!(
+            screen.current(),
+            None,
+            "the cursor rests on the folded heading"
+        );
+        screen.handle_key(key(KeyCode::Enter));
+        assert_eq!(screen.current().unwrap().id, "END-5", "opened by hand");
+        screen.handle_key(key(KeyCode::Char('r')));
+        settle(&mut screen);
+        assert!(
+            !screen.folded.contains("duplicate"),
+            "a group opened by hand stays open when the list is read again"
+        );
+        assert!(screen.folded.contains("done"));
+    }
+
     fn team_of(states: &[&str]) -> Arc<Team> {
         Arc::new(Team {
             id: "t".into(),
@@ -2113,7 +2191,13 @@ mod tests {
                 .map(|id| linear::State {
                     id: (*id).into(),
                     name: (*id).into(),
-                    kind: "unstarted".into(),
+                    kind: match *id {
+                        "done" => "completed",
+                        "canceled" => "canceled",
+                        "duplicate" => "duplicate",
+                        _ => "unstarted",
+                    }
+                    .into(),
                     position: 0.0,
                 })
                 .collect(),

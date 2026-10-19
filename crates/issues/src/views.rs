@@ -77,7 +77,7 @@ pub fn place(issue: &Issue, group: Group, team: Option<&Team>) -> (usize, String
         Group::Status => {
             let at = team
                 .and_then(|team| {
-                    team.states
+                    status_order(team)
                         .iter()
                         .position(|s| Some(&s.id) == issue.state_id.as_ref())
                 })
@@ -85,6 +85,20 @@ pub fn place(issue: &Issue, group: Group, team: Option<&Team>) -> (usize, String
             (at, issue.state.clone())
         }
     }
+}
+
+/// A state's work is over: done, cancelled, or a duplicate, which Linear
+/// gives a type of its own.
+pub fn is_closed(state: &linear::State) -> bool {
+    matches!(state.kind.as_str(), "completed" | "canceled" | "duplicate")
+}
+
+/// The team's states as the status groups stack: what is still open, the
+/// state closest to done first, then the closed ones in workflow order.
+fn status_order(team: &Team) -> Vec<&linear::State> {
+    let (closed, open): (Vec<&linear::State>, Vec<&linear::State>) =
+        team.states.iter().partition(|s| is_closed(s));
+    open.into_iter().rev().chain(closed).collect()
 }
 
 #[cfg(test)]
