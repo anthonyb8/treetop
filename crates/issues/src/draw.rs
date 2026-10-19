@@ -92,12 +92,16 @@ fn form_keys(field: Field) -> &'static [(&'static str, &'static str)] {
 }
 
 /// Every key, for the `?` overlay.
-const HELP: [(&str, &str); 24] = [
+const HELP: [(&str, &str); 25] = [
     (
         "Enter →",
         "read it: the whole issue, its description and comments",
     ),
     ("← h Esc", "back to the list"),
+    (
+        "J K PgDn PgUp",
+        "scroll the preview below the list, a line or a page",
+    ),
     ("p", "pick it up: an agent on it in a new tree"),
     ("s", "status: pick one, typing narrows the list"),
     ("l", "labels: Tab marks or unmarks each, Enter applies them"),
@@ -253,7 +257,7 @@ impl Screen {
             self.draw_footer(frame, footer, p);
         } else {
             let [list, detail, footer] = Layout::vertical([
-                Constraint::Percentage(60),
+                Constraint::Percentage(50),
                 Constraint::Fill(1),
                 Constraint::Length(1),
             ])
@@ -541,13 +545,23 @@ impl Screen {
         let inner = block.inner(area);
         let text = Paragraph::new(lines).wrap(Wrap { trim: false });
         let height = u16::try_from(text.line_count(inner.width)).unwrap_or(u16::MAX);
-        let block = if height > inner.height {
-            block.title_bottom(Line::styled(" Enter reads the rest ", fg(p.muted)))
+        let max = height.saturating_sub(inner.height);
+        self.preview_max.set(max);
+        self.preview_height.set(inner.height);
+        let scroll = self.preview_scroll(&issue.id);
+        let block = if max > 0 {
+            block.title_bottom(Line::styled(
+                format!(
+                    " {}%  J K or PgDn PgUp scroll it, Enter reads it whole ",
+                    u32::from(scroll) * 100 / u32::from(max)
+                ),
+                fg(p.muted),
+            ))
         } else {
             block
         };
         frame.render_widget(block, area);
-        frame.render_widget(text, inner);
+        frame.render_widget(text.scroll((scroll, 0)), inner);
     }
 
     /// The open issue over the whole of `area`: its title and fields, its

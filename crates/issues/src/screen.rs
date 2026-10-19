@@ -85,6 +85,12 @@ pub struct Screen {
     pub(crate) view_height: Cell<u16>,
     /// The furthest the open issue scrolls, as it was last drawn.
     pub(crate) max_scroll: Cell<u16>,
+    /// The preview below the list scrolled down this many rows, for the
+    /// issue of this id; any other issue's preview starts at its top.
+    pub(crate) preview: (String, u16),
+    /// The furthest the preview scrolls, and how tall it is, as last drawn.
+    pub(crate) preview_max: Cell<u16>,
+    pub(crate) preview_height: Cell<u16>,
     /// The issues opened from the open one's links, by id, the one on
     /// screen last; Esc goes back along them.
     pub(crate) trail: Vec<String>,
@@ -188,6 +194,9 @@ impl Screen {
             focus: Focus::List,
             scroll: 0,
             max_scroll: Cell::new(0),
+            preview: (String::new(), 0),
+            preview_max: Cell::new(0),
+            preview_height: Cell::new(0),
             view_height: Cell::new(0),
             trail: Vec::new(),
             target: None,
@@ -973,6 +982,27 @@ impl Screen {
         self.scroll = 0;
     }
 
+    /// The rows the preview of the issue under the cursor is scrolled down.
+    pub(crate) fn preview_scroll(&self, id: &str) -> u16 {
+        if self.preview.0 == id {
+            self.preview.1.min(self.preview_max.get())
+        } else {
+            0
+        }
+    }
+
+    /// Scrolls the preview below the list `delta` rows, within what it
+    /// holds, so an issue is read without opening it.
+    fn scroll_preview(&mut self, delta: i32) {
+        let Some(id) = self.current().map(|i| i.id.clone()) else {
+            return;
+        };
+        let now = i32::from(self.preview_scroll(&id));
+        let max = i32::from(self.preview_max.get());
+        let to = u16::try_from((now + delta).clamp(0, max)).unwrap_or(0);
+        self.preview = (id, to);
+    }
+
     /// Folds every group, or unfolds them all when every one is folded.
     fn toggle_all_folds(&mut self) {
         let groups: BTreeSet<String> = (0..self.issues.len())
@@ -1227,6 +1257,16 @@ impl Screen {
             KeyCode::End | KeyCode::Char('G') => self.move_by(isize::MAX),
             KeyCode::Enter | KeyCode::Right if self.is_folded(self.selected) => {
                 self.toggle_fold();
+            }
+            KeyCode::Char('J') => self.scroll_preview(1),
+            KeyCode::Char('K') => self.scroll_preview(-1),
+            KeyCode::PageDown => {
+                let page = i32::from(self.preview_height.get().saturating_sub(1).max(1));
+                self.scroll_preview(page);
+            }
+            KeyCode::PageUp => {
+                let page = i32::from(self.preview_height.get().saturating_sub(1).max(1));
+                self.scroll_preview(-page);
             }
             KeyCode::Char('z') => self.toggle_fold(),
             KeyCode::Char('Z') => self.toggle_all_folds(),
@@ -1685,7 +1725,10 @@ mod tests {
         settle(&mut screen);
         wait_for(&mut screen, |s| s.detail().is_some());
         let below = drawn(&screen).join("\n");
-        assert!(below.contains("Enter reads the rest"), "{below}");
+        assert!(
+            below.contains("J K or PgDn PgUp scroll it, Enter reads it whole"),
+            "{below}"
+        );
         screen.handle_key(key(KeyCode::Enter));
         let open = drawn(&screen).join("\n");
         assert!(!open.contains("STATUS"), "the list is gone: {open}");
@@ -1980,6 +2023,38 @@ mod tests {
         assert_eq!(screen.selected, 2, "the last heading");
         screen.handle_key(key(KeyCode::Char('Z')));
         assert!(screen.folded.is_empty(), "and unfolds them all");
+    }
+
+    #[test]
+    fn the_preview_scrolls_within_its_issue_and_starts_at_the_top_of_the_next() {
+        let (mut screen, _) = screen();
+        drawn(&screen);
+        let first = screen.current().unwrap().id.clone();
+        screen.preview_max.set(5);
+        screen.preview_height.set(4);
+        screen.handle_key(key(KeyCode::Char('J')));
+        screen.handle_key(key(KeyCode::Char('J')));
+        assert_eq!(screen.preview_scroll(&first), 2);
+        screen.handle_key(key(KeyCode::PageDown));
+        assert_eq!(screen.preview_scroll(&first), 5, "no further than it holds");
+        screen.handle_key(key(KeyCode::Char('K')));
+        assert_eq!(screen.preview_scroll(&first), 4);
+        screen.handle_key(key(KeyCode::PageUp));
+        assert_eq!(screen.preview_scroll(&first), 1);
+        screen.handle_key(key(KeyCode::Char('J')));
+        screen.handle_key(key(KeyCode::Char('j')));
+        let second = screen.current().unwrap().id.clone();
+        assert_ne!(first, second);
+        assert_eq!(
+            screen.preview_scroll(&second),
+            0,
+            "the next issue starts at its top"
+        );
+        assert_eq!(
+            screen.current().unwrap().id,
+            second,
+            "J and K scroll; j and k still move"
+        );
     }
 
     fn team_of(states: &[&str]) -> Arc<Team> {
