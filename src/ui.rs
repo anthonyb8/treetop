@@ -41,10 +41,14 @@ const KEYS: [(&str, &str); 11] = [
 ];
 
 /// Every key on the list, for the `?` overlay.
-const HELP: [(&str, &str); 22] = [
+const HELP: [(&str, &str); 23] = [
     (
         "Enter",
         "open the agent: its chat, a cold one started again, else its tree",
+    ),
+    (
+        "t",
+        "go to the tree: its tmux pane or a window in it, else a shell there",
     ),
     (
         "n",

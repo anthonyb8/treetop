@@ -38,6 +38,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | Key | Does |
 |---|---|
 | Enter | open the agent of the tree under the cursor: its chat in a popup, starting a cold one again, else the tree itself (see [Agent chats](#agent-chats) and [Entering a tree](#entering-a-tree)) |
+| `t` | go to the tree itself, even when its agent has a chat: its tmux pane or a window in it, else a shell there (see [Entering a tree](#entering-a-tree)) |
 | `n` | start a new agent in a fresh tree, on a branch named for the task (see [New agents](#new-agents)) |
 | `m` | write a message to the agents in the marked trees, or the tree under the cursor |
 | `c` | ask the coordinator; send nothing to open its chat (see [The coordinator](#the-coordinator)) |
@@ -465,7 +466,7 @@ Each workspace has its own coordinator; a stopped one is only ever taken up agai
 
 ## Entering a tree
 
-Enter on a tree whose agent has no chat to open here, or no agent at all, goes to the tree.
+`t` goes to the tree under the cursor, and Enter does too on a tree whose agent has no chat to open here, or no agent at all.
 
 Inside tmux, a tree with an agent switches to the pane that agent runs in, in whichever session it is, and never opens a new one.
 The pane is the one whose process is the agent, its parent or its grandparent, so a pane an agent once used and something else uses now is never mistaken for it.

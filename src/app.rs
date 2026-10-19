@@ -1838,6 +1838,12 @@ impl App {
         }
         match key.code {
             KeyCode::Enter => return self.open_agent(),
+            // The tree itself, even where Enter would open its agent's chat.
+            KeyCode::Char('t') => {
+                if let Some(tree) = self.current() {
+                    return Outcome::Enter(tree.clone());
+                }
+            }
             KeyCode::Tab => self.is_issues = true,
             KeyCode::Char('i') => self.show_issue(),
             KeyCode::Char('I') => self.choose_issue(),
@@ -2458,6 +2464,11 @@ mod tests {
         assert!(
             matches!(press(&mut app, KeyCode::Enter), Outcome::Enter(t) if t.name == "8"),
             "an agent with no chat is in a pane, which going to the tree finds"
+        );
+        press(&mut app, KeyCode::Home);
+        assert!(
+            matches!(press(&mut app, KeyCode::Char('t')), Outcome::Enter(t) if t.name == "4"),
+            "t goes to the tree, though its agent has a chat"
         );
     }
 
