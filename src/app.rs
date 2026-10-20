@@ -220,21 +220,40 @@ pub enum NoteKind {
     Done,
 }
 
-/// A notification: an agent's question or answer, or news of a PR.
+/// One thing a notification says: an agent's question or answer, or news
+/// of a PR.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Note {
+pub struct Entry {
     /// What dismissing it remembers: the report and when it was written, or
     /// the PR and its state, so a newer word notifies again.
     pub key: String,
     pub kind: NoteKind,
-    /// The tree it comes from, by name.
-    pub tree: Option<String>,
     /// Who: the agent's name, or the PR's label.
     pub who: String,
+    /// The agent's job, which a reply goes to; None for a PR's, whose reply
+    /// goes to the tree's agents.
+    pub job: Option<String>,
     /// The agent sits at a dialog in its chat, which only its chat answers.
     pub is_at_prompt: bool,
     pub text: String,
     pub at: SystemTime,
+}
+
+/// A tree's notifications, in one box: what needs you first, then PR news,
+/// then what finished, the newest first in each.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Note {
+    /// The tree they come from, by name.
+    pub tree: String,
+    /// Never empty.
+    pub entries: Vec<Entry>,
+}
+
+impl Note {
+    /// The most pressing entry, which the box leads with.
+    pub fn top(&self) -> &Entry {
+        &self.entries[0]
+    }
 }
 
 /// How long a finished agent's answer stays a notification.
@@ -806,6 +825,7 @@ impl App {
             });
         } else {
             if job.kind == Kind::Return {
+                self.dismiss_tree(&job.tree.name);
                 self.returned(&path);
             }
             self.jobs
@@ -1497,12 +1517,13 @@ impl App {
             .collect()
     }
 
-    /// The notifications of this workspace's trees not yet dismissed, top
-    /// first: what needs you, then PR news, then what finished in the last
-    /// day, the newest first in each.
+    /// The notifications of this workspace's trees not yet dismissed, one
+    /// per tree, top first: what needs you, then PR news, then what finished
+    /// in the last day, the newest first in each, a tree ranked by its most
+    /// pressing.
     pub fn notifications(&self) -> Vec<Note> {
         let dismissed = &self.dismissed.dismissed;
-        let mut notes: Vec<Note> = Vec::new();
+        let mut entries: Vec<(String, Entry)> = Vec::new();
         for item in self.items() {
             let kind = match item.state {
                 State::Blocked => NoteKind::NeedsYou,
@@ -1522,67 +1543,108 @@ impl App {
                 .updated
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs());
-            // An agent of another workspace is that workspace's news.
+            // An agent of another workspace is that workspace's news, and
+            // one in a tree since returned is nobody's.
             let Some(tree) = item
                 .tree
                 .or_else(|| pool::holding(&self.trees, item.report.dir.as_deref()?))
+                .filter(|t| t.is_held())
                 .map(|t| t.name.clone())
             else {
                 continue;
             };
-            let tree = Some(tree);
             let is_at_prompt = item.is_at_prompt();
             let text = if is_at_prompt {
                 "waiting at a prompt in its chat: e opens it".to_string()
             } else {
                 item.text().to_string()
             };
-            notes.push(Note {
-                key: format!("{}@{at}", item.report.job),
-                kind,
+            entries.push((
                 tree,
-                who: item.report.name.clone(),
-                is_at_prompt,
-                text,
-                at: item.report.updated,
-            });
+                Entry {
+                    key: format!("{}@{at}", item.report.job),
+                    kind,
+                    who: item.report.name.clone(),
+                    job: Some(item.report.job.clone()),
+                    is_at_prompt,
+                    text,
+                    at: item.report.updated,
+                },
+            ));
         }
         for tree in &self.trees {
-            let Some(ship) = tree.ship.as_ref() else {
+            let Some(ship) = tree.ship.as_ref().filter(|_| tree.is_held()) else {
                 continue;
             };
             if !ship.stage.needs_you() && ship.stage != Stage::Merged {
                 continue;
             }
-            notes.push(Note {
-                key: format!("pr:{}:{}", tree.path.display(), ship.label),
-                kind: NoteKind::Pr,
-                tree: Some(tree.name.clone()),
-                who: ship.label.clone(),
-                is_at_prompt: false,
-                text: format!(
-                    "{} on {}",
-                    ship.label,
-                    tree.branch.as_deref().unwrap_or(&ship.branch)
-                ),
-                at: UNIX_EPOCH,
-            });
+            entries.push((
+                tree.name.clone(),
+                Entry {
+                    key: format!("pr:{}:{}", tree.path.display(), ship.label),
+                    kind: NoteKind::Pr,
+                    who: ship.label.clone(),
+                    job: None,
+                    is_at_prompt: false,
+                    text: format!(
+                        "{} on {}",
+                        ship.label,
+                        tree.branch.as_deref().unwrap_or(&ship.branch)
+                    ),
+                    at: UNIX_EPOCH,
+                },
+            ));
         }
-        notes.retain(|n| !dismissed.contains(&n.key));
-        notes.sort_by(|a, b| a.kind.cmp(&b.kind).then(b.at.cmp(&a.at)));
+        entries.retain(|(_, e)| !dismissed.contains(&e.key));
+        entries.sort_by(|(_, a), (_, b)| a.kind.cmp(&b.kind).then(b.at.cmp(&a.at)));
+        // Sorted, so a tree's box goes where its most pressing entry does.
+        let mut notes: Vec<Note> = Vec::new();
+        for (tree, entry) in entries {
+            match notes.iter_mut().find(|n| n.tree == tree) {
+                Some(note) => note.entries.push(entry),
+                None => notes.push(Note {
+                    tree,
+                    entries: vec![entry],
+                }),
+            }
+        }
         notes
     }
 
-    /// Dismisses notification `at`, so the next shows.
+    /// Remembers `keys` as dismissed, on screen and in their file.
+    fn dismiss_keys(&mut self, keys: &[String]) {
+        for key in keys {
+            self.dismissed.dismiss(key);
+        }
+        if let Some(path) = &self.dismissed_path
+            && !keys.is_empty()
+        {
+            let _ = dismissed::update(path, |s| keys.iter().for_each(|k| s.dismiss(k)));
+        }
+    }
+
+    /// Dismisses notification `at`, everything in its box, so the next
+    /// shows.
     fn dismiss_note(&mut self, at: usize) {
         let Some(note) = self.notifications().into_iter().nth(at) else {
             self.message = Some("no notifications".into());
             return;
         };
-        self.dismissed.dismiss(&note.key);
-        if let Some(path) = &self.dismissed_path {
-            let _ = dismissed::update(path, |s| s.dismiss(&note.key));
-        }
+        let keys: Vec<String> = note.entries.into_iter().map(|e| e.key).collect();
+        self.dismiss_keys(&keys);
+    }
+
+    /// Dismisses the notification of tree `name`, so a tree handed out again
+    /// never shows its last agent's.
+    fn dismiss_tree(&mut self, name: &str) {
+        let keys: Vec<String> = self
+            .notifications()
+            .into_iter()
+            .filter(|n| n.tree == name)
+            .flat_map(|n| n.entries.into_iter().map(|e| e.key))
+            .collect();
+        self.dismiss_keys(&keys);
     }
 
     /// Answers notification `at` in place: a reply line opens in it, or, for
@@ -1592,10 +1654,8 @@ impl App {
             self.message = Some("no notifications".into());
             return Outcome::Continue;
         };
-        let Some(tree) = note.tree else {
-            return Outcome::Continue;
-        };
-        if note.is_at_prompt {
+        if note.top().is_at_prompt {
+            let tree = note.tree;
             self.note = None;
             let path = self
                 .trees
@@ -1641,20 +1701,26 @@ impl App {
                     self.note_reply = None;
                     return Outcome::Continue;
                 };
-                let tree = note.tree.as_deref().and_then(|name| self.named_tree(name));
-                let to = tree.as_ref().map(Self::recipients).unwrap_or_default();
+                // The reply answers the entry the box leads with: its agent
+                // alone, or for a PR the tree's.
+                let top = note.top();
+                let to: Vec<Recipient> = self
+                    .named_tree(&note.tree)
+                    .as_ref()
+                    .map(Self::recipients)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|r| top.job.is_none() || r.job == top.job)
+                    .collect();
                 if to.is_empty() {
-                    self.message = Some(format!("{} has no chat to type into", note.who));
+                    self.message = Some(format!("{} has no chat to type into", top.who));
                     return Outcome::Continue;
                 }
                 self.note_reply = None;
                 self.dismiss_note(at);
                 let left = self.notifications().len();
                 self.note = (left > 0).then(|| at.min(left - 1));
-                self.message = Some(format!(
-                    "sending to tree {}...",
-                    note.tree.unwrap_or_default()
-                ));
+                self.message = Some(format!("sending to tree {}...", note.tree));
                 return Outcome::Send { to, text: reply };
             }
             KeyCode::Char(c) if !is_ctrl => text.push(c),
@@ -3491,8 +3557,8 @@ mod tests {
         }]);
         let notes = app.notifications();
         assert_eq!(notes.len(), 1, "with no pane, this is where it is read");
-        assert_eq!(notes[0].who, coordinator::NAME);
-        assert_eq!(notes[0].text, "c00rd1na says");
+        assert_eq!(notes[0].top().who, coordinator::NAME);
+        assert_eq!(notes[0].top().text, "c00rd1na says");
     }
 
     #[test]
@@ -3572,14 +3638,17 @@ mod tests {
             recent("busy", State::Working, "/p/8/app", 5),
         ]);
         let shown = |app: &App| -> Vec<String> {
-            app.notifications().iter().map(|n| n.who.clone()).collect()
+            app.notifications()
+                .iter()
+                .map(|n| n.top().who.clone())
+                .collect()
         };
         assert_eq!(
             shown(&app),
             ["job ask", "job done"],
             "what needs you first; an old answer, another workspace's and a working agent left out"
         );
-        assert_eq!(app.notifications()[0].tree.as_deref(), Some("8"));
+        assert_eq!(app.notifications()[0].tree, "8");
         press(&mut app, KeyCode::Char('e'));
         assert_eq!(
             (app.note, app.note_reply.as_deref()),
@@ -3604,11 +3673,103 @@ mod tests {
     }
 
     #[test]
+    fn returning_a_tree_clears_its_notifications_for_good() {
+        let mut app = app();
+        app.apply_reports(vec![
+            recent("ask", State::Blocked, "/p/4/app", 60),
+            recent("other", State::Blocked, "/p/8/app", 30),
+        ]);
+        let trees = |app: &App| -> Vec<String> {
+            app.notifications().into_iter().map(|n| n.tree).collect()
+        };
+        assert_eq!(trees(&app), ["8", "4"]);
+        press(&mut app, KeyCode::Char('r'));
+        let job = queued(press(&mut app, KeyCode::Char('y'))).remove(0);
+        assert_eq!(job.tree.name, "4");
+        app.job_finished(job, true, String::new());
+        assert_eq!(trees(&app), ["8"], "tree 4's went with it");
+        // The pool hands tree 4 out again: its last agent's words stay gone.
+        let mut listed = app.trees.clone();
+        let four = listed.iter_mut().find(|t| t.name == "4").unwrap();
+        four.status = "leased".into();
+        app.set_trees(listed);
+        assert_eq!(trees(&app), ["8"]);
+    }
+
+    #[test]
+    fn a_tree_has_one_notification_what_needs_you_first_and_x_clears_it_all() {
+        let mut app = app();
+        app.apply_reports(vec![
+            recent("done", State::Done, "/p/8/app", 30),
+            recent("ask", State::Blocked, "/p/8/app", 600),
+            recent("other", State::Done, "/p/4/app", 5),
+        ]);
+        let notes = app.notifications();
+        let shown: Vec<(&str, Vec<&str>)> = notes
+            .iter()
+            .map(|n| {
+                let who = n.entries.iter().map(|e| e.who.as_str()).collect();
+                (n.tree.as_str(), who)
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [("8", vec!["job ask", "job done"]), ("4", vec!["job other"])],
+            "one box a tree, ranked by what it most needs"
+        );
+        press(&mut app, KeyCode::Char('x'));
+        let left: Vec<String> = app.notifications().into_iter().map(|n| n.tree).collect();
+        assert_eq!(left, ["4"], "x dismissed all of tree 8's");
+    }
+
+    /// A background agent with a chat, running job `job`.
+    fn background(job: &str) -> Agent {
+        Agent {
+            job: Some(job.into()),
+            ..attachable(job)
+        }
+    }
+
+    #[test]
+    fn a_reply_goes_to_the_agent_the_box_leads_with_not_the_whole_tree() {
+        let mut app = app();
+        app.apply_agents(&HashMap::from([(
+            PathBuf::from("/p/8/app"),
+            vec![background("busy"), background("ask")],
+        )]));
+        app.apply_reports(vec![
+            recent("busy", State::Done, "/p/8/app", 5),
+            recent("ask", State::Blocked, "/p/8/app", 60),
+        ]);
+        assert_eq!(app.notifications()[0].entries.len(), 2);
+        press(&mut app, KeyCode::Char('e'));
+        type_in(&mut app, "use branding/");
+        let Outcome::Send { to, .. } = press(&mut app, KeyCode::Enter) else {
+            panic!("the reply goes out");
+        };
+        let jobs: Vec<Option<&str>> = to.iter().map(|r| r.job.as_deref()).collect();
+        assert_eq!(jobs, [Some("ask")], "the one waiting on you, alone");
+    }
+
+    #[test]
+    fn a_tree_returned_elsewhere_notifies_no_more() {
+        let mut app = app();
+        app.apply_reports(vec![recent("ask", State::Blocked, "/p/4/app", 60)]);
+        assert_eq!(app.notifications().len(), 1);
+        // Returned with treehouse itself, so treetop only sees the listing.
+        let mut listed = app.trees.clone();
+        let four = listed.iter_mut().find(|t| t.name == "4").unwrap();
+        four.status = "available".into();
+        app.set_trees(listed);
+        assert!(app.notifications().is_empty());
+    }
+
+    #[test]
     fn down_past_the_last_tree_steps_through_the_notifications() {
         let mut app = app();
         app.apply_agents(&HashMap::from([(
             PathBuf::from("/p/8/app"),
-            vec![attachable("ask")],
+            vec![background("ask")],
         )]));
         app.apply_reports(vec![
             recent("ask", State::Blocked, "/p/8/app", 60),

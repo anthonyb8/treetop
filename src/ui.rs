@@ -12,8 +12,8 @@ use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wr
 
 use crate::agents::{Agent, Status};
 use crate::app::{
-    App, DiffView, Item, JobState, LogEntry, Note, NoteKind, Opening, Pending, Picker, Review,
-    Shipping,
+    App, DiffView, Entry, Item, JobState, LogEntry, Note, NoteKind, Opening, Pending, Picker,
+    Review, Shipping,
 };
 use crate::chat::Chat;
 use crate::coordinator;
@@ -903,7 +903,90 @@ fn draw_notifications(frame: &mut Frame, app: &App, area: Rect) {
     draw_notification(frame, top, card, app.note.is_some(), place, reply);
 }
 
-/// One notification in full, in a box of its own.
+/// How long ago an entry was written, after a ` · `; none for a PR's.
+fn entry_age(entry: &Entry) -> String {
+    entry
+        .at
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .filter(|d| d.as_secs() > 0)
+        .map_or(String::new(), |d| format!(" · {}", ago(d.as_secs())))
+}
+
+/// What a tree's box says, in `area`: its most pressing entry whole, and
+/// under it each other entry on a line of its own, cut at the edge, so a
+/// tree with a lot to say still shows all of it.
+fn draw_note_body(frame: &mut Frame, note: &Note, area: Rect) {
+    let t = theme();
+    let text = |entry: &Entry| -> Vec<Line<'static>> {
+        entry
+            .text
+            .lines()
+            .map(|l| Line::raw(l.to_string()))
+            .collect()
+    };
+    let [top, rest @ ..] = note.entries.as_slice() else {
+        return;
+    };
+    if rest.is_empty() {
+        frame.render_widget(Paragraph::new(text(top)).wrap(Wrap { trim: false }), area);
+        return;
+    }
+    let heading = |entry: &Entry| -> Vec<Span<'static>> {
+        let (mark, what, color) = note_style(entry.kind);
+        vec![
+            Span::styled(
+                format!("{mark} {what} "),
+                fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("· {}{}", entry.who, entry_age(entry)), fg(t.title)),
+        ]
+    };
+    // The others keep at most half the box, with a blank line above them;
+    // the last line left says how many more there are when they do not fit.
+    let room = usize::from(area.height / 2).max(1);
+    let mut others: Vec<Line<'static>> = Vec::new();
+    for (at, entry) in rest.iter().enumerate() {
+        if others.len() + 1 == room && rest.len() - at > 1 {
+            others.push(Line::styled(
+                format!("… and {} more", rest.len() - at),
+                fg(t.muted),
+            ));
+            break;
+        }
+        let mut spans = heading(entry);
+        let first = entry.text.lines().next().unwrap_or_default();
+        let used: usize = spans.iter().map(Span::width).sum::<usize>() + 2;
+        let room = usize::from(area.width).saturating_sub(used);
+        let first = if first.chars().count() > room {
+            let kept: String = first.chars().take(room.saturating_sub(1)).collect();
+            format!("{}…", kept.trim_end())
+        } else {
+            first.to_string()
+        };
+        spans.push(Span::styled(format!("  {first}"), fg(t.muted)));
+        others.push(Line::from(spans));
+    }
+    let rows = u16::try_from(others.len()).unwrap_or(u16::MAX);
+    let mut head = vec![Line::from(heading(top))];
+    head.extend(text(top));
+    let head = Paragraph::new(head).wrap(Wrap { trim: false });
+    // The others follow the top entry, which gives up its end for them.
+    let head_rows = u16::try_from(head.line_count(area.width))
+        .unwrap_or(u16::MAX)
+        .min(area.height.saturating_sub(rows + 1));
+    let [head_area, _, rest_area, _] = Layout::vertical([
+        Constraint::Length(head_rows),
+        Constraint::Length(1),
+        Constraint::Length(rows),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+    frame.render_widget(head, head_area);
+    frame.render_widget(Paragraph::new(others), rest_area);
+}
+
+/// One tree's notification in full, in a box of its own.
 fn draw_notification(
     frame: &mut Frame,
     note: &Note,
@@ -913,17 +996,14 @@ fn draw_notification(
     reply: Option<&str>,
 ) {
     let t = theme();
-    let (mark, what, color) = note_style(note.kind);
-    let place = note
-        .tree
-        .as_deref()
-        .map_or(String::new(), |tree| format!(" tree {tree} ·"));
-    let age = note
-        .at
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .filter(|d| d.as_secs() > 0)
-        .map_or(String::new(), |d| format!(" · {}", ago(d.as_secs())));
+    let top = note.top();
+    let (mark, what, color) = note_style(top.kind);
+    let place = format!(" tree {} ·", note.tree);
+    // One entry is named in the border; several each name their own.
+    let who = match note.entries.len() {
+        1 => format!("{}{}", top.who, entry_age(top)),
+        count => format!("{count} new"),
+    };
     let block = Block::bordered()
         .border_style(fg(if has_keys { t.accent } else { t.border }))
         .padding(ratatui::widgets::Padding::horizontal(1))
@@ -932,7 +1012,7 @@ fn draw_notification(
                 format!(" {mark} {what} "),
                 fg(color).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!("·{place} {}{age} ", note.who), fg(t.title)),
+            Span::styled(format!("·{place} {who} "), fg(t.title)),
         ]))
         .title_bottom(
             Line::styled(
@@ -961,19 +1041,13 @@ fn draw_notification(
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let Some(reply) = reply else {
-        frame.render_widget(
-            Paragraph::new(note.text.clone()).wrap(Wrap { trim: false }),
-            inner,
-        );
+        draw_note_body(frame, note, inner);
         return;
     };
     // The reply is typed on the card's last line, under what it answers.
     let [text_area, reply_area] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(inner);
-    frame.render_widget(
-        Paragraph::new(note.text.clone()).wrap(Wrap { trim: false }),
-        text_area,
-    );
+    draw_note_body(frame, note, text_area);
     let room = usize::from(reply_area.width.saturating_sub(3)).max(1);
     let skip = reply.chars().count().saturating_sub(room);
     let shown: String = reply.chars().skip(skip).collect();
@@ -982,7 +1056,10 @@ fn draw_notification(
         Line::from(vec![
             Span::styled("› ", fg(t.accent).add_modifier(Modifier::BOLD)),
             Span::styled(
-                format!("reply to {}", note.who),
+                match note.top().job {
+                    Some(_) => format!("reply to {}", note.top().who),
+                    None => format!("reply to tree {}'s agents", note.tree),
+                },
                 fg(t.muted).add_modifier(Modifier::ITALIC),
             ),
         ])

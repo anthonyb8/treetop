@@ -374,14 +374,16 @@ When an agent comes to need you, or finishes, treetop rings the terminal bell, a
 
 ### Notifications
 
-Under the list, what the agents said stacks up as notifications: an agent waiting on you, then a PR that needs you or merged, then an answer from the last day, the newest first within each.
-The top one shows whole, its tree, agent and age in its border, and the ones behind it show as edges under it with how many there are.
+Under the list, what the agents said stacks up as notifications, one box per tree: an agent waiting on you, then a PR that needs you or merged, then an answer from the last day, the newest first within each, and a tree's box goes where its most pressing entry does.
+Inside a box, the most pressing entry shows whole and the tree's other entries a line each under it.
+The top box shows in full, its tree in its border with the agent and age of a single entry or how many entries there are, and the ones behind it show as edges under it with how many there are.
 `↓` past the last tree moves into them, and the border turns thick: `↑`/`↓` step through the stack, `e` or Enter answers the one showing, `x` dismisses it, and `↑` from the first or Esc goes back to the list.
 From the list, `e` and `x` act on the top one.
-`e` answers it in place: a reply line opens in the notification, Enter sends what you type to its agent and dismisses it, answered, so the next shows, and Esc cancels; for an agent sitting at a dialog, which only its chat can answer, its chat opens instead.
-`x` dismisses it, and the next one shows; a newer word from the same agent notifies again.
+`e` answers it in place: a reply line opens in the notification, Enter sends what you type to the agent of the entry the box leads with, or for a PR to the tree's agents, and dismisses the box, answered, so the next shows, and Esc cancels; for an agent sitting at a dialog, which only its chat can answer, its chat opens instead.
+`x` dismisses the whole box, and the next one shows; a newer word from the same agent notifies again.
 Dismissals are kept in `$XDG_STATE_HOME/treetop/dismissed-<workspace>.json`, one per workspace, so they stay dismissed when treetop opens again.
 Only this workspace's trees notify; agents elsewhere are counted in the summary.
+A tree's notifications go when it is returned, and do not come back when it is handed out again.
 `v` shows the tree under the cursor in full in their place: where it is, its agents, ports, processes, PR and last action; `v` again goes back.
 The summary counts the trees that need you, and, as "elsewhere", agents outside the pool waiting on you, which have no row.
 These job files are internal to Claude Code, like its session files, so a release that changes them blanks SAYS until treetop catches up.
