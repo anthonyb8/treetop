@@ -695,7 +695,7 @@ dependencies = [
 
 [[package]]
 name = "issues"
-version = "0.1.32"
+version = "0.1.33"
 dependencies = [
  "image",
  "linear",
@@ -777,7 +777,7 @@ dependencies = [
 
 [[package]]
 name = "linear"
-version = "0.1.32"
+version = "0.1.33"
 dependencies = [
  "serde",
  "serde_json",
@@ -2030,7 +2030,7 @@ dependencies = [
 
 [[package]]
 name = "treetop"
-version = "0.1.32"
+version = "0.1.33"
 dependencies = [
  "anyhow",
  "issues",
