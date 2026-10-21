@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
@@ -11,7 +11,6 @@ use ratatui::layout::Rect;
 use crate::agents::{Agent, Status};
 use crate::coordinator;
 use crate::diff::Layout;
-use crate::dismissed;
 use crate::dispatch::{Edit, Prompt, Purpose, Recipient, Target};
 use crate::jobs::{Job, Kind, Launch, Message, Pick, ShipAction, ShipCall};
 use crate::keeper::Kept;
@@ -209,56 +208,6 @@ pub enum Outcome {
     },
 }
 
-/// What a notification says happened.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum NoteKind {
-    /// An agent waits on you.
-    NeedsYou,
-    /// A PR needs you, or merged.
-    Pr,
-    /// An agent finished.
-    Done,
-}
-
-/// One thing a notification says: an agent's question or answer, or news
-/// of a PR.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Entry {
-    /// What dismissing it remembers: the report and when it was written, or
-    /// the PR and its state, so a newer word notifies again.
-    pub key: String,
-    pub kind: NoteKind,
-    /// Who: the agent's name, or the PR's label.
-    pub who: String,
-    /// The agent's job, which a reply goes to; None for a PR's, whose reply
-    /// goes to the tree's agents.
-    pub job: Option<String>,
-    /// The agent sits at a dialog in its chat, which only its chat answers.
-    pub is_at_prompt: bool,
-    pub text: String,
-    pub at: SystemTime,
-}
-
-/// A tree's notifications, in one box: what needs you first, then PR news,
-/// then what finished, the newest first in each.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Note {
-    /// The tree they come from, by name.
-    pub tree: String,
-    /// Never empty.
-    pub entries: Vec<Entry>,
-}
-
-impl Note {
-    /// The most pressing entry, which the box leads with.
-    pub fn top(&self) -> &Entry {
-        &self.entries[0]
-    }
-}
-
-/// How long a finished agent's answer stays a notification.
-const DONE_NOTE_LIFE: Duration = Duration::from_secs(24 * 60 * 60);
-
 #[derive(Default)]
 pub struct App {
     pub trees: Vec<Tree>,
@@ -279,19 +228,6 @@ pub struct App {
     /// The Issues screen is shown in place of the trees; the program
     /// around the app owns it and gives it the keys.
     pub is_issues: bool,
-    /// The notifications dismissed, as last read from their file.
-    pub dismissed: dismissed::State,
-    /// Where that file is: the workspace's, set once the screen opens; None
-    /// keeps them in memory, as in tests.
-    pub dismissed_path: Option<PathBuf>,
-    /// The tree details show under the list in place of the notifications,
-    /// with `v`.
-    pub is_details_shown: bool,
-    /// The notification the keys are on, an index into `notifications`,
-    /// once `↓` has gone past the last tree into them.
-    pub note: Option<usize>,
-    /// The reply being typed in the notification showing, to its agent.
-    pub note_reply: Option<String>,
     /// What `:` is asked about: what was on screen when it opened.
     ask_context: Option<String>,
     /// The issue to open on the Issues screen as it comes on, by id, taken
@@ -342,7 +278,7 @@ pub struct App {
     /// The workspace picker, while it is open.
     pub picker: Option<Picker>,
     /// Every background agent's latest report, for the AGENT column's mark,
-    /// the notifications, the bell and finding a stopped coordinator.
+    /// asks, the bell and finding a stopped coordinator.
     pub reports: Vec<Report>,
     /// Each job's state at the last read, so a change can be announced;
     /// None until the first read, which announces nothing.
@@ -366,6 +302,10 @@ pub struct App {
     last_stages: Option<HashMap<PathBuf, Stage>>,
     /// A PR's failure read for its agent, ready to send.
     failure: Option<Outcome>,
+    /// The agents whose question or prompt has been on screen, its chat
+    /// opened for it or open while it asked, by their chat's command. One
+    /// leaves once it stops asking, so its next ask opens again.
+    asked: BTreeSet<String>,
     /// Issues a merge has left with nothing blocking them, by id, until
     /// a tree takes one up.
     pub ready: BTreeSet<String>,
@@ -827,7 +767,6 @@ impl App {
             });
         } else {
             if job.kind == Kind::Return {
-                self.dismiss_tree(&job.tree.name);
                 self.returned(&path);
             }
             self.jobs
@@ -1090,6 +1029,99 @@ impl App {
             self.opening = None;
         }
         None
+    }
+
+    /// The agents asking you something now, a question or a prompt but
+    /// not a finished turn, with a chat to answer it in, in list order and
+    /// then any a filter hides: each one's tree, name and chat command.
+    fn asks(&self) -> Vec<(&Tree, &Agent, Vec<String>)> {
+        let shown = self.visible();
+        let hidden = self
+            .trees
+            .iter()
+            .filter(|t| !shown.iter().any(|s| s.path == t.path))
+            .collect::<Vec<_>>();
+        shown
+            .into_iter()
+            .chain(hidden)
+            .flat_map(|tree| tree.agents.iter().map(move |agent| (tree, agent)))
+            .filter(|(_, agent)| !coordinator::is_assistant(&agent.name))
+            // A busy agent asks nothing, whatever its last report says: the
+            // report is written as a turn ends, so it lags a turn under way.
+            .filter(|(_, agent)| {
+                agent.status == Some(Status::Waiting)
+                    || agent.status != Some(Status::Busy)
+                        && agent.job.as_deref().is_some_and(|job| {
+                            self.reports
+                                .iter()
+                                .any(|r| r.job == job && r.state == State::Blocked)
+                        })
+            })
+            .filter_map(|(tree, agent)| Some((tree, agent, agent.attach.clone()?)))
+            .collect()
+    }
+
+    /// Nothing else is on screen or being typed: the list alone, where an
+    /// ask's chat may open without taking over something under way.
+    fn is_free(&self) -> bool {
+        self.view.is_none()
+            && self.prompt.is_none()
+            && self.picker.is_none()
+            && self.opening.is_none()
+            && self.awaiting_chat.is_none()
+            && self.started_chat.is_none()
+            && !self.is_help
+            && self.reviews.is_empty()
+            && self.shipping.is_none()
+            && self.pending.is_none()
+            && !self.is_filtering
+            && !self.is_issues
+            && !self.is_quitting
+    }
+
+    /// The chat of the next agent asking you something that has not been
+    /// on screen yet, once you are free on the list, so each ask comes to
+    /// you in turn as you finish with the last. The cursor moves to its
+    /// tree, so leaving the chat lands on it.
+    pub fn next_ask(&mut self) -> Option<Outcome> {
+        let asks: Vec<(PathBuf, String, String, Vec<String>)> = self
+            .asks()
+            .into_iter()
+            .map(|(tree, agent, command)| {
+                (
+                    tree.path.clone(),
+                    tree.name.clone(),
+                    agent.name.clone(),
+                    command,
+                )
+            })
+            .collect();
+        self.asked
+            .retain(|key| asks.iter().any(|(.., command)| command.join(" ") == *key));
+        if !self.is_free() {
+            return None;
+        }
+        let (path, tree, agent, command) = asks
+            .into_iter()
+            .find(|(.., command)| !self.asked.contains(&command.join(" ")))?;
+        self.asked.insert(command.join(" "));
+        if !self.visible().iter().any(|t| t.path == path) {
+            self.filter.clear();
+        }
+        self.reselect(Some(path));
+        Some(Outcome::Chat {
+            command,
+            agent,
+            tree,
+        })
+    }
+
+    /// The chat running `command` is on screen, so whatever its agent asks
+    /// now has been seen and does not open again when it closes.
+    pub fn saw_chat(&mut self, command: &[String]) {
+        if self.asks().iter().any(|(.., c)| c.as_slice() == command) {
+            self.asked.insert(command.join(" "));
+        }
     }
 
     /// The chat of the next tree down the list, as filtered, that has one,
@@ -1499,264 +1531,12 @@ impl App {
         self.prompt = Some(Prompt::start(tree, self.user.clone()));
     }
 
-    /// The tree `place` names: its number, `main`, or an agent's name.
-    fn named_tree(&self, place: &str) -> Option<Tree> {
-        self.trees
-            .iter()
-            .find(|t| {
-                t.name == place
-                    || (place == "main" && t.is_main)
-                    || t.agents.iter().any(|a| a.name == place)
-            })
-            .cloned()
-    }
-
     /// The agents of `tree` that a message can be typed to.
     fn recipients(tree: &Tree) -> Vec<Recipient> {
         tree.agents
             .iter()
             .filter_map(|a| Recipient::of(a, &tree.name))
             .collect()
-    }
-
-    /// The notifications of this workspace's trees not yet dismissed, one
-    /// per tree, top first: what needs you, then PR news, then what finished
-    /// in the last day, the newest first in each, a tree ranked by its most
-    /// pressing.
-    pub fn notifications(&self) -> Vec<Note> {
-        let dismissed = &self.dismissed.dismissed;
-        let mut entries: Vec<(String, Entry)> = Vec::new();
-        for item in self.items() {
-            let kind = match item.state {
-                State::Blocked => NoteKind::NeedsYou,
-                State::Done
-                    if item
-                        .report
-                        .updated
-                        .elapsed()
-                        .is_ok_and(|age| age < DONE_NOTE_LIFE) =>
-                {
-                    NoteKind::Done
-                }
-                _ => continue,
-            };
-            let at = item
-                .report
-                .updated
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs());
-            // An agent of another workspace is that workspace's news, and
-            // one in a tree since returned is nobody's.
-            let Some(tree) = item
-                .tree
-                .or_else(|| pool::holding(&self.trees, item.report.dir.as_deref()?))
-                .filter(|t| t.is_held())
-                .map(|t| t.name.clone())
-            else {
-                continue;
-            };
-            let is_at_prompt = item.is_at_prompt();
-            let text = if is_at_prompt {
-                "waiting at a prompt in its chat: e opens it".to_string()
-            } else {
-                item.text().to_string()
-            };
-            entries.push((
-                tree,
-                Entry {
-                    key: format!("{}@{at}", item.report.job),
-                    kind,
-                    who: item.report.name.clone(),
-                    job: Some(item.report.job.clone()),
-                    is_at_prompt,
-                    text,
-                    at: item.report.updated,
-                },
-            ));
-        }
-        for tree in &self.trees {
-            let Some(ship) = tree.ship.as_ref().filter(|_| tree.is_held()) else {
-                continue;
-            };
-            if !ship.stage.needs_you() && ship.stage != Stage::Merged {
-                continue;
-            }
-            entries.push((
-                tree.name.clone(),
-                Entry {
-                    key: format!("pr:{}:{}", tree.path.display(), ship.label),
-                    kind: NoteKind::Pr,
-                    who: ship.label.clone(),
-                    job: None,
-                    is_at_prompt: false,
-                    text: format!(
-                        "{} on {}",
-                        ship.label,
-                        tree.branch.as_deref().unwrap_or(&ship.branch)
-                    ),
-                    at: UNIX_EPOCH,
-                },
-            ));
-        }
-        entries.retain(|(_, e)| !dismissed.contains(&e.key));
-        entries.sort_by(|(_, a), (_, b)| a.kind.cmp(&b.kind).then(b.at.cmp(&a.at)));
-        // Sorted, so a tree's box goes where its most pressing entry does.
-        let mut notes: Vec<Note> = Vec::new();
-        for (tree, entry) in entries {
-            match notes.iter_mut().find(|n| n.tree == tree) {
-                Some(note) => note.entries.push(entry),
-                None => notes.push(Note {
-                    tree,
-                    entries: vec![entry],
-                }),
-            }
-        }
-        notes
-    }
-
-    /// Remembers `keys` as dismissed, on screen and in their file.
-    fn dismiss_keys(&mut self, keys: &[String]) {
-        for key in keys {
-            self.dismissed.dismiss(key);
-        }
-        if let Some(path) = &self.dismissed_path
-            && !keys.is_empty()
-        {
-            let _ = dismissed::update(path, |s| keys.iter().for_each(|k| s.dismiss(k)));
-        }
-    }
-
-    /// Dismisses notification `at`, everything in its box, so the next
-    /// shows.
-    fn dismiss_note(&mut self, at: usize) {
-        let Some(note) = self.notifications().into_iter().nth(at) else {
-            self.message = Some("no notifications".into());
-            return;
-        };
-        let keys: Vec<String> = note.entries.into_iter().map(|e| e.key).collect();
-        self.dismiss_keys(&keys);
-    }
-
-    /// Dismisses the notification of tree `name`, so a tree handed out again
-    /// never shows its last agent's.
-    fn dismiss_tree(&mut self, name: &str) {
-        let keys: Vec<String> = self
-            .notifications()
-            .into_iter()
-            .filter(|n| n.tree == name)
-            .flat_map(|n| n.entries.into_iter().map(|e| e.key))
-            .collect();
-        self.dismiss_keys(&keys);
-    }
-
-    /// Answers notification `at` in place: a reply line opens in it, or, for
-    /// an agent at a dialog, which only its chat answers, its chat opens.
-    fn answer_note(&mut self, at: usize) -> Outcome {
-        let Some(note) = self.notifications().into_iter().nth(at) else {
-            self.message = Some("no notifications".into());
-            return Outcome::Continue;
-        };
-        if note.top().is_at_prompt {
-            let tree = note.tree;
-            self.note = None;
-            let path = self
-                .trees
-                .iter()
-                .find(|t| t.name == tree)
-                .map(|t| t.path.clone());
-            self.filter.clear();
-            self.reselect(path);
-            return self.open_agent();
-        }
-        self.note = Some(at);
-        self.note_reply = Some(String::new());
-        Outcome::Continue
-    }
-
-    /// Keys while a reply is typed in notification `at`: Enter sends it to
-    /// its agent and dismisses it, answered; Esc keeps it.
-    fn handle_reply_key(&mut self, key: KeyEvent, at: usize) -> Outcome {
-        let Some(text) = &mut self.note_reply else {
-            return Outcome::Continue;
-        };
-        let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        match key.code {
-            KeyCode::Esc => self.note_reply = None,
-            KeyCode::Char('c') if is_ctrl => return self.quit(),
-            KeyCode::Char('u') if is_ctrl => text.clear(),
-            KeyCode::Char('w') if is_ctrl => {
-                let kept = text.trim_end().len();
-                let cut = text[..kept]
-                    .rfind(char::is_whitespace)
-                    .map_or(0, |at| at + 1);
-                text.truncate(cut);
-            }
-            KeyCode::Backspace => {
-                text.pop();
-            }
-            KeyCode::Enter => {
-                let reply = text.trim().to_string();
-                if reply.is_empty() {
-                    return Outcome::Continue;
-                }
-                let Some(note) = self.notifications().into_iter().nth(at) else {
-                    self.note_reply = None;
-                    return Outcome::Continue;
-                };
-                // The reply answers the entry the box leads with: its agent
-                // alone, or for a PR the tree's.
-                let top = note.top();
-                let to: Vec<Recipient> = self
-                    .named_tree(&note.tree)
-                    .as_ref()
-                    .map(Self::recipients)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|r| top.job.is_none() || r.job == top.job)
-                    .collect();
-                if to.is_empty() {
-                    self.message = Some(format!("{} has no chat to type into", top.who));
-                    return Outcome::Continue;
-                }
-                self.note_reply = None;
-                self.dismiss_note(at);
-                let left = self.notifications().len();
-                self.note = (left > 0).then(|| at.min(left - 1));
-                self.message = Some(format!("sending to tree {}...", note.tree));
-                return Outcome::Send { to, text: reply };
-            }
-            KeyCode::Char(c) if !is_ctrl => text.push(c),
-            _ => {}
-        }
-        Outcome::Continue
-    }
-
-    /// Keys while the notifications have them: step through the stack,
-    /// answer or dismiss the one showing, and go back to the list.
-    fn handle_note_key(&mut self, key: KeyEvent, at: usize) -> Outcome {
-        let count = self.notifications().len();
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') if at == 0 => self.note = None,
-            KeyCode::Up | KeyCode::Char('k') => self.note = Some(at - 1),
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.note = Some((at + 1).min(count.saturating_sub(1)));
-            }
-            KeyCode::Esc | KeyCode::Left => self.note = None,
-            KeyCode::Enter | KeyCode::Char('e') => return self.answer_note(at),
-            KeyCode::Char('x') => {
-                self.dismiss_note(at);
-                let left = self.notifications().len();
-                self.note = (left > 0).then(|| at.min(left - 1));
-            }
-            KeyCode::Char('v') => {
-                self.note = None;
-                self.is_details_shown = true;
-            }
-            KeyCode::Char('q') => return self.quit(),
-            KeyCode::Char('?') => self.is_help = true,
-            _ => {}
-        }
-        Outcome::Continue
     }
 
     /// Opens the box for one line to the assistant, about `context`, what
@@ -2300,12 +2080,6 @@ impl App {
             }
             return Outcome::Continue;
         }
-        if let Some(at) = self.note {
-            if self.note_reply.is_some() {
-                return self.handle_reply_key(key, at);
-            }
-            return self.handle_note_key(key, at);
-        }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return match key.code {
                 KeyCode::Char('c') => Outcome::Quit,
@@ -2410,9 +2184,6 @@ impl App {
                 let context = self.cursor_context();
                 self.open_ask(context);
             }
-            KeyCode::Char('x') => self.dismiss_note(0),
-            KeyCode::Char('e') => return self.answer_note(0),
-            KeyCode::Char('v') => self.is_details_shown = !self.is_details_shown,
             KeyCode::Char('i') => self.show_issue(),
             KeyCode::Char('I') => self.choose_issue(),
             KeyCode::Char('m') => self.open_message(),
@@ -2423,14 +2194,6 @@ impl App {
                 self.selected = 0;
             }
             KeyCode::Esc => self.marked.clear(),
-            // Past the last tree, the keys go on down into the notifications.
-            KeyCode::Down | KeyCode::Char('j')
-                if self.selected + 1 >= self.visible().len()
-                    && !self.is_details_shown
-                    && !self.notifications().is_empty() =>
-            {
-                self.note = Some(0);
-            }
             KeyCode::Down | KeyCode::Char('j') => self.move_by(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_by(-1),
             KeyCode::Home | KeyCode::Char('g') => self.move_by(isize::MIN),
@@ -3551,19 +3314,6 @@ mod tests {
     }
 
     #[test]
-    fn the_assistants_answer_shows_as_a_notification() {
-        let mut app = app_with_main();
-        app.apply_reports(vec![Report {
-            name: coordinator::NAME.into(),
-            ..recent("c00rd1na", State::Done, "/repo", 5)
-        }]);
-        let notes = app.notifications();
-        assert_eq!(notes.len(), 1, "with no pane, this is where it is read");
-        assert_eq!(notes[0].top().who, coordinator::NAME);
-        assert_eq!(notes[0].top().text, "c00rd1na says");
-    }
-
-    #[test]
     fn capital_n_starts_an_agent_in_the_tree_under_the_cursor() {
         let mut app = app();
         let at = |app: &App, name: &str| app.visible().iter().position(|t| t.name == name).unwrap();
@@ -3619,203 +3369,6 @@ mod tests {
         let launch = job.launch.unwrap();
         assert!(launch.is_coordinator);
         assert_eq!(launch.name.as_deref(), Some(coordinator::NAME));
-    }
-
-    /// A report written `ago` before now.
-    fn recent(job: &str, state: State, dir: &str, ago: u64) -> Report {
-        Report {
-            updated: SystemTime::now() - Duration::from_secs(ago),
-            ..report(job, state, dir, 0)
-        }
-    }
-
-    #[test]
-    fn notifications_stack_what_needs_you_first_and_x_shows_the_next() {
-        let mut app = app();
-        app.apply_reports(vec![
-            recent("done", State::Done, "/p/4/app", 60),
-            recent("ask", State::Blocked, "/p/8/app", 600),
-            recent("old", State::Done, "/p/4/app", 2 * 24 * 60 * 60),
-            recent("away", State::Blocked, "/elsewhere/9/app", 5),
-            recent("busy", State::Working, "/p/8/app", 5),
-        ]);
-        let shown = |app: &App| -> Vec<String> {
-            app.notifications()
-                .iter()
-                .map(|n| n.top().who.clone())
-                .collect()
-        };
-        assert_eq!(
-            shown(&app),
-            ["job ask", "job done"],
-            "what needs you first; an old answer, another workspace's and a working agent left out"
-        );
-        assert_eq!(app.notifications()[0].tree, "8");
-        press(&mut app, KeyCode::Char('e'));
-        assert_eq!(
-            (app.note, app.note_reply.as_deref()),
-            (Some(0), Some("")),
-            "answering opens a reply in the notification itself"
-        );
-        press(&mut app, KeyCode::Esc);
-        assert_eq!((app.note, app.note_reply.as_deref()), (Some(0), None));
-        press(&mut app, KeyCode::Char('x'));
-        assert_eq!(shown(&app), ["job done"], "dismissed, the next shows");
-        assert!(
-            app.dismissed
-                .dismissed
-                .iter()
-                .any(|k| k.starts_with("ask@"))
-        );
-        // A newer word from the same agent notifies again.
-        app.apply_reports(vec![recent("ask", State::Blocked, "/p/8/app", 1)]);
-        assert_eq!(shown(&app), ["job ask"]);
-        press(&mut app, KeyCode::Char('v'));
-        assert!(app.is_details_shown, "v shows the tree details instead");
-    }
-
-    #[test]
-    fn returning_a_tree_clears_its_notifications_for_good() {
-        let mut app = app();
-        app.apply_reports(vec![
-            recent("ask", State::Blocked, "/p/4/app", 60),
-            recent("other", State::Blocked, "/p/8/app", 30),
-        ]);
-        let trees = |app: &App| -> Vec<String> {
-            app.notifications().into_iter().map(|n| n.tree).collect()
-        };
-        assert_eq!(trees(&app), ["8", "4"]);
-        press(&mut app, KeyCode::Char('r'));
-        let job = queued(press(&mut app, KeyCode::Char('y'))).remove(0);
-        assert_eq!(job.tree.name, "4");
-        app.job_finished(job, true, String::new());
-        assert_eq!(trees(&app), ["8"], "tree 4's went with it");
-        // The pool hands tree 4 out again: its last agent's words stay gone.
-        let mut listed = app.trees.clone();
-        let four = listed.iter_mut().find(|t| t.name == "4").unwrap();
-        four.status = "leased".into();
-        app.set_trees(listed);
-        assert_eq!(trees(&app), ["8"]);
-    }
-
-    #[test]
-    fn a_tree_has_one_notification_what_needs_you_first_and_x_clears_it_all() {
-        let mut app = app();
-        app.apply_reports(vec![
-            recent("done", State::Done, "/p/8/app", 30),
-            recent("ask", State::Blocked, "/p/8/app", 600),
-            recent("other", State::Done, "/p/4/app", 5),
-        ]);
-        let notes = app.notifications();
-        let shown: Vec<(&str, Vec<&str>)> = notes
-            .iter()
-            .map(|n| {
-                let who = n.entries.iter().map(|e| e.who.as_str()).collect();
-                (n.tree.as_str(), who)
-            })
-            .collect();
-        assert_eq!(
-            shown,
-            [("8", vec!["job ask", "job done"]), ("4", vec!["job other"])],
-            "one box a tree, ranked by what it most needs"
-        );
-        press(&mut app, KeyCode::Char('x'));
-        let left: Vec<String> = app.notifications().into_iter().map(|n| n.tree).collect();
-        assert_eq!(left, ["4"], "x dismissed all of tree 8's");
-    }
-
-    /// A background agent with a chat, running job `job`.
-    fn background(job: &str) -> Agent {
-        Agent {
-            job: Some(job.into()),
-            ..attachable(job)
-        }
-    }
-
-    #[test]
-    fn a_reply_goes_to_the_agent_the_box_leads_with_not_the_whole_tree() {
-        let mut app = app();
-        app.apply_agents(&HashMap::from([(
-            PathBuf::from("/p/8/app"),
-            vec![background("busy"), background("ask")],
-        )]));
-        app.apply_reports(vec![
-            recent("busy", State::Done, "/p/8/app", 5),
-            recent("ask", State::Blocked, "/p/8/app", 60),
-        ]);
-        assert_eq!(app.notifications()[0].entries.len(), 2);
-        press(&mut app, KeyCode::Char('e'));
-        type_in(&mut app, "use branding/");
-        let Outcome::Send { to, .. } = press(&mut app, KeyCode::Enter) else {
-            panic!("the reply goes out");
-        };
-        let jobs: Vec<Option<&str>> = to.iter().map(|r| r.job.as_deref()).collect();
-        assert_eq!(jobs, [Some("ask")], "the one waiting on you, alone");
-    }
-
-    #[test]
-    fn a_tree_returned_elsewhere_notifies_no_more() {
-        let mut app = app();
-        app.apply_reports(vec![recent("ask", State::Blocked, "/p/4/app", 60)]);
-        assert_eq!(app.notifications().len(), 1);
-        // Returned with treehouse itself, so treetop only sees the listing.
-        let mut listed = app.trees.clone();
-        let four = listed.iter_mut().find(|t| t.name == "4").unwrap();
-        four.status = "available".into();
-        app.set_trees(listed);
-        assert!(app.notifications().is_empty());
-    }
-
-    #[test]
-    fn down_past_the_last_tree_steps_through_the_notifications() {
-        let mut app = app();
-        app.apply_agents(&HashMap::from([(
-            PathBuf::from("/p/8/app"),
-            vec![background("ask")],
-        )]));
-        app.apply_reports(vec![
-            recent("ask", State::Blocked, "/p/8/app", 60),
-            recent("done", State::Done, "/p/4/app", 30),
-        ]);
-        press(&mut app, KeyCode::Char('G'));
-        press(&mut app, KeyCode::Down);
-        assert_eq!(
-            app.note,
-            Some(0),
-            "past the last tree, into the notifications"
-        );
-        press(&mut app, KeyCode::Down);
-        assert_eq!(app.note, Some(1));
-        press(&mut app, KeyCode::Down);
-        assert_eq!(app.note, Some(1), "no further than the last");
-        press(&mut app, KeyCode::Char('x'));
-        assert_eq!(app.note, Some(0), "dismissed, the one before shows");
-        assert_eq!(app.notifications().len(), 1);
-        press(&mut app, KeyCode::Up);
-        assert_eq!(app.note, None, "up from the first goes back to the list");
-        press(&mut app, KeyCode::Down);
-        assert_eq!(press(&mut app, KeyCode::Enter), Outcome::Continue);
-        assert_eq!(
-            app.note_reply.as_deref(),
-            Some(""),
-            "Enter answers the one showing"
-        );
-        assert_eq!(
-            press(&mut app, KeyCode::Enter),
-            Outcome::Continue,
-            "nothing to send yet"
-        );
-        type_in(&mut app, "branding/ please");
-        let Outcome::Send { to, text } = press(&mut app, KeyCode::Enter) else {
-            panic!("the reply goes to the agent");
-        };
-        assert_eq!(
-            (to[0].tree.as_str(), text.as_str()),
-            ("8", "branding/ please")
-        );
-        assert_eq!(app.note_reply, None);
-        assert!(app.notifications().is_empty(), "answered, so dismissed");
-        assert_eq!(app.note, None, "none left, back on the list");
     }
 
     #[test]
@@ -3922,6 +3475,100 @@ mod tests {
             attach: Some(vec!["claude".into(), "attach".into(), name.into()]),
             ..agent(name)
         }
+    }
+
+    fn chat_of(outcome: Option<Outcome>) -> Option<String> {
+        match outcome {
+            Some(Outcome::Chat { agent, .. }) => Some(agent),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn each_ask_opens_its_chat_in_turn_once_you_are_free_on_the_list() {
+        let mut app = app();
+        let asking = Agent {
+            job: Some("j4".into()),
+            ..attachable("asks")
+        };
+        let at_prompt = Agent {
+            status: Some(Status::Waiting),
+            ..attachable("prompt")
+        };
+        let finished = Agent {
+            job: Some("j8".into()),
+            ..attachable("finished")
+        };
+        app.apply_agents(&HashMap::from([
+            (PathBuf::from("/p/4/app"), vec![asking]),
+            (PathBuf::from("/p/8/app"), vec![at_prompt, finished]),
+        ]));
+        app.apply_reports(vec![
+            report("j4", State::Blocked, "/p/4/app", 5),
+            report("j8", State::Done, "/p/8/app", 1),
+        ]);
+        press(&mut app, KeyCode::Char('m'));
+        assert_eq!(app.next_ask(), None, "not while a message is typed");
+        press(&mut app, KeyCode::Esc);
+        let first = chat_of(app.next_ask()).unwrap();
+        assert_eq!(
+            app.current().unwrap().name,
+            if first == "asks" { "4" } else { "8" }
+        );
+        let second = chat_of(app.next_ask()).unwrap();
+        let mut opened = [first, second];
+        opened.sort();
+        assert_eq!(opened, ["asks", "prompt"], "a finished turn never opens");
+        assert_eq!(app.next_ask(), None, "each ask opens once");
+    }
+
+    #[test]
+    fn an_ask_a_filter_hides_still_opens_and_the_filter_clears() {
+        let mut app = app();
+        let asking = Agent {
+            status: Some(Status::Waiting),
+            ..attachable("asks")
+        };
+        app.apply_agents(&HashMap::from([(PathBuf::from("/p/8/app"), vec![asking])]));
+        app.filter = "end-1".into();
+        assert_eq!(chat_of(app.next_ask()).as_deref(), Some("asks"));
+        assert!(app.filter.is_empty());
+        assert_eq!(app.current().unwrap().name, "8");
+    }
+
+    #[test]
+    fn an_ask_seen_in_its_open_chat_stays_shut_and_a_new_one_opens() {
+        let mut app = app();
+        let asking = Agent {
+            job: Some("j4".into()),
+            ..attachable("asks")
+        };
+        app.apply_agents(&HashMap::from([(PathBuf::from("/p/4/app"), vec![asking])]));
+        let command: Vec<String> = ["claude", "attach", "asks"].map(String::from).into();
+        app.apply_reports(vec![report("j4", State::Blocked, "/p/4/app", 5)]);
+        app.saw_chat(&command);
+        assert_eq!(app.next_ask(), None, "answered in the chat it asked in");
+        app.apply_reports(vec![report("j4", State::Working, "/p/4/app", 4)]);
+        assert_eq!(app.next_ask(), None);
+        app.apply_reports(vec![report("j4", State::Blocked, "/p/4/app", 3)]);
+        assert_eq!(
+            chat_of(app.next_ask()).as_deref(),
+            Some("asks"),
+            "asks again"
+        );
+    }
+
+    #[test]
+    fn a_busy_agent_never_opens_on_a_question_its_last_report_asked() {
+        let mut app = app();
+        let busy = Agent {
+            job: Some("j4".into()),
+            status: Some(Status::Busy),
+            ..attachable("busy")
+        };
+        app.apply_agents(&HashMap::from([(PathBuf::from("/p/4/app"), vec![busy])]));
+        app.apply_reports(vec![report("j4", State::Blocked, "/p/4/app", 5)]);
+        assert_eq!(app.next_ask(), None);
     }
 
     #[test]

@@ -18,7 +18,6 @@ mod cli;
 mod config;
 mod coordinator;
 mod diff;
-mod dismissed;
 mod dispatch;
 mod github_plugin;
 mod jobs;
@@ -387,6 +386,22 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             open_chat(term, app, &mut chats, &command, agent, tree)?;
             is_stale = true;
         }
+        // An agent asking you something gets its chat opened once nothing
+        // else is on screen, the next as the last one closes.
+        match chats.open() {
+            Some(open) => app.saw_chat(open.command()),
+            None => {
+                if let Some(Outcome::Chat {
+                    command,
+                    agent,
+                    tree,
+                }) = app.next_ask()
+                {
+                    open_chat(term, app, &mut chats, &command, agent, tree)?;
+                    is_stale = true;
+                }
+            }
+        }
         let pumped = chats.pump();
         is_stale |= pumped.is_stale;
         if let Some((agent, tree)) = pumped.delivered.last() {
@@ -578,10 +593,6 @@ fn show(term: &mut Term, start: PathBuf, mut checkout: PathBuf, is_issues: bool)
         let mut app = App::new(here.take());
         app.is_in_tmux = tmux::is_inside();
         app.checkout = checkout.clone();
-        app.dismissed_path = dismissed::path(&checkout);
-        if let Some(path) = &app.dismissed_path {
-            app.dismissed = dismissed::read_from(path);
-        }
         app.user = branch::user();
         app.ship_plugins = ship::plugins(&checkout).0;
         app.is_issues = std::mem::take(&mut is_issues);

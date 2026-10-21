@@ -12,8 +12,7 @@ use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wr
 
 use crate::agents::{Agent, Status};
 use crate::app::{
-    App, DiffView, Entry, Item, JobState, LogEntry, Note, NoteKind, Opening, Pending, Picker,
-    Review, Shipping,
+    App, DiffView, Item, JobState, LogEntry, Opening, Pending, Picker, Review, Shipping,
 };
 use crate::chat::Chat;
 use crate::coordinator;
@@ -27,11 +26,9 @@ use crate::theme::theme;
 
 /// The bar's keys, most useful first: on a narrow bar the keys at the end
 /// are the ones left out, and `?` lists them all.
-const KEYS: [(&str, &str); 15] = [
+const KEYS: [(&str, &str); 13] = [
     ("Enter", "open"),
     ("?", "help"),
-    ("e", "answer"),
-    ("x", "dismiss"),
     ("n", "new"),
     ("N", "new here"),
     ("m", "message"),
@@ -45,19 +42,8 @@ const KEYS: [(&str, &str); 15] = [
     ("q", "quit"),
 ];
 
-/// The bar's keys while a reply is typed in a notification.
-const REPLY_KEYS: [(&str, &str); 2] = [("Enter", "send to the agent"), ("Esc", "cancel")];
-
-/// The bar's keys while the notifications have them.
-const NOTE_KEYS: [(&str, &str); 4] = [
-    ("e", "answer"),
-    ("x", "dismiss"),
-    ("↑ ↓", "the others"),
-    ("Esc", "back to the list"),
-];
-
 /// Every key on the list, for the `?` overlay.
-const HELP: [(&str, &str); 29] = [
+const HELP: [(&str, &str); 26] = [
     (
         "Enter",
         "open the agent: its chat, a cold one started again, else its tree",
@@ -106,15 +92,6 @@ const HELP: [(&str, &str); 29] = [
     ),
     ("b", "rename the tree's branch"),
     ("w", "switch workspace"),
-    (
-        "e",
-        "answer the top notification: type the reply in it, Enter sends it to the agent",
-    ),
-    ("x", "dismiss the top notification, and see the next"),
-    (
-        "v",
-        "the tree details under the list, in place of the notifications",
-    ),
     ("Tab", "the repository's issues"),
     (
         "i",
@@ -181,11 +158,7 @@ pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>, issues: Option<&i
                 Layout::vertical([Constraint::Fill(1), Constraint::Length(DETAIL_HEIGHT)])
                     .areas(main);
             draw_table(frame, app, body);
-            if app.is_details_shown {
-                draw_detail(frame, app, detail);
-            } else {
-                draw_notifications(frame, app, detail);
-            }
+            draw_detail(frame, app, detail);
             draw_footer(frame, app, footer);
         }
     }
@@ -399,7 +372,7 @@ fn agent_style(status: Option<Status>) -> (&'static str, Style) {
 
 /// The first agent in the tree, and how many more, marked by the tree's
 /// latest report when it needs you or is done, else by the agent's status;
-/// its words are in the notifications and the detail pane. A held tree
+/// its words are in the detail pane. A held tree
 /// with no agent, once agents have been read, says so: it is the one to
 /// check on.
 fn agent_cell(app: &App, tree: &Tree) -> Cell<'static> {
@@ -752,14 +725,7 @@ fn footer_left(app: &App, width: u16) -> Line<'static> {
         ));
     }
     let used = u16::try_from(narrowing.iter().map(Span::width).sum::<usize>()).unwrap_or(width);
-    let keys: &[(&str, &str)] = if app.note_reply.is_some() {
-        &REPLY_KEYS
-    } else if app.note.is_some() {
-        &NOTE_KEYS
-    } else {
-        &KEYS
-    };
-    let mut spans = fitting_keys(keys, width.saturating_sub(used));
+    let mut spans = fitting_keys(&KEYS, width.saturating_sub(used));
     spans.extend(narrowing);
     Line::from(spans)
 }
@@ -809,263 +775,8 @@ fn state_style(state: State) -> (&'static str, Style) {
     }
 }
 
-/// How many notifications show as edges under the top one.
-const NOTE_LAYERS: usize = 2;
-
-/// How a notification reads: its mark, what happened, and its colour.
-fn note_style(kind: NoteKind) -> (&'static str, &'static str, Color) {
-    let t = theme();
-    match kind {
-        NoteKind::NeedsYou => ("●", "needs you", t.warning),
-        NoteKind::Pr => ("◆", "PR", t.info),
-        NoteKind::Done => ("✓", "done", t.success),
-    }
-}
-
-/// The notifications under the list, stacked: the top one whole, the ones
-/// behind it as edges, so dismissing it shows the next.
-fn draw_notifications(frame: &mut Frame, app: &App, area: Rect) {
-    let t = theme();
-    let notes = app.notifications();
-    // The one showing: the one the keys are on, else the top one.
-    let at = app.note.unwrap_or(0).min(notes.len().saturating_sub(1));
-    let Some(top) = notes.get(at) else {
-        let block = Block::bordered()
-            .border_style(fg(t.border))
-            .title(Span::styled(" Notifications ", fg(t.muted)))
-            .title_bottom(Line::styled(" v tree details ", fg(t.muted)).right_aligned());
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-        frame.render_widget(
-            Paragraph::new(
-                " Nothing new. An agent's question, its answer, and news of a PR land here.",
-            )
-            .style(fg(t.muted))
-            .wrap(Wrap { trim: false }),
-            inner,
-        );
-        return;
-    };
-    // The ones behind show as an edge each, inset, under the top one.
-    let after = notes.len() - at - 1;
-    let behind = after.min(NOTE_LAYERS);
-    let layers = u16::try_from(behind).unwrap_or(0);
-    let card = Rect {
-        height: area.height.saturating_sub(layers),
-        ..area
-    };
-    for layer in 1..=layers {
-        let inset = layer * 2;
-        let width = area.width.saturating_sub(inset * 2);
-        let y = card.y + card.height + layer - 1;
-        let mut edge = format!("╰{}╯", "─".repeat(usize::from(width.saturating_sub(2))));
-        if layer == 1 {
-            let more = format!(" {after} more ");
-            let at = 2.min(edge.chars().count());
-            let head: String = edge.chars().take(at).collect();
-            let tail: String = edge.chars().skip(at + more.chars().count()).collect();
-            edge = format!("{head}{more}{tail}");
-        }
-        frame.render_widget(
-            Paragraph::new(Line::styled(edge, fg(t.border))),
-            Rect::new(area.x + inset, y, width, 1),
-        );
-    }
-    let place = (notes.len() > 1).then(|| format!("{} of {}", at + 1, notes.len()));
-    let reply = app.note_reply.as_deref().filter(|_| app.note.is_some());
-    draw_notification(frame, top, card, app.note.is_some(), place, reply);
-}
-
-/// How long ago an entry was written, after a ` · `; none for a PR's.
-fn entry_age(entry: &Entry) -> String {
-    entry
-        .at
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .filter(|d| d.as_secs() > 0)
-        .map_or(String::new(), |d| format!(" · {}", ago(d.as_secs())))
-}
-
-/// What a tree's box says, in `area`: its most pressing entry whole, and
-/// under it each other entry on a line of its own, cut at the edge, so a
-/// tree with a lot to say still shows all of it.
-fn draw_note_body(frame: &mut Frame, note: &Note, area: Rect) {
-    let t = theme();
-    let text = |entry: &Entry| -> Vec<Line<'static>> {
-        entry
-            .text
-            .lines()
-            .map(|l| Line::raw(l.to_string()))
-            .collect()
-    };
-    let [top, rest @ ..] = note.entries.as_slice() else {
-        return;
-    };
-    if rest.is_empty() {
-        frame.render_widget(Paragraph::new(text(top)).wrap(Wrap { trim: false }), area);
-        return;
-    }
-    let heading = |entry: &Entry| -> Vec<Span<'static>> {
-        let (mark, what, color) = note_style(entry.kind);
-        vec![
-            Span::styled(
-                format!("{mark} {what} "),
-                fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!("· {}{}", entry.who, entry_age(entry)), fg(t.title)),
-        ]
-    };
-    // The others keep at most half the box, with a blank line above them;
-    // the last line left says how many more there are when they do not fit.
-    let room = usize::from(area.height / 2).max(1);
-    let mut others: Vec<Line<'static>> = Vec::new();
-    for (at, entry) in rest.iter().enumerate() {
-        if others.len() + 1 == room && rest.len() - at > 1 {
-            others.push(Line::styled(
-                format!("… and {} more", rest.len() - at),
-                fg(t.muted),
-            ));
-            break;
-        }
-        let mut spans = heading(entry);
-        let first = entry.text.lines().next().unwrap_or_default();
-        let used: usize = spans.iter().map(Span::width).sum::<usize>() + 2;
-        let room = usize::from(area.width).saturating_sub(used);
-        let first = if first.chars().count() > room {
-            let kept: String = first.chars().take(room.saturating_sub(1)).collect();
-            format!("{}…", kept.trim_end())
-        } else {
-            first.to_string()
-        };
-        spans.push(Span::styled(format!("  {first}"), fg(t.muted)));
-        others.push(Line::from(spans));
-    }
-    let rows = u16::try_from(others.len()).unwrap_or(u16::MAX);
-    let mut head = vec![Line::from(heading(top))];
-    head.extend(text(top));
-    let head = Paragraph::new(head).wrap(Wrap { trim: false });
-    // The others follow the top entry, which gives up its end for them.
-    let head_rows = u16::try_from(head.line_count(area.width))
-        .unwrap_or(u16::MAX)
-        .min(area.height.saturating_sub(rows + 1));
-    let [head_area, _, rest_area, _] = Layout::vertical([
-        Constraint::Length(head_rows),
-        Constraint::Length(1),
-        Constraint::Length(rows),
-        Constraint::Fill(1),
-    ])
-    .areas(area);
-    frame.render_widget(head, head_area);
-    frame.render_widget(Paragraph::new(others), rest_area);
-}
-
-/// One tree's notification in full, in a box of its own.
-fn draw_notification(
-    frame: &mut Frame,
-    note: &Note,
-    area: Rect,
-    has_keys: bool,
-    position: Option<String>,
-    reply: Option<&str>,
-) {
-    let t = theme();
-    let top = note.top();
-    let (mark, what, color) = note_style(top.kind);
-    let place = format!(" tree {} ·", note.tree);
-    // One entry is named in the border; several each name their own.
-    let who = match note.entries.len() {
-        1 => format!("{}{}", top.who, entry_age(top)),
-        count => format!("{count} new"),
-    };
-    let block = Block::bordered()
-        .border_style(fg(if has_keys { t.accent } else { t.border }))
-        .padding(ratatui::widgets::Padding::horizontal(1))
-        .title(Line::from(vec![
-            Span::styled(
-                format!(" {mark} {what} "),
-                fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!("·{place} {who} "), fg(t.title)),
-        ]))
-        .title_bottom(
-            Line::styled(
-                if reply.is_some() {
-                    " Enter sends it to the agent · Esc cancels "
-                } else if has_keys {
-                    " e answer · x dismiss · ↑ ↓ the others · Esc back "
-                } else {
-                    " ↓ to go through them · e answer · x dismiss · v details "
-                },
-                fg(if has_keys { t.accent } else { t.muted }),
-            )
-            .right_aligned(),
-        );
-    let block = match position {
-        Some(position) => {
-            block.title(Line::styled(format!(" {position} "), fg(t.muted)).right_aligned())
-        }
-        None => block,
-    };
-    let block = if has_keys {
-        block.border_type(ratatui::widgets::BorderType::Thick)
-    } else {
-        block
-    };
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let Some(reply) = reply else {
-        draw_note_body(frame, note, inner);
-        return;
-    };
-    // The reply is typed on the card's last line, under what it answers.
-    let [text_area, reply_area] =
-        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(inner);
-    draw_note_body(frame, note, text_area);
-    let room = usize::from(reply_area.width.saturating_sub(3)).max(1);
-    let skip = reply.chars().count().saturating_sub(room);
-    let shown: String = reply.chars().skip(skip).collect();
-    let x = u16::try_from(shown.chars().count() + 2).unwrap_or(0);
-    let line = if reply.is_empty() {
-        Line::from(vec![
-            Span::styled("› ", fg(t.accent).add_modifier(Modifier::BOLD)),
-            Span::styled(
-                match note.top().job {
-                    Some(_) => format!("reply to {}", note.top().who),
-                    None => format!("reply to tree {}'s agents", note.tree),
-                },
-                fg(t.muted).add_modifier(Modifier::ITALIC),
-            ),
-        ])
-    } else {
-        Line::from(vec![
-            Span::styled("› ", fg(t.accent).add_modifier(Modifier::BOLD)),
-            Span::raw(shown),
-        ])
-    };
-    frame.render_widget(Paragraph::new(line), reply_area);
-    let x = if reply.is_empty() { 2 } else { x };
-    frame.set_cursor_position((
-        reply_area.x + x.min(reply_area.width.saturating_sub(1)),
-        reply_area.y,
-    ));
-}
-
 /// Rows the detail pane takes, borders included.
 const DETAIL_HEIGHT: u16 = 12;
-
-/// How long ago `at`, seconds since the epoch, was, as short as it reads.
-fn ago(at: u64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs());
-    let secs = now.saturating_sub(at);
-    match secs {
-        0..60 => "just now".into(),
-        60..3_600 => format!("{}m ago", secs / 60),
-        3_600..86_400 => format!("{}h ago", secs / 3_600),
-        _ => format!("{}d ago", secs / 86_400),
-    }
-}
 
 /// The tree under the cursor in full: where it is, its agents, what it
 /// serves and runs, what its agent last said with its latest steps, and its

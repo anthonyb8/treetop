@@ -342,6 +342,11 @@ impl Chat {
         self.is_ready
     }
 
+    /// The command it runs, which identifies it.
+    pub fn command(&self) -> &[String] {
+        &self.command
+    }
+
     /// The chat's program has exited.
     pub fn is_ended(&self) -> bool {
         self.is_ended

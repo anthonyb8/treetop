@@ -44,9 +44,6 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | `m` | write a message to the agents in the marked trees, or the tree under the cursor |
 | `:` | ask the assistant about the tree under the cursor, or write `@17 ...` for that tree's agent (see [The assistant](#the-assistant)) |
 | `c` | talk to the assistant in its chat; send nothing to open the chat |
-| `e` | answer the top notification in place, with a reply line in it, or open the agent's chat when it sits at a dialog |
-| `x` | dismiss the top notification, and see the next |
-| `v` | show the tree details under the list in place of the notifications, and back |
 | `d` | open the side-by-side diff of the tree under the cursor in a popup |
 | `r` | return the marked trees, or the one under the cursor, to the pool; `D` in its dialog destroys them from disk instead, after reviewing treehouse's preview of each |
 | Space | mark or unmark the tree under the cursor |
@@ -262,7 +259,7 @@ treetop starts new agents with it unless `TREETOP_NEW_AGENT` names a command.
 ## What the actions run
 
 Both run in the background, up to four trees at once, while treetop stays on screen; each row's STATUS shows queued, returning, destroying, returned, destroyed or failed.
-The tree details (`v`) show the end of each tree's last action's output, and a failure also shows its last line in the status line.
+The detail pane under the list shows the end of each tree's last action's output, and a failure also shows its last line in the status line.
 
 - **Return** first shows a dialog listing each tree's uncommitted files, unpushed commits and running processes, or "unknown changes" where git cannot read it. On `y`, for each tree at once:
   1. it removes the tree's background agents through their plugin, running or cold, so none is found in the tree when it is leased again; a session that moved in with `EnterWorktree` runs from elsewhere, so treehouse would not stop it, and removing it can hand the tree back already, through the `WorktreeRemove` hook, which the return then takes as done; an agent its plugin cannot remove is stopped instead, so the tree stops keeping it awake;
@@ -317,7 +314,7 @@ The text wraps and the box grows with it.
 ### The assistant
 
 `:` sends what you type to the assistant with the tree under the cursor as context, and `c` sends it as it is.
-It answers in its chat, which `c` with nothing typed opens, and its answer also shows under the list as a notification (see [Notifications](#notifications)).
+It answers in its chat, which `c` with nothing typed opens,.
 A message that starts with `@` goes to an agent instead, not the assistant: `@17 put it in branding/` types it into tree 17's agent's chat, as `m` would.
 `@` takes a tree number, `main`, or the start of an agent's words, `@fix-log` for "fix the login redirect", and several `@`s send to each; one that names no tree, or more than one, opens the box again on what you typed, with the status line saying why.
 On the Issues screen, `:` opens the box with the issue under the cursor as context.
@@ -363,30 +360,31 @@ Agents with no chat to type into, such as an interactive session or a bare proce
 
 ### What agents say
 
-Every background agent's latest report is read from Claude Code's job files under `~/.claude/jobs` and marks its tree's row in AGENT: `●` while it needs you, `✓` once it is done. What it said, the question it waits on, its answer, else what it is doing now, is in the notifications and the detail pane.
+Every background agent's latest report is read from Claude Code's job files under `~/.claude/jobs` and marks its tree's row in AGENT: `●` while it needs you, `✓` once it is done. What it said, the question it waits on, its answer, else what it is doing now, is in the detail pane, and a question opens its chat (see [Asks open their chat](#asks-open-their-chat)).
 A report belongs to the tree whose `treetop.json` names its job, or where its agent runs now, so a recycled tree never shows the last agent's words.
 An agent sitting at a question dialog or permission prompt needs you too, though its report still says working, since only its chat can answer it.
 Trees waiting on you come first in the list, and the cursor stays on its tree as rows move.
 Finished and stopped reports go after a day; working and waiting ones stay.
-The assistant's own reports are left off its row, since it speaks through its notifications and `c`.
+The assistant's own reports are left off its row, since it speaks through its chat, which `c` opens.
+
+### Asks open their chat
+
+An agent that asks you something, a question or a permission prompt, gets its chat opened for you, so you answer it there in full.
+It waits until you are free on the list: never over a chat, the compose box, a filter, the diff, a dialog or the Issues screen.
+Leaving a chat with Ctrl+Q opens the next ask, so once you are done with other work they come to you one after another until none is left.
+Each ask opens once: one you have seen, opened for you or asked while its chat was open, stays shut until that agent asks something new, and its row keeps its `●` for Enter.
+A finished agent never opens, nor does a busy one whose last report still asks, nor one with no chat here, such as `claude` in a tmux pane.
+A filter that hides the asking tree is cleared, so the cursor lands on it.
+Opening treetop, or coming back to a workspace, opens what is waiting there.
 
 When an agent comes to need you, or finishes, treetop rings the terminal bell, and inside tmux shows it in the status line for five seconds, so it is heard from any window; the assistant finishing an answer rings it too.
 
-### Notifications
+### The detail pane
 
-Under the list, what the agents said stacks up as notifications, one box per tree: an agent waiting on you, then a PR that needs you or merged, then an answer from the last day, the newest first within each, and a tree's box goes where its most pressing entry does.
-Inside a box, the most pressing entry shows whole and the tree's other entries a line each under it.
-The top box shows in full, its tree in its border with the agent and age of a single entry or how many entries there are, and the ones behind it show as edges under it with how many there are.
-`↓` past the last tree moves into them, and the border turns thick: `↑`/`↓` step through the stack, `e` or Enter answers the one showing, `x` dismisses it, and `↑` from the first or Esc goes back to the list.
-From the list, `e` and `x` act on the top one.
-`e` answers it in place: a reply line opens in the notification, Enter sends what you type to the agent of the entry the box leads with, or for a PR to the tree's agents, and dismisses the box, answered, so the next shows, and Esc cancels; for an agent sitting at a dialog, which only its chat can answer, its chat opens instead.
-`x` dismisses the whole box, and the next one shows; a newer word from the same agent notifies again.
-Dismissals are kept in `$XDG_STATE_HOME/treetop/dismissed-<workspace>.json`, one per workspace, so they stay dismissed when treetop opens again.
-Only this workspace's trees notify; agents elsewhere are counted in the summary.
-A tree's notifications go when it is returned, and do not come back when it is handed out again.
-`v` shows the tree under the cursor in full in their place: where it is, its agents, ports, processes, PR and last action; `v` again goes back.
+Under the list, the pane shows the tree under the cursor in full: where it is, who holds it, its agents, ports and processes, everything its agent last said with its latest steps, its PR, and the outcome of its last action.
+Only this workspace's agents open their chat; agents elsewhere are counted in the summary.
 The summary counts the trees that need you, and, as "elsewhere", agents outside the pool waiting on you, which have no row.
-These job files are internal to Claude Code, like its session files, so a release that changes them blanks those marks and notes until treetop catches up.
+These job files are internal to Claude Code, like its session files, so a release that changes them blanks those marks until treetop catches up.
 
 ## After the agent
 
