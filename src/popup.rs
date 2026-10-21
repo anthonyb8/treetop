@@ -1,7 +1,8 @@
 //! Where a popup sits: the chat, the diff and the compose box float over the
 //! tree table, with a margin of it left showing round the edge, so treetop
 //! stays on screen and a chat never passes for a terminal of its own. The
-//! chat's terminal is sized from the same rectangle the frame is drawn in.
+//! chat and the diff say what they show in a bar on the first row inside the
+//! border, and the chat's terminal is sized from the rows under it.
 
 use ratatui::layout::Rect;
 
@@ -30,11 +31,29 @@ pub fn inner(screen: Rect) -> Rect {
     )
 }
 
+/// The bar on the first row inside the popup's border.
+pub fn bar(screen: Rect) -> Rect {
+    let inner = inner(screen);
+    Rect::new(inner.x, inner.y, inner.width, inner.height.min(1))
+}
+
+/// Inside the popup's border, under its bar: where a chat's terminal or a
+/// diff goes.
+pub fn body(screen: Rect) -> Rect {
+    let inner = inner(screen);
+    Rect::new(
+        inner.x,
+        inner.y + inner.height.min(1),
+        inner.width,
+        inner.height.saturating_sub(1),
+    )
+}
+
 /// The size of a terminal drawn inside the popup, `(rows, cols)`, for a
 /// screen of `rows` by `cols`.
 pub fn terminal_size(rows: u16, cols: u16) -> (u16, u16) {
-    let inner = inner(Rect::new(0, 0, cols, rows));
-    (inner.height.max(1), inner.width.max(1))
+    let body = body(Rect::new(0, 0, cols, rows));
+    (body.height.max(1), body.width.max(1))
 }
 
 /// A box of `width` by `height` in the middle of `area`, shrunk to fit.
@@ -58,13 +77,16 @@ mod tests {
         let screen = Rect::new(0, 0, 160, 48);
         assert_eq!(area(screen), Rect::new(10, 4, 140, 40));
         assert_eq!(inner(screen), Rect::new(11, 5, 138, 38));
-        assert_eq!(terminal_size(48, 160), (38, 138));
+        assert_eq!(bar(screen), Rect::new(11, 5, 138, 1));
+        assert_eq!(body(screen), Rect::new(11, 6, 138, 37));
+        assert_eq!(terminal_size(48, 160), (37, 138));
     }
 
     #[test]
     fn a_small_screen_keeps_a_thin_margin_and_never_underflows() {
         assert_eq!(area(Rect::new(0, 0, 40, 10)), Rect::new(2, 1, 36, 8));
         assert_eq!(area(Rect::new(0, 0, 4, 2)), Rect::new(0, 0, 4, 2));
+        assert_eq!(body(Rect::new(0, 0, 4, 2)), Rect::new(1, 1, 2, 0));
         assert_eq!(terminal_size(0, 0), (1, 1));
     }
 }

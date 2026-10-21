@@ -95,7 +95,7 @@ fn leave_screen() -> Result<()> {
     Ok(())
 }
 
-/// The size of the terminal a chat runs in: the inside of its popup.
+/// The size of the terminal a chat runs in: its popup under the bar.
 fn chat_size(term: &Term) -> Result<(u16, u16)> {
     let size = term.size()?;
     Ok(popup::terminal_size(size.height, size.width))
@@ -451,7 +451,7 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                 Event::Mouse(mouse) => {
                     let size = term.size()?;
                     let screen = Rect::new(0, 0, size.width, size.height);
-                    open.send_mouse(mouse, popup::inner(screen));
+                    open.send_mouse(mouse, popup::body(screen));
                 }
                 _ => {}
             }

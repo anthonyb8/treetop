@@ -341,8 +341,8 @@ pub struct App {
     pub checkout: PathBuf,
     /// The workspace picker, while it is open.
     pub picker: Option<Picker>,
-    /// Every background agent's latest report, for the SAYS column, the bell
-    /// and finding a stopped coordinator.
+    /// Every background agent's latest report, for the AGENT column's mark,
+    /// the notifications, the bell and finding a stopped coordinator.
     pub reports: Vec<Report>,
     /// Each job's state at the last read, so a change can be announced;
     /// None until the first read, which announces nothing.
@@ -702,8 +702,10 @@ impl App {
     /// stays on its row and its last line goes to the status line.
     pub fn job_finished(&mut self, job: Job, is_ok: bool, output: String) {
         // A merge's follow-up only says what it found: a failure shows in
-        // the detail pane, since the work itself is done.
+        // the detail pane, since the work itself is done. Its stand-in goes,
+        // or it would count as running forever and hold up a switch.
         if job.kind == Kind::Land {
+            self.jobs.remove(&job.key);
             if let (true, Some(pick)) = (is_ok && !job.ready.is_empty(), &job.landing) {
                 self.message = Some(format!(
                     "{} merged · {} ready",
@@ -945,9 +947,9 @@ impl App {
             Some(Ok(layout)) => (layout.rows.len(), layout.file_starts.clone()),
             _ => (0, Vec::new()),
         };
-        // The popup's height, less the file header pinned at its top and the
-        // key bar at its bottom.
-        let body = crate::popup::inner(Rect::new(0, 0, 80, self.screen_height)).height;
+        // The popup under its bar, less the file header pinned at its top
+        // and the key bar at its bottom.
+        let body = crate::popup::body(Rect::new(0, 0, 80, self.screen_height)).height;
         let page = isize::try_from(body.saturating_sub(2)).map_or(1, |p| p.max(1));
         let Some(view) = self.view.as_mut() else {
             return Outcome::Continue;
@@ -2995,8 +2997,8 @@ mod tests {
         press(&mut app, KeyCode::Char(' '));
         assert_eq!(
             scroll(&app),
-            4,
-            "a page is the popup's inside less the pinned header and the key bar"
+            3,
+            "a page is the popup's inside less its bar, the pinned header and the key bar"
         );
         press(&mut app, KeyCode::Char('G'));
         assert_eq!(scroll(&app), 14);
@@ -4176,6 +4178,29 @@ mod tests {
                 needs_you: false,
                 is_ready: true,
             })
+        );
+    }
+
+    #[test]
+    fn a_finished_merge_follow_up_never_holds_up_a_switch() {
+        let mut app = app();
+        app.checkout = PathBuf::from("/p/main");
+        let mut record = Sidecar::leased_now();
+        record.ticket = Some("END-1".into());
+        app.apply_sidecars(HashMap::from([(PathBuf::from("/p/4/app"), record)]));
+        let merged = ship("feature/end-1-a", Stage::Merged, "#12 merged");
+        app.apply_ship(ships(&[("/p/4/app", merged)]));
+        let job = app.ready_landings().remove(0);
+        app.job_started(&job);
+        app.job_finished(job, true, "END-1 merged".into());
+        assert_eq!(app.active_jobs(), 0);
+        app.open_picker(vec![
+            choice("/p/main", None),
+            choice("/home/me/lander", None),
+        ]);
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Outcome::Switch(PathBuf::from("/home/me/lander"))
         );
     }
 

@@ -69,10 +69,10 @@ In a true-colour terminal (`COLORTERM=truecolor`) treetop draws in gruvbox-mater
 The columns are what a destroy would lose.
 GIT says what is not safe yet, in a Powerlevel10k prompt's symbols: `⇡2` commits on no remote, `+1` staged, `!3` unstaged and `?4` untracked files, each only when there are some, so a clean tree is blank.
 `─` means git could not read a held tree, which deserves a look before it goes.
-PROCS counts processes running inside the tree, and PORTS the TCP ports they listen on: the lowest, and how many more.
+PORTS lists the TCP ports the tree's processes listen on: the lowest, and how many more; the processes themselves are in the detail pane and the return dialog.
 `o` opens the lowest in the browser on a desktop; on a server reached over SSH it copies the URL to the clipboard of the computer you are typing at, through the terminal (OSC 52; inside tmux, `set-clipboard on`).
 AGENT names the coding agent working in the tree, from the sources under [Agents](#agents); `no agent` on a held tree marks one nobody is working in.
-SAYS is its agent's latest word (see [What agents say](#what-agents-say)).
+Its mark is `●` in bold when the tree's agent needs you and `✓` when it is done (see [What agents say](#what-agents-say)), else the agent's own status: `●` busy, `○` idle, `◌` cold.
 Trees waiting on you sort to the top, set apart from the rest by a blank line; below it come the main checkout, then the other trees with the most recently active agent first, so trees nobody has worked in for a while sink to the bottom.
 An agent's last activity is its latest report, or when its Claude Code transcript last grew.
 Trees held for later but not worked on now can be parked with `z`: they go under a Parked heading at the bottom, folded, and `Z` opens it.
@@ -281,7 +281,7 @@ The tree treetop was started in is never a target, because returning or destroyi
 ## Agent chats
 
 Enter opens the chat of the agent in the tree under the cursor in a popup over treetop, the way `d` opens the diff.
-The pool stays on screen, dimmed, round the popup's border, so a chat never passes for a Claude Code session of your own; the popup's title names the tree, branch and agent, and its bottom edge the keys out.
+The pool stays on screen, dimmed, round the popup's border, so a chat never passes for a Claude Code session of your own; a bar on the popup's first row, inside its border, names the tree, branch and agent, with the keys out at its right.
 The chat's terminal is the size of the inside of the popup, and follows it when the terminal is resized.
 **Ctrl+Q** always comes back to the list as you left it, whatever the chat is doing, and Enter on another tree opens that one.
 **Ctrl+\\** goes straight to the next agent's chat, down the list as filtered, skipping trees with none and wrapping at the end; the cursor follows, so Ctrl+Q lands on the tree you were last in.
@@ -363,7 +363,7 @@ Agents with no chat to type into, such as an interactive session or a bare proce
 
 ### What agents say
 
-Every background agent's latest report is read from Claude Code's job files under `~/.claude/jobs` and shown on its tree's row, in SAYS: the question while it needs you, the answer once it is done, else what it is doing now.
+Every background agent's latest report is read from Claude Code's job files under `~/.claude/jobs` and marks its tree's row in AGENT: `●` while it needs you, `✓` once it is done. What it said, the question it waits on, its answer, else what it is doing now, is in the notifications and the detail pane.
 A report belongs to the tree whose `treetop.json` names its job, or where its agent runs now, so a recycled tree never shows the last agent's words.
 An agent sitting at a question dialog or permission prompt needs you too, though its report still says working, since only its chat can answer it.
 Trees waiting on you come first in the list, and the cursor stays on its tree as rows move.
@@ -386,7 +386,7 @@ Only this workspace's trees notify; agents elsewhere are counted in the summary.
 A tree's notifications go when it is returned, and do not come back when it is handed out again.
 `v` shows the tree under the cursor in full in their place: where it is, its agents, ports, processes, PR and last action; `v` again goes back.
 The summary counts the trees that need you, and, as "elsewhere", agents outside the pool waiting on you, which have no row.
-These job files are internal to Claude Code, like its session files, so a release that changes them blanks SAYS until treetop catches up.
+These job files are internal to Claude Code, like its session files, so a release that changes them blanks those marks and notes until treetop catches up.
 
 ## After the agent
 

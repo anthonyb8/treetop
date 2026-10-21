@@ -321,15 +321,6 @@ fn freshness(app: &App) -> Span<'static> {
     Span::raw(format!("  listed {age} ago"))
 }
 
-fn count_cell(value: Option<usize>, color: Color) -> Cell<'static> {
-    let muted = fg(theme().muted);
-    match value {
-        Some(0) => Cell::from("0").style(muted),
-        Some(n) => Cell::from(n.to_string()).style(fg(color)),
-        None => Cell::from("-").style(muted),
-    }
-}
-
 /// A tree's git state as a Powerlevel10k prompt writes it: `⇡` commits on
 /// no remote, `+` staged, `!` unstaged and `?` untracked files, each only
 /// when there are some. Nothing for a clean tree.
@@ -406,8 +397,11 @@ fn agent_style(status: Option<Status>) -> (&'static str, Style) {
     }
 }
 
-/// The first agent in the tree, and how many more. A held tree with none,
-/// once agents have been read, says so: it is the one to check on.
+/// The first agent in the tree, and how many more, marked by the tree's
+/// latest report when it needs you or is done, else by the agent's status;
+/// its words are in the notifications and the detail pane. A held tree
+/// with no agent, once agents have been read, says so: it is the one to
+/// check on.
 fn agent_cell(app: &App, tree: &Tree) -> Cell<'static> {
     let Some(first) = tree.agents.first() else {
         return if tree.is_held() && app.is_agents_read {
@@ -416,7 +410,10 @@ fn agent_cell(app: &App, tree: &Tree) -> Cell<'static> {
             Cell::from("")
         };
     };
-    let (glyph, style) = agent_style(first.status);
+    let (glyph, style) = match app.says(tree).map(|item| item.state) {
+        Some(state @ (State::Blocked | State::Done)) => state_style(state),
+        _ => agent_style(first.status),
+    };
     let more = match tree.agents.len() - 1 {
         0 => String::new(),
         n => format!(" +{n}"),
@@ -472,7 +469,6 @@ fn row(app: &App, tree: &Tree) -> Row<'static> {
         Some(b) => Cell::from(b.clone()),
         None => Cell::from("(detached)").style(fg(t.muted)),
     };
-    let procs = (!tree.processes.is_empty() || tree.is_held()).then_some(tree.processes.len());
     let mut cells = vec![
         Cell::from(mark),
         Cell::from(tree.name.clone()),
@@ -486,8 +482,6 @@ fn row(app: &App, tree: &Tree) -> Row<'static> {
         .style(fg(t.accent)),
         branch,
         agent_cell(app, tree),
-        says_cell(app, tree),
-        count_cell(procs, t.warning),
         ports_cell(tree),
         git_cell(tree),
     ];
@@ -504,7 +498,7 @@ fn row(app: &App, tree: &Tree) -> Row<'static> {
 fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
     let t = theme();
     let mut titles = vec![
-        "", "#", "STATUS", "TICKET", "BRANCH", "AGENT", "SAYS", "PROCS", "PORTS", "GIT",
+        "", "#", "STATUS", "TICKET", "BRANCH", "AGENT", "PORTS", "GIT",
     ];
     if app.is_shipping() {
         titles.push("PR");
@@ -532,10 +526,8 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
         Constraint::Length(4),
         Constraint::Length(13),
         Constraint::Length(9),
-        Constraint::Fill(2),
-        Constraint::Length(22),
         Constraint::Fill(3),
-        Constraint::Length(6),
+        Constraint::Fill(2),
         Constraint::Length(11),
         Constraint::Length(14),
     ];
@@ -815,25 +807,6 @@ fn state_style(state: State) -> (&'static str, Style) {
         State::Working => ("·", fg(t.info)),
         State::Stopped => ("■", fg(t.muted)),
     }
-}
-
-/// The tree's agent's latest word, its first line: the question it waits on,
-/// its answer once done, else what it is doing.
-fn says_cell(app: &App, tree: &Tree) -> Cell<'static> {
-    let Some(item) = app.says(tree) else {
-        return Cell::from("");
-    };
-    let (glyph, style) = state_style(item.state);
-    let first = item.text().lines().next().unwrap_or("").to_string();
-    let text_style = if item.state == State::Blocked {
-        Style::new().add_modifier(Modifier::BOLD)
-    } else {
-        Style::new()
-    };
-    Cell::from(Line::from(vec![
-        Span::styled(format!("{glyph} "), style),
-        Span::styled(first, text_style),
-    ]))
 }
 
 /// How many notifications show as edges under the top one.
@@ -1775,10 +1748,10 @@ fn draw_diff_rows(frame: &mut Frame, layout: &DiffLayout, view: &DiffView, body:
 /// The side-by-side diff of one tree against its base, in a popup.
 fn draw_diff_view(frame: &mut Frame, app: &App, view: &DiffView) {
     let t = theme();
-    let area = popup::area(frame.area());
-    // The keys sit in a bar on the popup's last row, drawn like a file header.
+    // What the diff is sits in a bar on the popup's first row, and the keys
+    // in one on its last, both drawn like a file header.
     let [body, key_row] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)])
-        .areas(popup::inner(frame.area()));
+        .areas(popup::body(frame.area()));
     let tree = app.trees.iter().find(|tree| tree.path == view.path);
     let mut title = vec![
         Span::styled(" diff ", t.badge),
@@ -1792,7 +1765,6 @@ fn draw_diff_view(frame: &mut Frame, app: &App, view: &DiffView) {
             Style::new().add_modifier(Modifier::BOLD),
         ),
     ];
-    frame.render_widget(Clear, area);
     let loaded = app.diffs.get(&view.path).map(|d| &d.layout);
     if let Some(Ok(layout)) = loaded {
         let diff = &layout.diff;
@@ -1817,7 +1789,7 @@ fn draw_diff_view(frame: &mut Frame, app: &App, view: &DiffView) {
             )));
         }
     }
-    frame.render_widget(popup_block(Line::from(title)), area);
+    bar_popup(frame, title, Vec::new());
     frame.render_widget(
         Paragraph::new(Line::from(fitting_keys(&DIFF_KEYS, key_row.width))).style(t.diff.header),
         key_row,
@@ -1836,9 +1808,10 @@ fn draw_diff_view(frame: &mut Frame, app: &App, view: &DiffView) {
     }
 }
 
-/// An agent's chat in a popup over treetop, under a title naming its branch,
-/// tree and agent, with the keys out at the right of the same line. The branch comes from
-/// the latest listing, so it follows the agent if it switches branches.
+/// An agent's chat in a popup over treetop, under a bar naming its branch,
+/// tree and agent, with the keys out at the right of the same line. The
+/// branch comes from the latest listing, so it follows the agent if it
+/// switches branches.
 fn draw_chat(frame: &mut Frame, app: &App, chat: &Chat) {
     let body = chat_frame(frame, app, &chat.agent, &chat.tree);
     if !chat.is_ready() {
@@ -1870,11 +1843,10 @@ fn opening_note(agent: &str) -> String {
     }
 }
 
-/// A chat's popup: its frame and title, cleared, with the keys out at the
-/// right of the title. Returns where the chat's screen goes.
+/// A chat's popup: its frame and bar, cleared, with the keys out at the
+/// right of the bar. Returns where the chat's screen goes.
 fn chat_frame(frame: &mut Frame, app: &App, agent: &str, tree: &str) -> Rect {
     let t = theme();
-    let area = popup::area(frame.area());
     let title = if coordinator::is_assistant(agent) {
         vec![Span::styled(" coordinator ", t.badge)]
     } else {
@@ -1893,13 +1865,32 @@ fn chat_frame(frame: &mut Frame, app: &App, agent: &str, tree: &str) -> Rect {
             Span::raw(format!("  tree {tree}  {agent} ")),
         ]
     };
-    let keys = Line::from(key_bar(&[("^Q", "back to treetop"), ("^\\", "next chat")]));
+    let keys = key_bar(&[("^Q", "back to treetop"), ("^\\", "next chat")]);
+    bar_popup(frame, title, keys)
+}
+
+/// A popup with a bar on the first row inside its border, drawn like a
+/// diff's file header: `title` at its left and `keys` at its right, the keys
+/// left out where the two would not fit. Returns the rows under the bar.
+fn bar_popup(frame: &mut Frame, title: Vec<Span<'static>>, keys: Vec<Span<'static>>) -> Rect {
+    let screen = frame.area();
+    let area = popup::area(screen);
+    let bar = popup::bar(screen);
     frame.render_widget(Clear, area);
     frame.render_widget(
-        popup_block(Line::from(title)).title_top(keys.right_aligned()),
+        Block::bordered()
+            .border_style(fg(theme().accent))
+            .style(fg(theme().text)),
         area,
     );
-    popup::inner(frame.area())
+    let title = Line::from(title);
+    let keys = Line::from(keys);
+    let fits = title.width() + keys.width() <= usize::from(bar.width);
+    frame.render_widget(Paragraph::new(title).style(theme().diff.header), bar);
+    if fits {
+        frame.render_widget(Paragraph::new(keys.right_aligned()), bar);
+    }
+    popup::body(screen)
 }
 
 /// One muted line in the middle of `area`.
