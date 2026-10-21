@@ -117,6 +117,15 @@ pub struct Picker {
     pub selected: usize,
 }
 
+/// The ports of a tree serving several, for `o` to choose from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortMenu {
+    pub tree: String,
+    /// Each port and the process listening on it, lowest first.
+    pub ports: Vec<(u16, String)>,
+    pub selected: usize,
+}
+
 /// The diff of one tree in its popup, and where it is scrolled to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffView {
@@ -277,6 +286,8 @@ pub struct App {
     pub checkout: PathBuf,
     /// The workspace picker, while it is open.
     pub picker: Option<Picker>,
+    /// The ports `o` offers, while its menu is open.
+    pub port_menu: Option<PortMenu>,
     /// Every background agent's latest report, for the AGENT column's mark,
     /// asks, the bell and finding a stopped coordinator.
     pub reports: Vec<Report>,
@@ -1067,6 +1078,7 @@ impl App {
         self.view.is_none()
             && self.prompt.is_none()
             && self.picker.is_none()
+            && self.port_menu.is_none()
             && self.opening.is_none()
             && self.awaiting_chat.is_none()
             && self.started_chat.is_none()
@@ -2022,20 +2034,70 @@ impl App {
         self.start(tree, Launch::pick(id, self.checkout.clone()))
     }
 
-    /// Opens the lowest port the tree under the cursor serves.
+    /// Opens the port the tree under the cursor serves, or, where it
+    /// serves several, such as a frontend and a backend, a menu of them.
     fn browse(&mut self) -> Outcome {
         let Some(tree) = self.current() else {
             return Outcome::Continue;
         };
-        match tree.ports().first() {
-            Some(&port) => Outcome::Browse {
-                port,
-                tree: tree.name.clone(),
-            },
-            None => {
-                self.message = Some(format!("tree {} serves no port", tree.name));
+        let tree_name = tree.name.clone();
+        let ports = tree.served();
+        match ports.as_slice() {
+            [] => {
+                self.message = Some(format!("tree {tree_name} serves no port"));
                 Outcome::Continue
             }
+            [(port, _)] => Outcome::Browse {
+                port: *port,
+                tree: tree_name,
+            },
+            _ => {
+                self.port_menu = Some(PortMenu {
+                    tree: tree_name,
+                    ports,
+                    selected: 0,
+                });
+                Outcome::Continue
+            }
+        }
+    }
+
+    /// Keys while the port menu is open: a number or Enter opens a port,
+    /// and Esc closes it.
+    fn handle_port_key(&mut self, key: KeyEvent) -> Outcome {
+        let Some(menu) = self.port_menu.as_mut() else {
+            return Outcome::Continue;
+        };
+        let last = menu.ports.len().saturating_sub(1);
+        let chosen = match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                menu.selected = (menu.selected + 1).min(last);
+                return Outcome::Continue;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                menu.selected = menu.selected.saturating_sub(1);
+                return Outcome::Continue;
+            }
+            KeyCode::Enter => menu.selected,
+            KeyCode::Char(c @ '1'..='9') => {
+                let at = usize::from(c as u8 - b'1');
+                if at > last {
+                    return Outcome::Continue;
+                }
+                at
+            }
+            KeyCode::Esc | KeyCode::Char('q' | 'o') => {
+                self.port_menu = None;
+                return Outcome::Continue;
+            }
+            _ => return Outcome::Continue,
+        };
+        match self.port_menu.take() {
+            Some(menu) => Outcome::Browse {
+                port: menu.ports[chosen].0,
+                tree: menu.tree,
+            },
+            None => Outcome::Continue,
         }
     }
 
@@ -2062,6 +2124,9 @@ impl App {
         }
         if self.picker.is_some() {
             return self.handle_picker_key(key);
+        }
+        if self.port_menu.is_some() {
+            return self.handle_port_key(key);
         }
         if let Some(opening) = self.opening.clone() {
             let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -2836,12 +2901,12 @@ mod tests {
     }
 
     #[test]
-    fn o_opens_the_lowest_port_or_says_there_is_none() {
+    fn o_opens_the_one_port_or_says_there_is_none() {
         let mut app = app();
         let process = Process {
             pid: 1,
             name: "node".into(),
-            ports: vec![5223, 9229],
+            ports: vec![5223],
         };
         app.apply_processes(&HashMap::from([(PathBuf::from("/p/4/app"), vec![process])]));
         assert_eq!(
@@ -2854,6 +2919,43 @@ mod tests {
         press(&mut app, KeyCode::Down);
         assert_eq!(press(&mut app, KeyCode::Char('o')), Outcome::Continue);
         assert_eq!(app.message.as_deref(), Some("tree 7 serves no port"));
+    }
+
+    #[test]
+    fn o_offers_each_port_of_a_tree_serving_a_frontend_and_a_backend() {
+        let mut app = app();
+        let process = |pid, name: &str, ports| Process {
+            pid,
+            name: name.into(),
+            ports,
+        };
+        app.apply_processes(&HashMap::from([(
+            PathBuf::from("/p/4/app"),
+            vec![
+                process(1, "uvicorn", vec![8000]),
+                process(2, "node", vec![5173]),
+            ],
+        )]));
+        let browse = |port| Outcome::Browse {
+            port,
+            tree: "4".into(),
+        };
+        assert_eq!(press(&mut app, KeyCode::Char('o')), Outcome::Continue);
+        let menu = app.port_menu.as_ref().unwrap();
+        assert_eq!(
+            menu.ports,
+            [(5173, "node".to_string()), (8000, "uvicorn".to_string())]
+        );
+        assert_eq!(app.next_ask(), None, "the menu keeps chats shut");
+        assert_eq!(press(&mut app, KeyCode::Char('2')), browse(8000));
+        assert!(app.port_menu.is_none());
+        press(&mut app, KeyCode::Char('o'));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(press(&mut app, KeyCode::Enter), browse(8000));
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(press(&mut app, KeyCode::Char('9')), Outcome::Continue);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.port_menu.is_none(), "Esc closes it");
     }
 
     fn type_in(app: &mut App, text: &str) {

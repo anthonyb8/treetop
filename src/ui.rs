@@ -12,7 +12,7 @@ use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wr
 
 use crate::agents::{Agent, Status};
 use crate::app::{
-    App, DiffView, Item, JobState, LogEntry, Opening, Pending, Picker, Review, Shipping,
+    App, DiffView, Item, JobState, LogEntry, Opening, Pending, Picker, PortMenu, Review, Shipping,
 };
 use crate::chat::Chat;
 use crate::coordinator;
@@ -83,7 +83,10 @@ const HELP: [(&str, &str); 26] = [
         "/",
         "filter by tree, branch, holder, agent or PR, such as merged",
     ),
-    ("o", "open the lowest port the tree serves"),
+    (
+        "o",
+        "open the port the tree serves, or choose one where it serves several",
+    ),
     ("O", "open the tree's PR"),
     ("f", "send what failed on the tree's PR to its agent"),
     (
@@ -167,6 +170,7 @@ pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>, issues: Option<&i
         || app.prompt.is_some()
         || app.opening.is_some()
         || app.picker.is_some()
+        || app.port_menu.is_some()
         || app.is_help
     {
         let area = frame.area();
@@ -184,6 +188,8 @@ pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>, issues: Option<&i
         draw_prompt(frame, prompt);
     } else if let Some(picker) = &app.picker {
         draw_picker(frame, app, picker);
+    } else if let Some(menu) = &app.port_menu {
+        draw_port_menu(frame, menu);
     } else if app.is_issues {
         // The trees' own dialogs wait until the trees are back on screen.
     } else if let Some(review) = app.reviews.front() {
@@ -417,16 +423,19 @@ fn pr_cell(tree: &Tree) -> Cell<'static> {
     }
 }
 
-/// The lowest port the tree serves and how many more, `-` for none.
+/// Every port the tree serves, lowest first, so a frontend and a backend
+/// both show; `-` for none.
 fn ports_cell(tree: &Tree) -> Cell<'static> {
     let ports = tree.ports();
-    match ports.as_slice() {
-        [] => Cell::from("-").style(fg(theme().muted)),
-        [first] => Cell::from(format!(":{first}")).style(fg(theme().info)),
-        [first, rest @ ..] => {
-            Cell::from(format!(":{first} +{}", rest.len())).style(fg(theme().info))
-        }
+    if ports.is_empty() {
+        return Cell::from("-").style(fg(theme().muted));
     }
+    let text = ports
+        .iter()
+        .map(|port| format!(":{port}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Cell::from(text).style(fg(theme().info))
 }
 
 fn row(app: &App, tree: &Tree) -> Row<'static> {
@@ -501,7 +510,7 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
         Constraint::Length(9),
         Constraint::Fill(3),
         Constraint::Fill(2),
-        Constraint::Length(11),
+        Constraint::Length(17),
         Constraint::Length(14),
     ];
     if app.is_shipping() {
@@ -949,6 +958,53 @@ fn draw_picker(frame: &mut Frame, app: &App, picker: &Picker) {
     ];
     let table = Table::new(rows, widths).row_highlight_style(t.cursor);
     let mut state = TableState::default().with_selected(Some(picker.selected));
+    frame.render_stateful_widget(table, inner, &mut state);
+}
+
+/// The ports `o` offers for a tree serving several, each with its number
+/// key and the process listening on it.
+fn draw_port_menu(frame: &mut Frame, menu: &PortMenu) {
+    let t = theme();
+    let screen = frame.area();
+    let width = screen.width.saturating_sub(4).min(48);
+    let height = u16::try_from(menu.ports.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2);
+    let area = popup::centered(screen, width, height);
+    let keys = [("1-9", "open"), ("Enter", "open"), ("Esc", "close")];
+    let block = popup_block(Line::styled(
+        format!(" Tree {} serves ", menu.tree),
+        fg(t.title).add_modifier(Modifier::BOLD),
+    ))
+    .title_bottom(Line::from(fitting_keys(&keys, width.saturating_sub(2))));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let rows: Vec<Row> = menu
+        .ports
+        .iter()
+        .enumerate()
+        .map(|(at, (port, name))| {
+            let number = if at < 9 {
+                format!(" {} ", at + 1)
+            } else {
+                String::new()
+            };
+            Row::new(vec![
+                Cell::from(Span::styled(number, t.badge)),
+                Cell::from(format!("localhost:{port}"))
+                    .style(fg(t.info).add_modifier(Modifier::BOLD)),
+                Cell::from(name.clone()).style(fg(t.muted)),
+            ])
+        })
+        .collect();
+    let widths = [
+        Constraint::Length(3),
+        Constraint::Length(16),
+        Constraint::Fill(1),
+    ];
+    let table = Table::new(rows, widths).row_highlight_style(t.cursor);
+    let mut state = TableState::default().with_selected(Some(menu.selected));
     frame.render_stateful_widget(table, inner, &mut state);
 }
 

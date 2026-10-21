@@ -99,6 +99,20 @@ impl Tree {
         ports.dedup();
         ports
     }
+
+    /// Every port the tree serves, lowest first, each once, with the name
+    /// of the process listening on it, so a frontend and a backend can be
+    /// told apart.
+    pub fn served(&self) -> Vec<(u16, String)> {
+        let mut served: Vec<(u16, String)> = self
+            .processes
+            .iter()
+            .flat_map(|p| p.ports.iter().map(|&port| (port, p.name.clone())))
+            .collect();
+        served.sort_unstable();
+        served.dedup_by_key(|(port, _)| *port);
+        served
+    }
 }
 
 /// The tree `dir` is in. A tree can sit inside another, as a worktree under
