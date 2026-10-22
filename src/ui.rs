@@ -14,8 +14,8 @@ use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wr
 
 use crate::agents::{Agent, Status};
 use crate::app::{
-    App, DiffView, Item, JobState, LogEntry, Opening, Pending, Picker, PortMenu, Review, SCRATCH,
-    ScratchMenu, Shipping,
+    App, DiffView, Group, Item, JobState, ListRow, LogEntry, Opening, Pending, Picker, PortMenu,
+    Review, SCRATCH, ScratchMenu, Shipping,
 };
 use crate::assistant;
 use crate::chat::Chat;
@@ -49,7 +49,7 @@ const KEYS: [(&str, &str); 13] = [
 const HELP: [(&str, &str); 27] = [
     (
         "Enter",
-        "open the agent: its chat, a cold one started again, else its tree",
+        "open the agent: its chat, a cold one started again, else its tree; on a heading, fold or open its group",
     ),
     (
         "t",
@@ -516,32 +516,27 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
         titles.push("PR");
     }
     let header = Row::new(titles).style(t.header);
-    let visible = app.visible();
-    let mut rows: Vec<Row> = visible.iter().map(|tree| row(app, tree)).collect();
-    // A blank line sets the trees waiting on you apart from the rest, a
-    // heading names each base the list is grouped by, and one sets Parked
-    // apart below them. The cursor skips them all, so each pushes the rows
-    // below it one further down the table.
-    let mut extras: Vec<(usize, Row)> = Vec::new();
-    let waiting = app.waiting_rows(&visible);
-    if waiting > 0 && waiting < visible.len() {
-        extras.push((waiting, Row::new(Vec::<Cell>::new())));
-    }
-    for (start, base, count) in app.base_rows(&visible) {
-        extras.push((start, base_heading(base.as_deref(), count)));
-    }
-    if let Some((start, count)) = app.parked_rows(&visible) {
-        extras.push((start, parked_heading(app.is_parked_open, count)));
-    }
-    let selected = app.selected
-        + extras
-            .iter()
-            .filter(|(start, _)| app.selected >= *start)
-            .count();
-    // Inserted from the bottom up, so each lands where it was counted.
-    extras.sort_by_key(|(start, _)| *start);
-    for (start, row) in extras.into_iter().rev() {
-        rows.insert(start, row);
+    // A blank line sets each heading apart from the trees above it. The
+    // cursor never lands on one, so each pushes the rows below it one
+    // further down the table.
+    let mut rows: Vec<Row> = Vec::new();
+    let mut selected = 0;
+    for (at, list_row) in app.rows().into_iter().enumerate() {
+        if matches!(list_row, ListRow::Heading { .. }) && at > 0 {
+            rows.push(Row::new(Vec::<Cell>::new()));
+        }
+        if at == app.selected {
+            selected = rows.len();
+        }
+        rows.push(match list_row {
+            ListRow::Tree(tree) => row(app, tree),
+            ListRow::Heading {
+                group,
+                count,
+                waiting,
+                is_folded,
+            } => heading_row(app, &group, count, waiting, is_folded),
+        });
     }
     let mut widths = vec![
         Constraint::Length(1),
@@ -563,47 +558,71 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_stateful_widget(table, area, &mut state);
 }
 
-/// The heading over the trees cut from one base, or over the free trees
-/// for None, while the list is grouped by base.
-fn base_heading(base: Option<&str>, count: usize) -> Row<'static> {
+/// A group's heading: folded or open, which group, and how many trees it
+/// holds. A base's names its branch in the BRANCH column, wide enough for
+/// any name, and the main checkout's branch carries the checkout itself,
+/// with its ports and git state in their columns. A folded heading says how
+/// many of its trees wait on you.
+fn heading_row(
+    app: &App,
+    group: &Group,
+    count: usize,
+    waiting: usize,
+    is_folded: bool,
+) -> Row<'static> {
     let t = theme();
-    // The base is a branch, so it heads the BRANCH column, wide enough for
-    // any name.
-    let (label, name) = match base {
-        Some(base) => ("base", base.to_string()),
-        None => ("free", "not leased".to_string()),
+    let glyph = if is_folded { "▸" } else { "▾" };
+    let main = app
+        .trees
+        .iter()
+        .find(|tree| tree.is_main)
+        .filter(|tree| matches!(group, Group::Base(b) if tree.branch.as_ref() == Some(b)));
+    let (label, mut name) = match group {
+        Group::Base(base) => (
+            "base",
+            vec![
+                Span::styled(
+                    if base.is_empty() {
+                        "trees".to_string()
+                    } else {
+                        base.clone()
+                    },
+                    fg(t.title).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("  {count}"), fg(t.muted)),
+            ],
+        ),
+        Group::Free => (
+            "free",
+            vec![Span::styled(format!("{count} not leased"), fg(t.muted))],
+        ),
+        Group::Parked => (
+            "parked",
+            vec![Span::styled(format!("{count} set aside"), fg(t.muted))],
+        ),
     };
-    Row::new(vec![
-        Cell::from("▾").style(fg(t.accent)),
+    if main.is_some() {
+        name.push(Span::styled("  · main checkout", fg(t.muted)));
+    }
+    let waits = if is_folded && waiting > 0 {
+        Cell::from(format!("● {waiting} waiting on you"))
+            .style(fg(t.warning).add_modifier(Modifier::BOLD))
+    } else {
+        Cell::from("")
+    };
+    let mut cells = vec![
+        Cell::from(glyph).style(fg(t.accent)),
         Cell::from(""),
         Cell::from(label).style(fg(t.muted)),
         Cell::from(""),
-        Cell::from(Line::from(vec![
-            Span::styled(name, fg(t.title).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("  {count}"), fg(t.muted)),
-        ])),
-    ])
-}
-
-/// The heading over the trees set aside: folded, it is all that shows of
-/// them.
-fn parked_heading(is_open: bool, count: usize) -> Row<'static> {
-    let t = theme();
-    let (glyph, hint) = if is_open {
-        ("▾", "Z folds it")
-    } else {
-        ("▸", "Z opens it")
-    };
-    Row::new(vec![
-        Cell::from(glyph).style(fg(t.accent)),
-        Cell::from(""),
-        Cell::from(Line::from(vec![
-            Span::styled("Parked", fg(t.title).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("  {count}"), fg(t.muted)),
-        ])),
-        Cell::from(""),
-        Cell::from(hint).style(fg(t.muted)),
-    ])
+        Cell::from(Line::from(name)),
+        waits,
+    ];
+    if let Some(main) = main {
+        cells.push(ports_cell(main));
+        cells.push(git_cell(main));
+    }
+    Row::new(cells)
 }
 
 fn pane_block() -> Block<'static> {
@@ -1236,7 +1255,7 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
         keys.insert(1, ("Alt+Enter", "new line"));
     }
     if prompt.is_editing_base {
-        keys.insert(0, ("Tab", "complete"));
+        keys.insert(0, ("←→", "pick"));
     }
     if prompt.names_base() {
         keys.insert(0, ("↑↓", "branch, base"));
@@ -1271,15 +1290,8 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
         }
         if prompt.names_base() {
             let base_row = Rect::new(inner.x, inner.y + 1, inner.width, 1);
+            // Picked, never typed, so it shows no cursor.
             frame.render_widget(Paragraph::new(base_line(prompt)), base_row);
-            if prompt.is_editing_base {
-                let typed = prompt.base.as_deref().map_or(0, |b| b.chars().count());
-                let at = u16::try_from(FIELD_LABEL + typed).unwrap_or(u16::MAX);
-                frame.set_cursor_position(Position::new(
-                    (base_row.x + at).min(base_row.right().saturating_sub(1)),
-                    base_row.y,
-                ));
-            }
         }
         text_area = Rect::new(
             inner.x,
@@ -1320,46 +1332,42 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
 /// alike, so the two values line up.
 const FIELD_LABEL: usize = 7;
 
-/// The compose box's base line: the branch a fresh tree is cut from, typed
-/// with the branch it would complete to after it, else the pool's.
+/// The compose box's base line: the branch a fresh tree is cut from, the
+/// pool's until another is picked; while it has the focus, between arrows
+/// with where it stands among the branches.
 fn base_line(prompt: &Prompt) -> Line<'static> {
     let t = theme();
     let label = Span::styled("base   ", fg(t.muted));
-    let typed = prompt.base.clone().unwrap_or_default();
-    let pools = || {
-        Span::styled(
-            match &prompt.default_base {
-                Some(base) => format!("{base}, the pool's"),
-                None => "the pool's".to_string(),
-            },
-            fg(t.muted).add_modifier(Modifier::ITALIC),
-        )
-    };
+    let name = prompt.base_shown().unwrap_or("the pool's").to_string();
+    let is_pools = prompt.base_name().is_none();
     if !prompt.is_editing_base {
-        return match prompt.base_name() {
-            Some(base) => Line::from(vec![label, Span::raw(base)]),
-            None => Line::from(vec![label, pools()]),
-        };
+        return Line::from(vec![
+            label,
+            if is_pools {
+                Span::styled(
+                    format!("{name}, the pool's"),
+                    fg(t.muted).add_modifier(Modifier::ITALIC),
+                )
+            } else {
+                Span::raw(name)
+            },
+        ]);
     }
-    let mut spans = vec![
+    Line::from(vec![
         label,
-        Span::styled(typed.clone(), fg(t.accent).add_modifier(Modifier::BOLD)),
-    ];
-    match prompt.base_suggestion() {
-        Some(suggested) if suggested.to_lowercase().starts_with(&typed.to_lowercase()) => {
-            spans.push(Span::styled(
-                suggested
-                    .chars()
-                    .skip(typed.chars().count())
-                    .collect::<String>(),
-                fg(t.muted),
-            ));
-        }
-        Some(suggested) => spans.push(Span::styled(format!("  {suggested}?"), fg(t.muted))),
-        None if typed.is_empty() => spans.push(pools()),
-        None => {}
-    }
-    Line::from(spans)
+        Span::styled("‹ ", fg(t.accent)),
+        Span::styled(name, fg(t.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(" ›", fg(t.accent)),
+        Span::styled(
+            format!(
+                "  {}/{}{}",
+                prompt.base_at + 1,
+                prompt.bases.len().max(1),
+                if is_pools { ", the pool's" } else { "" }
+            ),
+            fg(t.muted),
+        ),
+    ])
 }
 
 /// The compose box's branch line: the branch a new agent will start on,

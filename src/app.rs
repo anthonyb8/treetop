@@ -127,6 +127,31 @@ pub struct PortMenu {
     pub selected: usize,
 }
 
+/// A group of the list, under a heading of its own.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Group {
+    /// The trees cut from this base; the main checkout heads its branch's.
+    Base(String),
+    /// The trees nobody holds.
+    Free,
+    /// The trees set aside.
+    Parked,
+}
+
+/// A row of the list: a group's heading, or a tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListRow<'a> {
+    Heading {
+        group: Group,
+        /// The trees in it, shown or folded.
+        count: usize,
+        /// How many of them wait on you, which a folded heading says.
+        waiting: usize,
+        is_folded: bool,
+    },
+    Tree(&'a Tree),
+}
+
 /// The scratch chats `C` lists, under a first line that starts a new one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScratchMenu {
@@ -356,6 +381,11 @@ pub struct App {
     landings: Vec<Job>,
     /// The Parked group is open, showing the trees set aside.
     pub is_parked_open: bool,
+    /// The groups folded to their heading, besides Parked.
+    pub folded: BTreeSet<Group>,
+    /// The cursor has been put on a tree once, so a listing that moves it
+    /// keeps it near where it was rather than on the first tree.
+    is_cursor_placed: bool,
 }
 
 /// How long a started agent may take to show up before treetop stops
@@ -470,104 +500,168 @@ impl App {
         tree.sidecar.as_ref().is_some_and(|s| s.parked)
     }
 
-    /// The bases the held trees were cut from, the pool's first and the
-    /// rest by name. With more than one, the list groups its trees by them.
+    /// The bases the list groups trees under: the main checkout's branch,
+    /// which it heads, and each one a held tree was cut from, the pool's
+    /// first and the rest by name.
     pub fn bases_in_use(&self) -> Vec<String> {
+        let main = self
+            .trees
+            .iter()
+            .find(|t| t.is_main)
+            .and_then(|t| t.branch.clone());
         let mut bases: Vec<String> = self
             .trees
             .iter()
             .filter(|t| t.is_held() && !t.is_main)
-            .filter_map(|t| self.base_of(t))
+            // A pool whose base is unknown still lists its trees, under ''.
+            .map(|t| self.base_of(t).unwrap_or_default())
+            .chain(main)
             .collect();
         bases.sort_by_key(|b| (Some(b) != self.base.as_ref(), b.clone()));
         bases.dedup();
         bases
     }
 
-    /// The base `tree` is listed under among `bases`: the one it was cut
-    /// from, or for the main checkout its own branch where that is one of
-    /// them, else the pool's. None for a tree held by no one.
-    fn group_of(&self, tree: &Tree, bases: &[String]) -> Option<usize> {
-        if !tree.is_held() {
+    /// The group `tree` is listed under: Parked for one set aside that does
+    /// not wait on you, the free trees, else the base it was cut from. None
+    /// for the main checkout, which heads its branch's group rather than
+    /// being a row, so no agent is ever started or shown there.
+    pub fn group_of(&self, tree: &Tree) -> Option<Group> {
+        if tree.is_main {
             return None;
         }
-        let base = if tree.is_main {
-            tree.branch
-                .clone()
-                .filter(|b| bases.contains(b))
-                .or_else(|| self.base.clone())
+        Some(if Self::is_parked(tree) && !self.needs_you(tree) {
+            Group::Parked
+        } else if !tree.is_held() {
+            Group::Free
         } else {
-            self.base_of(tree)
-        };
-        base.and_then(|b| bases.iter().position(|x| *x == b))
-            .or(Some(0))
+            Group::Base(self.base_of(tree).unwrap_or_default())
+        })
     }
 
-    /// The trees the list shows, filtered: those waiting on you first, then
-    /// the main checkout, then the rest, each part with the most recently
-    /// active agent first, and trees with no activity in pool order last.
-    /// Parked trees come last, and only while Parked is open or a filter
-    /// looks for them; one that waits on you comes first all the same.
-    /// Where the held trees come from more than one base, each base's trees
-    /// are listed together, in that order within, the pool's base first,
-    /// then the free trees, then Parked.
-    pub fn visible(&self) -> Vec<&Tree> {
+    /// The group is folded to its heading. Parked starts folded, the rest
+    /// open.
+    pub fn is_folded(&self, group: &Group) -> bool {
+        match group {
+            Group::Parked => !self.is_parked_open,
+            _ => self.folded.contains(group),
+        }
+    }
+
+    fn toggle_fold(&mut self, group: &Group) {
+        match group {
+            Group::Parked => self.is_parked_open = !self.is_parked_open,
+            _ => {
+                if !self.folded.remove(group) {
+                    self.folded.insert(group.clone());
+                }
+            }
+        }
+    }
+
+    /// `tree` is one the filter looks for, by number, branch, holder,
+    /// ticket, PR or agent.
+    fn is_found(tree: &Tree, needle: &str) -> bool {
+        needle.is_empty()
+            || [
+                Some(&tree.name),
+                tree.branch.as_ref(),
+                tree.holder.as_ref(),
+                tree.sidecar.as_ref().and_then(|s| s.ticket.as_ref()),
+                tree.ship.as_ref().map(|s| &s.label),
+            ]
+            .into_iter()
+            .flatten()
+            .chain(tree.agents.iter().map(|a| &a.name))
+            .any(|field| field.to_lowercase().contains(needle))
+    }
+
+    /// The list as it shows: each group under its heading, the bases first,
+    /// the pool's leading, then the free trees, then Parked. Within a group,
+    /// trees waiting on you come first, then the most recently active, and
+    /// trees with no activity in pool order last. A folded group shows its
+    /// heading alone; a filter opens every group and leaves out those it
+    /// finds nothing in, but the main checkout's branch keeps its heading.
+    pub fn rows(&self) -> Vec<ListRow<'_>> {
         let needle = self.filter.to_lowercase();
-        let mut visible: Vec<&Tree> = self
+        let bases = self.bases_in_use();
+        let rank = |group: &Group| match group {
+            Group::Base(base) => bases.iter().position(|b| b == base).unwrap_or(0),
+            Group::Free => bases.len(),
+            Group::Parked => bases.len() + 1,
+        };
+        let mut trees: Vec<(Group, &Tree)> = self
             .trees
             .iter()
-            .filter(|t| {
-                needle.is_empty()
-                    || [
-                        Some(&t.name),
-                        t.branch.as_ref(),
-                        t.holder.as_ref(),
-                        t.sidecar.as_ref().and_then(|s| s.ticket.as_ref()),
-                        t.ship.as_ref().map(|s| &s.label),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .chain(t.agents.iter().map(|a| &a.name))
-                    .any(|field| field.to_lowercase().contains(&needle))
-            })
+            .filter(|t| Self::is_found(t, &needle))
+            .filter_map(|t| Some((self.group_of(t)?, t)))
             .collect();
-        visible.retain(|t| {
-            self.is_parked_open || !needle.is_empty() || !Self::is_parked(t) || self.needs_you(t)
-        });
-        let bases = self.bases_in_use();
-        let is_grouped = bases.len() > 1;
-        visible.sort_by_cached_key(|t| {
-            let needs_you = self.needs_you(t);
-            let group = match self.group_of(t, &bases) {
-                _ if !is_grouped => 0,
-                _ if Self::is_parked(t) && !needs_you => bases.len() + 1,
-                Some(at) => at,
-                None => bases.len(),
-            };
+        trees.sort_by_cached_key(|(group, t)| {
             (
-                group,
-                !needs_you,
-                !needs_you && Self::is_parked(t),
-                !t.is_main,
+                rank(group),
+                !self.needs_you(t),
                 std::cmp::Reverse(self.active_at(t)),
             )
         });
-        visible
-    }
-
-    /// Where Parked starts among the visible trees, and how many trees it
-    /// holds, shown or not; None when no tree is parked.
-    pub fn parked_rows(&self, visible: &[&Tree]) -> Option<(usize, usize)> {
-        let count = self
+        let main = self
             .trees
             .iter()
-            .filter(|t| Self::is_parked(t) && !self.needs_you(t))
-            .count();
-        let start = visible
+            .find(|t| t.is_main)
+            .and_then(|t| t.branch.clone());
+        let groups = bases
             .iter()
-            .position(|t| Self::is_parked(t) && !self.needs_you(t))
-            .unwrap_or(visible.len());
-        (count > 0).then_some((start, count))
+            .map(|b| Group::Base(b.clone()))
+            .chain([Group::Free, Group::Parked]);
+        let mut rows = Vec::new();
+        for group in groups {
+            let members: Vec<&Tree> = trees
+                .iter()
+                .filter(|(g, _)| *g == group)
+                .map(|(_, t)| *t)
+                .collect();
+            let is_mains = matches!(&group, Group::Base(b) if Some(b) == main.as_ref());
+            if members.is_empty() && !is_mains {
+                continue;
+            }
+            let is_folded = needle.is_empty() && self.is_folded(&group);
+            rows.push(ListRow::Heading {
+                waiting: members.iter().filter(|t| self.needs_you(t)).count(),
+                count: members.len(),
+                is_folded,
+                group,
+            });
+            if !is_folded {
+                rows.extend(members.into_iter().map(ListRow::Tree));
+            }
+        }
+        rows
+    }
+
+    /// The trees the list shows, in its order: those in open groups.
+    pub fn visible(&self) -> Vec<&Tree> {
+        self.rows()
+            .into_iter()
+            .filter_map(|row| match row {
+                ListRow::Tree(tree) => Some(tree),
+                ListRow::Heading { .. } => None,
+            })
+            .collect()
+    }
+
+    /// The row of the first tree, where the cursor starts, else the first.
+    fn first_tree_row(&self) -> usize {
+        self.rows()
+            .iter()
+            .position(|row| matches!(row, ListRow::Tree(_)))
+            .unwrap_or(0)
+    }
+
+    /// The group whose heading the cursor is on.
+    pub fn current_heading(&self) -> Option<Group> {
+        match self.rows().get(self.selected) {
+            Some(ListRow::Heading { group, .. }) => Some(group.clone()),
+            _ => None,
+        }
     }
 
     /// `z`: sets the tree under the cursor aside under Parked, or brings it
@@ -596,43 +690,9 @@ impl App {
         if let Some(tree) = self.trees.iter_mut().find(|t| t.path == path) {
             tree.sidecar = Some(Box::new(record.clone()));
         }
-        let last = self.visible().len().saturating_sub(1);
+        let last = self.rows().len().saturating_sub(1);
         self.selected = self.selected.min(last);
         Outcome::Record { path, record }
-    }
-
-    /// How many of the visible trees at the top wait on you, which the list
-    /// sets apart from the rest; none while it is grouped by base, where
-    /// they come first in their group instead.
-    pub fn waiting_rows(&self, visible: &[&Tree]) -> usize {
-        if self.bases_in_use().len() > 1 {
-            return 0;
-        }
-        visible.iter().take_while(|t| self.needs_you(t)).count()
-    }
-
-    /// Where each base's trees start among the visible ones, the base, and
-    /// how many it lists, while the list is grouped by base, then the free
-    /// trees, under None; empty while it is not grouped.
-    pub fn base_rows(&self, visible: &[&Tree]) -> Vec<(usize, Option<String>, usize)> {
-        let bases = self.bases_in_use();
-        if bases.len() < 2 {
-            return Vec::new();
-        }
-        let mut rows: Vec<(usize, Option<String>, usize)> = Vec::new();
-        for (at, tree) in visible.iter().enumerate() {
-            if Self::is_parked(tree) && !self.needs_you(tree) {
-                continue;
-            }
-            let group = self
-                .group_of(tree, &bases)
-                .map(|group| bases[group].clone());
-            match rows.last_mut() {
-                Some((_, base, count)) if *base == group => *count += 1,
-                _ => rows.push((at, group, 1)),
-            }
-        }
-        rows
     }
 
     /// When the tree's agents last worked: their latest report, or what
@@ -678,8 +738,12 @@ impl App {
         agents
     }
 
+    /// The tree under the cursor; None on a heading.
     pub fn current(&self) -> Option<&Tree> {
-        self.visible().get(self.selected).copied()
+        match self.rows().get(self.selected) {
+            Some(ListRow::Tree(tree)) => Some(tree),
+            _ => None,
+        }
     }
 
     pub fn start_listing(&mut self) {
@@ -769,11 +833,21 @@ impl App {
         self.marked.retain(|p| paths.contains(p));
         self.jobs
             .retain(|path, state| state.is_active() || paths.contains(path));
-        let visible = self.visible();
-        self.selected = cursor
-            .and_then(|c| visible.iter().position(|t| t.path == c))
-            .unwrap_or(self.selected)
-            .min(visible.len().saturating_sub(1));
+        let rows = self.rows();
+        let at = cursor.and_then(|c| {
+            rows.iter()
+                .position(|row| matches!(row, ListRow::Tree(t) if t.path == c))
+        });
+        let last = rows.len().saturating_sub(1);
+        let has_tree = rows.iter().any(|row| matches!(row, ListRow::Tree(_)));
+        drop(rows);
+        // The first listing puts the cursor on the first tree, not a heading.
+        self.selected = match at {
+            Some(at) => at,
+            None if !self.is_cursor_placed => self.first_tree_row(),
+            None => self.selected.min(last),
+        };
+        self.is_cursor_placed |= has_tree;
     }
 
     pub fn job_started(&mut self, job: &Job) {
@@ -964,7 +1038,7 @@ impl App {
     }
 
     fn move_by(&mut self, delta: isize) {
-        let last = self.visible().len().saturating_sub(1);
+        let last = self.rows().len().saturating_sub(1);
         self.selected = self.selected.saturating_add_signed(delta).min(last);
     }
 
@@ -1180,7 +1254,7 @@ impl App {
         let hidden = self
             .trees
             .iter()
-            .filter(|t| !shown.iter().any(|s| s.path == t.path))
+            .filter(|t| !t.is_main && !shown.iter().any(|s| s.path == t.path))
             .collect::<Vec<_>>();
         shown
             .into_iter()
@@ -1250,6 +1324,14 @@ impl App {
         self.asked.insert(command.join(" "));
         if !self.visible().iter().any(|t| t.path == path) {
             self.filter.clear();
+            let group = self
+                .trees
+                .iter()
+                .find(|t| t.path == path)
+                .and_then(|t| self.group_of(t));
+            if let Some(group) = group.filter(|g| self.is_folded(g)) {
+                self.toggle_fold(&group);
+            }
         }
         self.reselect(Some(path));
         Some(Outcome::Chat {
@@ -1274,7 +1356,7 @@ impl App {
     pub fn next_chat(&mut self, from: &str) -> Option<Outcome> {
         let visible = self.visible();
         let start = visible.iter().position(|t| t.name == from)?;
-        let (index, agent, command, tree) = (1..visible.len())
+        let (path, agent, command, tree) = (1..visible.len())
             .map(|step| (start + step) % visible.len())
             .find_map(|index| {
                 let tree = visible[index];
@@ -1282,13 +1364,13 @@ impl App {
                     .into_iter()
                     .find(|a| a.attach.is_some())?;
                 Some((
-                    index,
+                    tree.path.clone(),
                     agent.name.clone(),
                     agent.attach.clone()?,
                     tree.name.clone(),
                 ))
             })?;
-        self.selected = index;
+        self.reselect(Some(path));
         Some(Outcome::Chat {
             command,
             agent,
@@ -1689,7 +1771,12 @@ impl App {
 
     /// Puts the cursor back on the tree at `path` after the list re-sorts.
     fn reselect(&mut self, path: Option<PathBuf>) {
-        if let Some(at) = path.and_then(|p| self.visible().iter().position(|t| t.path == p)) {
+        let at = path.and_then(|p| {
+            self.rows()
+                .iter()
+                .position(|row| matches!(row, ListRow::Tree(t) if t.path == p))
+        });
+        if let Some(at) = at {
             self.selected = at;
         }
     }
@@ -1741,11 +1828,17 @@ impl App {
     }
 
     /// Opens the compose box for a new agent in a fresh tree, its base line
-    /// starting on the pool's base and suggesting the repository's branches.
+    /// starting on the pool's base and stepping through the repository's
+    /// branches.
     fn open_dispatch(&mut self) {
         let mut prompt = Prompt::dispatch(Target::NewTree, self.user.clone());
         prompt.default_base = self.base.clone();
-        prompt.bases = crate::branch::bases(&self.checkout);
+        let mut bases = crate::branch::bases(&self.checkout);
+        if let Some(base) = &self.base {
+            bases.retain(|b| b != base);
+            bases.insert(0, base.clone());
+        }
+        prompt.bases = bases;
         self.prompt = Some(prompt);
     }
 
@@ -2464,7 +2557,7 @@ impl App {
                 KeyCode::Char(c) => self.filter.push(c),
                 _ => {}
             }
-            self.selected = 0;
+            self.selected = self.first_tree_row();
             return Outcome::Continue;
         }
         if !self.is_quitting {
@@ -2475,6 +2568,13 @@ impl App {
         }
         if key.code == KeyCode::Char('C') {
             return Outcome::Scratches;
+        }
+        // On a heading, Enter folds its group or opens it again.
+        if key.code == KeyCode::Enter
+            && let Some(group) = self.current_heading()
+        {
+            self.toggle_fold(&group);
+            return Outcome::Continue;
         }
         match key.code {
             KeyCode::Enter => return self.open_agent(),
@@ -2496,7 +2596,7 @@ impl App {
             KeyCode::Char('?') => self.is_help = true,
             KeyCode::Esc if !self.filter.is_empty() => {
                 self.filter.clear();
-                self.selected = 0;
+                self.selected = self.first_tree_row();
             }
             KeyCode::Esc => self.marked.clear(),
             KeyCode::Down | KeyCode::Char('j') => self.move_by(1),
@@ -2519,7 +2619,7 @@ impl App {
             KeyCode::Char('z') => return self.toggle_park(),
             KeyCode::Char('Z') => {
                 self.is_parked_open = !self.is_parked_open;
-                let last = self.visible().len().saturating_sub(1);
+                let last = self.rows().len().saturating_sub(1);
                 self.selected = self.selected.min(last);
             }
             KeyCode::Char('c') => self.open_assistant(),
@@ -2564,6 +2664,23 @@ mod tests {
         app
     }
 
+    /// Puts the cursor on tree `name`.
+    fn select(app: &mut App, name: &str) {
+        let path = app
+            .trees
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap()
+            .path
+            .clone();
+        app.reselect(Some(path));
+        assert_eq!(
+            app.current().map(|t| t.name.as_str()),
+            Some(name),
+            "tree {name} is listed"
+        );
+    }
+
     fn press(app: &mut App, code: KeyCode) -> Outcome {
         app.handle_key(KeyEvent::from(code))
     }
@@ -2584,7 +2701,8 @@ mod tests {
     #[test]
     fn return_confirms_marked_trees_then_queues_them() {
         let mut app = app();
-        for _ in 0..3 {
+        for name in ["4", "8", "7"] {
+            select(&mut app, name);
             press(&mut app, KeyCode::Char(' '));
         }
         press(&mut app, KeyCode::Char('r'));
@@ -2617,7 +2735,7 @@ mod tests {
     #[test]
     fn d_in_the_return_dialog_previews_a_destroy_and_only_y_on_it_destroys() {
         let mut app = app();
-        press(&mut app, KeyCode::Down);
+        select(&mut app, "7");
         press(&mut app, KeyCode::Char('r'));
         let jobs = queued(press(&mut app, KeyCode::Char('D')));
         assert_eq!(names(&jobs), [(Kind::Preview, "7")]);
@@ -2747,7 +2865,7 @@ mod tests {
             [("00000004".into(), true), ("00000008".into(), false)]
         );
 
-        app.selected = app.visible().iter().position(|t| t.name == "4").unwrap();
+        select(&mut app, "4");
         press(&mut app, KeyCode::Char('r'));
         press(&mut app, KeyCode::Char('y'));
         assert_eq!(
@@ -2801,14 +2919,13 @@ mod tests {
         let mut sidecar = *app.trees[2].sidecar.clone().unwrap();
         sidecar.ticket = Some("END-799".into());
         app.apply_sidecars(HashMap::from([(PathBuf::from("/p/8/app"), sidecar)]));
-        app.selected = app.visible().iter().position(|t| t.name == "8").unwrap();
+        select(&mut app, "8");
         press(&mut app, KeyCode::Char('i'));
         assert!(app.is_issues);
         assert_eq!(app.open_issue.as_deref(), Some("END-799"));
         app.is_issues = false;
         app.open_issue = None;
-        let unleased = app.visible().iter().position(|t| !t.is_held()).unwrap();
-        app.selected = unleased;
+        select(&mut app, "7");
         press(&mut app, KeyCode::Char('i'));
         assert!(!app.is_issues, "an unleased tree works on nothing");
         assert!(app.message.as_deref().unwrap().contains("is not leased"));
@@ -2818,7 +2935,7 @@ mod tests {
     fn an_issue_chosen_for_a_tree_is_recorded_in_its_sidecar() {
         let mut app = app();
         dispatched(&mut app, "/p/8/app", "j1");
-        app.selected = app.visible().iter().position(|t| t.name == "8").unwrap();
+        select(&mut app, "8");
         press(&mut app, KeyCode::Char('i'));
         assert!(app.is_issues, "a tree on no issue chooses one");
         assert_eq!(app.choose_issue_for.as_deref(), Some("8"));
@@ -2850,7 +2967,7 @@ mod tests {
         let mut app = app();
         app.checkout = PathBuf::from("/p/main");
         dispatched(&mut app, "/p/8/app", "j1");
-        app.selected = app.visible().iter().position(|t| t.name == "8").unwrap();
+        select(&mut app, "8");
         press(&mut app, KeyCode::Char('i'));
         assert_eq!(app.choose_issue_for.as_deref(), Some("8"));
         assert!(matches!(app.pick("END-9".into()), Outcome::Queue(_)));
@@ -2867,7 +2984,7 @@ mod tests {
     #[test]
     fn an_issue_chosen_for_a_tree_returned_meanwhile_goes_nowhere() {
         let mut app = app();
-        app.selected = app.visible().iter().position(|t| t.name == "8").unwrap();
+        select(&mut app, "8");
         press(&mut app, KeyCode::Char('I'));
         app.returned(&PathBuf::from("/p/8/app"));
         assert_eq!(app.attach("END-7".into()), None);
@@ -3063,15 +3180,38 @@ mod tests {
         );
     }
 
+    /// The list as rows read: `▾name count` for an open heading, `▸` for a
+    /// folded one, else the tree's name.
+    fn shape(app: &App) -> Vec<String> {
+        app.rows()
+            .into_iter()
+            .map(|row| match row {
+                ListRow::Tree(tree) => tree.name.clone(),
+                ListRow::Heading {
+                    group,
+                    count,
+                    is_folded,
+                    ..
+                } => {
+                    let name = match group {
+                        Group::Base(base) => base,
+                        Group::Free => "free".into(),
+                        Group::Parked => "parked".into(),
+                    };
+                    format!("{}{name} {count}", if is_folded { "▸" } else { "▾" })
+                }
+            })
+            .collect()
+    }
+
     #[test]
-    fn the_list_groups_trees_by_base_once_more_than_one_is_in_use() {
+    fn the_list_groups_trees_under_headings_that_enter_folds() {
         let mut app = app();
         app.base = Some("development".into());
-        let names =
-            |app: &App| -> Vec<String> { app.visible().iter().map(|t| t.name.clone()).collect() };
-        assert!(
-            app.base_rows(&app.visible()).is_empty(),
-            "one base, no headings"
+        assert_eq!(
+            shape(&app),
+            ["▾development 2", "4", "8", "▾free 1", "7"],
+            "even one base has its heading"
         );
         let mut record = Sidecar::leased_now();
         record.base = Some("main".into());
@@ -3087,19 +3227,137 @@ mod tests {
             "the pool's first"
         );
         assert_eq!(
-            names(&app),
-            ["8", "4", "7"],
-            "tree 4 waits on you, but first in its own group, not the list"
+            shape(&app),
+            ["▾development 1", "8", "▾main 1", "4", "▾free 1", "7"],
+            "tree 4 waits on you, first in its own group"
         );
         assert_eq!(
-            app.base_rows(&app.visible()),
-            [
-                (0, Some("development".into()), 1),
-                (1, Some("main".into()), 1),
-                (2, None, 1)
-            ]
+            app.current().map(|t| t.name.as_str()),
+            Some("8"),
+            "the cursor starts on a tree"
         );
-        assert_eq!(app.waiting_rows(&app.visible()), 0, "no gap while grouped");
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.current(), None, "on main's heading");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            shape(&app),
+            ["▾development 1", "8", "▸main 1", "▾free 1", "7"]
+        );
+        assert!(matches!(app.rows()[2], ListRow::Heading { waiting: 1, .. }));
+        app.filter = "end-1".into();
+        assert_eq!(
+            shape(&app),
+            ["▾main 1", "4"],
+            "a filter opens what it finds"
+        );
+        app.filter.clear();
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(shape(&app)[2], "▾main 1", "Enter opens it again");
+    }
+
+    #[test]
+    fn the_main_checkout_heads_its_branchs_group_and_is_no_row() {
+        let mut app = app_with_main();
+        let main = app.trees.iter().position(|t| t.is_main).unwrap();
+        app.trees[main].branch = Some("development".into());
+        app.base = Some("development".into());
+        let mut own = attachable("old session");
+        own.status = Some(Status::Waiting);
+        let path = app.trees[main].path.clone();
+        app.apply_agents(&HashMap::from([(path, vec![own])]));
+        assert_eq!(shape(&app), ["▾development 2", "4", "8", "▾free 1", "7"]);
+        assert_eq!(
+            app.next_ask(),
+            None,
+            "nothing in the main checkout is asked"
+        );
+        app.trees.retain(|t| t.is_main);
+        assert_eq!(
+            shape(&app),
+            ["▾development 0"],
+            "its heading stays with no trees"
+        );
+    }
+
+    #[test]
+    fn trees_sort_waiting_first_then_by_their_agents_last_work() {
+        let names =
+            |app: &App| -> Vec<String> { app.visible().iter().map(|t| t.name.clone()).collect() };
+        let mut app = app();
+        assert_eq!(
+            names(&app),
+            ["4", "8", "7"],
+            "held in pool order, then free"
+        );
+        dispatched(&mut app, "/p/4/app", "old");
+        dispatched(&mut app, "/p/8/app", "new");
+        app.apply_reports(vec![
+            report("old", State::Working, "/p/4/app", 500),
+            report("new", State::Working, "/p/8/app", 10),
+        ]);
+        assert_eq!(names(&app), ["8", "4", "7"]);
+        let quiet = Agent {
+            active_at: Some(1_000),
+            ..agent("quiet")
+        };
+        app.apply_agents(&HashMap::from([(PathBuf::from("/p/4/app"), vec![quiet])]));
+        assert_eq!(names(&app), ["4", "8", "7"], "an agent's own time counts");
+        app.apply_reports(vec![
+            report("old", State::Working, "/p/4/app", 500),
+            report("new", State::Blocked, "/p/8/app", 10),
+        ]);
+        assert_eq!(names(&app), ["8", "4", "7"]);
+    }
+
+    #[test]
+    fn z_parks_a_tree_out_of_sight_and_z_again_brings_it_back() {
+        let mut app = app();
+        let Outcome::Record { path, record } = press(&mut app, KeyCode::Char('z')) else {
+            panic!("z records the park");
+        };
+        assert_eq!(path, PathBuf::from("/p/4/app"));
+        assert!(record.parked);
+        assert_eq!(
+            app.message.as_deref(),
+            Some("parked tree 4; Z opens Parked")
+        );
+        assert_eq!(shape(&app), ["▾ 1", "8", "▾free 1", "7", "▸parked 1"]);
+        app.filter = "end-1".into();
+        assert_eq!(shape(&app), ["▾parked 1", "4"], "a filter still finds it");
+        app.filter.clear();
+        press(&mut app, KeyCode::Char('Z'));
+        assert_eq!(shape(&app), ["▾ 1", "8", "▾free 1", "7", "▾parked 1", "4"]);
+        press(&mut app, KeyCode::End);
+        let Outcome::Record { record, .. } = press(&mut app, KeyCode::Char('z')) else {
+            panic!("z records it back");
+        };
+        assert!(!record.parked);
+        assert_eq!(shape(&app), ["▾ 2", "4", "8", "▾free 1", "7"]);
+        app.reselect(Some(PathBuf::from("/p/7/app")));
+        assert!(
+            matches!(press(&mut app, KeyCode::Char('z')), Outcome::Continue),
+            "an available tree has nothing to park"
+        );
+    }
+
+    #[test]
+    fn a_parked_tree_that_needs_you_comes_back_to_its_group() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('z'));
+        let mut sidecars = HashMap::new();
+        sidecars.insert(PathBuf::from("/p/4/app"), {
+            let mut record = Sidecar::leased_now();
+            record.parked = true;
+            record.job = Some("ask".into());
+            record
+        });
+        app.apply_sidecars(sidecars);
+        app.apply_reports(vec![report("ask", State::Blocked, "/p/4/app", 1)]);
+        assert_eq!(
+            shape(&app),
+            ["▾ 2", "4", "8", "▾free 1", "7"],
+            "first, and not set aside"
+        );
     }
 
     fn scratch(job: &str, name: &str) -> Scratch {
@@ -3169,7 +3427,7 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_tree_is_leased_from_the_base_typed() {
+    fn a_fresh_tree_is_leased_from_the_base_picked() {
         let mut app = app();
         app.base = Some("development".into());
         press(&mut app, KeyCode::Char('n'));
@@ -3179,8 +3437,7 @@ mod tests {
         type_in(&mut app, "fix the login");
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Down);
-        type_in(&mut app, "ma");
-        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Right);
         let job = queued(press(&mut app, KeyCode::Enter)).remove(0);
         assert_eq!(job.launch.unwrap().base.as_deref(), Some("main"));
     }
@@ -3188,7 +3445,7 @@ mod tests {
     #[test]
     fn d_on_an_available_tree_says_there_is_nothing_to_diff() {
         let mut app = app();
-        press(&mut app, KeyCode::Down);
+        select(&mut app, "7");
         press(&mut app, KeyCode::Char('d'));
         assert!(app.view.is_none());
         assert_eq!(
@@ -3282,7 +3539,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_the_main_checkout_never_opens_the_assistant() {
+    fn the_main_checkout_leads_with_neither_the_assistant_nor_a_stopped_session() {
         let mut app = app_with_main();
         let main = app.trees.iter().find(|t| t.is_main).unwrap().path.clone();
         let mut assistant = attachable(assistant::NAME);
@@ -3295,11 +3552,20 @@ mod tests {
             main.clone(),
             vec![assistant.clone(), old.clone(), own],
         )]));
+        let names = |app: &App| -> Vec<String> {
+            let main = app.trees.iter().find(|t| t.is_main).unwrap();
+            App::agents_of(main)
+                .iter()
+                .map(|a| a.name.clone())
+                .collect()
+        };
+        assert_eq!(names(&app), ["fix the export"]);
         app.reselect(Some(main.clone()));
-        assert!(matches!(
-            press(&mut app, KeyCode::Enter),
-            Outcome::Chat { agent, .. } if agent == "fix the export"
-        ));
+        assert_ne!(
+            app.current().map(|t| t.is_main),
+            Some(true),
+            "the main checkout is no row to put the cursor on"
+        );
         app.apply_agents(&HashMap::from([(main, vec![assistant, old])]));
         let main = app.trees.iter().find(|t| t.is_main).unwrap();
         assert!(
@@ -3328,14 +3594,14 @@ mod tests {
                 tree: "4".into()
             }
         );
-        press(&mut app, KeyCode::Char('j'));
+        select(&mut app, "7");
         assert!(matches!(press(&mut app, KeyCode::Enter), Outcome::Enter(t) if t.name == "7"));
-        press(&mut app, KeyCode::Char('j'));
+        select(&mut app, "8");
         assert!(
             matches!(press(&mut app, KeyCode::Enter), Outcome::Enter(t) if t.name == "8"),
             "an agent with no chat is in a pane, which going to the tree finds"
         );
-        press(&mut app, KeyCode::Home);
+        select(&mut app, "4");
         assert!(
             matches!(press(&mut app, KeyCode::Char('t')), Outcome::Enter(t) if t.name == "4"),
             "t goes to the tree, though its agent has a chat"
@@ -3374,7 +3640,7 @@ mod tests {
                 tree: "4".into()
             }
         );
-        press(&mut app, KeyCode::Down);
+        select(&mut app, "7");
         assert_eq!(press(&mut app, KeyCode::Char('o')), Outcome::Continue);
         assert_eq!(app.message.as_deref(), Some("tree 7 serves no port"));
     }
@@ -3586,16 +3852,13 @@ mod tests {
     }
 
     #[test]
-    fn the_main_checkout_is_never_returned_or_destroyed() {
+    fn the_main_checkout_is_no_row_so_never_returned_or_destroyed() {
         let mut app = app_with_main();
-        press(&mut app, KeyCode::Home);
-        assert_eq!(app.current().unwrap().name, "main");
-        press(&mut app, KeyCode::Char('r'));
-        assert!(app.pending.is_none());
-        assert_eq!(
-            app.message.as_deref(),
-            Some("the main checkout is never returned or destroyed")
-        );
+        assert!(app.visible().iter().all(|t| !t.is_main));
+        for _ in 0..8 {
+            press(&mut app, KeyCode::Up);
+            assert_ne!(app.current().map(|t| t.is_main), Some(true));
+        }
     }
 
     fn report(job: &str, state: State, dir: &str, age: u64) -> Report {
@@ -3662,7 +3925,7 @@ mod tests {
     fn the_cursor_stays_on_its_tree_when_an_agent_starts_waiting() {
         let mut app = app();
         app.apply_agents(&HashMap::new());
-        press(&mut app, KeyCode::End);
+        select(&mut app, "8");
         assert_eq!(app.current().unwrap().name, "8");
         let waiting = Agent {
             status: Some(Status::Waiting),
@@ -3755,7 +4018,7 @@ mod tests {
     fn a_switch_waits_for_running_actions() {
         let mut app = app_with_main();
         app.checkout = PathBuf::from("/repo");
-        press(&mut app, KeyCode::End);
+        select(&mut app, "8");
         press(&mut app, KeyCode::Char('r'));
         press(&mut app, KeyCode::Char('y'));
         app.open_picker(vec![
@@ -3801,8 +4064,8 @@ mod tests {
             ["job cde62519 needs you: waiting at a prompt in its chat: Enter opens it"]
         );
         assert_eq!(app.needing_you(), 1);
-        press(&mut app, KeyCode::Home);
-        assert_eq!(app.current().unwrap().name, "8", "it sorts first");
+        assert_eq!(app.visible()[0].name, "8", "it sorts first");
+        select(&mut app, "8");
         assert!(matches!(
             press(&mut app, KeyCode::Enter),
             Outcome::Chat { tree, .. } if tree == "8"
@@ -3829,8 +4092,7 @@ mod tests {
     #[test]
     fn colon_types_to_the_assistant_about_the_tree_under_the_cursor() {
         let mut app = app_with_main();
-        let at = app.visible().iter().position(|t| t.name == "4").unwrap();
-        app.selected = at;
+        select(&mut app, "4");
         press(&mut app, KeyCode::Char(':'));
         assert_eq!(app.prompt.as_ref().unwrap().target(), Some(Target::Ask));
         type_in(&mut app, "what is 4 waiting on?");
@@ -3876,8 +4138,7 @@ mod tests {
     #[test]
     fn capital_n_starts_an_agent_in_the_tree_under_the_cursor() {
         let mut app = app();
-        let at = |app: &App, name: &str| app.visible().iter().position(|t| t.name == name).unwrap();
-        app.selected = at(&app, "7");
+        select(&mut app, "7");
         press(&mut app, KeyCode::Char('N'));
         assert!(
             app.prompt.as_ref().unwrap().names_branch(),
@@ -3890,7 +4151,7 @@ mod tests {
         assert_eq!(launch.task, "fix login");
         assert!(!launch.is_new_tree, "this tree, not a fresh one");
         assert!(launch.branch.is_some());
-        app.selected = at(&app, "4");
+        select(&mut app, "4");
         press(&mut app, KeyCode::Char('N'));
         type_in(&mut app, "add tests");
         let job = queued(press(&mut app, KeyCode::Enter)).remove(0);
@@ -3900,7 +4161,7 @@ mod tests {
             None,
             "a held tree keeps its branch"
         );
-        app.selected = at(&app, "4");
+        select(&mut app, "4");
         press(&mut app, KeyCode::Char('N'));
         assert!(app.prompt.is_none(), "not while its start is queued");
         assert_eq!(
@@ -4280,7 +4541,7 @@ mod tests {
             Outcome::OpenUrl("https://github.com/o/r/pull/12".into())
         );
         app.filter.clear();
-        press(&mut app, KeyCode::End);
+        select(&mut app, "8");
         assert_eq!(press(&mut app, KeyCode::Char('O')), Outcome::Continue);
         assert_eq!(app.message.as_deref(), Some("tree 8 has no PR to open"));
     }
@@ -4472,94 +4733,5 @@ mod tests {
         gate.plugin = "no-mistakes".into();
         app.apply_ship(ships(&[("/p/4/app", gate)]));
         app
-    }
-
-    #[test]
-    fn trees_sort_waiting_first_then_main_then_by_their_agents_last_work() {
-        let names =
-            |app: &App| -> Vec<String> { app.visible().iter().map(|t| t.name.clone()).collect() };
-        let mut app = app_with_main();
-        assert_eq!(names(&app), ["main", "4", "7", "8"], "pool order to begin");
-        dispatched(&mut app, "/p/4/app", "old");
-        dispatched(&mut app, "/p/8/app", "new");
-        app.apply_reports(vec![
-            report("old", State::Working, "/p/4/app", 500),
-            report("new", State::Working, "/p/8/app", 10),
-        ]);
-        assert_eq!(names(&app), ["main", "8", "4", "7"]);
-        assert_eq!(app.waiting_rows(&app.visible()), 0);
-        let quiet = Agent {
-            active_at: Some(1_000),
-            ..agent("quiet")
-        };
-        app.apply_agents(&HashMap::from([(PathBuf::from("/p/4/app"), vec![quiet])]));
-        assert_eq!(
-            names(&app),
-            ["main", "4", "8", "7"],
-            "an agent's own time counts"
-        );
-        app.apply_reports(vec![
-            report("old", State::Working, "/p/4/app", 500),
-            report("new", State::Blocked, "/p/8/app", 10),
-        ]);
-        assert_eq!(names(&app), ["8", "main", "4", "7"]);
-        assert_eq!(app.waiting_rows(&app.visible()), 1);
-    }
-
-    #[test]
-    fn z_parks_a_tree_out_of_sight_and_z_again_brings_it_back() {
-        let names =
-            |app: &App| -> Vec<String> { app.visible().iter().map(|t| t.name.clone()).collect() };
-        let mut app = app();
-        assert_eq!(names(&app), ["4", "7", "8"]);
-        let Outcome::Record { path, record } = press(&mut app, KeyCode::Char('z')) else {
-            panic!("z records the park");
-        };
-        assert_eq!(path, PathBuf::from("/p/4/app"));
-        assert!(record.parked);
-        assert_eq!(
-            app.message.as_deref(),
-            Some("parked tree 4; Z opens Parked")
-        );
-        assert_eq!(names(&app), ["7", "8"], "folded away");
-        assert_eq!(app.parked_rows(&app.visible()), Some((2, 1)));
-        app.filter = "end-1".into();
-        assert_eq!(names(&app), ["4"], "a filter still finds it");
-        app.filter.clear();
-        press(&mut app, KeyCode::Char('Z'));
-        assert_eq!(names(&app), ["7", "8", "4"], "Parked opens below the rest");
-        press(&mut app, KeyCode::End);
-        let Outcome::Record { record, .. } = press(&mut app, KeyCode::Char('z')) else {
-            panic!("z records it back");
-        };
-        assert!(!record.parked);
-        assert_eq!(app.parked_rows(&app.visible()), None);
-        press(&mut app, KeyCode::Home);
-        assert_eq!(press(&mut app, KeyCode::Char('j')), Outcome::Continue);
-        assert!(
-            matches!(press(&mut app, KeyCode::Char('z')), Outcome::Continue),
-            "an available tree has nothing to park"
-        );
-    }
-
-    #[test]
-    fn a_parked_tree_that_needs_you_comes_to_the_top() {
-        let mut app = app();
-        press(&mut app, KeyCode::Char('z'));
-        let mut sidecars = HashMap::new();
-        sidecars.insert(PathBuf::from("/p/4/app"), {
-            let mut record = Sidecar::leased_now();
-            record.parked = true;
-            record.job = Some("ask".into());
-            record
-        });
-        app.apply_sidecars(sidecars);
-        app.apply_reports(vec![report("ask", State::Blocked, "/p/4/app", 1)]);
-        assert_eq!(app.visible()[0].name, "4");
-        assert_eq!(
-            app.parked_rows(&app.visible()),
-            None,
-            "it is not counted as set aside"
-        );
     }
 }

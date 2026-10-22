@@ -90,16 +90,16 @@ pub struct Prompt {
     pub branch: Option<String>,
     /// Keys go to the branch rather than the task.
     pub is_editing_branch: bool,
-    /// The branch a fresh tree is cut from, as typed; empty or None cuts it
-    /// from the pool's base.
-    pub base: Option<String>,
+    /// Which of `bases` a fresh tree is cut from: the first, the pool's
+    /// base, until `←`/`→` picks another.
+    pub base_at: usize,
     /// Keys go to the base rather than the task.
     pub is_editing_base: bool,
     /// The pool's base, which a fresh tree is cut from unless another is
-    /// typed.
+    /// picked.
     pub default_base: Option<String>,
-    /// The repository's branches, local and on origin, for the base line
-    /// to suggest.
+    /// The branches a fresh tree can be cut from, the pool's base first,
+    /// so the base line only ever names a real one.
     pub bases: Vec<String>,
     /// Whose branches these are, for the name a task gives.
     pub user: String,
@@ -120,7 +120,7 @@ impl Prompt {
             text: String::new(),
             branch: None,
             is_editing_branch: false,
-            base: None,
+            base_at: 0,
             is_editing_base: false,
             default_base: None,
             bases: Vec::new(),
@@ -194,30 +194,38 @@ impl Prompt {
         self.target() == Some(Target::NewTree)
     }
 
-    /// The base a fresh tree is cut from when it is not the pool's: the
-    /// typed name. None cuts it from the pool's base.
+    /// The branch the base line shows: the one picked, else the pool's.
+    pub fn base_shown(&self) -> Option<&str> {
+        self.bases
+            .get(self.base_at)
+            .map(String::as_str)
+            .or(self.default_base.as_deref())
+    }
+
+    /// The base a fresh tree is cut from when it is not the pool's: the one
+    /// picked. None cuts it from the pool's base.
     pub fn base_name(&self) -> Option<String> {
         if !self.names_base() {
             return None;
         }
-        let typed = self.base.as_deref().map(str::trim).unwrap_or_default();
-        (!typed.is_empty() && Some(typed) != self.default_base.as_deref())
-            .then(|| typed.to_string())
+        self.bases
+            .get(self.base_at)
+            .filter(|b| Some(b.as_str()) != self.default_base.as_deref())
+            .cloned()
     }
 
-    /// The branch the base line suggests for what is typed: the first that
-    /// starts with it, else the first that contains it.
-    pub fn base_suggestion(&self) -> Option<&str> {
-        let typed = self.base.as_deref().map(str::trim).unwrap_or_default();
-        if typed.is_empty() {
-            return None;
+    /// Steps the base to the next branch, or the one before, round the
+    /// list.
+    fn step_base(&mut self, forward: bool) {
+        let count = self.bases.len();
+        if count == 0 {
+            return;
         }
-        let typed = typed.to_lowercase();
-        let others = || self.bases.iter().filter(|b| b.to_lowercase() != typed);
-        others()
-            .find(|b| b.to_lowercase().starts_with(&typed))
-            .or_else(|| others().find(|b| b.to_lowercase().contains(&typed)))
-            .map(String::as_str)
+        self.base_at = if forward {
+            (self.base_at + 1) % count
+        } else {
+            (self.base_at + count - 1) % count
+        };
     }
 
     /// A one-line field has the focus: the branch or the base.
@@ -225,22 +233,23 @@ impl Prompt {
         self.is_editing_branch || self.is_editing_base
     }
 
-    /// The line keys edit: the branch or base while it has the focus, else
-    /// the text.
+    /// The line keys edit: the branch while it has the focus, else the
+    /// text. The base is picked, never typed, so it is neither.
     fn line(&mut self) -> &mut String {
         if self.is_editing_branch {
             self.branch.get_or_insert_with(String::new)
-        } else if self.is_editing_base {
-            self.base.get_or_insert_with(String::new)
         } else {
             &mut self.text
         }
     }
 
     /// Pasted text is kept whole, line breaks and all: the agent reads it as
-    /// one message. A branch or base takes it as one line.
+    /// one message. A branch takes it as one line, and the base none.
     pub fn paste(&mut self, text: &str) {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if self.is_editing_base {
+            return;
+        }
         if self.is_editing_field() {
             self.line().push_str(&text.replace('\n', ""));
         } else {
@@ -295,11 +304,10 @@ impl Prompt {
             KeyCode::Enter => return Edit::Submit,
             KeyCode::Down => self.move_focus(true),
             KeyCode::Up => self.move_focus(false),
-            KeyCode::Tab if self.is_editing_base => {
-                if let Some(suggested) = self.base_suggestion().map(str::to_string) {
-                    self.base = Some(suggested);
-                }
-            }
+            KeyCode::Right if self.is_editing_base => self.step_base(true),
+            KeyCode::Left if self.is_editing_base => self.step_base(false),
+            // The base line takes no typing: it only ever names a branch.
+            KeyCode::Char(_) | KeyCode::Backspace if self.is_editing_base => {}
             KeyCode::Char('u') if ctrl => self.line().clear(),
             KeyCode::Char('w') if ctrl => {
                 // A branch's words are split by / and - rather than spaces.
@@ -398,24 +406,31 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_tree_takes_a_base_typed_with_suggestions_else_the_pools() {
+    fn a_fresh_tree_is_cut_from_a_branch_picked_by_scrolling_else_the_pools() {
         let mut prompt = Prompt::dispatch(Target::NewTree, "anthony".into());
         prompt.default_base = Some("development".into());
         prompt.bases = ["development", "main", "release/2026-10"]
             .map(String::from)
             .into();
         assert_eq!(prompt.base_name(), None, "the pool's base");
+        assert_eq!(prompt.base_shown(), Some("development"));
         prompt.edit(KeyEvent::from(KeyCode::Down));
         assert!(prompt.is_editing_branch);
         prompt.edit(KeyEvent::from(KeyCode::Down));
         assert!(prompt.is_editing_base && !prompt.is_editing_branch);
-        type_in(&mut prompt, "re");
-        assert_eq!(prompt.base_suggestion(), Some("release/2026-10"));
-        prompt.edit(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-        type_in(&mut prompt, "ma");
-        assert_eq!(prompt.base_suggestion(), Some("main"));
-        prompt.edit(KeyEvent::from(KeyCode::Tab));
+        type_in(&mut prompt, "xyz");
+        prompt.paste("nope");
+        assert_eq!(prompt.base_shown(), Some("development"), "nothing is typed");
+        assert_eq!(prompt.text, "");
+        prompt.edit(KeyEvent::from(KeyCode::Right));
         assert_eq!(prompt.base_name().as_deref(), Some("main"));
+        prompt.edit(KeyEvent::from(KeyCode::Left));
+        prompt.edit(KeyEvent::from(KeyCode::Left));
+        assert_eq!(
+            prompt.base_name().as_deref(),
+            Some("release/2026-10"),
+            "round the list"
+        );
         prompt.edit(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
         assert_eq!(prompt.text, "", "a base is one line");
         prompt.edit(KeyEvent::from(KeyCode::Down));
@@ -424,13 +439,8 @@ mod tests {
         assert_eq!(prompt.text, "x");
         prompt.edit(KeyEvent::from(KeyCode::Up));
         assert!(prompt.is_editing_base, "up goes back to the base");
-        prompt.edit(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-        type_in(&mut prompt, "development");
-        assert_eq!(
-            prompt.base_name(),
-            None,
-            "naming the pool's base is the default"
-        );
+        prompt.edit(KeyEvent::from(KeyCode::Right));
+        assert_eq!(prompt.base_name(), None, "back on the pool's base");
     }
 
     #[test]
