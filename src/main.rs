@@ -1,6 +1,6 @@
 //! treetop: an htop-style view of a treehouse worktree pool, for seeing which
 //! agent works in each tree and what it serves, talking to them and to the
-//! coordinator that oversees them, and marking trees and returning or
+//! assistant that oversees them, and marking trees and returning or
 //! destroying them. Run it from anywhere in a pooled repository. Chats and
 //! diffs open in popups over the pool; `t` goes to the tree itself, a tmux
 //! pane or window inside tmux, else a shell that comes back to treetop when
@@ -9,6 +9,7 @@
 mod actions;
 mod agents;
 mod app;
+mod assistant;
 mod branch;
 mod builtin;
 mod cache;
@@ -16,7 +17,6 @@ mod chat;
 mod child;
 mod cli;
 mod config;
-mod coordinator;
 mod diff;
 mod dispatch;
 mod github_plugin;
@@ -30,6 +30,7 @@ mod pool;
 mod popup;
 mod refresh;
 mod reports;
+mod scratch;
 mod ship;
 mod sidecar;
 mod theme;
@@ -41,6 +42,7 @@ mod workspaces;
 
 use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -56,7 +58,7 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::layout::Rect;
 
-use crate::app::{App, Choice, Outcome};
+use crate::app::{App, Choice, Opening, Outcome};
 use crate::chat::Chats;
 use crate::dispatch::Recipient;
 use crate::jobs::{Kind, Worker};
@@ -234,7 +236,8 @@ fn choices() -> Vec<Choice> {
 fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
     let refresher = Refresher::spawn(checkout.to_path_buf(), app.trees.clone());
     let worker = Worker::spawn();
-    let diffs = diff::Loader::spawn(diff::base(checkout));
+    app.base = diff::base(checkout);
+    let diffs = diff::Loader::spawn(app.base.clone());
     // The Issues screen, made the first time it is shown.
     let mut issues: Option<issues::Screen> = None;
     let mut was_issues = false;
@@ -246,6 +249,9 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
     let mut keeper = Keeper::default();
     // Whether the mouse is captured for an open issue, apart from a chat's.
     let mut is_issue_mouse = false;
+    // A scratch chat starting, and those being deleted, off this thread.
+    let mut starting_scratch: Option<mpsc::Receiver<Result<scratch::Scratch, String>>> = None;
+    let mut removing_scratch: Vec<mpsc::Receiver<Result<String, String>>> = Vec::new();
     loop {
         while let Ok(update) = refresher.updates.try_recv() {
             is_stale = true;
@@ -310,8 +316,8 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             is_stale = true;
             app.diff_loaded(path, diff);
         }
-        if let Some(path) = app.wanted_diff() {
-            diffs.request(path);
+        if let Some((path, base)) = app.wanted_diff() {
+            diffs.request(path, base);
         }
         if app.is_issues {
             match issues.as_mut() {
@@ -376,6 +382,50 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
         if app.is_quitting && app.active_jobs() == 0 {
             return Ok(Exit::Quit);
         }
+        if let Some(result) = starting_scratch.as_ref().and_then(|r| r.try_recv().ok()) {
+            starting_scratch = None;
+            is_stale = true;
+            match result {
+                // Esc while it started leaves it for C to open.
+                Ok(chat) if app.opening.is_none() => {
+                    app.message = Some(format!("{} is ready; C opens it", chat.name));
+                }
+                Ok(chat) => {
+                    app.opening = None;
+                    open_chat(
+                        term,
+                        app,
+                        &mut chats,
+                        &chat.attach(),
+                        chat.name,
+                        app::SCRATCH.into(),
+                    )?;
+                }
+                // Said in the list it was asked from, whole, since the bar
+                // would cut it short.
+                Err(err) => {
+                    app.opening = None;
+                    app.open_scratch_menu(scratch::list());
+                    if let Some(menu) = app.scratch_menu.as_mut() {
+                        menu.error = Some(format!("could not start a scratch chat: {err}"));
+                    }
+                }
+            }
+        }
+        removing_scratch.retain(|result| match result.try_recv() {
+            Ok(Ok(name)) => {
+                app.message = Some(format!("deleted {name}"));
+                is_stale = true;
+                false
+            }
+            Ok(Err(err)) => {
+                app.message = Some(format!("could not delete the scratch chat: {err}"));
+                is_stale = true;
+                false
+            }
+            Err(mpsc::TryRecvError::Empty) => true,
+            Err(mpsc::TryRecvError::Disconnected) => false,
+        });
         if !chats.is_open()
             && let Some(Outcome::Chat {
                 command,
@@ -528,6 +578,25 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             Outcome::Continue => {}
             Outcome::Quit => return Ok(Exit::Quit),
             Outcome::Workspaces => app.open_picker(choices()),
+            Outcome::Scratches => app.open_scratch_menu(scratch::list()),
+            Outcome::NewScratch => {
+                app.opening = Some(Opening {
+                    agent: "a scratch chat".into(),
+                    tree: app::SCRATCH.into(),
+                });
+                let (done, result) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = done.send(scratch::start());
+                });
+                starting_scratch = Some(result);
+            }
+            Outcome::RemoveScratch(chat) => {
+                let (done, result) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = done.send(scratch::remove(&chat).map(|()| chat.name));
+                });
+                removing_scratch.push(result);
+            }
             Outcome::Switch(path) => return Ok(Exit::Switch(path)),
             Outcome::Chat {
                 command,
@@ -594,6 +663,7 @@ fn show(term: &mut Term, start: PathBuf, mut checkout: PathBuf, is_issues: bool)
         app.is_in_tmux = tmux::is_inside();
         app.checkout = checkout.clone();
         app.user = branch::user();
+        app.scratch_root = scratch::root();
         app.ship_plugins = ship::plugins(&checkout).0;
         app.is_issues = std::mem::take(&mut is_issues);
         if let Some(mut cached) = cache::read(&checkout) {

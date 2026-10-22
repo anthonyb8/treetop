@@ -1,7 +1,7 @@
 //! treetop's commands that print and exit rather than open the screen:
 //! `status`, `send`, `dispatch`, `tickets` and `pick`. They are how the
-//! coordinator sees and steers the other agents, and work as well from any
-//! shell. Each reads only what it needs, so a call costs the coordinator one
+//! assistant sees and steers the other agents, and work as well from any
+//! shell. Each reads only what it needs, so a call costs the assistant one
 //! small JSON read.
 
 use std::path::{Path, PathBuf};
@@ -13,10 +13,10 @@ use serde_json::{Value, json};
 
 use crate::agents;
 use crate::app::report_state;
+use crate::assistant;
 use crate::builtin;
 use crate::cache;
 use crate::chat::Chats;
-use crate::coordinator;
 use crate::dispatch::Recipient;
 use crate::jobs::{self, Job, Kind, Launch};
 use crate::live;
@@ -214,12 +214,12 @@ fn report_json(report: &Report, trees: &[Tree], now: SystemTime) -> Value {
 
 /// Every tree that is held or has an agent or report in it, with its agents
 /// and reports, then the reports from outside the pool. Available trees
-/// with nothing in them are only counted. The coordinator is left out of
+/// with nothing in them are only counted. The assistant is left out of
 /// what it reads about.
 fn status_json(trees: &[Tree], reports: &[Report], ready: &[String], now: SystemTime) -> Value {
     let reports: Vec<&Report> = reports
         .iter()
-        .filter(|r| !coordinator::is_assistant(&r.name))
+        .filter(|r| !assistant::is_assistant(&r.name))
         .collect();
     let holding = |report: &Report| reports::tree_of(report, trees).map(|tree| tree.path.clone());
     let mut listed = Vec::new();
@@ -228,7 +228,7 @@ fn status_json(trees: &[Tree], reports: &[Report], ready: &[String], now: System
         let agents: Vec<Value> = tree
             .agents
             .iter()
-            .filter(|a| !coordinator::is_assistant(&a.name))
+            .filter(|a| !assistant::is_assistant(&a.name))
             .map(|a| {
                 json!({
                     "name": a.name,
@@ -303,12 +303,12 @@ fn status(checkout: &Path) -> Result<()> {
 
 /// Whom `target` names: every agent with a chat in the tree of that number
 /// (or `main`), else the agents of that name, else a stopped agent of that
-/// name, which `claude attach` starts again. Never the coordinator itself.
+/// name, which `claude attach` starts again. Never the assistant itself.
 fn recipients(trees: &[Tree], reports: &[Report], target: &str) -> Vec<Recipient> {
     let chats = |tree: &Tree, is_named: &dyn Fn(&str) -> bool| -> Vec<Recipient> {
         tree.agents
             .iter()
-            .filter(|a| !coordinator::is_assistant(&a.name) && is_named(&a.name))
+            .filter(|a| !assistant::is_assistant(&a.name) && is_named(&a.name))
             .filter_map(|a| Recipient::of(a, &tree.name))
             .collect()
     };
@@ -324,7 +324,7 @@ fn recipients(trees: &[Tree], reports: &[Report], target: &str) -> Vec<Recipient
     }
     reports
         .iter()
-        .filter(|r| !coordinator::is_assistant(&r.name) && r.name.eq_ignore_ascii_case(target))
+        .filter(|r| !assistant::is_assistant(&r.name) && r.name.eq_ignore_ascii_case(target))
         .max_by_key(|r| r.updated)
         .map(|r| {
             let tree = reports::tree_of(r, trees);
@@ -528,18 +528,18 @@ mod tests {
         let trees = vec![
             tree("4", "leased", vec![agent("fix-login", "aa")]),
             tree("7", "available", vec![]),
-            tree("8", "leased", vec![agent(coordinator::NAME, "cc")]),
+            tree("8", "leased", vec![agent(assistant::NAME, "cc")]),
         ];
         let reports = vec![
             report("aa", "fix-login", State::Blocked, "/p/4/app"),
             report("bb", "old-task", State::Stopped, "/home/me/elsewhere"),
-            report("cc", coordinator::NAME, State::Working, "/p/8/app"),
+            report("cc", assistant::NAME, State::Working, "/p/8/app"),
         ];
         (trees, reports)
     }
 
     #[test]
-    fn status_lists_what_is_held_counts_the_rest_and_leaves_out_the_coordinator() {
+    fn status_lists_what_is_held_counts_the_rest_and_leaves_out_the_assistant() {
         let (trees, reports) = pool();
         let status = status_json(&trees, &reports, &[], SystemTime::UNIX_EPOCH);
         let listed: Vec<&str> = status["trees"]
@@ -570,7 +570,7 @@ mod tests {
         assert_eq!(stopped[0].command, ["claude", "attach", "bb"]);
         assert_eq!(stopped[0].tree, "outside the pool");
         assert!(recipients(&trees, &reports, "8").is_empty(), "never itself");
-        assert!(recipients(&trees, &reports, coordinator::NAME).is_empty());
+        assert!(recipients(&trees, &reports, assistant::NAME).is_empty());
         assert!(recipients(&trees, &reports, "nobody").is_empty());
     }
 }

@@ -1,4 +1,4 @@
-//! The compose box where you write to agents: a word with the coordinator
+//! The compose box where you write to agents: a word with the assistant
 //! (`c`, `:`), a task for a new agent in a fresh tree (`n`) or in the tree
 //! under the cursor (`N`), a line for agents already working (`m`), or a
 //! branch's new name (`b`). Kept free of terminal
@@ -8,13 +8,13 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::pool::Tree;
 
-/// Where the text goes: to the coordinator, or to a new agent.
+/// Where the text goes: to the assistant, or to a new agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
     /// The one agent that oversees the rest, started in the main checkout on
-    /// first use; see `coordinator`.
-    Coordinator,
-    /// One line for the coordinator about what is on screen, or for the
+    /// first use; see `assistant`.
+    Assistant,
+    /// One line for the assistant about what is on screen, or for the
     /// agents its leading `@` words name.
     Ask,
     /// A new agent in a tree the pool hands out when the job runs, so two
@@ -90,6 +90,17 @@ pub struct Prompt {
     pub branch: Option<String>,
     /// Keys go to the branch rather than the task.
     pub is_editing_branch: bool,
+    /// The branch a fresh tree is cut from, as typed; empty or None cuts it
+    /// from the pool's base.
+    pub base: Option<String>,
+    /// Keys go to the base rather than the task.
+    pub is_editing_base: bool,
+    /// The pool's base, which a fresh tree is cut from unless another is
+    /// typed.
+    pub default_base: Option<String>,
+    /// The repository's branches, local and on origin, for the base line
+    /// to suggest.
+    pub bases: Vec<String>,
     /// Whose branches these are, for the name a task gives.
     pub user: String,
 }
@@ -109,6 +120,10 @@ impl Prompt {
             text: String::new(),
             branch: None,
             is_editing_branch: false,
+            base: None,
+            is_editing_base: false,
+            default_base: None,
+            bases: Vec::new(),
             user: String::new(),
         }
     }
@@ -152,7 +167,7 @@ impl Prompt {
     }
 
     /// The target gets a branch named for it: a new agent's tree does, and
-    /// a free tree leased for one; the coordinator's main checkout and a tree
+    /// a free tree leased for one; the assistant's main checkout and a tree
     /// someone holds keep their own.
     pub fn names_branch(&self) -> bool {
         match &self.purpose {
@@ -173,36 +188,92 @@ impl Prompt {
             .or_else(|| crate::branch::for_task(&self.user, &self.text))
     }
 
-    /// The line keys edit: the branch while it has the focus, else the text.
+    /// The target is a fresh tree, which can be cut from a branch other
+    /// than the pool's base.
+    pub fn names_base(&self) -> bool {
+        self.target() == Some(Target::NewTree)
+    }
+
+    /// The base a fresh tree is cut from when it is not the pool's: the
+    /// typed name. None cuts it from the pool's base.
+    pub fn base_name(&self) -> Option<String> {
+        if !self.names_base() {
+            return None;
+        }
+        let typed = self.base.as_deref().map(str::trim).unwrap_or_default();
+        (!typed.is_empty() && Some(typed) != self.default_base.as_deref())
+            .then(|| typed.to_string())
+    }
+
+    /// The branch the base line suggests for what is typed: the first that
+    /// starts with it, else the first that contains it.
+    pub fn base_suggestion(&self) -> Option<&str> {
+        let typed = self.base.as_deref().map(str::trim).unwrap_or_default();
+        if typed.is_empty() {
+            return None;
+        }
+        let typed = typed.to_lowercase();
+        let others = || self.bases.iter().filter(|b| b.to_lowercase() != typed);
+        others()
+            .find(|b| b.to_lowercase().starts_with(&typed))
+            .or_else(|| others().find(|b| b.to_lowercase().contains(&typed)))
+            .map(String::as_str)
+    }
+
+    /// A one-line field has the focus: the branch or the base.
+    fn is_editing_field(&self) -> bool {
+        self.is_editing_branch || self.is_editing_base
+    }
+
+    /// The line keys edit: the branch or base while it has the focus, else
+    /// the text.
     fn line(&mut self) -> &mut String {
         if self.is_editing_branch {
             self.branch.get_or_insert_with(String::new)
+        } else if self.is_editing_base {
+            self.base.get_or_insert_with(String::new)
         } else {
             &mut self.text
         }
     }
 
     /// Pasted text is kept whole, line breaks and all: the agent reads it as
-    /// one message. A branch takes it as one line.
+    /// one message. A branch or base takes it as one line.
     pub fn paste(&mut self, text: &str) {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
-        if self.is_editing_branch {
+        if self.is_editing_field() {
             self.line().push_str(&text.replace('\n', ""));
         } else {
             self.text.push_str(&text);
         }
     }
 
-    /// Moves the focus between the task and the branch. The branch starts
-    /// from the name the task gave it, so it is edited rather than retyped.
-    fn toggle_branch(&mut self) {
+    /// Moves the focus round the task, the branch and, for a fresh tree,
+    /// the base, `forward` going down. The branch starts from the name the
+    /// task gave it, so it is edited rather than retyped.
+    fn move_focus(&mut self, forward: bool) {
         if !self.names_branch() {
             return;
         }
-        if !self.is_editing_branch && self.branch.is_none() {
+        // 0 is the task, 1 the branch, 2 the base.
+        let lines = if self.names_base() { 3 } else { 2 };
+        let at = if self.is_editing_branch {
+            1
+        } else if self.is_editing_base {
+            2
+        } else {
+            0
+        };
+        let next = if forward {
+            (at + 1) % lines
+        } else {
+            (at + lines - 1) % lines
+        };
+        if next == 1 && self.branch.is_none() {
             self.branch = self.branch_name();
         }
-        self.is_editing_branch = !self.is_editing_branch;
+        self.is_editing_branch = next == 1;
+        self.is_editing_base = next == 2;
     }
 
     pub fn edit(&mut self, key: KeyEvent) -> Edit {
@@ -217,16 +288,22 @@ impl Prompt {
                     .modifiers
                     .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
             {
-                if !self.is_editing_branch {
+                if !self.is_editing_field() {
                     self.text.push('\n');
                 }
             }
             KeyCode::Enter => return Edit::Submit,
-            KeyCode::Up | KeyCode::Down => self.toggle_branch(),
+            KeyCode::Down => self.move_focus(true),
+            KeyCode::Up => self.move_focus(false),
+            KeyCode::Tab if self.is_editing_base => {
+                if let Some(suggested) = self.base_suggestion().map(str::to_string) {
+                    self.base = Some(suggested);
+                }
+            }
             KeyCode::Char('u') if ctrl => self.line().clear(),
             KeyCode::Char('w') if ctrl => {
                 // A branch's words are split by / and - rather than spaces.
-                let is_branch = self.is_editing_branch;
+                let is_branch = self.is_editing_field();
                 let line = self.line();
                 let kept = line.trim_end().len();
                 let cut = line[..kept]
@@ -321,8 +398,52 @@ mod tests {
     }
 
     #[test]
-    fn the_coordinator_keeps_the_main_checkouts_branch() {
-        let mut prompt = Prompt::dispatch(Target::Coordinator, "anthony".into());
+    fn a_fresh_tree_takes_a_base_typed_with_suggestions_else_the_pools() {
+        let mut prompt = Prompt::dispatch(Target::NewTree, "anthony".into());
+        prompt.default_base = Some("development".into());
+        prompt.bases = ["development", "main", "release/2026-10"]
+            .map(String::from)
+            .into();
+        assert_eq!(prompt.base_name(), None, "the pool's base");
+        prompt.edit(KeyEvent::from(KeyCode::Down));
+        assert!(prompt.is_editing_branch);
+        prompt.edit(KeyEvent::from(KeyCode::Down));
+        assert!(prompt.is_editing_base && !prompt.is_editing_branch);
+        type_in(&mut prompt, "re");
+        assert_eq!(prompt.base_suggestion(), Some("release/2026-10"));
+        prompt.edit(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        type_in(&mut prompt, "ma");
+        assert_eq!(prompt.base_suggestion(), Some("main"));
+        prompt.edit(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(prompt.base_name().as_deref(), Some("main"));
+        prompt.edit(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        assert_eq!(prompt.text, "", "a base is one line");
+        prompt.edit(KeyEvent::from(KeyCode::Down));
+        assert!(!prompt.is_editing_base, "round to the task");
+        type_in(&mut prompt, "x");
+        assert_eq!(prompt.text, "x");
+        prompt.edit(KeyEvent::from(KeyCode::Up));
+        assert!(prompt.is_editing_base, "up goes back to the base");
+        prompt.edit(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        type_in(&mut prompt, "development");
+        assert_eq!(
+            prompt.base_name(),
+            None,
+            "naming the pool's base is the default"
+        );
+    }
+
+    #[test]
+    fn a_held_trees_box_has_no_base_line() {
+        let mut prompt = Prompt::message(Vec::new());
+        assert!(!prompt.names_base());
+        prompt.edit(KeyEvent::from(KeyCode::Down));
+        assert!(!prompt.is_editing_base);
+    }
+
+    #[test]
+    fn the_assistant_keeps_the_main_checkouts_branch() {
+        let mut prompt = Prompt::dispatch(Target::Assistant, "anthony".into());
         type_in(&mut prompt, "fix it");
         prompt.edit(KeyEvent::from(KeyCode::Down));
         assert!(!prompt.is_editing_branch);

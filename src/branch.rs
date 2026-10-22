@@ -26,6 +26,39 @@ pub fn user() -> String {
     slug(&name)
 }
 
+/// The branches a fresh tree can be cut from: the repository's local
+/// branches and origin's, by name, each once, the most recently committed
+/// first. Empty where git cannot say.
+pub fn bases(checkout: &std::path::Path) -> Vec<String> {
+    let Some(out) = Command::new("git")
+        .arg("-C")
+        .arg(checkout)
+        .args([
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--format=%(refname:short)",
+            "refs/heads",
+            "refs/remotes/origin",
+        ])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+    else {
+        return Vec::new();
+    };
+    let mut bases: Vec<String> = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let name = line.trim().trim_start_matches("origin/");
+        if name.is_empty() || name == "HEAD" || name == "origin" {
+            continue;
+        }
+        if !bases.iter().any(|b| b == name) {
+            bases.push(name.to_string());
+        }
+    }
+    bases
+}
+
 /// `text` as a branch-safe slug: lowercase words of letters and digits
 /// joined by `-`, cut at a word boundary to LONGEST characters.
 pub fn slug(text: &str) -> String {

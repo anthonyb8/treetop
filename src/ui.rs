@@ -3,6 +3,8 @@
 //! floats over them in a popup, with the table dimmed round it, so treetop
 //! never leaves the screen. Every colour comes from `theme`.
 
+use std::time::{Duration, UNIX_EPOCH};
+
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -12,10 +14,11 @@ use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wr
 
 use crate::agents::{Agent, Status};
 use crate::app::{
-    App, DiffView, Item, JobState, LogEntry, Opening, Pending, Picker, PortMenu, Review, Shipping,
+    App, DiffView, Item, JobState, LogEntry, Opening, Pending, Picker, PortMenu, Review, SCRATCH,
+    ScratchMenu, Shipping,
 };
+use crate::assistant;
 use crate::chat::Chat;
-use crate::coordinator;
 use crate::diff::{Change, FileDiff, Layout as DiffLayout, Row as DiffRow, Side, ViewRow};
 use crate::dispatch::{Prompt, Purpose, Target};
 use crate::pool::{Tree, Work};
@@ -43,7 +46,7 @@ const KEYS: [(&str, &str); 13] = [
 ];
 
 /// Every key on the list, for the `?` overlay.
-const HELP: [(&str, &str); 26] = [
+const HELP: [(&str, &str); 27] = [
     (
         "Enter",
         "open the agent: its chat, a cold one started again, else its tree",
@@ -95,6 +98,10 @@ const HELP: [(&str, &str); 26] = [
     ),
     ("b", "rename the tree's branch"),
     ("w", "switch workspace"),
+    (
+        "C",
+        "scratch chats, tied to no tree: start one, open one, or x twice to delete one",
+    ),
     ("Tab", "the repository's issues"),
     (
         "i",
@@ -171,6 +178,7 @@ pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>, issues: Option<&i
         || app.opening.is_some()
         || app.picker.is_some()
         || app.port_menu.is_some()
+        || app.scratch_menu.is_some()
         || app.is_help
     {
         let area = frame.area();
@@ -190,6 +198,8 @@ pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>, issues: Option<&i
         draw_picker(frame, app, picker);
     } else if let Some(menu) = &app.port_menu {
         draw_port_menu(frame, menu);
+    } else if let Some(menu) = &app.scratch_menu {
+        draw_scratch_menu(frame, app, menu);
     } else if app.is_issues {
         // The trees' own dialogs wait until the trees are back on screen.
     } else if let Some(review) = app.reviews.front() {
@@ -217,11 +227,15 @@ fn summary(app: &App, is_compact: bool) -> Vec<Span<'static>> {
         let (trees, held) = (pool.clone().count(), pool.filter(|t| t.is_held()).count());
         let running = app.trees.iter().filter(|t| !t.processes.is_empty()).count();
         let serving = app.trees.iter().filter(|t| !t.ports().is_empty()).count();
-        let agents = app.trees.iter().map(|t| t.agents.len()).sum::<usize>();
+        let agents = app
+            .trees
+            .iter()
+            .map(|t| App::agents_of(t).len())
+            .sum::<usize>();
         let waiting = app
             .trees
             .iter()
-            .flat_map(|t| &t.agents)
+            .flat_map(App::agents_of)
             .filter(|a| a.status == Some(Status::Waiting))
             .count();
         spans.push(Span::raw(format!("{trees} trees  {held} held")));
@@ -274,6 +288,15 @@ fn summary(app: &App, is_compact: bool) -> Vec<Span<'static>> {
         spans.push(Span::raw("reading the pool..."));
     }
     spans.push(Span::raw(" "));
+    if let Some(state) = app.assistant_state() {
+        let style = match state {
+            "asks you" => t.badge.bg(t.warning),
+            "answering" => t.badge.bg(t.info),
+            _ => t.badge,
+        };
+        spans.push(Span::styled(format!(" assistant · {state} "), style));
+        spans.push(Span::raw(" "));
+    }
     let badge = match crate::workspaces::name(&app.checkout) {
         name if name.is_empty() => " treetop ".to_string(),
         name => format!(" treetop · {name} "),
@@ -376,14 +399,16 @@ fn agent_style(status: Option<Status>) -> (&'static str, Style) {
     }
 }
 
-/// The first agent in the tree, and how many more, marked by the tree's
-/// latest report when it needs you or is done, else by the agent's status;
-/// its words are in the detail pane. A held tree
-/// with no agent, once agents have been read, says so: it is the one to
-/// check on.
+/// The tree's leading agent, as `App::agents_of` orders them, and how many
+/// more are live, marked by the tree's latest report when it needs you or
+/// is done, else by the agent's status; its words are in the detail pane.
+/// Assistants never show, and stopped agents only where nothing is live. A
+/// held tree with no agent, once agents have been read, says so: it is the
+/// one to check on. The main checkout with none is simply blank.
 fn agent_cell(app: &App, tree: &Tree) -> Cell<'static> {
-    let Some(first) = tree.agents.first() else {
-        return if tree.is_held() && app.is_agents_read {
+    let agents = App::agents_of(tree);
+    let Some(first) = agents.first() else {
+        return if tree.is_held() && !tree.is_main && app.is_agents_read {
             Cell::from("no agent").style(fg(theme().muted))
         } else {
             Cell::from("")
@@ -393,7 +418,12 @@ fn agent_cell(app: &App, tree: &Tree) -> Cell<'static> {
         Some(state @ (State::Blocked | State::Done)) => state_style(state),
         _ => agent_style(first.status),
     };
-    let more = match tree.agents.len() - 1 {
+    let live = agents
+        .iter()
+        .skip(1)
+        .filter(|a| a.status != Some(Status::Cold))
+        .count();
+    let more = match live {
         0 => String::new(),
         n => format!(" +{n}"),
     };
@@ -488,21 +518,31 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
     let header = Row::new(titles).style(t.header);
     let visible = app.visible();
     let mut rows: Vec<Row> = visible.iter().map(|tree| row(app, tree)).collect();
-    // A blank line sets the trees waiting on you apart from the rest, and a
-    // heading sets Parked apart below them. The cursor skips both, so each
-    // pushes the rows below it one further down the table.
+    // A blank line sets the trees waiting on you apart from the rest, a
+    // heading names each base the list is grouped by, and one sets Parked
+    // apart below them. The cursor skips them all, so each pushes the rows
+    // below it one further down the table.
+    let mut extras: Vec<(usize, Row)> = Vec::new();
     let waiting = app.waiting_rows(&visible);
-    let gap = waiting > 0 && waiting < visible.len();
-    let parked = app.parked_rows(&visible);
-    if let Some((start, count)) = parked {
-        rows.insert(start, parked_heading(app.is_parked_open, count));
+    if waiting > 0 && waiting < visible.len() {
+        extras.push((waiting, Row::new(Vec::<Cell>::new())));
     }
-    if gap {
-        rows.insert(waiting, Row::new(Vec::<Cell>::new()));
+    for (start, base, count) in app.base_rows(&visible) {
+        extras.push((start, base_heading(base.as_deref(), count)));
+    }
+    if let Some((start, count)) = app.parked_rows(&visible) {
+        extras.push((start, parked_heading(app.is_parked_open, count)));
     }
     let selected = app.selected
-        + usize::from(gap && app.selected >= waiting)
-        + usize::from(parked.is_some_and(|(start, _)| app.selected >= start));
+        + extras
+            .iter()
+            .filter(|(start, _)| app.selected >= *start)
+            .count();
+    // Inserted from the bottom up, so each lands where it was counted.
+    extras.sort_by_key(|(start, _)| *start);
+    for (start, row) in extras.into_iter().rev() {
+        rows.insert(start, row);
+    }
     let mut widths = vec![
         Constraint::Length(1),
         Constraint::Length(4),
@@ -521,6 +561,28 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
         .row_highlight_style(t.cursor);
     let mut state = TableState::default().with_selected(Some(selected));
     frame.render_stateful_widget(table, area, &mut state);
+}
+
+/// The heading over the trees cut from one base, or over the free trees
+/// for None, while the list is grouped by base.
+fn base_heading(base: Option<&str>, count: usize) -> Row<'static> {
+    let t = theme();
+    // The base is a branch, so it heads the BRANCH column, wide enough for
+    // any name.
+    let (label, name) = match base {
+        Some(base) => ("base", base.to_string()),
+        None => ("free", "not leased".to_string()),
+    };
+    Row::new(vec![
+        Cell::from("▾").style(fg(t.accent)),
+        Cell::from(""),
+        Cell::from(label).style(fg(t.muted)),
+        Cell::from(""),
+        Cell::from(Line::from(vec![
+            Span::styled(name, fg(t.title).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  {count}"), fg(t.muted)),
+        ])),
+    ])
 }
 
 /// The heading over the trees set aside: folded, it is all that shows of
@@ -589,6 +651,12 @@ fn detail_lines(app: &App, tree: &Tree) -> Vec<Line<'static>> {
         .as_ref()
         .map(|h| format!("  held by {h}"))
         .unwrap_or_default();
+    // Where a held tree was cut from, which its diff and PR go against.
+    let base = app
+        .base_of(tree)
+        .filter(|_| tree.is_held() && !tree.is_main)
+        .map(|b| format!("  from {b}"))
+        .unwrap_or_default();
     let mut lines = vec![
         Line::from(vec![
             Span::styled(
@@ -600,6 +668,7 @@ fn detail_lines(app: &App, tree: &Tree) -> Vec<Line<'static>> {
                 fg(t.muted),
             ),
             Span::styled(holder, fg(t.muted)),
+            Span::styled(base, fg(t.muted)),
         ]),
         agents_line(app, tree),
         Line::from(vec![
@@ -961,6 +1030,83 @@ fn draw_picker(frame: &mut Frame, app: &App, picker: &Picker) {
     frame.render_stateful_widget(table, inner, &mut state);
 }
 
+/// The scratch chats `C` lists: a line that starts a new one, then each
+/// chat, the newest first, with its age and what it last said.
+fn draw_scratch_menu(frame: &mut Frame, app: &App, menu: &ScratchMenu) {
+    let t = theme();
+    let screen = frame.area();
+    let width = screen.width.saturating_sub(4).min(96);
+    // Wrapped here, at words, so the box is sized to the rows it takes.
+    let error: Option<Vec<Line>> = menu.error.as_ref().map(|error| {
+        word_wrap(error, usize::from(width.saturating_sub(2)))
+            .into_iter()
+            .map(|row| Line::styled(row, fg(t.danger)))
+            .collect()
+    });
+    let error_height = error.as_ref().map_or(0, |lines| lines.len() + 1);
+    let height = u16::try_from(menu.chats.len() + 1 + error_height)
+        .unwrap_or(u16::MAX)
+        .saturating_add(2);
+    let area = popup::centered(screen, width, height);
+    let keys: &[(&str, &str)] = if menu.is_deleting {
+        &[("x", "again deletes it"), ("any key", "keeps it")]
+    } else {
+        &[("Enter", "open"), ("x x", "delete"), ("Esc", "close")]
+    };
+    let block = popup_block(Line::styled(
+        " Scratch chats ",
+        fg(t.title).add_modifier(Modifier::BOLD),
+    ))
+    .title_bottom(Line::from(fitting_keys(keys, width.saturating_sub(2))));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let mut rows = vec![Row::new(vec![
+        Cell::from("+").style(fg(t.accent)),
+        Cell::from("new chat").style(Style::new().add_modifier(Modifier::BOLD)),
+        Cell::from(""),
+        Cell::from("a Claude session for thinking, in no tree").style(fg(t.muted)),
+    ])];
+    for (at, chat) in menu.chats.iter().enumerate() {
+        let is_doomed = menu.is_deleting && menu.selected == at + 1;
+        let said = app.scratch_says(&chat.job).unwrap_or_default();
+        rows.push(Row::new(vec![
+            Cell::from(if is_doomed { "x" } else { " " }).style(fg(t.danger)),
+            Cell::from(chat.name.clone()).style(if is_doomed {
+                fg(t.danger).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().add_modifier(Modifier::BOLD)
+            }),
+            Cell::from(reports::age(UNIX_EPOCH + Duration::from_secs(chat.created)))
+                .style(fg(t.info)),
+            Cell::from(said).style(fg(t.muted)),
+        ]));
+    }
+    let widths = [
+        Constraint::Length(1),
+        Constraint::Length(14),
+        Constraint::Length(8),
+        Constraint::Fill(1),
+    ];
+    let [list_area, error_area] = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(u16::try_from(error_height).unwrap_or(0)),
+    ])
+    .areas(inner);
+    let table = Table::new(rows, widths).row_highlight_style(t.cursor);
+    let mut state = TableState::default().with_selected(Some(menu.selected));
+    frame.render_stateful_widget(table, list_area, &mut state);
+    if let Some(lines) = error {
+        let below = Rect::new(
+            error_area.x,
+            error_area.y + 1,
+            error_area.width,
+            error_area.height.saturating_sub(1),
+        );
+        frame.render_widget(Paragraph::new(lines), below);
+    }
+}
+
 /// The ports `o` offers for a tree serving several, each with its number
 /// key and the process listening on it.
 fn draw_port_menu(frame: &mut Frame, menu: &PortMenu) {
@@ -1049,11 +1195,13 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
     let text_height = u16::try_from(rows.len())
         .unwrap_or(u16::MAX)
         .clamp(COMPOSE_ROWS.0, COMPOSE_ROWS.1);
-    // Borders, then the branch and a blank line when the box names one.
-    let chrome = if prompt.names_branch() { 4 } else { 2 };
+    // Borders, then the branch, the base for a fresh tree, and a blank line
+    // when the box names a branch.
+    let fields = u16::from(prompt.names_branch()) + u16::from(prompt.names_base());
+    let chrome = 2 + fields + u16::from(fields > 0);
     let area = popup::centered(screen, width, text_height + chrome);
     let (title, placeholder) = match (prompt.target(), &prompt.purpose) {
-        (Some(Target::Coordinator), _) => (
+        (Some(Target::Assistant), _) => (
             " Talk to the assistant ".to_string(),
             "a message for its chat, or send nothing to open the chat",
         ),
@@ -1083,10 +1231,16 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
         ),
     };
     let mut keys = vec![("Enter", "send"), ("Esc", "cancel")];
-    if !matches!(prompt.purpose, Purpose::Rename { .. }) && !prompt.is_editing_branch {
+    let is_editing_field = prompt.is_editing_branch || prompt.is_editing_base;
+    if !matches!(prompt.purpose, Purpose::Rename { .. }) && !is_editing_field {
         keys.insert(1, ("Alt+Enter", "new line"));
     }
-    if prompt.names_branch() {
+    if prompt.is_editing_base {
+        keys.insert(0, ("Tab", "complete"));
+    }
+    if prompt.names_base() {
+        keys.insert(0, ("↑↓", "branch, base"));
+    } else if prompt.names_branch() {
         keys.insert(0, ("↑↓", "branch"));
     }
     let block = popup_block(Line::styled(
@@ -1108,18 +1262,30 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
         let branch_row = Rect::new(inner.x, inner.y, inner.width, 1);
         frame.render_widget(Paragraph::new(branch_line(prompt)), branch_row);
         if prompt.is_editing_branch {
-            let typed = prompt.branch.as_deref().map_or(0, str::len);
-            let at = u16::try_from("branch ".len() + typed).unwrap_or(u16::MAX);
+            let typed = prompt.branch.as_deref().map_or(0, |b| b.chars().count());
+            let at = u16::try_from(FIELD_LABEL + typed).unwrap_or(u16::MAX);
             frame.set_cursor_position(Position::new(
                 (branch_row.x + at).min(branch_row.right().saturating_sub(1)),
                 branch_row.y,
             ));
         }
+        if prompt.names_base() {
+            let base_row = Rect::new(inner.x, inner.y + 1, inner.width, 1);
+            frame.render_widget(Paragraph::new(base_line(prompt)), base_row);
+            if prompt.is_editing_base {
+                let typed = prompt.base.as_deref().map_or(0, |b| b.chars().count());
+                let at = u16::try_from(FIELD_LABEL + typed).unwrap_or(u16::MAX);
+                frame.set_cursor_position(Position::new(
+                    (base_row.x + at).min(base_row.right().saturating_sub(1)),
+                    base_row.y,
+                ));
+            }
+        }
         text_area = Rect::new(
             inner.x,
-            inner.y + 2,
+            inner.y + fields + 1,
             inner.width,
-            inner.height.saturating_sub(2),
+            inner.height.saturating_sub(fields + 1),
         );
     }
     if prompt.text.is_empty() {
@@ -1129,7 +1295,7 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
                 .style(fg(t.muted).add_modifier(Modifier::ITALIC)),
             text_area,
         );
-        if !prompt.is_editing_branch {
+        if !is_editing_field {
             frame.set_cursor_position(Position::new(text_area.x, text_area.y));
         }
         return;
@@ -1139,7 +1305,7 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
     let first = rows.len().saturating_sub(shown);
     let lines: Vec<Line> = rows[first..].iter().map(|r| Line::raw(r.clone())).collect();
     frame.render_widget(Paragraph::new(lines), text_area);
-    if prompt.is_editing_branch {
+    if is_editing_field {
         return;
     }
     let last = rows.last().map_or(0, |row| row.chars().count());
@@ -1148,6 +1314,52 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
         text_area.x + u16::try_from(last).unwrap_or(0),
         text_area.y + cursor_row,
     ));
+}
+
+/// The width of a field's label in the compose box, `branch ` and `base   `
+/// alike, so the two values line up.
+const FIELD_LABEL: usize = 7;
+
+/// The compose box's base line: the branch a fresh tree is cut from, typed
+/// with the branch it would complete to after it, else the pool's.
+fn base_line(prompt: &Prompt) -> Line<'static> {
+    let t = theme();
+    let label = Span::styled("base   ", fg(t.muted));
+    let typed = prompt.base.clone().unwrap_or_default();
+    let pools = || {
+        Span::styled(
+            match &prompt.default_base {
+                Some(base) => format!("{base}, the pool's"),
+                None => "the pool's".to_string(),
+            },
+            fg(t.muted).add_modifier(Modifier::ITALIC),
+        )
+    };
+    if !prompt.is_editing_base {
+        return match prompt.base_name() {
+            Some(base) => Line::from(vec![label, Span::raw(base)]),
+            None => Line::from(vec![label, pools()]),
+        };
+    }
+    let mut spans = vec![
+        label,
+        Span::styled(typed.clone(), fg(t.accent).add_modifier(Modifier::BOLD)),
+    ];
+    match prompt.base_suggestion() {
+        Some(suggested) if suggested.to_lowercase().starts_with(&typed.to_lowercase()) => {
+            spans.push(Span::styled(
+                suggested
+                    .chars()
+                    .skip(typed.chars().count())
+                    .collect::<String>(),
+                fg(t.muted),
+            ));
+        }
+        Some(suggested) => spans.push(Span::styled(format!("  {suggested}?"), fg(t.muted))),
+        None if typed.is_empty() => spans.push(pools()),
+        None => {}
+    }
+    Line::from(spans)
 }
 
 /// The compose box's branch line: the branch a new agent will start on,
@@ -1603,8 +1815,8 @@ fn draw_opening(frame: &mut Frame, app: &App, opening: &Opening) {
 }
 
 fn opening_note(agent: &str) -> String {
-    if coordinator::is_assistant(agent) {
-        "opening the coordinator...".into()
+    if assistant::is_assistant(agent) {
+        "opening the assistant...".into()
     } else {
         format!("opening {agent}...")
     }
@@ -1614,8 +1826,16 @@ fn opening_note(agent: &str) -> String {
 /// right of the bar. Returns where the chat's screen goes.
 fn chat_frame(frame: &mut Frame, app: &App, agent: &str, tree: &str) -> Rect {
     let t = theme();
-    let title = if coordinator::is_assistant(agent) {
-        vec![Span::styled(" coordinator ", t.badge)]
+    let title = if assistant::is_assistant(agent) {
+        vec![Span::styled(" assistant ", t.badge)]
+    } else if tree == SCRATCH {
+        vec![
+            Span::styled(" scratch ", t.badge),
+            Span::styled(
+                format!(" {agent} "),
+                Style::new().add_modifier(Modifier::BOLD),
+            ),
+        ]
     } else {
         let branch = app
             .trees

@@ -55,6 +55,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | `s` | start a ship run of the tree's branch, such as no-mistakes', after a dialog; on a run under way, show it |
 | `b` | rename the branch of the tree under the cursor |
 | `w` | switch to another workspace: the pool of another repository treetop has been opened in |
+| `C` | scratch chats, tied to no tree: start one, open one, or delete one (see [Scratch chats](#scratch-chats)) |
 | Tab | switch to the Issues screen, and back (see [Issues](#issues)) |
 | `j` `k` / arrows, `g` `G` | move |
 | Esc | clear the filter, then the marks |
@@ -69,9 +70,14 @@ GIT says what is not safe yet, in a Powerlevel10k prompt's symbols: `⇡2` commi
 PORTS lists every TCP port the tree's processes listen on, lowest first, so a frontend and a backend both show; the processes themselves are in the detail pane and the return dialog.
 `o` opens the port in the browser on a desktop, and where the tree serves several it opens a menu of them, each with the process listening on it, picked with its number or `j`/`k` and Enter; on a server reached over SSH it copies the URL to the clipboard of the computer you are typing at, through the terminal (OSC 52; inside tmux, `set-clipboard on`).
 AGENT names the coding agent working in the tree, from the sources under [Agents](#agents); `no agent` on a held tree marks one nobody is working in.
+Where a tree has several, it names the most pressing live one, waiting on you, then busy, then idle, the most recently active first, and counts the other live ones as `+N`; a stopped agent shows only where nothing is live, and Enter opens the same agent the row names.
+The assistant is never a tree's agent, and the main checkout shows only live agents, since its stopped ones are sessions once run in place.
 Its mark is `●` in bold when the tree's agent needs you and `✓` when it is done (see [What agents say](#what-agents-say)), else the agent's own status: `●` busy, `○` idle, `◌` cold.
 Trees waiting on you sort to the top, set apart from the rest by a blank line; below it come the main checkout, then the other trees with the most recently active agent first, so trees nobody has worked in for a while sink to the bottom.
 An agent's last activity is its latest report, or when its Claude Code transcript last grew.
+Where the held trees were cut from more than one base (see [New agents](#new-agents)), the list groups them by base, each group under a heading naming its branch, the pool's base first and the rest by name, then the free trees under their own heading, then Parked.
+Within a group the order is the same, so a tree waiting on you comes first in its group, and the blank line is left out; the main checkout goes under its own branch where that is one of the bases, else the pool's.
+With one base in use the list is not grouped.
 Trees held for later but not worked on now can be parked with `z`: they go under a Parked heading at the bottom, folded, and `Z` opens it.
 A parked tree that comes to need you still sorts to the top, a filter still finds parked trees, and returning a tree clears it, since parking is kept in its `treetop.json` as `parked`.
 PR is where the tree's branch stands after its agent: its pull request's number and stage, or the step of a pipeline it is going through (see [After the agent](#after-the-agent)).
@@ -90,7 +96,7 @@ On opening, treetop draws the last listing it saved under `$XDG_CACHE_HOME/treet
 
 ## The diff
 
-`d` opens the tree under the cursor in a side-by-side diff, in a popup over the pool, the way a pull request shows it: everything its branch changes against the pool's base (`base_branch` in `treehouse.toml`, else `origin/HEAD`), measured from their merge base, plus uncommitted and untracked files.
+`d` opens the tree under the cursor in a side-by-side diff, in a popup over the pool, the way a pull request shows it: everything its branch changes against its base, the branch it was cut from (see [New agents](#new-agents)) or else the pool's (`base_branch` in `treehouse.toml`, else `origin/HEAD`), measured from their merge base, plus uncommitted and untracked files.
 Removed lines sit on the left and the added lines that replace them on the right, row by row, with line numbers on both sides; within a changed line, the words that differ are highlighted.
 Every file runs in one scroll, each under a header with its path and its additions and deletions, and the header of the file you are reading stays pinned to the top.
 Its colours are the diff highlight groups Neovim uses under gruvbox-material (medium): `DiffDelete` and `DiffAdd` behind lines, `LineNr` for numbers, `diffLine` for hunks, `diffFile` for paths.
@@ -324,6 +330,7 @@ A message to it is sent the way `m` sends one, typed into its chat behind the sc
 treetop finds it again by its name: while it runs, and for a day after it stops, through `claude attach`, which starts it again with its conversation kept.
 After that a new one starts.
 A coordinator from before the assistant, named `treetop-coordinator`, is never taken for it, since it acts itself; it is left off the rows, and a new assistant starts beside it.
+It is never a tree's agent, so it is left off the main checkout's row: a badge at the right of the bottom bar shows it instead, `assistant · answering` while it works on your message, `asks you`, `idle` or `stopped`, and none before it first starts.
 
 It sees the other agents through treetop commands it may run without asking; it does not send, start or return anything itself, and ends its answer with the next steps it would take, for you to take with treetop's keys:
 
@@ -335,10 +342,22 @@ It sees the other agents through treetop commands it may run without asking; it 
 `treetop send`, `dispatch` and `pick` remain, for you and any other agent, from any shell.
 Each command prints only what it is asked for, so a question costs the assistant one small read rather than a crawl through every transcript.
 
+### Scratch chats
+
+`C` lists scratch chats: Claude Code sessions for thinking something through, tied to no tree.
+The first line starts a new one, idle, and opens its chat as soon as it runs; Enter on a chat opens it again, starting it if it stopped, and `x` twice deletes it with `claude rm`.
+Each line shows how old the chat is and what it last said.
+They all run in one folder, `$XDG_STATE_HOME/treetop/scratch` (else `~/.local/state/treetop/scratch`), outside every repository, so they never land on a tree, never open as asks, are left out of the summary, and are the same list in every workspace.
+Claude Code runs a background session only in a folder you have trusted, so before the first one, run `claude` in that folder once and accept its trust prompt; until then the list says so.
+
 ### New agents
 
 Every tree is leased with `treetop` as the holder, and a tree treetop leases always gets a branch: `<git user.name>/<the task as a slug>`, shown on the compose box's branch line.
-Up or Down moves to that line to change the name before sending; a tree someone already holds keeps its branch.
+Down moves to that line to change the name before sending, and Up comes back; a tree someone already holds keeps its branch.
+A fresh tree from `n` also has a base line under it: the branch the tree is cut from, the pool's base unless you type another.
+Typing there suggests the repository's branches, local and on origin, the most recently committed first, and Tab takes the suggestion.
+treetop leases the tree with `treehouse get --lease --base <branch>` and records the base in the tree's `treetop.json`, so its diff goes against it and the detail pane says `from <branch>`.
+`N` on a free tree cannot take a base, since `treehouse lease` takes the tree as it is.
 `b` renames the branch of the tree under the cursor, or names one on a detached HEAD.
 
 The agent is `claude --bg --name <the task's first words> -- <task>`, which Claude Code's own agent view lists too; `TREETOP_NEW_AGENT` names another command, which gets the task as its last argument.

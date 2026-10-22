@@ -38,6 +38,10 @@ pub struct Sidecar {
     #[serde(default)]
     pub task: Option<String>,
     pub branch: Option<String>,
+    /// The branch the tree was cut from when it was not the pool's base,
+    /// which its diff and PR go against.
+    #[serde(default)]
+    pub base: Option<String>,
     /// treehouse's identity for the lease, when it gave one.
     pub lease_id: Option<String>,
     /// When treetop leased the tree, in seconds since the epoch.
@@ -59,6 +63,7 @@ impl Sidecar {
             task: None,
             parked: false,
             branch: None,
+            base: None,
             lease_id: None,
             leased_at: SystemTime::now()
                 .duration_since(UNIX_EPOCH)

@@ -367,19 +367,20 @@ pub fn layout(diff: BranchDiff) -> Layout {
     }
 }
 
-/// Reads diffs one at a time on its own thread, in the order asked.
+/// Reads diffs one at a time on its own thread, in the order asked, each
+/// against the base it is asked with, else the pool's.
 pub struct Loader {
-    requests: Sender<PathBuf>,
+    requests: Sender<(PathBuf, Option<String>)>,
     pub results: Receiver<(PathBuf, Result<Layout, String>)>,
 }
 
 impl Loader {
     pub fn spawn(base: Option<String>) -> Self {
-        let (requests, queue) = mpsc::channel::<PathBuf>();
+        let (requests, queue) = mpsc::channel::<(PathBuf, Option<String>)>();
         let (results_tx, results) = mpsc::channel();
         thread::spawn(move || {
-            for path in queue {
-                let diff = read(&path, base.as_deref()).map(layout);
+            for (path, own) in queue {
+                let diff = read(&path, own.as_deref().or(base.as_deref())).map(layout);
                 if results_tx.send((path, diff)).is_err() {
                     return;
                 }
@@ -388,8 +389,8 @@ impl Loader {
         Loader { requests, results }
     }
 
-    pub fn request(&self, path: PathBuf) {
-        let _ = self.requests.send(path);
+    pub fn request(&self, path: PathBuf, base: Option<String>) {
+        let _ = self.requests.send((path, base));
     }
 }
 

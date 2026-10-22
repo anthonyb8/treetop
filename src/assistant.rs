@@ -1,7 +1,6 @@
-//! The coordinator: one Claude Code session in the main checkout that you
-//! talk to about every agent at once, as the assistant. It runs in the
-//! background like any agent treetop starts, under a fixed name so treetop
-//! finds it again. It sees the others through `treetop status` and
+//! The assistant: one Claude Code session in the main checkout that you
+//! talk to about every agent at once. It runs in the background like any
+//! agent treetop starts, under a fixed name so treetop finds it again. It sees the others through `treetop status` and
 //! `tickets`, which it may run without asking, and answers in its chat. It
 //! does not send, start or return anything itself; it says what it would do,
 //! and you do it with treetop's keys.
@@ -12,21 +11,21 @@ use std::path::Path;
 /// from the agents it coordinates.
 pub const NAME: &str = "treetop-assistant";
 
-/// The name coordinators ran under before the assistant. One still running
-/// acts itself, so it is never taken as the assistant, but it is left off
-/// the rows like one.
+/// The name the assistant ran under when it was the coordinator, which
+/// acted itself. One still running is never taken as the assistant, but it
+/// is left off the rows like one.
 const LEGACY: &str = "treetop-coordinator";
 
-/// Whether an agent of this name is an assistant, this one or an older
-/// coordinator, rather than an agent it coordinates.
+/// Whether an agent of this name is an assistant, this one or an old
+/// coordinator, rather than an agent it keeps track of.
 pub fn is_assistant(name: &str) -> bool {
     name == NAME || name == LEGACY
 }
 
-/// The commands the coordinator may run without asking.
+/// The commands the assistant may run without asking.
 const ALLOWED: [&str; 2] = ["status", "tickets"];
 
-/// What the coordinator is told on top of Claude Code's own system prompt.
+/// What the assistant is told on top of Claude Code's own system prompt.
 /// `treetop` is the command that runs this treetop, `checkout` the main
 /// checkout of the pool it coordinates.
 fn system_prompt(treetop: &str, checkout: &Path) -> String {
@@ -55,7 +54,7 @@ unpushed, or starting the next issue from `{treetop} tickets`."
     )
 }
 
-/// The command that starts the coordinator, with `task` as its first message
+/// The command that starts the assistant, with `task` as its first message
 /// when there is one.
 pub fn command(treetop: &str, checkout: &Path, task: &str) -> Vec<String> {
     let mut command: Vec<String> = ["claude", "--bg", "--allowedTools"]
@@ -80,7 +79,7 @@ pub fn command(treetop: &str, checkout: &Path, task: &str) -> Vec<String> {
     command
 }
 
-/// How the coordinator runs this treetop: the path of the running binary, so
+/// How the assistant runs this treetop: the path of the running binary, so
 /// it works whether or not treetop is on its PATH.
 pub fn treetop() -> String {
     std::env::current_exe()

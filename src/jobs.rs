@@ -130,8 +130,11 @@ pub struct Launch {
     /// Lease a fresh tree from the pool first and start it there; `tree` is
     /// a stand-in until then.
     pub is_new_tree: bool,
-    /// Start the coordinator rather than an agent for the task.
-    pub is_coordinator: bool,
+    /// The branch that fresh tree is cut from; None cuts it from the pool's
+    /// base.
+    pub base: Option<String>,
+    /// Start the assistant rather than an agent for the task.
+    pub is_assistant: bool,
     /// The ticket it picks up, which gives it its task, name and branch.
     pub ticket: Option<Pick>,
 }
@@ -167,7 +170,8 @@ impl Launch {
             task,
             branch: None,
             is_new_tree,
-            is_coordinator: false,
+            base: None,
+            is_assistant: false,
             ticket: None,
         }
     }
@@ -333,14 +337,14 @@ enum Starter {
     /// `TREETOP_NEW_AGENT`, split on whitespace, with the task as its last
     /// argument: any agent, with no plugin.
     Command(Vec<String>),
-    /// The coordinator, a Claude Code session with its own flags, run by the
+    /// The assistant, a Claude Code session with its own flags, run by the
     /// Claude Code plugin's rules.
-    Coordinator(Vec<String>, Plugin),
+    Assistant(Vec<String>, Plugin),
     /// An agent plugin's `start`.
     Plugin(Plugin),
 }
 
-/// How `launch` starts: the coordinator's command, else `TREETOP_NEW_AGENT`,
+/// How `launch` starts: the assistant's command, else `TREETOP_NEW_AGENT`,
 /// else the default agent plugin, else the first there is.
 fn starter(launch: &Launch, dir: &Path) -> Result<Starter, String> {
     let agent = || {
@@ -348,10 +352,9 @@ fn starter(launch: &Launch, dir: &Path) -> Result<Starter, String> {
             .or_else(|| plugin::of_kind(PluginKind::Agent).into_iter().next())
             .ok_or_else(|| "start: no agent plugin".to_string())
     };
-    if launch.is_coordinator {
-        let command =
-            crate::coordinator::command(&crate::coordinator::treetop(), dir, &launch.task);
-        return Ok(Starter::Coordinator(command, agent()?));
+    if launch.is_assistant {
+        let command = crate::assistant::command(&crate::assistant::treetop(), dir, &launch.task);
+        return Ok(Starter::Assistant(command, agent()?));
     }
     let custom = std::env::var("TREETOP_NEW_AGENT")
         .ok()
@@ -489,7 +492,7 @@ fn start_steps(job: &mut Job, log: &mut String, undone: &mut Vec<Undo>) -> Resul
         job.launch = Some(launch.clone());
     }
     let is_leasing = launch.is_new_tree || !job.tree.is_held();
-    let branch = (is_leasing && !launch.is_coordinator).then(|| {
+    let branch = (is_leasing && !launch.is_assistant).then(|| {
         launch
             .branch
             .clone()
@@ -514,6 +517,10 @@ fn start_steps(job: &mut Job, log: &mut String, undone: &mut Vec<Undo>) -> Resul
         command.args(["get", "--lease", "--json", "--lease-holder", "treetop"]);
         if let Some(name) = branch.as_ref().filter(|_| !resumes) {
             command.args(["--branch", name]);
+        }
+        if let Some(base) = &launch.base {
+            command.args(["--base", base]);
+            record.base = Some(base.clone());
         }
         let out =
             exec(&mut command, TREEHOUSE_LIMIT, log).map_err(|why| format!("lease: {why}"))?;
@@ -576,7 +583,7 @@ fn start_steps(job: &mut Job, log: &mut String, undone: &mut Vec<Undo>) -> Resul
     if is_leasing {
         record.agent = Some(match &starter {
             Starter::Command(command) => agent_name(&command[0]),
-            Starter::Coordinator(_, plugin) | Starter::Plugin(plugin) => plugin.name().to_string(),
+            Starter::Assistant(_, plugin) | Starter::Plugin(plugin) => plugin.name().to_string(),
         });
         record.branch = checked_out(&job.tree.path);
         sidecar::write(&job.tree.path, &record)
@@ -594,7 +601,7 @@ fn start_steps(job: &mut Job, log: &mut String, undone: &mut Vec<Undo>) -> Resul
             .map_err(|why| format!("start: {why}"))?;
             return Ok(());
         }
-        Starter::Coordinator(command, plugin) => {
+        Starter::Assistant(command, plugin) => {
             let (program, args) = command.split_first().ok_or("start: no agent command")?;
             let out = exec(
                 Command::new(program).args(args).current_dir(&job.tree.path),

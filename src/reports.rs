@@ -8,7 +8,7 @@
 //!   `output.result` once done, and where it works (`worktreePath`, else `cwd`).
 //! - `timeline.jsonl`: one `{at, state, detail}` line per step.
 //!
-//! `treetop status` hands each job's latest word to the coordinator too.
+//! `treetop status` hands each job's latest word to the assistant too.
 //!
 //! These files are internal and undocumented, as the session files are, so
 //! every field is read by name and anything unexpected leaves a job out
