@@ -356,7 +356,9 @@ Claude Code runs a background session only in a folder you have trusted, so befo
 Every tree is leased with `treetop` as the holder, and a tree treetop leases always gets a branch: `<git user.name>/<the task as a slug>`, shown on the compose box's branch line.
 Down moves to that line to change the name before sending, and Up comes back; a tree someone already holds keeps its branch.
 A fresh tree from `n` also has a base line under it: the branch the tree is cut from, the pool's base unless you pick another.
-On it, `←` and `→` step through the repository's branches, local and on origin, the pool's base first and the rest most recently committed first, so it only ever names a real branch; nothing is typed there.
+On it, `←` and `→` step through the repository's branches, local and on origin, the pool's base first and the rest most recently committed first.
+Typing there narrows them to those that start with what you type, then those that contain it, ignoring case, and `←` and `→` step through the matches; Backspace and Ctrl+U widen them again.
+It only ever names a real branch: when what you type matches none, the line says so, and Enter keeps the box open until it does.
 treetop leases the tree with `treehouse get --lease --base <branch>` and records the base in the tree's `treetop.json`, so its diff goes against it and the detail pane says `from <branch>`.
 `N` on a free tree cannot take a base, since `treehouse lease` takes the tree as it is.
 `b` renames the branch of the tree under the cursor, or names one on a detached HEAD.

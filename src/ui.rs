@@ -1252,6 +1252,7 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
         keys.insert(1, ("Alt+Enter", "new line"));
     }
     if prompt.is_editing_base {
+        keys.insert(0, ("type", "narrow"));
         keys.insert(0, ("←→", "pick"));
     }
     if prompt.names_base() {
@@ -1287,8 +1288,16 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
         }
         if prompt.names_base() {
             let base_row = Rect::new(inner.x, inner.y + 1, inner.width, 1);
-            // Picked, never typed, so it shows no cursor.
             frame.render_widget(Paragraph::new(base_line(prompt)), base_row);
+            // The cursor sits after what is typed, which narrows the list.
+            if prompt.is_editing_base {
+                let typed = prompt.base_typed.chars().count();
+                let at = u16::try_from(FIELD_LABEL + typed).unwrap_or(u16::MAX);
+                frame.set_cursor_position(Position::new(
+                    (base_row.x + at).min(base_row.right().saturating_sub(1)),
+                    base_row.y,
+                ));
+            }
         }
         text_area = Rect::new(
             inner.x,
@@ -1330,41 +1339,59 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
 const FIELD_LABEL: usize = 7;
 
 /// The compose box's base line: the branch a fresh tree is cut from, the
-/// pool's until another is picked; while it has the focus, between arrows
-/// with where it stands among the branches.
+/// pool's until another is picked. While it has the focus it shows what is
+/// typed, then the match picked between arrows and where it stands among
+/// the matches; a typed name that matches no branch says so.
 fn base_line(prompt: &Prompt) -> Line<'static> {
     let t = theme();
     let label = Span::styled("base   ", fg(t.muted));
-    let name = prompt.base_shown().unwrap_or("the pool's").to_string();
+    let typed = prompt.base_typed.clone();
+    let unmatched = || {
+        Span::styled(
+            format!("no branch matches \"{}\"", typed.trim()),
+            fg(t.danger).add_modifier(Modifier::BOLD),
+        )
+    };
     let is_pools = prompt.base_name().is_none();
     if !prompt.is_editing_base {
-        return Line::from(vec![
-            label,
-            if is_pools {
-                Span::styled(
-                    format!("{name}, the pool's"),
-                    fg(t.muted).add_modifier(Modifier::ITALIC),
-                )
-            } else {
-                Span::raw(name)
-            },
-        ]);
-    }
-    Line::from(vec![
-        label,
-        Span::styled("‹ ", fg(t.accent)),
-        Span::styled(name, fg(t.accent).add_modifier(Modifier::BOLD)),
-        Span::styled(" ›", fg(t.accent)),
-        Span::styled(
-            format!(
-                "  {}/{}{}",
-                prompt.base_at + 1,
-                prompt.bases.len().max(1),
-                if is_pools { ", the pool's" } else { "" }
+        let shown = match prompt.base_shown() {
+            None => unmatched(),
+            Some(name) if is_pools => Span::styled(
+                format!("{name}, the pool's"),
+                fg(t.muted).add_modifier(Modifier::ITALIC),
             ),
-            fg(t.muted),
-        ),
-    ])
+            Some(name) => Span::raw(name.to_string()),
+        };
+        return Line::from(vec![label, shown]);
+    }
+    let mut spans = vec![
+        label,
+        Span::styled(typed.clone(), fg(t.accent).add_modifier(Modifier::BOLD)),
+    ];
+    if !typed.is_empty() {
+        spans.push(Span::raw("  "));
+    }
+    match prompt.base_shown() {
+        None => spans.push(unmatched()),
+        Some(name) => {
+            let matches = prompt.base_matches().len().max(1);
+            let place = if typed.trim().is_empty() {
+                format!("  {}/{matches}", prompt.base_at + 1)
+            } else {
+                format!("  {}/{matches} matching", prompt.base_at + 1)
+            };
+            spans.extend([
+                Span::styled("‹ ", fg(t.accent)),
+                Span::styled(name.to_string(), fg(t.accent).add_modifier(Modifier::BOLD)),
+                Span::styled(" ›", fg(t.accent)),
+                Span::styled(
+                    format!("{place}{}", if is_pools { ", the pool's" } else { "" }),
+                    fg(t.muted),
+                ),
+            ]);
+        }
+    }
+    Line::from(spans)
 }
 
 /// The compose box's branch line: the branch a new agent will start on,

@@ -420,8 +420,15 @@ fn last_line(output: &str) -> &str {
 }
 
 /// Why git would refuse the branch the compose box would send: the renamed
-/// one, or the one a new agent starts on.
+/// one, or the one a new agent starts on; or, for a fresh tree, that what
+/// is typed on its base line names no branch to cut it from.
 fn branch_problem(prompt: &Prompt) -> Option<String> {
+    if prompt.is_base_unmatched() {
+        return Some(format!(
+            "no branch matches \"{}\" to cut the tree from",
+            prompt.base_typed.trim()
+        ));
+    }
     let name = match &prompt.purpose {
         Purpose::Rename { .. } => prompt.text.trim().to_string(),
         _ => prompt.branch_name()?,
@@ -3420,6 +3427,24 @@ mod tests {
             report("o1", State::Blocked, "/elsewhere/app", 5),
         ]);
         assert_eq!(app.elsewhere(), 1);
+    }
+
+    #[test]
+    fn a_base_typed_that_names_no_branch_keeps_the_box_open() {
+        let mut app = app();
+        app.base = Some("development".into());
+        press(&mut app, KeyCode::Char('n'));
+        app.prompt.as_mut().unwrap().bases = vec!["development".into(), "main".into()];
+        type_in(&mut app, "fix the login");
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        type_in(&mut app, "nope");
+        assert_eq!(press(&mut app, KeyCode::Enter), Outcome::Continue);
+        assert!(app.prompt.is_some(), "kept open to fix");
+        assert_eq!(
+            app.message.as_deref(),
+            Some("no branch matches \"nope\" to cut the tree from")
+        );
     }
 
     #[test]

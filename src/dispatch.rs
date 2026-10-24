@@ -87,9 +87,13 @@ pub struct Prompt {
     pub branch: Option<String>,
     /// Keys go to the branch rather than the task.
     pub is_editing_branch: bool,
-    /// Which of `bases` a fresh tree is cut from: the first, the pool's
-    /// base, until `←`/`→` picks another.
+    /// Which of the branches matching `base_typed` a fresh tree is cut
+    /// from: the first, the pool's base with nothing typed, until `←`/`→`
+    /// picks another.
     pub base_at: usize,
+    /// What is typed on the base line, which narrows the branches it steps
+    /// through to those that start with it, then those that contain it.
+    pub base_typed: String,
     /// Keys go to the base rather than the task.
     pub is_editing_base: bool,
     /// The pool's base, which a fresh tree is cut from unless another is
@@ -118,6 +122,7 @@ impl Prompt {
             branch: None,
             is_editing_branch: false,
             base_at: 0,
+            base_typed: String::new(),
             is_editing_base: false,
             default_base: None,
             bases: Vec::new(),
@@ -191,12 +196,35 @@ impl Prompt {
         self.target() == Some(Target::NewTree)
     }
 
-    /// The branch the base line shows: the one picked, else the pool's.
-    pub fn base_shown(&self) -> Option<&str> {
-        self.bases
-            .get(self.base_at)
+    /// The branches the base line steps through: all of them with nothing
+    /// typed, else those that start with what is typed, then those that
+    /// contain it, ignoring case.
+    pub fn base_matches(&self) -> Vec<&str> {
+        let typed = self.base_typed.trim().to_lowercase();
+        let (mut starts, contains): (Vec<&str>, Vec<&str>) = self
+            .bases
+            .iter()
             .map(String::as_str)
-            .or(self.default_base.as_deref())
+            .filter(|b| b.to_lowercase().contains(&typed))
+            .partition(|b| b.to_lowercase().starts_with(&typed));
+        starts.extend(contains);
+        starts
+    }
+
+    /// Something is typed on the base line that names no branch, so there
+    /// is nothing to cut a tree from.
+    pub fn is_base_unmatched(&self) -> bool {
+        self.names_base() && !self.base_typed.trim().is_empty() && self.base_matches().is_empty()
+    }
+
+    /// The branch the base line shows: the one picked among the matches,
+    /// else, with nothing typed, the pool's.
+    pub fn base_shown(&self) -> Option<&str> {
+        match self.base_matches().get(self.base_at) {
+            Some(base) => Some(base),
+            None if self.base_typed.trim().is_empty() => self.default_base.as_deref(),
+            None => None,
+        }
     }
 
     /// The base a fresh tree is cut from when it is not the pool's: the one
@@ -205,16 +233,22 @@ impl Prompt {
         if !self.names_base() {
             return None;
         }
-        self.bases
+        self.base_matches()
             .get(self.base_at)
-            .filter(|b| Some(b.as_str()) != self.default_base.as_deref())
-            .cloned()
+            .filter(|b| Some(**b) != self.default_base.as_deref())
+            .map(|b| b.to_string())
     }
 
-    /// Steps the base to the next branch, or the one before, round the
-    /// list.
+    /// Narrows the base line to what is now typed, back on its first match.
+    fn retype_base(&mut self, edit: impl FnOnce(&mut String)) {
+        edit(&mut self.base_typed);
+        self.base_at = 0;
+    }
+
+    /// Steps the base to the next matching branch, or the one before, round
+    /// the list.
     fn step_base(&mut self, forward: bool) {
-        let count = self.bases.len();
+        let count = self.base_matches().len();
         if count == 0 {
             return;
         }
@@ -231,7 +265,8 @@ impl Prompt {
     }
 
     /// The line keys edit: the branch while it has the focus, else the
-    /// text. The base is picked, never typed, so it is neither.
+    /// text. The base has keys of its own, since what is typed there only
+    /// narrows the branches.
     fn line(&mut self) -> &mut String {
         if self.is_editing_branch {
             self.branch.get_or_insert_with(String::new)
@@ -241,10 +276,12 @@ impl Prompt {
     }
 
     /// Pasted text is kept whole, line breaks and all: the agent reads it as
-    /// one message. A branch takes it as one line, and the base none.
+    /// one message. A branch or base takes it as one line.
     pub fn paste(&mut self, text: &str) {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         if self.is_editing_base {
+            let line = text.replace('\n', "");
+            self.retype_base(|typed| typed.push_str(line.trim()));
             return;
         }
         if self.is_editing_field() {
@@ -303,8 +340,19 @@ impl Prompt {
             KeyCode::Up => self.move_focus(false),
             KeyCode::Right if self.is_editing_base => self.step_base(true),
             KeyCode::Left if self.is_editing_base => self.step_base(false),
-            // The base line takes no typing: it only ever names a branch.
-            KeyCode::Char(_) | KeyCode::Backspace if self.is_editing_base => {}
+            // Typing on the base line narrows the branches; it never names
+            // one that does not exist.
+            KeyCode::Char('u' | 'w') if ctrl && self.is_editing_base => {
+                self.retype_base(String::clear);
+            }
+            KeyCode::Char(c) if !ctrl && self.is_editing_base => {
+                self.retype_base(|typed| typed.push(c));
+            }
+            KeyCode::Backspace if self.is_editing_base => {
+                self.retype_base(|typed| {
+                    typed.pop();
+                });
+            }
             KeyCode::Char('u') if ctrl => self.line().clear(),
             KeyCode::Char('w') if ctrl => {
                 // A branch's words are split by / and - rather than spaces.
@@ -415,10 +463,6 @@ mod tests {
         assert!(prompt.is_editing_branch);
         prompt.edit(KeyEvent::from(KeyCode::Down));
         assert!(prompt.is_editing_base && !prompt.is_editing_branch);
-        type_in(&mut prompt, "xyz");
-        prompt.paste("nope");
-        assert_eq!(prompt.base_shown(), Some("development"), "nothing is typed");
-        assert_eq!(prompt.text, "");
         prompt.edit(KeyEvent::from(KeyCode::Right));
         assert_eq!(prompt.base_name().as_deref(), Some("main"));
         prompt.edit(KeyEvent::from(KeyCode::Left));
@@ -438,6 +482,51 @@ mod tests {
         assert!(prompt.is_editing_base, "up goes back to the base");
         prompt.edit(KeyEvent::from(KeyCode::Right));
         assert_eq!(prompt.base_name(), None, "back on the pool's base");
+    }
+
+    #[test]
+    fn typing_on_the_base_line_narrows_it_to_real_branches() {
+        let mut prompt = Prompt::dispatch(Target::NewTree, "anthony".into());
+        prompt.default_base = Some("development".into());
+        prompt.bases = [
+            "development",
+            "main",
+            "anthony/release-notes",
+            "release/2026-10",
+        ]
+        .map(String::from)
+        .into();
+        prompt.edit(KeyEvent::from(KeyCode::Down));
+        prompt.edit(KeyEvent::from(KeyCode::Down));
+        type_in(&mut prompt, "rel");
+        assert_eq!(
+            prompt.base_matches(),
+            ["release/2026-10", "anthony/release-notes"],
+            "those it starts first"
+        );
+        assert_eq!(prompt.base_name().as_deref(), Some("release/2026-10"));
+        prompt.edit(KeyEvent::from(KeyCode::Right));
+        assert_eq!(prompt.base_name().as_deref(), Some("anthony/release-notes"));
+        assert_eq!(prompt.text, "", "the task is untouched");
+        type_in(&mut prompt, "zz");
+        assert!(prompt.is_base_unmatched());
+        assert_eq!(prompt.base_shown(), None, "no branch, never the pool's");
+        assert_eq!(prompt.base_name(), None);
+        prompt.edit(KeyEvent::from(KeyCode::Backspace));
+        prompt.edit(KeyEvent::from(KeyCode::Backspace));
+        assert!(!prompt.is_base_unmatched());
+        prompt.edit(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(
+            prompt.base_shown(),
+            Some("development"),
+            "all of them again"
+        );
+        prompt.paste("MAI\n");
+        assert_eq!(
+            prompt.base_name().as_deref(),
+            Some("main"),
+            "case is ignored"
+        );
     }
 
     #[test]
