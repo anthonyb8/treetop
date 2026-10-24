@@ -43,7 +43,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | `N` | start a new agent in the tree under the cursor: a free one is leased for it, on a branch named for the task, and a held one keeps its branch |
 | `m` | write a message to the agents in the marked trees, or the tree under the cursor |
 | `:` | ask the assistant about the tree under the cursor, or write `@17 ...` for that tree's agent (see [The assistant](#the-assistant)) |
-| `c` | talk to the assistant in its chat; send nothing to open the chat |
+| `a` | open the assistant's chat, where it answers, starting it if there is none |
 | `d` | open the side-by-side diff of the tree under the cursor in a popup |
 | `r` | return the marked trees, or the one under the cursor, to the pool; `D` in its dialog destroys them from disk instead, after reviewing treehouse's preview of each |
 | Space | mark or unmark the tree under the cursor |
@@ -72,7 +72,7 @@ PORTS lists every TCP port the tree's processes listen on, lowest first, so a fr
 AGENT names the coding agent working in the tree, from the sources under [Agents](#agents); `no agent` on a held tree marks one nobody is working in.
 Where a tree has several, it names the most pressing live one, waiting on you, then busy, then idle, the most recently active first, and counts the other live ones as `+N`; a stopped agent shows only where nothing is live, and Enter opens the same agent the row names.
 The assistant is never a tree's agent.
-Its mark is `●` in bold when the tree's agent needs you and `✓` when it is done (see [What agents say](#what-agents-say)), else the agent's own status: `●` busy, `○` idle, `◌` cold.
+Its mark is `●` in bold when the tree's agent needs you, `✓` when it is done and `✗` when its process died, as on a restart (see [What agents say](#what-agents-say)), else the agent's own status: `●` busy, `○` idle, `◌` cold.
 The list is in groups, each under a heading with a blank line above it: a group per base the held trees were cut from (see [New agents](#new-agents)), the pool's base first and the rest by name, then the free trees, then Parked.
 The repository's main checkout is no row of its own: it heads its branch's group, `main · main checkout`, with its ports and git state, and no agent is ever started or shown there, so work happens in trees and the main checkout stays clean.
 Within a group, trees waiting on you come first, then those with the most recently active agent, so trees nobody has worked in for a while sink to the bottom.
@@ -313,15 +313,15 @@ treetop is where agents are sent out, and the assistant is who keeps track of th
 
 `n` opens the compose box in the middle of the screen for a new agent in a fresh tree from the pool, leased with `treehouse get --lease` when the job runs, so two quick dispatches never share one.
 `N` opens it for a new agent in the tree under the cursor instead: a free tree is leased for it with `treehouse lease`, and one already held is started in as it is.
-`:` opens it to the assistant, about the tree under the cursor (see below), and `c` to its chat; nothing typed after `c` opens the chat.
+`:` opens it to the assistant, about the tree under the cursor (see below).
 
 Enter sends it, Alt+Enter breaks the line, Esc cancels, Ctrl+U clears the text and Ctrl+W a word; a paste keeps its line breaks.
 The text wraps and the box grows with it.
 
 ### The assistant
 
-`:` sends what you type to the assistant with the tree under the cursor as context, and `c` sends it as it is.
-It answers in its chat, which `c` with nothing typed opens,.
+`:` sends what you type to the assistant with the tree under the cursor as context.
+It answers in its chat, which `a` opens.
 A message that starts with `@` goes to an agent instead, not the assistant: `@17 put it in branding/` types it into tree 17's agent's chat, as `m` would.
 `@` takes a tree number, `main`, or the start of an agent's words, `@fix-log` for "fix the login redirect", and several `@`s send to each; one that names no tree, or more than one, opens the box again on what you typed, with the status line saying why.
 On the Issues screen, `:` opens the box with the issue under the cursor as context.
@@ -384,8 +384,9 @@ Every background agent's latest report is read from Claude Code's job files unde
 A report belongs to the tree whose `treetop.json` names its job, or where its agent runs now, so a recycled tree never shows the last agent's words.
 An agent sitting at a question dialog or permission prompt needs you too, though its report still says working, since only its chat can answer it.
 Trees waiting on you come first in the list, and the cursor stays on its tree as rows move.
-Finished and stopped reports go after a day; working and waiting ones stay.
-The assistant's own reports are left off its row, since it speaks through its chat, which `c` opens.
+An agent whose process died stays on its tree as a cold agent, so Enter starts it again with its conversation, as the tree keeping it awake also does.
+Finished, stopped and failed reports go after a day; working and waiting ones stay.
+The assistant's own reports are left off its row, since it speaks through its chat, which `a` opens.
 
 ### Asks open their chat
 

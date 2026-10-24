@@ -1,5 +1,5 @@
 //! The compose box where you write to agents: a word with the assistant
-//! (`c`, `:`), a task for a new agent in a fresh tree (`n`) or in the tree
+//! (`:`), a task for a new agent in a fresh tree (`n`) or in the tree
 //! under the cursor (`N`), a line for agents already working (`m`), or a
 //! branch's new name (`b`). Kept free of terminal
 //! I/O, like `app`.
@@ -11,9 +11,6 @@ use crate::pool::Tree;
 /// Where the text goes: to the assistant, or to a new agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
-    /// The one agent that oversees the rest, started in the main checkout on
-    /// first use; see `assistant`.
-    Assistant,
     /// One line for the assistant about what is on screen, or for the
     /// agents its leading `@` words name.
     Ask,
@@ -449,15 +446,6 @@ mod tests {
         assert!(!prompt.names_base());
         prompt.edit(KeyEvent::from(KeyCode::Down));
         assert!(!prompt.is_editing_base);
-    }
-
-    #[test]
-    fn the_assistant_keeps_the_main_checkouts_branch() {
-        let mut prompt = Prompt::dispatch(Target::Assistant, "anthony".into());
-        type_in(&mut prompt, "fix it");
-        prompt.edit(KeyEvent::from(KeyCode::Down));
-        assert!(!prompt.is_editing_branch);
-        assert_eq!(prompt.branch_name(), None);
     }
 
     #[test]

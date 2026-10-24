@@ -96,7 +96,7 @@ impl<'a> Item<'a> {
     fn rank(&self) -> u8 {
         match self.state {
             State::Blocked => 0,
-            State::Done | State::Stopped => 1,
+            State::Done | State::Stopped | State::Failed => 1,
             State::Working => 2,
         }
     }
@@ -905,7 +905,7 @@ impl App {
             self.jobs
                 .insert(path.clone(), JobState::Done(job.kind, Instant::now()));
             self.message = Some(if is_assistant {
-                "the assistant started on your message; c, Enter opens its chat".to_string()
+                "the assistant started on your message; a opens its chat".to_string()
             } else if job.tree.is_main {
                 "dispatched to the main checkout; Enter on it opens its chat".to_string()
             } else {
@@ -918,7 +918,7 @@ impl App {
             self.jobs
                 .insert(path.clone(), JobState::Done(job.kind, Instant::now()));
             // Its chat opens only while its popup still stands in for it; Esc
-            // on the popup means it is opened later, with `c`.
+            // on the popup means it is opened later, with `a`.
             let known = self
                 .trees
                 .iter()
@@ -928,7 +928,7 @@ impl App {
             match (self.opening.as_mut(), job.attach.clone()) {
                 (None, _) => {
                     self.message = Some(if is_assistant {
-                        "the assistant started; c, Enter opens its chat".to_string()
+                        "the assistant started; a opens its chat".to_string()
                     } else {
                         format!(
                             "agent started in tree {}; Enter on it opens its chat",
@@ -1402,6 +1402,7 @@ impl App {
                     match item.state {
                         State::Blocked => was != Some(State::Blocked),
                         State::Done => was.is_some_and(|w| w != State::Done),
+                        State::Failed => was.is_some_and(|w| w != State::Failed),
                         State::Working | State::Stopped => false,
                     }
                 })
@@ -2013,11 +2014,6 @@ impl App {
         })
     }
 
-    /// Opens the compose box to the assistant.
-    fn open_assistant(&mut self) {
-        self.prompt = Some(Prompt::dispatch(Target::Assistant, self.user.clone()));
-    }
-
     /// Opens the compose box on the name of the branch of the tree under the
     /// cursor, to rename it. A tree nobody holds has no branch to keep, and
     /// the main checkout's is yours.
@@ -2134,7 +2130,6 @@ impl App {
                 self.start(*tree, launch)
             }
             Purpose::Dispatch { target } => match target {
-                Target::Assistant => self.converse(text),
                 Target::Ask => self.ask(text),
                 Target::NewTree => self.dispatch(text, branch, base),
             },
@@ -2622,7 +2617,8 @@ impl App {
                 let last = self.rows().len().saturating_sub(1);
                 self.selected = self.selected.min(last);
             }
-            KeyCode::Char('c') => self.open_assistant(),
+            // The assistant's chat, where it answers.
+            KeyCode::Char('a') => return self.converse(String::new()),
             KeyCode::Char('n') => self.open_dispatch(),
             KeyCode::Char('N') => self.open_start(),
             KeyCode::Char('d') => self.open_diff(),
@@ -3742,8 +3738,7 @@ mod tests {
     #[test]
     fn a_started_chat_opens_from_the_command_its_start_gave_without_waiting_to_see_it() {
         let mut app = app_with_main();
-        press(&mut app, KeyCode::Char('c'));
-        let job = queued(press(&mut app, KeyCode::Enter)).remove(0);
+        let job = queued(press(&mut app, KeyCode::Char('a'))).remove(0);
         assert_eq!(app.opening.as_ref().unwrap().agent, assistant::NAME);
         app.job_finished(started(job), true, String::new());
         assert_eq!(
@@ -3760,8 +3755,7 @@ mod tests {
     #[test]
     fn esc_on_a_chat_on_its_way_stops_waiting_and_a_failed_start_ends_it() {
         let mut app = app_with_main();
-        press(&mut app, KeyCode::Char('c'));
-        let job = queued(press(&mut app, KeyCode::Enter)).remove(0);
+        let job = queued(press(&mut app, KeyCode::Char('a'))).remove(0);
         assert!(app.opening.is_some());
         assert_eq!(
             press(&mut app, KeyCode::Char('q')),
@@ -3771,15 +3765,9 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         assert!(app.opening.is_none());
         app.job_finished(started(job), true, String::new());
-        assert_eq!(app.ready_chat(), None, "dismissed, it opens only with c");
-        assert!(
-            app.message
-                .as_deref()
-                .unwrap()
-                .contains("c, Enter opens its chat")
-        );
-        press(&mut app, KeyCode::Char('c'));
-        let job = queued(press(&mut app, KeyCode::Enter)).remove(0);
+        assert_eq!(app.ready_chat(), None, "dismissed, it opens only with a");
+        assert!(app.message.as_deref().unwrap().contains("a opens its chat"));
+        let job = queued(press(&mut app, KeyCode::Char('a'))).remove(0);
         app.job_finished(job, false, "claude: not found".into());
         assert!(app.opening.is_none());
     }
@@ -4189,19 +4177,15 @@ mod tests {
     }
 
     #[test]
-    fn c_talks_to_the_assistant_and_starts_it_in_the_main_checkout() {
+    fn asking_starts_the_assistant_in_the_main_checkout() {
         let mut app = app_with_main();
-        press(&mut app, KeyCode::Char('c'));
-        assert_eq!(
-            app.prompt.as_ref().unwrap().target(),
-            Some(Target::Assistant)
-        );
+        press(&mut app, KeyCode::Char(':'));
         type_in(&mut app, "what needs me?");
         let job = queued(press(&mut app, KeyCode::Enter)).remove(0);
         assert!(job.tree.is_main);
         let launch = job.launch.clone().unwrap();
         assert!(launch.is_assistant);
-        assert_eq!(launch.task, "what needs me?");
+        assert!(launch.task.starts_with("what needs me?"), "{}", launch.task);
         assert_eq!(launch.name.as_deref(), Some(assistant::NAME));
         assert!(app.opening.is_none(), "given a message, nothing opens");
         app.job_finished(
@@ -4229,21 +4213,20 @@ mod tests {
             PathBuf::from("/repo"),
             vec![attachable(assistant::NAME)],
         )]));
-        press(&mut app, KeyCode::Char('c'));
+        press(&mut app, KeyCode::Char(':'));
         type_in(&mut app, "status?");
         match press(&mut app, KeyCode::Enter) {
             Outcome::Send { to, text } => {
-                assert_eq!(text, "status?");
+                assert!(text.starts_with("status?"), "{text}");
                 assert_eq!(to[0].command, ["claude", "attach", assistant::NAME]);
                 assert_eq!(to[0].tree, "main");
             }
             other => panic!("expected the message sent as m sends, got {other:?}"),
         }
         assert!(app.opening.is_none(), "no chat opens");
-        press(&mut app, KeyCode::Char('c'));
         assert!(
-            matches!(press(&mut app, KeyCode::Enter), Outcome::Chat { agent, .. } if agent == assistant::NAME),
-            "nothing typed opens its chat"
+            matches!(press(&mut app, KeyCode::Char('a')), Outcome::Chat { agent, .. } if agent == assistant::NAME),
+            "a opens its chat"
         );
     }
 
@@ -4255,9 +4238,8 @@ mod tests {
             ..report(job, State::Stopped, "/repo", age)
         };
         app.apply_reports(vec![stopped("old", 50), stopped("latest", 5)]);
-        press(&mut app, KeyCode::Char('c'));
         assert!(matches!(
-            press(&mut app, KeyCode::Enter),
+            press(&mut app, KeyCode::Char('a')),
             Outcome::Chat { command, .. } if command == ["claude", "attach", "latest"]
         ));
     }

@@ -36,7 +36,7 @@ const KEYS: [(&str, &str); 13] = [
     ("N", "new here"),
     ("m", "message"),
     (":", "ask"),
-    ("c", "chat"),
+    ("a", "assistant"),
     ("d", "diff"),
     ("i", "issue"),
     ("r", "return"),
@@ -65,12 +65,12 @@ const HELP: [(&str, &str); 27] = [
     ),
     ("m", "message the agents in the marked trees, or this one"),
     (
-        "c",
-        "talk to the assistant in its chat; send nothing to open the chat",
-    ),
-    (
         ":",
         "ask the assistant about this tree; @17 or @name sends to that agent instead",
+    ),
+    (
+        "a",
+        "open the assistant's chat, where it answers; starts it if there is none",
     ),
     ("d", "diff of the tree against its base"),
     (
@@ -415,7 +415,7 @@ fn agent_cell(app: &App, tree: &Tree) -> Cell<'static> {
         };
     };
     let (glyph, style) = match app.says(tree).map(|item| item.state) {
-        Some(state @ (State::Blocked | State::Done)) => state_style(state),
+        Some(state @ (State::Blocked | State::Done | State::Failed)) => state_style(state),
         _ => agent_style(first.status),
     };
     let live = agents
@@ -869,6 +869,7 @@ fn state_style(state: State) -> (&'static str, Style) {
         State::Done => ("✓", fg(t.success)),
         State::Working => ("·", fg(t.info)),
         State::Stopped => ("■", fg(t.muted)),
+        State::Failed => ("✗", fg(t.danger)),
     }
 }
 
@@ -1220,10 +1221,6 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
     let chrome = 2 + fields + u16::from(fields > 0);
     let area = popup::centered(screen, width, text_height + chrome);
     let (title, placeholder) = match (prompt.target(), &prompt.purpose) {
-        (Some(Target::Assistant), _) => (
-            " Talk to the assistant ".to_string(),
-            "a message for its chat, or send nothing to open the chat",
-        ),
         (Some(Target::Ask), _) => (
             " Ask the assistant ".to_string(),
             "a question about what is on screen, or @17 for that tree's agent",
