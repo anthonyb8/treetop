@@ -783,15 +783,51 @@ fn run_hook(name: &str, command: &[String], tree: &Path, log: &mut String) {
 
 /// Ends every background agent a plugin reports in the tree, through that
 /// plugin, since treehouse stops only processes standing in it, and a
-/// session that moved in with `EnterWorktree` stands elsewhere. Each is
+/// session that moved in with `EnterWorktree` stands elsewhere. A plugin
+/// that answers `clear` deletes every job that worked in the tree, those it
+/// does not report, such as failed ones, included. Elsewhere each agent is
 /// removed where its plugin can, so it is not found in the tree once the
 /// tree is leased again, else stopped, cold ones too, so its plugin stops
 /// keeping it awake.
 fn end_agents(tree: &Tree, log: &mut String) {
+    let answers = |plugin: &Plugin, op: &str| {
+        plugin
+            .description()
+            .is_ok_and(|d| d.ops.iter().any(|o| o == op))
+    };
+    let mut cleared = Vec::new();
+    for plugin in plugin::of_kind(PluginKind::Agent) {
+        if !answers(&plugin, "clear") {
+            continue;
+        }
+        let name = plugin.name().to_string();
+        match plugin.call("clear", json!({ "dir": tree.path })) {
+            Ok(result) => {
+                let count = |key: &str| result[key].as_array().map_or(0, Vec::len);
+                if count("removed") > 0 {
+                    let _ = writeln!(log, "{name} removed {} agents", count("removed"));
+                }
+                for why in result["failed"].as_array().into_iter().flatten() {
+                    let _ = writeln!(
+                        log,
+                        "{name} could not remove {}",
+                        why.as_str().unwrap_or_default()
+                    );
+                }
+                cleared.push(name);
+            }
+            Err(err) => {
+                let _ = writeln!(log, "{name} could not clear the tree: {err}");
+            }
+        }
+    }
     for agent in tree.agents.iter().filter(|a| a.is_background) {
         let (Some(name), Some(id)) = (&agent.plugin, &agent.job) else {
             continue;
         };
+        if cleared.contains(name) {
+            continue;
+        }
         let Some(plugin) = plugin::named(PluginKind::Agent, name) else {
             let _ = writeln!(
                 log,
@@ -800,10 +836,7 @@ fn end_agents(tree: &Tree, log: &mut String) {
             );
             continue;
         };
-        let can_remove = plugin
-            .description()
-            .is_ok_and(|d| d.ops.iter().any(|op| op == "remove"));
-        if can_remove {
+        if answers(&plugin, "remove") {
             match plugin.call("remove", json!({ "id": id })) {
                 Ok(_) => {
                     let _ = writeln!(log, "{name} removed {} ({id})", agent.name);
@@ -1071,13 +1104,16 @@ pub fn run(job: &mut Job) -> (bool, String) {
             TREEHOUSE_LIMIT,
             &mut log,
         ),
-        Kind::Destroy => capture(
-            treehouse("destroy", &job.tree.path)
-                .args(INCLUDE)
-                .arg("--yes"),
-            TREEHOUSE_LIMIT,
-            &mut log,
-        ),
+        Kind::Destroy => {
+            end_agents(&job.tree, &mut log);
+            capture(
+                treehouse("destroy", &job.tree.path)
+                    .args(INCLUDE)
+                    .arg("--yes"),
+                TREEHOUSE_LIMIT,
+                &mut log,
+            )
+        }
     };
     (is_ok, log)
 }

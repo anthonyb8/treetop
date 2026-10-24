@@ -140,6 +140,7 @@ A waiting agent is drawn in the warning colour, a busy one in green and an idle 
 
 A held tree keeps its background agents awake while treetop runs, so an agent never comes apart from its tree.
 Claude Code's daemon retires a background session that has sat idle for about an hour; treetop pins each one in a held tree, as Ctrl+T in `claude agents` does, so the daemon leaves it running, and starts any that has gone cold again in the background, with its conversation and no new message, at most once every ten minutes.
+A cold one with no conversation saved to resume is left cold, and a wake that comes up as a new session rather than the cold one removes the new one, so waking never piles up sessions.
 The main checkout keeps none, and a tree being returned stops keeping its agents: the return stops and unpins them.
 An agent treetop starts in a pool tree is told that the tree is its own, so it works there rather than taking a second tree with `EnterWorktree` and leaving the first empty.
 
@@ -232,6 +233,7 @@ Claude Code's is `{"input": "❯", "rule": "─", "dialogs": ["Do you want to", 
 | `stop` | `id` | nothing; the agent stops and is no longer kept awake |
 | `remove` | `id` | nothing; the agent is deleted, running or not, so it is found nowhere again; Claude Code's is `claude rm` |
 | `keep` | `ids` | `woken`, the ids it started again; keeps the agents of held trees running, starting cold ones again |
+| `clear` | `dir` | `removed`, the ids it deleted, and `failed`; deletes every agent that worked in `dir`, in any state, failed ones included, when its tree is returned or destroyed |
 
 A ticket plugin answers these, with its source's settings as `config`:
 
@@ -267,14 +269,14 @@ Both run in the background, up to four trees at once, while treetop stays on scr
 The detail pane under the list shows the end of each tree's last action's output, and a failure also shows its last line in the status line.
 
 - **Return** first shows a dialog listing each tree's uncommitted files, unpushed commits and running processes, or "unknown changes" where git cannot read it. On `y`, for each tree at once:
-  1. it removes the tree's background agents through their plugin, running or cold, so none is found in the tree when it is leased again; a session that moved in with `EnterWorktree` runs from elsewhere, so treehouse would not stop it, and removing it can hand the tree back already, through the `WorktreeRemove` hook, which the return then takes as done; an agent its plugin cannot remove is stopped instead, so the tree stops keeping it awake;
+  1. it removes the tree's background agents through their plugin, running, cold or failed, so none is found in the tree when it is leased again; a plugin that answers `clear` removes every one that worked in the tree, those it does not show included; a session that moved in with `EnterWorktree` runs from elsewhere, so treehouse would not stop it, and removing it can hand the tree back already, through the `WorktreeRemove` hook, which the return then takes as done; an agent its plugin cannot remove is stopped instead, so the tree stops keeping it awake;
   2. runs the `on_return` hook, if the config names one;
   3. runs `treehouse return --force`, which stops the processes left in the tree (the dialog replaces treehouse's own prompt), with `--if-lease-id` for a tree treetop leased, so a lease someone has taken since is never returned;
   4. deletes the branch treetop named for it when its work is in the pool's base branch, or when its PR merged with the branch where it is now, which covers a squash or rebase merge; a branch with commits after the merge is kept;
   5. removes `treetop.json`.
 
   The row turns available as soon as its return finishes.
-- **Destroy** runs `treehouse destroy`'s dry run with every `--include-*` flag in the background and shows it in a dialog per tree. `y` runs it with `--yes`; `n` keeps the tree.
+- **Destroy** runs `treehouse destroy`'s dry run with every `--include-*` flag in the background and shows it in a dialog per tree. `y` removes the tree's background agents as a return does, then runs it with `--yes`; `n` keeps the tree.
 
 `q` while an action runs waits for it to finish; `Ctrl-C` quits at once and leaves the running command to finish on its own.
 

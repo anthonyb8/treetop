@@ -16,6 +16,9 @@
 //!   for sitting idle, which its agent view toggles with Ctrl+T. `keep` adds
 //!   to it and `stop` takes away, under the lock Claude Code takes.
 //!
+//! `clear` deletes every job that worked in a tree, whatever its state,
+//! failed ones included, when the tree goes back to the pool.
+//!
 //! A background session opens in a terminal with `claude attach <id>`, where
 //! the id is the short one `claude --bg` prints: the session id's first eight
 //! characters. Attaching to a cold one starts it again, and so does `claude
@@ -511,7 +514,9 @@ static WOKEN: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(Mutex::d
 /// Keeps the jobs `ids` awake: pins them, so Claude Code's daemon does not
 /// retire them for sitting idle, and starts each one that is cold again in
 /// the background where it last worked, with its conversation and no new
-/// message.
+/// message. A cold job with no conversation to resume is left alone:
+/// `claude --bg --resume` would start a new job in its place that fails,
+/// cold in its turn, and so on without end.
 fn keep(args: &Value) -> Result<Value, Error> {
     let ids: Vec<&str> = args
         .get("ids")
@@ -521,8 +526,21 @@ fn keep(args: &Value) -> Result<Value, Error> {
     if ids.is_empty() {
         return Ok(json!({ "woken": [] }));
     }
-    set_pinned(&ids, true)?;
     let seen = find();
+    let projects = config_dir()
+        .map(|config| dirs(&config.join("projects")))
+        .unwrap_or_default();
+    let resumable = |id: &str| resume_id(id).filter(|s| transcript(&projects, s).is_some());
+    let ids: Vec<&str> = ids
+        .into_iter()
+        .filter(|id| {
+            seen.iter().any(|s| s.live && s.id.as_deref() == Some(id)) || resumable(id).is_some()
+        })
+        .collect();
+    if ids.is_empty() {
+        return Ok(json!({ "woken": [] }));
+    }
+    set_pinned(&ids, true)?;
     let mut woken = Vec::new();
     for id in ids {
         let Some(agent) = seen.iter().find(|s| s.id.as_deref() == Some(id)) else {
@@ -538,12 +556,20 @@ fn keep(args: &Value) -> Result<Value, Error> {
             }
             at.insert(id.to_string(), Instant::now());
         }
-        let Some(session) = resume_id(id) else {
+        let Some(session) = resumable(id) else {
             continue;
         };
         let dir = Some(agent.dir.as_path()).filter(|dir| dir.is_dir());
-        if claude(&["--bg", "--resume", &session], dir).is_ok() {
-            woken.push(id);
+        let Ok(output) = claude(&["--bg", "--resume", &session], dir) else {
+            continue;
+        };
+        match attach_id(&output) {
+            // It came up as a job of its own rather than as `id`, which
+            // stays cold: the new one is no agent anyone started.
+            Some(other) if other != id => {
+                let _ = claude(&["rm", other], None);
+            }
+            _ => woken.push(id),
         }
     }
     Ok(json!({ "woken": woken }))
@@ -569,6 +595,54 @@ fn remove(args: &Value) -> Result<Value, Error> {
     Ok(json!({}))
 }
 
+/// Every background job that worked in `dir` or under it, in any state:
+/// failed ones too, which no report shows.
+fn jobs_in(dir: &Path) -> Vec<String> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct State {
+        #[serde(default)]
+        worktree_path: Option<PathBuf>,
+        #[serde(default)]
+        cwd: Option<PathBuf>,
+    }
+    let Some(jobs) = config_dir().map(|config| config.join("jobs")) else {
+        return Vec::new();
+    };
+    let mut ids: Vec<String> = dirs(&jobs)
+        .into_iter()
+        .filter(|job| {
+            fs::read_to_string(job.join("state.json"))
+                .ok()
+                .and_then(|text| serde_json::from_str::<State>(&text).ok())
+                .and_then(|state| state.worktree_path.or(state.cwd))
+                .is_some_and(|worked| worked.starts_with(dir))
+        })
+        .filter_map(|job| Some(job.file_name()?.to_str()?.to_string()))
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Deletes every background job that worked in `dir`, running or not, so a
+/// tree handed back keeps none of them, and nothing keeps them awake.
+fn clear(args: &Value) -> Result<Value, Error> {
+    let dir = PathBuf::from(required(args, "dir")?);
+    let ids = jobs_in(&dir);
+    if ids.is_empty() {
+        return Ok(json!({ "removed": [], "failed": [] }));
+    }
+    set_pinned(&ids.iter().map(String::as_str).collect::<Vec<_>>(), false)?;
+    let (mut removed, mut failed) = (Vec::new(), Vec::new());
+    for id in ids {
+        match claude(&["rm", &id], None) {
+            Ok(_) => removed.push(id),
+            Err(err) => failed.push(format!("{id}: {err}")),
+        }
+    }
+    Ok(json!({ "removed": removed, "failed": failed }))
+}
+
 /// Answers one request as the Claude Code plugin.
 pub fn op(op: &str, args: &Value) -> Result<Value, Error> {
     match op {
@@ -576,7 +650,7 @@ pub fn op(op: &str, args: &Value) -> Result<Value, Error> {
             "protocol": PROTOCOL,
             "name": "claude",
             "kind": "agent",
-            "ops": ["start", "find", "attach", "send", "stop", "remove", "keep"],
+            "ops": ["start", "find", "attach", "send", "stop", "remove", "keep", "clear"],
             // The prompt box sits between two rules; a permission or
             // question dialog takes its place and numbers its choices. The
             // agent view, which `claude attach` goes back to, prompts for a
@@ -595,6 +669,7 @@ pub fn op(op: &str, args: &Value) -> Result<Value, Error> {
         "stop" => stop(args),
         "remove" => remove(args),
         "keep" => keep(args),
+        "clear" => clear(args),
         _ => Err(Error::new(
             Code::Unsupported,
             format!("claude does not answer {op}"),

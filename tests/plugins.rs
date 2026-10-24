@@ -118,6 +118,8 @@ fn a_built_in_answers_through_the_contract_on_stdin() {
     assert_eq!(reply["result"]["kind"], "agent");
     assert_eq!(
         reply["result"]["ops"],
-        serde_json::json!(["start", "find", "attach", "send", "stop", "remove", "keep"])
+        serde_json::json!([
+            "start", "find", "attach", "send", "stop", "remove", "keep", "clear"
+        ])
     );
 }

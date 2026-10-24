@@ -21,15 +21,20 @@ fn scratch(test: &str) -> PathBuf {
     fs::create_dir_all(root.join("bin")).unwrap();
     fs::create_dir_all(root.join("tree")).unwrap();
     // Stands in for `claude`: says where it ran and with what, and prints
-    // the id `claude --bg` prints.
+    // the id `claude --bg` prints, which for `--resume` is the resumed job's
+    // unless `new-job` names another.
     let fake = root.join("bin/claude");
     fs::write(
         &fake,
         format!(
-            "#!/bin/sh\necho \"$(pwd) $*\" >> {}\n\
+            "#!/bin/sh\necho \"$(pwd) $*\" >> {calls}\n\
              if [ \"$1\" = agents ]; then echo '[{{\"id\":\"0000aaaa\"}}]'; exit 0; fi\n\
-             echo '  claude attach 0000aaaa    open in this terminal'\n",
-            root.join("calls").display()
+             id=0000aaaa\n\
+             if [ \"$2\" = --resume ]; then id=$(echo \"$3\" | cut -c1-8); fi\n\
+             if [ -f {new} ]; then id=$(cat {new}); fi\n\
+             echo \"  claude attach $id    open in this terminal\"\n",
+            calls = root.join("calls").display(),
+            new = root.join("new-job").display(),
         ),
     )
     .unwrap();
@@ -37,12 +42,27 @@ fn scratch(test: &str) -> PathBuf {
     root
 }
 
-/// A background job that finished its turn in `dir`, last written `age` ago.
+/// A background job that finished its turn in `dir`, last written `age` ago,
+/// with its conversation saved.
 fn finished_job(root: &Path, job: &str, dir: &Path, age: Duration) {
+    job_in(root, job, "done", dir, age);
+    let projects = root.join("claude/projects/-tree");
+    fs::create_dir_all(&projects).unwrap();
+    fs::write(
+        projects.join(format!("{job}-1111-2222-3333-444444444444.jsonl")),
+        "{}\n",
+    )
+    .unwrap();
+}
+
+/// A background job in `state` in `dir`, last written `age` ago, with no
+/// conversation saved, as `claude --bg --resume` leaves one it could not
+/// resume.
+fn job_in(root: &Path, job: &str, state: &str, dir: &Path, age: Duration) {
     let path = root.join("claude/jobs").join(job);
     fs::create_dir_all(&path).unwrap();
     let state = json!({
-        "state": "done",
+        "state": state,
         "detail": "fixed the login redirect",
         "name": format!("agent {job}"),
         "cwd": dir,
@@ -114,6 +134,14 @@ fn calls(root: &Path) -> Vec<String> {
 
 fn pins(root: &Path) -> Vec<String> {
     serde_json::from_str(&fs::read_to_string(root.join("claude/jobs/pins.json")).unwrap()).unwrap()
+}
+
+/// What the stand-in `claude` was asked, without where it ran.
+fn asked(root: &Path) -> Vec<String> {
+    calls(root)
+        .iter()
+        .map(|c| c.split_once(' ').unwrap().1.to_string())
+        .collect()
 }
 
 /// A running background session for `job`, standing in this test's own
@@ -246,4 +274,72 @@ fn an_agent_started_in_a_tree_of_its_own_is_told_to_stay_in_it() {
         !calls(&root)[0].contains("--append-system-prompt"),
         "an agent in the main checkout may take a tree of its own"
     );
+}
+
+#[test]
+fn a_cold_agent_with_no_conversation_is_neither_woken_nor_pinned() {
+    let root = scratch("unresumable");
+    let tree = root.join("tree");
+    // A job `claude --bg --resume` started in place of one it could not
+    // resume: waking it would start another such job, and so on.
+    job_in(&root, "0aaaaaaa", "done", &tree, DAY);
+    fs::write(root.join("claude/jobs/pins.json"), "[]").unwrap();
+
+    let kept = call(&root, "keep", json!({ "ids": ["0aaaaaaa"] }));
+
+    assert_eq!(kept["woken"], json!([]));
+    assert!(calls(&root).is_empty(), "{:?}", calls(&root));
+    assert!(pins(&root).is_empty(), "{:?}", pins(&root));
+}
+
+#[test]
+fn a_wake_that_comes_up_as_another_job_removes_that_job() {
+    let root = scratch("respawned");
+    let tree = root.join("tree");
+    finished_job(&root, "0ccccccc", &tree, DAY);
+    fs::write(root.join("new-job"), "0ddddddd").unwrap();
+
+    let kept = call(&root, "keep", json!({ "ids": ["0ccccccc"] }));
+
+    assert_eq!(kept["woken"], json!([]), "0ccccccc is still cold");
+    assert_eq!(
+        asked(&root),
+        [
+            "--bg --resume 0ccccccc-1111-2222-3333-444444444444",
+            "rm 0ddddddd"
+        ]
+    );
+}
+
+#[test]
+fn clearing_a_tree_removes_every_job_that_worked_in_it_failed_ones_too() {
+    let root = scratch("clear");
+    let tree = root.join("tree");
+    let other = root.join("other");
+    finished_job(&root, "0aaaaaaa", &tree, DAY);
+    job_in(&root, "0bbbbbbb", "failed", &tree, DAY);
+    job_in(&root, "0ccccccc", "failed", &tree.join("sub"), DAY);
+    job_in(&root, "0ddddddd", "failed", &other, DAY);
+    fs::write(
+        root.join("claude/jobs/pins.json"),
+        r#"["0aaaaaaa", "0bbbbbbb", "0ddddddd"]"#,
+    )
+    .unwrap();
+
+    let described = call(&root, "describe", json!({}));
+    assert!(
+        described["ops"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("clear")),
+        "{described}"
+    );
+    let cleared = call(&root, "clear", json!({ "dir": tree }));
+
+    assert_eq!(
+        cleared["removed"],
+        json!(["0aaaaaaa", "0bbbbbbb", "0ccccccc"])
+    );
+    assert_eq!(asked(&root), ["rm 0aaaaaaa", "rm 0bbbbbbb", "rm 0ccccccc"]);
+    assert_eq!(pins(&root), ["0ddddddd"], "another tree's job stays");
 }
