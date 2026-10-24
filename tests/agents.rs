@@ -343,3 +343,25 @@ fn clearing_a_tree_removes_every_job_that_worked_in_it_failed_ones_too() {
     assert_eq!(asked(&root), ["rm 0aaaaaaa", "rm 0bbbbbbb", "rm 0ccccccc"]);
     assert_eq!(pins(&root), ["0ddddddd"], "another tree's job stays");
 }
+
+#[test]
+fn an_agent_that_died_is_found_cold_and_woken_with_its_conversation() {
+    let root = scratch("died");
+    let tree = root.join("tree");
+    finished_job(&root, "0aaaaaaa", &tree, Duration::ZERO);
+    // Its process was killed mid-turn, as a restart does.
+    job_in(&root, "0aaaaaaa", "failed", &tree, Duration::ZERO);
+
+    let found = call(&root, "find", json!({ "dirs": [tree] }));
+    let agents = found["agents"].as_array().unwrap();
+    assert_eq!(agents.len(), 1, "{found}");
+    assert_eq!(agents[0]["id"], "0aaaaaaa");
+    assert_eq!(agents[0]["live"], false);
+
+    let kept = call(&root, "keep", json!({ "ids": ["0aaaaaaa"] }));
+    assert_eq!(kept["woken"], json!(["0aaaaaaa"]));
+    assert_eq!(
+        asked(&root),
+        ["--bg --resume 0aaaaaaa-1111-2222-3333-444444444444"]
+    );
+}

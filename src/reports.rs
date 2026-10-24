@@ -3,7 +3,7 @@
 //! `claude --bg` prints, so the inbox reads what is already written and needs
 //! nothing from the agents:
 //!
-//! - `state.json`: its `state` (working, blocked, done or stopped), a one-line
+//! - `state.json`: its `state` (working, blocked, done, stopped or failed), a one-line
 //!   `detail`, the question in `needs` while blocked, the answer in
 //!   `output.result` once done, and where it works (`worktreePath`, else `cwd`).
 //! - `timeline.jsonl`: one `{at, state, detail}` line per step.
@@ -39,6 +39,9 @@ pub enum State {
     Done,
     /// Stopped by someone; `claude attach` opens it again.
     Stopped,
+    /// Its process died, as one does when the computer restarts mid-turn;
+    /// `claude attach` starts it again, with its conversation.
+    Failed,
 }
 
 impl State {
@@ -48,6 +51,7 @@ impl State {
             "working" => Some(State::Working),
             "done" => Some(State::Done),
             "stopped" => Some(State::Stopped),
+            "failed" => Some(State::Failed),
             _ => None,
         }
     }
@@ -58,13 +62,14 @@ impl State {
             State::Working => "working",
             State::Done => "done",
             State::Stopped => "stopped",
+            State::Failed => "failed",
         }
     }
 
     /// Whether the job has finished its turn, so its report is something to
     /// read rather than something still moving.
     pub fn is_settled(self) -> bool {
-        matches!(self, State::Done | State::Stopped)
+        matches!(self, State::Done | State::Stopped | State::Failed)
     }
 }
 
@@ -140,7 +145,7 @@ fn report(job: &str, state_json: &str, timeline: &str, updated: SystemTime) -> O
                 .and_then(|o| o.get("result"))
                 .and_then(Value::as_str),
         ),
-        State::Working | State::Stopped => None,
+        State::Working | State::Stopped | State::Failed => None,
     };
     let lines: Vec<&str> = timeline.lines().filter(|l| !l.trim().is_empty()).collect();
     let steps = lines[lines.len().saturating_sub(STEPS)..]
