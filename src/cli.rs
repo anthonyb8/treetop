@@ -1,7 +1,8 @@
 //! treetop's commands that print and exit rather than open the screen:
-//! `status`, `send`, `dispatch`, `tickets` and `pick`. They are how the
-//! assistant sees and steers the other agents, and work as well from any
-//! shell. Each reads only what it needs, so a call costs the assistant one
+//! `status`, `send`, `dispatch`, `resume`, `return`, `guard`, `tickets` and
+//! `pick`.
+//! They are how the assistant sees and steers the other agents, and work as
+//! well from any shell. Each reads only what it needs, so a call costs the assistant one
 //! small JSON read.
 
 use std::path::{Path, PathBuf};
@@ -18,6 +19,7 @@ use crate::builtin;
 use crate::cache;
 use crate::chat::Chats;
 use crate::dispatch::Recipient;
+use crate::guard::{self, Caller};
 use crate::jobs::{self, Job, Kind, Launch};
 use crate::live;
 use crate::plugin;
@@ -36,6 +38,15 @@ const USAGE: &str = "usage:
   treetop dispatch <new|main|N> <task>
                                    start a new agent on a task in a fresh tree,
                                    the main checkout or tree N
+  treetop resume <tree|job>        start a stopped or failed agent again in its
+                                   tree, with its conversation and flags
+  treetop return <tree>            give a tree back to the pool: one you hold, or
+                                   one whose PR merged with nothing unpushed or
+                                   uncommitted; never one something runs in
+  treetop guard <tree> [--in-tree] whether you may return the tree, or with
+                                   --in-tree run a command that acts on it
+  treetop hook pre-tool-use        Claude Code's PreToolUse hook: holds an agent's
+                                   shell commands to the guard
   treetop tickets [--mine] [words] this repository's open tickets, from its ticket source
   treetop pick <ID>                pick a ticket up: an agent on it in a fresh tree
   treetop plugins                  every plugin, built in or found, and what each is
@@ -103,8 +114,9 @@ fn plugins() -> String {
     lines.join("\n")
 }
 
-/// Runs the command `args` names, from the main checkout `checkout`.
-pub fn run(args: &[String], checkout: &Path) -> Result<()> {
+/// Runs the command `args` names, from the main checkout `checkout`; it was
+/// run in `start`.
+pub fn run(args: &[String], checkout: &Path, start: &Path) -> Result<()> {
     match args {
         [command] if command == "status" => status(checkout),
         [command, target, message @ ..] if command == "send" && !message.is_empty() => {
@@ -112,6 +124,12 @@ pub fn run(args: &[String], checkout: &Path) -> Result<()> {
         }
         [command, place, task @ ..] if command == "dispatch" && !task.is_empty() => {
             dispatch(checkout, place, &task.join(" "))
+        }
+        [command, target] if command == "resume" => resume(checkout, target),
+        [command, name] if command == "return" => give_back(checkout, name, start),
+        [command, name] if command == "guard" => check(checkout, name, false, start),
+        [command, name, flag] if command == "guard" && flag == "--in-tree" => {
+            check(checkout, name, true, start)
         }
         [command, rest @ ..] if command == "tickets" => tickets(checkout, rest),
         [command, id] if command == "pick" => pick(checkout, id),
@@ -281,9 +299,18 @@ fn status_json(trees: &[Tree], reports: &[Report], ready: &[String], now: System
     })
 }
 
-fn status(checkout: &Path) -> Result<()> {
+/// The pool as treehouse lists it now, with each tree's agents and
+/// processes.
+pub fn agent_listing(checkout: &Path) -> Result<Vec<Tree>> {
     let mut trees = listing(checkout)?;
     read_agents(&mut trees);
+    Ok(trees)
+}
+
+/// The pool as treehouse lists it now, with every held tree's agents,
+/// processes, git state and PR.
+pub fn full_listing(checkout: &Path) -> Result<Vec<Tree>> {
+    let mut trees = agent_listing(checkout)?;
     let held: Vec<(PathBuf, Check)> = trees
         .iter()
         .filter(|t| t.is_held())
@@ -294,6 +321,11 @@ fn status(checkout: &Path) -> Result<()> {
         tree.work = work.remove(&tree.path).flatten();
     }
     read_ship(checkout, &mut trees);
+    Ok(trees)
+}
+
+fn status(checkout: &Path) -> Result<()> {
+    let trees = full_listing(checkout)?;
     let ready = ready_after_merges(checkout, &trees);
     let reports = reports::Reader::default().read();
     let status = status_json(&trees, &reports, &ready, SystemTime::now());
@@ -482,6 +514,80 @@ fn dispatch(checkout: &Path, place: &str, task: &str) -> Result<()> {
     Ok(())
 }
 
+/// Starts the stopped or failed agent of tree `target` again, or job
+/// `target` when no tree has that name.
+fn resume(checkout: &Path, target: &str) -> Result<()> {
+    let trees = cached_listing(checkout)?;
+    let Some(tree) = trees.iter().find(|t| t.name == target) else {
+        let id = jobs::resume_job(target).map_err(anyhow::Error::msg)?;
+        println!("resumed {target} as {id}");
+        return Ok(());
+    };
+    let mut tree = tree.clone();
+    read_agents(std::slice::from_mut(&mut tree));
+    let mut job = Job::new(Kind::Resume, tree);
+    let (is_ok, output) = jobs::run(&mut job);
+    print!("{output}");
+    if !is_ok {
+        bail!("nothing was resumed in tree {target}");
+    }
+    Ok(())
+}
+
+/// Says whether the guard lets this caller, standing in `start`, return
+/// tree `name`, or with `is_in_tree` run a command that acts on it; a
+/// refusal fails with the reason. `name` may be a path in the tree.
+fn check(checkout: &Path, name: &str, is_in_tree: bool, start: &Path) -> Result<()> {
+    let trees = if is_in_tree {
+        agent_listing(checkout)?
+    } else {
+        full_listing(checkout)?
+    };
+    let path = start.join(name);
+    let tree = trees.iter().find(|t| t.name == name).or_else(|| {
+        path.canonicalize()
+            .ok()
+            .and_then(|path| pool::holding(&trees, &path))
+    });
+    let Some(tree) = tree else {
+        bail!("no tree {name} in the pool; `treetop status` lists them");
+    };
+    let caller = Caller::this(start);
+    let verdict = if is_in_tree {
+        guard::may_act_in(&trees, tree, &caller)
+    } else {
+        guard::may_return(&trees, tree, &caller)
+    };
+    match verdict {
+        Ok(()) => {
+            println!("ok: tree {}", tree.name);
+            Ok(())
+        }
+        Err(why) => bail!("{why}"),
+    }
+}
+
+/// Returns tree `name` as treetop's return does, if `guard` lets this
+/// caller: never from under a live process, and only a tree it holds or
+/// whose work is finished. The caller stands in `start`.
+fn give_back(checkout: &Path, name: &str, start: &Path) -> Result<()> {
+    let trees = full_listing(checkout)?;
+    let Some(tree) = trees.iter().find(|t| t.name == name) else {
+        bail!("no tree {name} in the pool; `treetop status` lists them");
+    };
+    if let Err(why) = guard::may_return(&trees, tree, &Caller::this(start)) {
+        bail!("not returned: {why}");
+    }
+    let mut job = Job::new(Kind::Return, tree.clone());
+    let (is_ok, output) = jobs::run(&mut job);
+    print!("{output}");
+    if !is_ok {
+        bail!("tree {name} was not returned");
+    }
+    println!("returned tree {name}");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,6 +616,7 @@ mod tests {
             plugin: None,
             active_at: None,
             context: None,
+            spend: None,
         }
     }
 

@@ -78,8 +78,15 @@ fn job_in(root: &Path, job: &str, state: &str, dir: &Path, age: Duration) {
         .unwrap();
 }
 
-/// One request to `treetop plugin claude`, and its reply.
+/// One request to `treetop plugin claude`, and its result.
 fn call(root: &Path, op: &str, args: Value) -> Value {
+    let reply = call_raw(root, op, args);
+    assert_eq!(reply["ok"], true, "{reply}");
+    reply["result"].clone()
+}
+
+/// One request to `treetop plugin claude`, and its whole reply.
+fn call_raw(root: &Path, op: &str, args: Value) -> Value {
     let path = format!(
         "{}:{}",
         root.join("bin").display(),
@@ -102,9 +109,7 @@ fn call(root: &Path, op: &str, args: Value) -> Value {
         .write_all(request.to_string().as_bytes())
         .unwrap();
     let out = child.wait_with_output().unwrap();
-    let reply: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(reply["ok"], true, "{reply}");
-    reply["result"].clone()
+    serde_json::from_slice(&out.stdout).unwrap()
 }
 
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
@@ -417,4 +422,132 @@ fn a_live_agent_says_how_full_its_context_is_and_roughly_from_where() {
             ],
         })
     );
+}
+
+#[test]
+fn a_failed_agent_resumes_in_its_tree_with_its_conversation_and_flags() {
+    let root = scratch("resume");
+    let tree = root.join("tree");
+    finished_job(&root, "0000bbbb", &tree, 2 * DAY);
+    finished_job(&root, "0000aaaa", &tree, Duration::ZERO);
+    // It failed mid-task, as job 238723a5 did, keeping how it was started.
+    let state = json!({
+        "state": "failed",
+        "name": "END-969",
+        "cwd": tree,
+        "sessionId": "0000aaaa-1111-2222-3333-444444444444",
+        "respawnFlags": ["--name", "END-969", "--permission-mode", "auto"],
+    });
+    fs::write(
+        root.join("claude/jobs/0000aaaa/state.json"),
+        state.to_string(),
+    )
+    .unwrap();
+
+    let since = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - DAY.as_secs();
+    let resumed = call(&root, "resume", json!({ "dir": tree, "since": since }));
+
+    assert_eq!(resumed, json!({ "id": "0000aaaa", "resumed": "0000aaaa" }));
+    assert_eq!(
+        calls(&root)[0],
+        format!(
+            "{} --bg --resume 0000aaaa-1111-2222-3333-444444444444 --name END-969 --permission-mode auto",
+            tree.display()
+        ),
+        "in its tree, with the flags it was started with"
+    );
+}
+
+#[test]
+fn a_running_agent_is_not_resumed_over() {
+    let root = scratch("resume-running");
+    let tree = root.join("tree");
+    finished_job(&root, "0000aaaa", &tree, Duration::ZERO);
+    running(&root, "0000aaaa", &tree);
+
+    let reply = call_raw(&root, "resume", json!({ "id": "0000aaaa" }));
+
+    assert_eq!(reply["ok"], false, "{reply}");
+    assert_eq!(reply["error"]["code"], "conflict");
+    assert!(calls(&root).is_empty(), "claude was not asked");
+}
+
+#[test]
+fn a_live_agent_says_what_its_session_has_spent_counting_each_reply_once() {
+    let root = scratch("spend");
+    let tree = root.join("tree");
+    running(&root, "0ccccccc", &tree);
+    let projects = root.join("claude/projects/-tree");
+    fs::create_dir_all(&projects).unwrap();
+    let reply = |id: &str, input: u64, read: u64, write: u64, output: u64| {
+        json!({ "type": "assistant", "cwd": tree,
+                "message": { "id": id, "model": "claude-sonnet-4-5", "usage": {
+                    "input_tokens": input, "cache_read_input_tokens": read,
+                    "cache_creation_input_tokens": write, "output_tokens": output } } })
+    };
+    // Claude Code writes a reply's thinking and its tool call as two
+    // entries, each with the whole reply's usage.
+    let entries = [
+        reply("msg_1", 10, 0, 2_000, 300),
+        reply("msg_1", 10, 0, 2_000, 300),
+        json!({ "type": "user", "cwd": tree }),
+        reply("msg_2", 4, 2_000, 100, 50),
+    ];
+    let mut transcript: String = entries.iter().map(|e| format!("{e}\n")).collect();
+    // A reply still being written counts once it is whole.
+    transcript.push_str(r#"{"type":"assistant","message":{"id":"msg_3","usage":{"#);
+    fs::write(
+        projects.join("0ccccccc-1111-2222-3333-444444444444.jsonl"),
+        transcript,
+    )
+    .unwrap();
+
+    let found = call(&root, "find", json!({ "dirs": [tree] }));
+
+    assert_eq!(
+        found["agents"][0]["spend"],
+        json!({ "input": 14, "cache_read": 2_000, "cache_write": 2_100, "output": 350 })
+    );
+}
+
+#[test]
+fn usage_reports_the_plans_limits_as_claude_code_last_read_them() {
+    let root = scratch("usage");
+    fs::write(
+        root.join("claude/.claude.json"),
+        json!({ "cachedUsageUtilization": {
+            "fetchedAtMs": 1_793_052_069_539u64,
+            "utilization": { "limits": [
+                { "kind": "session", "percent": 12.6, "resets_at": "2026-10-27T20:00:00+00:00" },
+                { "kind": "weekly_all", "percent": 40, "resets_at": null },
+                { "kind": "weekly_scoped", "percent": 0,
+                  "scope": { "model": { "display_name": "Fable" } } },
+            ] } } })
+        .to_string(),
+    )
+    .unwrap();
+
+    let usage = call(&root, "usage", json!({}));
+
+    assert_eq!(
+        usage,
+        json!({
+            "at": 1_793_052_069u64,
+            "limits": [
+                { "name": "5-hour", "percent": 13, "resets_at": 1_793_131_200u64 },
+                { "name": "weekly", "percent": 40, "resets_at": null },
+                { "name": "weekly Fable", "percent": 0, "resets_at": null },
+            ],
+        })
+    );
+}
+
+#[test]
+fn usage_with_nothing_read_yet_has_no_limits() {
+    let root = scratch("no-usage");
+    assert_eq!(call(&root, "usage", json!({}))["limits"], json!([]));
 }

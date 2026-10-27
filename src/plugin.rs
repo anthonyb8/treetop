@@ -316,6 +316,45 @@ pub struct Seen {
     /// How full its context window is, where the plugin can tell.
     #[serde(default)]
     pub context: Option<Context>,
+    /// The tokens its session has spent so far, where the plugin can tell.
+    #[serde(default)]
+    pub spend: Option<Spend>,
+}
+
+/// The tokens a session has spent across all its requests, each request
+/// counted once: what it sent fresh, read from the cache and wrote to it,
+/// and what came back.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Spend {
+    #[serde(default)]
+    pub input: u64,
+    #[serde(default)]
+    pub cache_read: u64,
+    #[serde(default)]
+    pub cache_write: u64,
+    #[serde(default)]
+    pub output: u64,
+}
+
+/// How much of the plan its agents run on is used, as an agent plugin's
+/// `usage` reports it: each limit, and when that was last read, in seconds
+/// since the epoch.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    #[serde(default)]
+    pub limits: Vec<Limit>,
+    #[serde(default)]
+    pub at: Option<u64>,
+}
+
+/// One limit of a plan, such as its five-hour or weekly allowance: how much
+/// of it is used, in percent, and when it resets, in seconds since the epoch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Limit {
+    pub name: String,
+    pub percent: u64,
+    #[serde(default)]
+    pub resets_at: Option<u64>,
 }
 
 /// How full an agent's context window is: `used` of `window` tokens, and

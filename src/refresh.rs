@@ -12,6 +12,10 @@
 //! PR stands, every SHIP, at once when the shared refs change (a push lands)
 //! or when asked, but never twice within SHIP_GAP, and every SHIP_BACKOFF
 //! while they cannot be reached, so a forge's rate limit is never at risk.
+//!
+//! A fourth asks the agent plugins how much of the plan is used, every
+//! USAGE, on a thread of its own, since the answer can come over the
+//! network and must never hold up the processes.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -26,7 +30,7 @@ use anyhow::Result;
 use crate::agents::{self, Agent};
 use crate::cache;
 use crate::live;
-use crate::plugin::Code;
+use crate::plugin::{Code, Usage};
 use crate::pool::{self, Process, Tree, Work};
 use crate::reports::{self, Report};
 use crate::ship::{self, Answer};
@@ -39,6 +43,7 @@ const GIT_EVERY: u32 = 2;
 const SHIP: Duration = Duration::from_secs(60);
 const SHIP_GAP: Duration = Duration::from_secs(15);
 const SHIP_BACKOFF: Duration = Duration::from_secs(300);
+const USAGE: Duration = Duration::from_secs(60);
 
 pub enum Update {
     ListingStarted,
@@ -50,6 +55,9 @@ pub enum Update {
     Sidecars(HashMap<PathBuf, Sidecar>),
     /// Every background agent's latest report, read with the agents.
     Reports(Vec<Report>),
+    /// How much of the plan the agents run on is used; None when no agent
+    /// plugin can say.
+    Usage(Option<Usage>),
     /// Where each held tree's PR stands, by path, or why no ship plugin
     /// could say.
     Ship(Result<Answer, String>),
@@ -90,6 +98,10 @@ impl Refresher {
                 checkout.clone(),
             );
             move || ship_clock(&checkout, &updates_tx, &ship_kick_rx, &paused, &trees)
+        });
+        thread::spawn({
+            let (updates_tx, paused) = (updates_tx.clone(), Arc::clone(&paused));
+            move || usage_clock(&updates_tx, &paused)
         });
         thread::spawn({
             let (kick, ship_kick, paused) = (kick.clone(), ship_kick.clone(), Arc::clone(&paused));
@@ -212,6 +224,18 @@ fn fast(
             seen = worktrees;
         }
         thread::sleep(FAST);
+    }
+}
+
+/// Asks how much of the plan is used, every USAGE while treetop is not
+/// paused, until treetop moves on.
+fn usage_clock(updates: &Sender<Update>, paused: &AtomicBool) {
+    loop {
+        if !paused.load(Ordering::Relaxed) && updates.send(Update::Usage(agents::usage())).is_err()
+        {
+            return;
+        }
+        thread::sleep(USAGE);
     }
 }
 

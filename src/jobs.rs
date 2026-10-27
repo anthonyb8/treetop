@@ -68,6 +68,9 @@ pub enum Kind {
     /// Starts a ship run of the tree's branch, or finds the command that
     /// shows the one under way.
     Ship,
+    /// Starts the tree's stopped or failed agent again, with its
+    /// conversation and the flags it was started with.
+    Resume,
 }
 
 impl Kind {
@@ -83,6 +86,7 @@ impl Kind {
             Kind::Fix => "reading",
             Kind::Land => "following up",
             Kind::Ship => "shipping",
+            Kind::Resume => "resuming",
         }
     }
 
@@ -98,6 +102,7 @@ impl Kind {
             Kind::Fix => "read",
             Kind::Land => "followed up",
             Kind::Ship => "run started",
+            Kind::Resume => "resumed",
         }
     }
 
@@ -112,6 +117,7 @@ impl Kind {
             Kind::Fix => "failure read",
             Kind::Land => "merge follow-up",
             Kind::Ship => "ship run",
+            Kind::Resume => "resume",
         }
     }
 }
@@ -922,6 +928,97 @@ pub fn send_cold(message: &Message) -> Result<(), String> {
         .map_err(|err| err.to_string())
 }
 
+/// The agent plugins that can start a stopped agent again.
+fn resumers() -> Vec<Plugin> {
+    plugin::of_kind(PluginKind::Agent)
+        .into_iter()
+        .filter(|p| {
+            p.description()
+                .is_ok_and(|d| d.ops.iter().any(|o| o == "resume"))
+        })
+        .collect()
+}
+
+/// Starts background job `id` again through the first agent plugin that
+/// knows it, and says the id it runs under now.
+pub fn resume_job(id: &str) -> Result<String, String> {
+    resume_with(&json!({ "id": id }))
+}
+
+/// Asks each plugin that resumes to resume what `args` names, until one
+/// does: the id it started, or every plugin's reason it did not.
+fn resume_with(args: &Value) -> Result<String, String> {
+    let mut why = Vec::new();
+    for plugin in resumers() {
+        match plugin.call("resume", args.clone()) {
+            Ok(result) => {
+                return result["id"]
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("{} said no id", plugin.name()));
+            }
+            Err(err) => why.push(format!("{}: {err}", plugin.name())),
+        }
+    }
+    Err(if why.is_empty() {
+        "no agent plugin resumes agents".into()
+    } else {
+        why.join("; ")
+    })
+}
+
+/// Starts the tree's stopped or failed agent again: the job its sidecar
+/// names, else a cold one placed in it, else the one that last worked in it
+/// since its lease began. A tree whose agent runs is left alone. The sidecar
+/// follows the agent to the id it runs under now.
+fn resume_in(tree: &Tree, log: &mut String) -> bool {
+    if let Some(agent) = tree.agents.iter().find(|a| a.pid.is_some()) {
+        let _ = writeln!(
+            log,
+            "{} is running in tree {}; open its chat",
+            agent.name, tree.name
+        );
+        return false;
+    }
+    let record = sidecar::read(&tree.path);
+    let mut ids: Vec<&str> = record.iter().filter_map(|r| r.job.as_deref()).collect();
+    ids.extend(tree.agents.iter().filter_map(|a| a.job.as_deref()));
+    ids.dedup();
+    let since = tree
+        .leased_at
+        .as_deref()
+        .and_then(pool::seconds)
+        .or_else(|| record.as_ref().map(|r| r.leased_at));
+    let tries = ids
+        .iter()
+        .map(|id| json!({ "id": id }))
+        .chain([json!({ "dir": tree.path, "since": since })]);
+    let mut why = Vec::new();
+    for args in tries {
+        match resume_with(&args) {
+            Ok(id) => {
+                let _ = writeln!(log, "resumed the agent in tree {} as {id}", tree.name);
+                if let Some(mut record) = record.filter(|r| r.job.as_deref() != Some(&id)) {
+                    record.job = Some(id);
+                    if let Err(err) = sidecar::write(&tree.path, &record) {
+                        let _ =
+                            writeln!(log, "could not record the job in {}: {err}", sidecar::FILE);
+                    }
+                }
+                return true;
+            }
+            Err(err) => why.push(err),
+        }
+    }
+    let _ = writeln!(
+        log,
+        "nothing to resume in tree {}: {}",
+        tree.name,
+        why.join("; ")
+    );
+    false
+}
+
 /// Writes what failed on the tree's PR to `log`, as the ship plugin that
 /// reported it tells it; the log is the text its agent is sent.
 fn read_failure(tree: &Tree, log: &mut String) -> bool {
@@ -1099,6 +1196,7 @@ pub fn run(job: &mut Job) -> (bool, String) {
         Kind::Fix => read_failure(&job.tree, &mut log),
         Kind::Land => land(job, &mut log),
         Kind::Ship => ship_run(job, &mut log),
+        Kind::Resume => resume_in(&job.tree, &mut log),
         Kind::Preview => capture(
             treehouse("destroy", &job.tree.path).args(INCLUDE),
             TREEHOUSE_LIMIT,

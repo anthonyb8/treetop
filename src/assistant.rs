@@ -1,9 +1,11 @@
 //! The assistant: one Claude Code session in the main checkout that you
 //! talk to about every agent at once. It runs in the background like any
-//! agent treetop starts, under a fixed name so treetop finds it again. It sees the others through `treetop status` and
-//! `tickets`, which it may run without asking, and answers in its chat. It
-//! does not send, start or return anything itself; it says what it would do,
-//! and you do it with treetop's keys.
+//! agent treetop starts, under a fixed name so treetop finds it again. It
+//! sees the others through `treetop status` and `tickets`, and manages them
+//! through `dispatch`, `resume`, `send` and `return`, all of which it may run
+//! without asking. `return` is guarded: it gives back only a tree whose work
+//! is finished and that nothing runs in, so anything more is still a request
+//! to you, which you carry out with treetop's keys.
 
 use std::path::Path;
 
@@ -23,7 +25,7 @@ pub fn is_assistant(name: &str) -> bool {
 }
 
 /// The commands the assistant may run without asking.
-const ALLOWED: [&str; 2] = ["status", "tickets"];
+const ALLOWED: [&str; 6] = ["status", "tickets", "dispatch", "resume", "send", "return"];
 
 /// What the assistant is told on top of Claude Code's own system prompt.
 /// `treetop` is the command that runs this treetop, `checkout` the main
@@ -33,9 +35,8 @@ fn system_prompt(treetop: &str, checkout: &Path) -> String {
     format!(
         "You are the assistant for the treehouse worktree pool of {checkout}, \
 opened from treetop. Other coding agents work in the pool's trees, one task each. \
-You do not change code yourself, and you do not message, start or return agents \
-yourself: you keep track of them, answer questions about them, and say what you \
-would do next, which the user does from treetop.
+You do not change code yourself: you keep track of the agents, answer questions \
+about them, and manage them with the commands below.
 
 These commands are yours, and you may run them without asking:
 - `{treetop} status` prints JSON: every tree with its number, branch, uncommitted \
@@ -43,14 +44,26 @@ and unpushed counts, ports and PR, each agent working in it with its state, and 
 background agent's latest report (the question it is waiting on, its answer once \
 done, else what it is doing now).
 - `{treetop} tickets [--mine] [words]` prints the repository's open issues.
+- `{treetop} dispatch <new|main|N> <task>` starts an agent on a task in a fresh \
+tree, the main checkout or tree N.
+- `{treetop} resume <tree|job>` starts a stopped or failed agent again in its tree, \
+with its conversation and the flags it was started with. Use it rather than a new \
+dispatch whenever a tree's agent has died, so its conversation is not lost.
+- `{treetop} send <tree|agent> <message>` types a message into an agent's chat.
+- `{treetop} return <tree>` gives a tree back to the pool. It refuses unless the \
+tree's PR is merged or it is on no branch, it has nothing unpushed and nothing \
+uncommitted, and no process runs in it. Never try to get round a refusal.
 
-Run `{treetop} status` before answering anything about the agents; never answer \
-from memory, since they move on between your turns. Lead with what is waiting on \
-the user, then what has finished, then what is still working. Keep it short: a \
-line per agent, its tree number first, saying what it means for the user, not just \
-what the agent said. End with the next steps you would take, a line each, such as \
-answering an agent's question, returning a tree whose PR merged with nothing \
-unpushed, or starting the next issue from `{treetop} tickets`."
+Run `{treetop} status` before answering anything about the agents or acting on \
+them; never act from memory, since they move on between your turns. Lead with what \
+is waiting on the user, then what has finished, then what is still working. Keep it \
+short: a line per agent, its tree number first, saying what it means for the user, \
+not just what the agent said.
+
+These four are the only ways you act. Everything else, such as returning a tree \
+`return` refuses, stopping or destroying anything, or changing code, stays a request \
+to the user: say what you would do and why, a line each, and the user does it from \
+treetop. After acting, say what you did."
     )
 }
 
@@ -98,11 +111,17 @@ mod tests {
         assert_eq!(command[..3], ["claude", "--bg", "--allowedTools"]);
         assert!(command.contains(&"Bash(/bin/treetop status:*)".to_string()));
         assert!(command.contains(&"Bash(treetop tickets:*)".to_string()));
+        for allowed in ["dispatch", "resume", "send", "return"] {
+            assert!(
+                command.contains(&format!("Bash(/bin/treetop {allowed}:*)")),
+                "it manages agents through {allowed}"
+            );
+        }
         assert!(
             !command
                 .iter()
-                .any(|a| a.contains("send:") || a.contains("dispatch:")),
-            "it advises; it does not act"
+                .any(|a| a.contains("pick:") || a.contains("plugin:")),
+            "only the commands it is given"
         );
         let prompt = command
             .iter()
