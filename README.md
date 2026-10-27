@@ -45,13 +45,14 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | `:` | ask the assistant about the tree under the cursor, or write `@17 ...` for that tree's agent (see [The assistant](#the-assistant)) |
 | `a` | open the assistant's chat, where it answers, starting it if there is none |
 | `d` | open the side-by-side diff of the tree under the cursor in a popup |
-| `r` | return the marked trees, or the one under the cursor, to the pool; `D` in its dialog destroys them from disk instead, after reviewing treehouse's preview of each |
+| `r` | return the marked trees, or the one under the cursor, to the pool; its dialog names each tree's branch, its uncommitted and unpushed counts and the pid of every live process a return would stop, and `D` in it destroys them from disk instead, after reviewing treehouse's preview of each |
 | Space | mark or unmark the tree under the cursor |
 | `z` | park the tree under the cursor, setting it aside under Parked, or bring it back; `Z` opens or folds Parked |
 | `/` | filter by number, branch, holder or agent; Enter keeps it, Esc clears it |
 | `o` | open the port the tree serves, `http://localhost:<port>`, in the browser, or copy it to the clipboard where there is no desktop; a tree serving several, such as a frontend and a backend, offers a menu of them |
 | `O` | open the tree's PR the same way (see [After the agent](#after-the-agent)) |
 | `f` | send what failed on the tree's PR, a check's log or a review's requested changes, to its agent |
+| `R` | resume the tree's stopped or failed agent in the tree, with its conversation and the flags it was started with, rather than a fresh dispatch that loses them |
 | `s` | start a ship run of the tree's branch, such as no-mistakes', after a dialog; on a run under way, show it |
 | `b` | rename the branch of the tree under the cursor |
 | `w` | switch to another workspace: the pool of another repository treetop has been opened in |
@@ -163,6 +164,13 @@ A hook is a command and its arguments, run in the tree with `TREETOP_TREE`, `TRE
 One that fails is written to the log and never stops the start or return it belongs to.
 A config file treetop cannot parse is reported in the log, and no hooks run.
 
+`[guard] in_tree` names commands of your own that act on the tree they run in, such as stopping its dev stack, each as the words it starts with; the guard hook lets an agent run them only in a tree it holds:
+
+```toml
+[guard]
+in_tree = ["docker compose down"]
+```
+
 Issues come from named sources, each a ticket plugin and the settings it is given; Linear's plugin is built in and the default.
 A repository picks its source by its main checkout's path under `[repos]`, and one without an entry has none, so an unrelated repository shows no one's issues.
 Its Issues screen says what to add, and `w` shows a source anyway.
@@ -223,9 +231,11 @@ An agent plugin answers these ops:
 | Op | Args | Result |
 |---|---|---|
 | `start` | `dir`, `name`, `prompt`, `isolated` (`dir` is a tree of the agent's own, to stay in) | `id`, once the agent runs |
-| `find` | `dirs` | `agents`: each with `id`, `name`, `dir`, `live`, and optionally `pid`, `status` (`busy`, `idle` or `waiting`), `background`, `attach` and `context`: `{ "used", "window", "parts" }`, `parts` each `{ "name", "tokens" }`, largest first |
+| `find` | `dirs` | `agents`: each with `id`, `name`, `dir`, `live`, and optionally `pid`, `status` (`busy`, `idle` or `waiting`), `background`, `attach`, `context`: `{ "used", "window", "parts" }`, `parts` each `{ "name", "tokens" }`, largest first, and `spend`: `{ "input", "cache_read", "cache_write", "output" }`, the tokens its session has spent |
 | `attach` | `id` | `argv`, the command that opens its chat in a terminal |
 | `send` | `id`, `text` | `delivered`, for an agent that is not running |
+| `usage` | none | `limits`, each `{ "name", "percent", "resets_at" }`, and `at`, when they were read, both in seconds since the epoch; the plan its agents run on, which the chat's sidebar shows |
+| `resume` | `id`, or `dir` and optionally `since`, seconds since the epoch | `id` it runs under now; starts a stopped or failed agent again with its conversation and the flags it was started with: job `id`, else the newest one not running that worked in `dir`, written since `since`; Claude Code's runs `claude --bg --resume` with the job's `respawnFlags`, where it was started |
 
 `describe` may also give `screen`, which tells treetop how to type a message into a running agent's chat: the input box is a line starting with `input` between two lines starting with `rule`, and a screen with no input box but one of `dialogs` on it is waiting on an answer.
 One of `away` on the screen's last few lines means the chat has left its agent for a list of other sessions, which `←` in an empty input box opens; treetop keeps `←` from it there, and opens the agent's chat again when it shows.
@@ -291,6 +301,10 @@ Where the popup is at least 100 columns wide, a sidebar at its right takes 30 of
 Under that is an estimate of where those tokens come from: the memory files and skills listing Claude Code put in before the first request, the rest of that request as the system prompt and tools, and everything since as the conversation.
 Claude Code's numbers come from its transcript: the tokens its latest request sent, against a window of a million tokens for a Claude 5 model, a `[1m]` one or one already past 200k, else 200k.
 An agent that cannot say shows "not known for this agent".
+Below it, Usage shows how much of your plan is used, a bar for each limit, such as the five-hour and weekly ones, with when each resets and how old the reading is, then what this session has spent: its fresh input, cache reads, cache writes and output, each request counted once, its subagents' included.
+Claude Code's limits are asked of Anthropic as `/usage` asks, with Claude Code's login from `~/.claude/.credentials.json`, once a minute and every five minutes while that fails.
+treetop only reads the login: an expired one is left for Claude Code to renew, since renewing it here would sign Claude Code out, and until then the sidebar shows the reading Claude Code last kept in `~/.claude.json`, with its age.
+At the bottom is the chat's tree: its branch, its uncommitted and unpushed counts, and its PR.
 **Ctrl+Q** always comes back to the list as you left it, whatever the chat is doing, and Enter on another tree opens that one.
 **Ctrl+\\** goes straight to the next agent's chat, down the list as filtered, skipping trees with none and wrapping at the end; the cursor follows, so Ctrl+Q lands on the tree you were last in.
 Neither key is a Claude Code default.
@@ -337,14 +351,46 @@ After that a new one starts.
 A coordinator from before the assistant, named `treetop-coordinator`, is never taken for it, since it acts itself; it is left off the rows, and a new assistant starts beside it.
 It is never a tree's agent: a badge at the right of the bottom bar shows it instead, `assistant · answering` while it works on your message, `asks you`, `idle` or `stopped`, and none before it first starts.
 
-It sees the other agents through treetop commands it may run without asking; it does not send, start or return anything itself, and ends its answer with the next steps it would take, for you to take with treetop's keys:
+It sees and manages the other agents through treetop commands it may run without asking.
+Anything they do not cover, such as returning a tree with work left in it, stays a request to you, for you to carry out with treetop's keys:
 
 | Command | Does |
 |---|---|
 | `treetop status` | prints JSON: each held tree's branch, uncommitted and unpushed counts and ports, its agents and their state, each background agent's latest report (the question it is waiting on, its answer once done, else what it is doing now), and its PR's stage as `ship`; idle trees are only counted, and `ready` lists the issues the merged trees' issues leave ready |
 | `treetop tickets [--mine] [words]` | prints the repository's open issues |
+| `treetop dispatch <new\|main\|N> <task>` | starts an agent on a task in a fresh tree, the main checkout or tree N |
+| `treetop resume <tree\|job>` | starts a stopped or failed agent again in its tree, with its conversation and the flags it was started with, as `R` does |
+| `treetop send <tree\|agent> <message>` | types a message into an agent's chat, as `m` does |
+| `treetop return <tree>` | gives a tree back to the pool, as `r` does, when the guard below lets it |
 
-`treetop send`, `dispatch` and `pick` remain, for you and any other agent, from any shell.
+`treetop return` never stops a process for whoever runs it.
+It refuses a tree that any live process works in, other than the caller's own: a process standing in it, or an agent treetop places in it.
+Beyond that, the caller may return the tree its own agent works in, or, when it is no agent, the tree it stands in; any other tree only once its PR has merged or it is on no branch, with nothing uncommitted and nothing unpushed.
+treehouse's own `--if-lease-holder` checks only the name it is handed, so this is the check to go through; everything it refuses is yours to return with `r`, whose dialog names what would be lost.
+`treetop guard <tree>` gives the same verdict without acting, and `--in-tree` the verdict on a command that acts on the tree it runs in, which the caller may run only in a tree it holds, or in one back in the pool that nothing runs in.
+
+### The guard hook
+
+Agents give trees back with `treehouse return` and `destroy` as often as through treetop, so `treetop hook pre-tool-use` holds their shell commands to the same guard as Claude Code's PreToolUse hook.
+It splits a Bash command into the commands it runs, following `cd`s and `sh -c`, and denies, with the guard's reason for the agent to read:
+
+- `treehouse return` or `destroy` of a tree `treetop return` would refuse;
+- `treehouse return --all` and `destroy --all`, which take every tree in the pool;
+- a command `[guard] in_tree` names (see [Config](#config)), run in a tree the agent does not hold.
+
+Anything else gets no answer, so Claude Code's own permissions decide as before; the hook never allows what they would not.
+It reads words, not what a shell would run, so it is a guard rail against an agent's mistake rather than a sandbox.
+Register it in `~/.claude/settings.json`:
+
+```json
+"hooks": {
+  "PreToolUse": [
+    { "matcher": "Bash", "hooks": [{ "type": "command", "command": "treetop hook pre-tool-use" }] }
+  ]
+}
+```
+
+`treetop pick` remains, for you and any other agent, from any shell.
 Each command prints only what it is asked for, so a question costs the assistant one small read rather than a crawl through every transcript.
 
 ### Scratch chats

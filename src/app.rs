@@ -14,7 +14,7 @@ use crate::diff::Layout;
 use crate::dispatch::{Edit, Prompt, Purpose, Recipient, Target};
 use crate::jobs::{Job, Kind, Launch, Message, Pick, ShipAction, ShipCall};
 use crate::keeper::Kept;
-use crate::plugin::Plugin;
+use crate::plugin::{Plugin, Usage};
 use crate::pool::{self, Process, Tree, Work};
 use crate::reports::{Report, State};
 use crate::scratch::Scratch;
@@ -363,6 +363,9 @@ pub struct App {
     /// Why the ship plugins could not say where the PRs stand, at the last
     /// ask.
     pub ship_error: Option<String>,
+    /// How much of the plan the agents run on is used, as the last agent
+    /// plugin that could say reported it.
+    pub usage: Option<Usage>,
     /// Each tree's stage at the last ask, so a change can be announced; None
     /// until the first ask, which announces nothing.
     last_stages: Option<HashMap<PathBuf, Stage>>,
@@ -1582,6 +1585,29 @@ impl App {
         Outcome::Continue
     }
 
+    /// Starts the tree's stopped or failed agent again, in its tree, with its
+    /// conversation and the flags it was started with, rather than a fresh
+    /// dispatch that would lose them.
+    fn resume(&mut self) -> Outcome {
+        let Some(tree) = self.current() else {
+            return Outcome::Continue;
+        };
+        let (name, path) = (tree.name.clone(), tree.path.clone());
+        self.message = if let Some(agent) = tree.agents.iter().find(|a| a.pid.is_some()) {
+            Some(format!(
+                "{} is running in tree {name}; Enter opens its chat",
+                agent.name
+            ))
+        } else if self.jobs.get(&path).is_some_and(|s| s.is_active()) {
+            Some(format!("tree {name} already has an action queued"))
+        } else {
+            let job = Job::new(Kind::Resume, tree.clone());
+            self.jobs.insert(path, JobState::Queued(Kind::Resume));
+            return Outcome::Queue(vec![job]);
+        };
+        Outcome::Continue
+    }
+
     /// Sends `text`, what failed on the PR of the tree at `path`, to the
     /// agents working there, led by a line saying what it is.
     fn send_failure(&mut self, path: &PathBuf, text: &str) {
@@ -2617,6 +2643,7 @@ impl App {
             KeyCode::Char('o') => return self.browse(),
             KeyCode::Char('O') => return self.open_pr(),
             KeyCode::Char('f') => return self.read_failure(),
+            KeyCode::Char('R') => return self.resume(),
             KeyCode::Char('s') => return self.ship(),
             KeyCode::Char('z') => return self.toggle_park(),
             KeyCode::Char('Z') => {
@@ -2839,6 +2866,7 @@ mod tests {
             plugin: Some("claude".into()),
             active_at: None,
             context: None,
+            spend: None,
         };
         let interactive = Agent {
             is_background: false,
@@ -3515,6 +3543,7 @@ mod tests {
             plugin: None,
             active_at: None,
             context: None,
+            spend: None,
         }
     }
 
@@ -4573,6 +4602,28 @@ mod tests {
         assert!(app.trees[0].ship.is_some());
         app.returned(&PathBuf::from("/p/4/app"));
         assert!(app.trees[0].ship.is_none());
+    }
+
+    #[test]
+    fn capital_r_resumes_a_tree_whose_agent_stopped_but_not_one_that_runs() {
+        let mut app = app();
+        let job = queued(press(&mut app, KeyCode::Char('R'))).remove(0);
+        assert_eq!((job.kind, job.tree.name.as_str()), (Kind::Resume, "4"));
+        assert_eq!(
+            press(&mut app, KeyCode::Char('R')),
+            Outcome::Continue,
+            "once at a time"
+        );
+        app.jobs.clear();
+        app.apply_agents(&HashMap::from([(
+            PathBuf::from("/p/4/app"),
+            vec![attachable("0908e7f3")],
+        )]));
+        assert_eq!(press(&mut app, KeyCode::Char('R')), Outcome::Continue);
+        assert_eq!(
+            app.message.as_deref(),
+            Some("0908e7f3 is running in tree 4; Enter opens its chat")
+        );
     }
 
     #[test]

@@ -20,6 +20,8 @@ mod config;
 mod diff;
 mod dispatch;
 mod github_plugin;
+mod guard;
+mod hook;
 mod jobs;
 mod keeper;
 mod linear_plugin;
@@ -281,6 +283,7 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                         worker.push(job);
                     }
                 }
+                Update::Usage(usage) => app.usage = usage,
                 Update::Agents(agents) => {
                     app.apply_agents(&agents);
                     let live: Vec<&Vec<String>> = agents
@@ -690,12 +693,19 @@ fn main() -> Result<()> {
     {
         return builtin::serve(name);
     }
+    // Claude Code runs its hooks wherever a session stands, in a repository
+    // or not.
+    if let [command, event] = args.as_slice()
+        && command == "hook"
+    {
+        return hook::run(event);
+    }
     // `treetop issues` opens the screen on the Issues screen.
     let is_issues = args == ["issues"];
     let checkout = checkout_for(&start, args.is_empty() || is_issues)?;
     std::env::set_current_dir(&checkout)?;
     if !args.is_empty() && !is_issues {
-        return cli::run(&args, &checkout);
+        return cli::run(&args, &checkout, &start);
     }
 
     let default_hook = std::panic::take_hook();

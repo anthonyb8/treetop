@@ -3,6 +3,7 @@
 //! floats over them in a popup, with the table dimmed round it, so treetop
 //! never leaves the screen. Every colour comes from `theme`.
 
+use std::collections::HashSet;
 use std::time::{Duration, UNIX_EPOCH};
 
 use ratatui::Frame;
@@ -23,7 +24,8 @@ use crate::assistant;
 use crate::chat::Chat;
 use crate::diff::{Change, FileDiff, Layout as DiffLayout, Row as DiffRow, Side, ViewRow};
 use crate::dispatch::{Prompt, Purpose, Target};
-use crate::plugin::Context;
+use crate::guard;
+use crate::plugin::{Context, Spend, Usage};
 use crate::pool::{Tree, Work};
 use crate::popup;
 use crate::reports::{self, State};
@@ -49,7 +51,7 @@ const KEYS: [(&str, &str); 13] = [
 ];
 
 /// Every key on the list, for the `?` overlay.
-const HELP: [(&str, &str); 27] = [
+const HELP: [(&str, &str); 28] = [
     (
         "Enter",
         "open the agent: its chat, a cold one started again, else its tree; on a heading, fold or open its group",
@@ -95,6 +97,10 @@ const HELP: [(&str, &str); 27] = [
     ),
     ("O", "open the tree's PR"),
     ("f", "send what failed on the tree's PR to its agent"),
+    (
+        "R",
+        "resume the tree's stopped or failed agent, with its conversation",
+    ),
     (
         "s",
         "start a ship run of the tree's branch, or show the one under way",
@@ -1468,26 +1474,21 @@ fn dialog(title: String, color: Color) -> Block<'static> {
         .border_style(fg(color))
 }
 
-/// What returning a tree throws away, as its confirm line says it.
+/// What returning a tree throws away, in words under its branch, since this
+/// dialog is the one place a tree is returned from under work.
 fn risk(tree: &Tree) -> Vec<Span<'static>> {
     let t = theme();
-    let mut spans = Vec::new();
+    let mut spans = vec![Span::raw(RETURN_INDENT)];
     match tree.work {
         None => spans.push(Span::styled(
-            "  unknown changes: git cannot read it",
+            "unknown changes: git cannot read it",
             fg(t.warning),
         )),
-        Some(w) if w.changed + w.unpushed > 0 => {
-            spans.push(Span::raw("  "));
-            spans.extend(git_spans(w));
-        }
-        Some(_) => spans.push(Span::styled("  clean", fg(t.success))),
-    }
-    if !tree.processes.is_empty() {
-        spans.push(Span::styled(
-            format!(", {} process(es) running", tree.processes.len()),
+        Some(w) if w.changed + w.unpushed > 0 => spans.push(Span::styled(
+            format!("{} uncommitted, {} unpushed", w.changed, w.unpushed),
             fg(t.warning),
-        ));
+        )),
+        Some(_) => spans.push(Span::styled("clean", fg(t.success))),
     }
     if let Some(ship) = tree.ship.as_ref().filter(|s| s.stage == Stage::Merged) {
         let number = ship.number().unwrap_or_else(|| "its PR".into());
@@ -1497,6 +1498,29 @@ fn risk(tree: &Tree) -> Vec<Span<'static>> {
         ));
     }
     spans
+}
+
+/// Where a tree's lines under its branch start in the return dialog.
+const RETURN_INDENT: &str = "      ";
+
+/// The live processes a return would stop, by pid, as lines under the
+/// tree's, wrapped to `width`; none when nothing runs in it.
+fn live_lines(tree: &Tree, width: usize) -> Vec<Line<'static>> {
+    let pids = guard::live_pids(tree, &HashSet::new());
+    if pids.is_empty() {
+        return Vec::new();
+    }
+    let pids: Vec<String> = pids.iter().map(u32::to_string).collect();
+    let text = format!("live: pid {}", pids.join(", "));
+    word_wrap(&text, width.saturating_sub(RETURN_INDENT.len()))
+        .into_iter()
+        .map(|row| {
+            Line::from(Span::styled(
+                format!("{RETURN_INDENT}{row}"),
+                fg(theme().danger),
+            ))
+        })
+        .collect()
 }
 
 /// Asks before a ship run, which pushes the branch and opens its PR.
@@ -1543,23 +1567,37 @@ fn draw_shipping(frame: &mut Frame, shipping: &Shipping) {
 }
 
 fn draw_confirm(frame: &mut Frame, pending: &Pending) {
-    let mut lines: Vec<Line> = pending
+    let width: u16 = 80;
+    let mut lines = Vec::new();
+    for t in &pending.trees {
+        lines.push(Line::raw(format!(
+            " {:>3}  {}",
+            t.name,
+            t.branch.as_deref().unwrap_or("(detached)")
+        )));
+        lines.push(Line::from(risk(t)));
+        lines.extend(live_lines(t, usize::from(width - 4)));
+    }
+    let is_live = pending
         .trees
         .iter()
-        .map(|t| {
-            let mut spans = vec![Span::raw(format!(
-                " {:>3}  {}",
-                t.name,
-                t.branch.as_deref().unwrap_or("(detached)")
-            ))];
-            spans.extend(risk(t));
-            Line::from(spans)
-        })
-        .collect();
+        .any(|t| !guard::live_pids(t, &HashSet::new()).is_empty());
     lines.push(Line::raw(""));
     lines.push(Line::raw(
-        " Uncommitted changes are discarded and running processes stopped.",
+        " Uncommitted changes are discarded and unpushed commits left behind.",
     ));
+    if is_live {
+        let has_agent = pending
+            .trees
+            .iter()
+            .any(|t| t.agents.iter().any(|a| a.pid.is_some()));
+        let text = if has_agent {
+            " The live processes above are stopped, an agent's session among them."
+        } else {
+            " The live processes above are stopped."
+        };
+        lines.push(Line::styled(text, fg(theme().danger)));
+    }
     lines.push(Line::raw(
         " y returns them to the pool, D destroys them from disk after a preview;",
     ));
@@ -1568,7 +1606,7 @@ fn draw_confirm(frame: &mut Frame, pending: &Pending) {
     let height = u16::try_from(lines.len())
         .unwrap_or(u16::MAX)
         .saturating_add(2);
-    let area = popup::centered(frame.area(), 80, height);
+    let area = popup::centered(frame.area(), width, height);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines).block(dialog(title, theme().warning)),
@@ -1827,8 +1865,8 @@ fn draw_diff_view(frame: &mut Frame, app: &App, view: &DiffView) {
 /// branch comes from the latest listing, so it follows the agent if it
 /// switches branches.
 fn draw_chat(frame: &mut Frame, app: &App, chat: &Chat) {
-    let context = context_of(app, Some(chat.command()), &chat.agent, &chat.tree);
-    let body = chat_frame(frame, app, &chat.agent, &chat.tree, context);
+    let agent = agent_of(app, Some(chat.command()), &chat.agent, &chat.tree);
+    let body = chat_frame(frame, app, &chat.agent, &chat.tree, agent);
     if !chat.is_ready() {
         draw_note(frame, body, &opening_note(&chat.agent));
         return;
@@ -1841,8 +1879,8 @@ fn draw_chat(frame: &mut Frame, app: &App, chat: &Chat) {
 /// The popup a chat on its way stands in with: the frame the chat opens in,
 /// so the hand-over from the compose box to the chat never leaves the popup.
 fn draw_opening(frame: &mut Frame, app: &App, opening: &Opening) {
-    let context = context_of(app, None, &opening.agent, &opening.tree);
-    let body = chat_frame(frame, app, &opening.agent, &opening.tree, context);
+    let agent = agent_of(app, None, &opening.agent, &opening.tree);
+    let body = chat_frame(frame, app, &opening.agent, &opening.tree, agent);
     let note = if opening.tree == "new" {
         "leasing a tree for the agent...".to_string()
     } else {
@@ -1862,13 +1900,7 @@ fn opening_note(agent: &str) -> String {
 /// A chat's popup: its frame and bar, cleared, with the keys out at the
 /// right of the bar, and its sidebar where there is room for one. Returns
 /// where the chat's screen goes.
-fn chat_frame(
-    frame: &mut Frame,
-    app: &App,
-    agent: &str,
-    tree: &str,
-    context: Option<&Context>,
-) -> Rect {
+fn chat_frame(frame: &mut Frame, app: &App, agent: &str, tree: &str, seen: Option<&Agent>) -> Rect {
     let t = theme();
     let title = if assistant::is_assistant(agent) {
         vec![Span::styled(" assistant ", t.badge)]
@@ -1905,19 +1937,24 @@ fn chat_frame(
             .padding(Padding::horizontal(1));
         let inner = block.inner(side);
         frame.render_widget(block, side);
-        frame.render_widget(Paragraph::new(sidebar_lines(context, inner.width)), inner);
+        let tree = app.trees.iter().find(|t| t.name == tree);
+        let now = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        let lines = sidebar_lines(seen, tree, app.usage.as_ref(), now, inner.width);
+        frame.render_widget(Paragraph::new(lines), inner);
     }
     popup::chat(frame.area())
 }
 
-/// The context of the chat's agent: the one its command attaches to, else
-/// the one of its name in its tree.
-fn context_of<'a>(
+/// The chat's agent: the one its command attaches to, else the one of its
+/// name in its tree.
+fn agent_of<'a>(
     app: &'a App,
     command: Option<&[String]>,
     agent: &str,
     tree: &str,
-) -> Option<&'a Context> {
+) -> Option<&'a Agent> {
     let agents = || app.trees.iter().flat_map(|t| &t.agents);
     command
         .and_then(|command| agents().find(|a| a.attach.as_deref() == Some(command)))
@@ -1927,9 +1964,17 @@ fn context_of<'a>(
                 .filter(|t| t.name == tree)
                 .flat_map(|t| &t.agents)
                 .find(|a| a.name == agent)
-        })?
-        .context
-        .as_ref()
+        })
+}
+
+/// A span of `seconds` in a few characters: `45s`, `12m`, `3h`, `6d`.
+fn span(seconds: u64) -> String {
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3_600 => format!("{}m", seconds / 60),
+        3_600..86_400 => format!("{}h", seconds / 3_600),
+        _ => format!("{}d", seconds / 86_400),
+    }
 }
 
 /// A count of tokens in a few characters: `850`, `97k`, `1M`.
@@ -1966,14 +2011,38 @@ fn meter(share: u64, width: u16) -> (String, String) {
     ("█".repeat(filled), "░".repeat(width - filled))
 }
 
-/// The chat's sidebar: how full its agent's context is, and an estimate of
-/// where it comes from, each part with its share of what is used.
-fn sidebar_lines(context: Option<&Context>, width: u16) -> Vec<Line<'static>> {
+/// The chat's sidebar: how full its agent's context is and where that comes
+/// from; then how much of the plan is used and what this session has spent;
+/// then where its tree stands. `now` is seconds since the epoch.
+fn sidebar_lines(
+    agent: Option<&Agent>,
+    tree: Option<&Tree>,
+    usage: Option<&Usage>,
+    now: u64,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let mut lines = context_lines(agent.and_then(|a| a.context.as_ref()), width);
+    lines.push(Line::raw(""));
+    lines.extend(usage_lines(usage, agent.and_then(|a| a.spend), now, width));
+    if let Some(tree) = tree {
+        lines.push(Line::raw(""));
+        lines.extend(tree_lines(tree, width));
+    }
+    lines
+}
+
+fn heading(text: &str) -> Line<'static> {
+    Line::styled(
+        text.to_string(),
+        fg(theme().title).add_modifier(Modifier::BOLD),
+    )
+}
+
+/// How full the agent's context is, and an estimate of where it comes from,
+/// each part with its share of what is used.
+fn context_lines(context: Option<&Context>, width: u16) -> Vec<Line<'static>> {
     let t = theme();
-    let mut lines = vec![Line::styled(
-        "Context",
-        fg(t.title).add_modifier(Modifier::BOLD),
-    )];
+    let mut lines = vec![heading("Context")];
     let Some(context) = context else {
         lines.push(Line::styled("not known for this agent", fg(t.muted)));
         return lines;
@@ -2007,6 +2076,115 @@ fn sidebar_lines(context: Option<&Context>, width: u16) -> Vec<Line<'static>> {
             Span::styled(format!("{of:>6}"), fg(t.muted)),
         ])
     }));
+    lines
+}
+
+/// How a limit reads: loud as it nears its end, where the agents stop.
+fn limit_style(percent: u64) -> Style {
+    let t = theme();
+    match percent {
+        90.. => fg(t.danger).add_modifier(Modifier::BOLD),
+        75.. => fg(t.warning),
+        _ => fg(t.muted),
+    }
+}
+
+/// How much of the plan is used, a meter per limit with when it resets, and
+/// how old that reading is; then the tokens this session has spent.
+fn usage_lines(
+    usage: Option<&Usage>,
+    spend: Option<Spend>,
+    now: u64,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let t = theme();
+    let mut title = vec![Span::styled(
+        "Usage",
+        fg(t.title).add_modifier(Modifier::BOLD),
+    )];
+    if let Some(at) = usage.and_then(|u| u.at) {
+        title.push(Span::styled(
+            format!("  as of {} ago", span(now.saturating_sub(at))),
+            fg(t.muted),
+        ));
+    }
+    let mut lines = vec![Line::from(title)];
+    match usage {
+        None => lines.push(Line::styled("plan not known", fg(t.muted))),
+        Some(usage) => {
+            // The names in a column as wide as the longest, leaving the
+            // meter at least half the row.
+            let longest = usage.limits.iter().map(|l| l.name.chars().count()).max();
+            let name_width = longest.unwrap_or(0).min(usize::from(width) / 2 - 1) + 1;
+            let meter_width = width.saturating_sub(5 + u16::try_from(name_width).unwrap_or(0));
+            for limit in &usage.limits {
+                let (filled, empty) = meter(limit.percent, meter_width);
+                let name: String = limit.name.chars().take(name_width - 1).collect();
+                lines.push(Line::from(vec![
+                    Span::raw(format!("{name:<name_width$}")),
+                    Span::styled(filled, limit_style(limit.percent)),
+                    Span::styled(empty, fg(t.border)),
+                    Span::styled(format!("{:>4}%", limit.percent), limit_style(limit.percent)),
+                ]));
+                if let Some(at) = limit.resets_at.filter(|at| *at > now) {
+                    lines.push(Line::styled(
+                        format!("{:name_width$}resets in {}", "", span(at - now)),
+                        fg(t.muted),
+                    ));
+                }
+            }
+        }
+    }
+    lines.extend([Line::raw(""), Line::styled("This session", fg(t.muted))]);
+    let Some(spend) = spend else {
+        lines.push(Line::styled("not known for this agent", fg(t.muted)));
+        return lines;
+    };
+    let name_width = usize::from(width).saturating_sub(6);
+    lines.extend(
+        [
+            ("input", spend.input),
+            ("cache read", spend.cache_read),
+            ("cache write", spend.cache_write),
+            ("output", spend.output),
+        ]
+        .into_iter()
+        .map(|(name, count)| {
+            Line::from(vec![
+                Span::raw(format!("{name:<name_width$}")),
+                Span::raw(format!("{:>6}", tokens(count))),
+            ])
+        }),
+    );
+    lines
+}
+
+/// Where the chat's tree stands: its branch, its uncommitted and unpushed
+/// work, and its PR.
+fn tree_lines(tree: &Tree, width: u16) -> Vec<Line<'static>> {
+    let t = theme();
+    let mut lines = vec![heading(&format!("Tree {}", tree.name))];
+    let branch = tree.branch.as_deref().unwrap_or("(detached)");
+    lines.extend(
+        wrap_chars(branch, usize::from(width))
+            .into_iter()
+            .map(Line::raw),
+    );
+    lines.push(match tree.work {
+        None => Line::styled("changes not known", fg(t.muted)),
+        Some(w) if w.changed + w.unpushed == 0 => Line::styled("clean", fg(t.success)),
+        Some(w) => Line::styled(
+            format!("{} uncommitted, {} unpushed", w.changed, w.unpushed),
+            fg(t.warning),
+        ),
+    });
+    lines.push(match &tree.ship {
+        Some(ship) => Line::from(vec![
+            Span::styled("PR ", fg(t.muted)),
+            Span::styled(ship.label.clone(), stage_style(ship.stage)),
+        ]),
+        None => Line::styled("no PR", fg(t.muted)),
+    });
     lines
 }
 
@@ -2167,5 +2345,141 @@ mod tests {
         assert_eq!(cursor, Some(Position::new(5, 2)));
         parser.process(b"\x1b[?25l");
         assert_eq!(draw_screen(parser.screen(), &mut buffer, area), None);
+    }
+}
+
+#[cfg(test)]
+mod sidebar_tests {
+    use super::*;
+    use crate::plugin::{Limit, Part};
+    use crate::ship::Ship;
+
+    const NOW: u64 = 1_793_052_000;
+
+    fn agent() -> Agent {
+        Agent {
+            name: "claude".into(),
+            pid: Some(1),
+            status: None,
+            source: crate::agents::Source::Plugin,
+            is_background: true,
+            attach: None,
+            job: None,
+            plugin: None,
+            active_at: None,
+            context: Some(Context {
+                used: 260_000,
+                window: 1_000_000,
+                parts: vec![Part {
+                    name: "conversation".into(),
+                    tokens: 230_000,
+                }],
+            }),
+            spend: Some(Spend {
+                input: 1_204,
+                cache_read: 25_300_000,
+                cache_write: 412_000,
+                output: 88_000,
+            }),
+        }
+    }
+
+    fn tree() -> Tree {
+        Tree {
+            name: "1".into(),
+            branch: Some("anthonyb8/fix-four-gaps-in-treetop-and-treehouse".into()),
+            work: Some(Work {
+                changed: 12,
+                unpushed: 3,
+                ..Work::default()
+            }),
+            ship: Some(Box::new(Ship {
+                branch: "b".into(),
+                stage: Stage::Merged,
+                label: "#12 merged".into(),
+                url: None,
+                head: None,
+                detail: Vec::new(),
+                plugin: "github".into(),
+            })),
+            ..crate::pool::stand_in(std::path::PathBuf::from("/p/1/app"))
+        }
+    }
+
+    fn usage() -> Usage {
+        Usage {
+            limits: vec![
+                Limit {
+                    name: "5-hour".into(),
+                    percent: 82,
+                    resets_at: Some(NOW + 2 * 3_600),
+                },
+                Limit {
+                    name: "weekly Fable".into(),
+                    percent: 4,
+                    resets_at: None,
+                },
+            ],
+            at: Some(NOW - 180),
+        }
+    }
+
+    fn text(lines: &[Line]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn the_sidebar_shows_context_then_usage_and_spend_then_the_tree() {
+        let agent = agent();
+        let lines = sidebar_lines(Some(&agent), Some(&tree()), Some(&usage()), NOW, 27);
+        let text = text(&lines);
+        for line in &text {
+            assert!(
+                line.chars().count() <= 27,
+                "{line:?} is wider than the sidebar"
+            );
+        }
+        assert_eq!(
+            text[7..],
+            [
+                "Usage  as of 3m ago",
+                "5-hour       ████████░  82%",
+                "             resets in 2h",
+                "weekly Fable █░░░░░░░░   4%",
+                "",
+                "This session",
+                "input                    1k",
+                "cache read            25.3M",
+                "cache write            412k",
+                "output                  88k",
+                "",
+                "Tree 1",
+                "anthonyb8/fix-four-gaps-in-",
+                "treetop-and-treehouse",
+                "12 uncommitted, 3 unpushed",
+                "PR #12 merged",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_agent_nothing_is_known_of_says_so_and_a_tree_is_left_out_when_none() {
+        let text = text(&sidebar_lines(None, None, None, NOW, 27));
+        assert_eq!(
+            text,
+            [
+                "Context",
+                "not known for this agent",
+                "",
+                "Usage",
+                "plan not known",
+                "",
+                "This session",
+                "not known for this agent",
+            ]
+        );
     }
 }

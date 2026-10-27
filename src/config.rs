@@ -14,6 +14,15 @@
 //! fails is shown in the log, and never stops the start or return it belongs
 //! to.
 //!
+//! `[guard]` names commands of your own that act on the tree they run in,
+//! such as stopping its dev stack, which the guard then lets an agent run
+//! only in a tree it holds (see `hook`):
+//!
+//! ```toml
+//! [guard]
+//! in_tree = ["docker compose down"]
+//! ```
+//!
 //! Issues come from named sources, each a ticket plugin and its settings,
 //! which the plugin gets as its `config`. A repository picks its source by
 //! its main checkout's path; with a single source, every repository uses it.
@@ -50,6 +59,16 @@ pub struct Hooks {
     /// Run before a tree is returned, after its agents are stopped.
     #[serde(default)]
     pub on_return: Vec<String>,
+}
+
+/// The guard's settings: what it watches beyond treehouse and treetop.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Guard {
+    /// Commands that act on the tree they run in, each as the words it
+    /// starts with, which an agent may run only in a tree it holds.
+    #[serde(default)]
+    pub in_tree: Vec<String>,
 }
 
 /// A place issues come from: a ticket plugin and the settings it is given.
@@ -89,6 +108,8 @@ pub struct Repo {
 pub struct Config {
     #[serde(default)]
     pub hooks: Hooks,
+    #[serde(default)]
+    pub guard: Guard,
     #[serde(default)]
     pub issues: BTreeMap<String, Source>,
     #[serde(default)]
@@ -186,6 +207,8 @@ mod tests {
         let config = parse("[hooks]\non_return = [\"harness\", \"stack\", \"down\"]\n").unwrap();
         assert_eq!(config.hooks.on_return, ["harness", "stack", "down"]);
         assert!(config.hooks.on_dispatch.is_empty());
+        let config = parse("[guard]\nin_tree = [\"docker compose down\"]\n").unwrap();
+        assert_eq!(config.guard.in_tree, ["docker compose down"]);
     }
 
     #[test]

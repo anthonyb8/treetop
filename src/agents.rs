@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::plugin::{self, Context, Kind, Seen};
+use crate::plugin::{self, Context, Kind, Seen, Spend, Usage};
 use crate::pool::{self, Process, Tree};
 use crate::sidecar::Sidecar;
 
@@ -102,6 +102,8 @@ pub struct Agent {
     pub active_at: Option<u64>,
     /// How full its context window is, where its source can tell.
     pub context: Option<Context>,
+    /// The tokens its session has spent, where its source can tell.
+    pub spend: Option<Spend>,
 }
 
 /// An agent and the directory it works in, before it is placed in a tree.
@@ -129,6 +131,7 @@ fn from_plugin(plugin: &str, seen: Seen) -> Sighting {
         plugin: Some(plugin.to_string()),
         active_at: seen.active_at,
         context: seen.context,
+        spend: seen.spend,
     };
     (seen.dir, agent)
 }
@@ -177,6 +180,20 @@ pub fn find(
     sightings.extend(seen);
     sightings.extend(procs::find(processes));
     place(trees, sightings, sidecars, &active)
+}
+
+/// How much of the plan the agents run on is used, from the first agent
+/// plugin that answers `usage`; None when none can say.
+pub fn usage() -> Option<Usage> {
+    plugin::of_kind(Kind::Agent)
+        .iter()
+        .filter(|p| {
+            p.description()
+                .is_ok_and(|d| d.ops.iter().any(|o| o == "usage"))
+        })
+        .filter_map(|p| p.call("usage", json!({})).ok())
+        .filter_map(|result| serde_json::from_value::<Usage>(result).ok())
+        .find(|usage| !usage.limits.is_empty())
 }
 
 /// When the tree's current lease began, in seconds since the epoch: as
@@ -268,6 +285,7 @@ mod tests {
             plugin: None,
             active_at: None,
             context: None,
+            spend: None,
         }
     }
 
@@ -335,6 +353,7 @@ mod tests {
                     attach: None,
                     active_at: None,
                     context: None,
+                    spend: None,
                 },
             )
         };
@@ -384,6 +403,7 @@ mod tests {
                     attach: None,
                     active_at: None,
                     context: None,
+                    spend: None,
                 },
             )
         };
@@ -438,6 +458,7 @@ mod tests {
                     attach: None,
                     active_at: None,
                     context: None,
+                    spend: None,
                 },
             )
         };
@@ -497,6 +518,7 @@ mod tests {
                 attach: None,
                 active_at: None,
                 context: None,
+                spend: None,
             },
         );
         let active = HashMap::from([("83f4be50".to_string(), at("2026-10-18T17:14:24Z"))]);

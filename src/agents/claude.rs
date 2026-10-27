@@ -10,7 +10,7 @@
 //! - `<config>/projects/<dir>/<sessionId>.jsonl`: the transcript. Every entry
 //!   carries the session's `cwd`, which after `EnterWorktree` is the tree,
 //!   and every reply the tokens its request sent, which is how full the
-//!   context is. The attachments before the first request say how much of
+//!   context is, and what it cost, which summed is what the session spent. The attachments before the first request say how much of
 //!   it is memory files and skills.
 //! - `<config>/jobs/<id>/state.json`: every background job, running or not,
 //!   which `reports` reads. One with no running session is a cold agent.
@@ -18,6 +18,16 @@
 //! - `<config>/jobs/pins.json`: the jobs Claude Code's daemon never retires
 //!   for sitting idle, which its agent view toggles with Ctrl+T. `keep` adds
 //!   to it and `stop` takes away, under the lock Claude Code takes.
+//!
+//! `resume` starts a stopped or failed job again as `claude --bg --resume`
+//! with the `respawnFlags` its `state.json` keeps, where it was started.
+//!
+//! - `~/.claude/.credentials.json` (in `CLAUDE_CONFIG_DIR` when that is
+//!   set): Claude Code's login, with which `usage` asks Anthropic how much
+//!   of the plan is used, as `/usage` does. It is only read, and an expired
+//!   one is not refreshed, since that would sign Claude Code out.
+//! - `~/.claude.json`: the plan's limits as `/usage` last fetched them,
+//!   under `cachedUsageUtilization`, which `usage` falls back on.
 //!
 //! `clear` deletes every job that worked in a tree, whatever its state,
 //! failed ones included, when the tree goes back to the pool.
@@ -41,7 +51,7 @@ use serde_json::{Value, json};
 
 use crate::child::{self, End};
 use crate::live;
-use crate::plugin::{Code, Context, Error, PROTOCOL, Part, Seen};
+use crate::plugin::{Code, Context, Error, Limit, PROTOCOL, Part, Seen, Spend, Usage as Plan};
 use crate::reports::Reader;
 
 /// How much of a transcript's end is read for its latest `cwd`. One entry is
@@ -127,6 +137,7 @@ fn live_session(session: &Session, start: Option<u64>, dir: PathBuf) -> Option<S
         attach: short.map(attach),
         active_at: None,
         context: None,
+        spend: None,
     })
 }
 
@@ -184,6 +195,9 @@ struct Entry {
 
 #[derive(Deserialize)]
 struct Message {
+    /// The reply's id, the same on every entry of one reply.
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
@@ -196,7 +210,7 @@ struct Attachment {
     kind: String,
 }
 
-/// The input of one request: every token of it was in the context.
+/// The tokens of one request: every token of its input was in the context.
 #[derive(Deserialize)]
 struct Usage {
     #[serde(default)]
@@ -205,6 +219,8 @@ struct Usage {
     cache_creation_input_tokens: u64,
     #[serde(default)]
     cache_read_input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
 }
 
 impl Entry {
@@ -321,12 +337,16 @@ fn split(used: u64, window: u64, opening: Option<Opening>) -> Context {
     }
 }
 
-/// What is known of each transcript: its opening once it has one, and its
-/// latest request, kept for a tail that holds none.
+/// What is known of each transcript: its opening once it has one, its
+/// latest request, kept for a tail that holds none, and what it has spent up
+/// to `read_to`, with the replies already counted.
 #[derive(Default)]
 struct Known {
     opening: Option<Opening>,
     latest: Option<(u64, Option<String>)>,
+    spend: Spend,
+    read_to: u64,
+    counted: HashSet<String>,
 }
 
 static KNOWN: LazyLock<Mutex<HashMap<PathBuf, Known>>> = LazyLock::new(Mutex::default);
@@ -354,6 +374,62 @@ fn context(path: &Path, end: &str) -> Option<Context> {
     }
     let (used, model) = known.latest.as_ref()?;
     Some(split(*used, window(model.as_deref(), *used), known.opening))
+}
+
+/// What the session of the transcript at `path` has spent, every request
+/// counted once, subagents' included: Claude Code writes each content block
+/// of a reply as an entry of its own, every one carrying the reply's usage.
+/// Only what was written since the last read is read.
+fn spend(path: &Path) -> Spend {
+    let mut known = KNOWN.lock().unwrap_or_else(PoisonError::into_inner);
+    let known = known.entry(path.to_path_buf()).or_default();
+    let Ok(mut file) = File::open(path) else {
+        return known.spend;
+    };
+    let len = file.metadata().map_or(0, |m| m.len());
+    if len < known.read_to {
+        // Written over: count it again from the start.
+        (known.spend, known.read_to) = (Spend::default(), 0);
+        known.counted.clear();
+    }
+    let mut bytes = Vec::new();
+    let read = file
+        .seek(SeekFrom::Start(known.read_to))
+        .and_then(|_| file.take(len - known.read_to).read_to_end(&mut bytes));
+    if read.is_err() {
+        return known.spend;
+    }
+    // A line still being written is read next time, whole.
+    let complete = bytes
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map_or(0, |at| at + 1);
+    for line in bytes[..complete].split(|b| *b == b'\n') {
+        let line = String::from_utf8_lossy(line);
+        if !line.contains("\"usage\"") {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<Entry>(&line) else {
+            continue;
+        };
+        let Some(message) = entry.message.filter(|_| entry.kind == "assistant") else {
+            continue;
+        };
+        let (Some(usage), is_new) = (
+            message.usage,
+            message.id.is_none_or(|id| known.counted.insert(id)),
+        ) else {
+            continue;
+        };
+        if is_new {
+            known.spend.input += usage.input_tokens;
+            known.spend.cache_read += usage.cache_read_input_tokens;
+            known.spend.cache_write += usage.cache_creation_input_tokens;
+            known.spend.output += usage.output_tokens;
+        }
+    }
+    known.read_to += u64::try_from(complete).unwrap_or(0);
+    known.spend
 }
 
 /// The session's transcript: the most recently written `<sessionId>.jsonl`
@@ -401,6 +477,7 @@ fn live_sessions(config: &Path) -> Vec<Seen> {
                 .as_deref()
                 .zip(end.as_deref())
                 .and_then(|(path, end)| context(path, end));
+            let spend = transcript.as_deref().map(spend);
             // It last worked when its transcript last grew.
             let active_at = transcript
                 .and_then(|path| fs::metadata(path).and_then(|m| m.modified()).ok())
@@ -409,6 +486,7 @@ fn live_sessions(config: &Path) -> Vec<Seen> {
             live_session(&session, live::stat(session.pid).map(|s| s.start), cwd).map(|seen| Seen {
                 active_at,
                 context,
+                spend,
                 ..seen
             })
         })
@@ -446,6 +524,7 @@ fn cold(live: &[Seen]) -> Vec<Seen> {
                 status: None,
                 background: true,
                 context: None,
+                spend: None,
             })
         })
         .collect()
@@ -598,19 +677,50 @@ fn start(args: &Value) -> Result<Value, Error> {
     Ok(json!({ "id": id }))
 }
 
+/// What a background job's `state.json` says about how to start it again.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JobState {
+    #[serde(default)]
+    resume_session_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    /// Where it was started, which `--resume` runs in again.
+    #[serde(default)]
+    cwd: Option<PathBuf>,
+    /// The tree it took with `EnterWorktree`, if it did.
+    #[serde(default)]
+    worktree_path: Option<PathBuf>,
+    /// The flags it was started with, which a resume passes again.
+    #[serde(default)]
+    respawn_flags: Vec<String>,
+}
+
+impl JobState {
+    fn session(&self) -> Option<&str> {
+        self.resume_session_id
+            .as_deref()
+            .or(self.session_id.as_deref())
+    }
+
+    /// Where it works: the tree it took, else where it was started.
+    fn dir(self) -> Option<PathBuf> {
+        self.worktree_path.or(self.cwd)
+    }
+}
+
+fn job_state(text: &str) -> Option<JobState> {
+    serde_json::from_str(text).ok()
+}
+
+fn read_job(id: &str) -> Option<JobState> {
+    let path = config_dir()?.join("jobs").join(id).join("state.json");
+    job_state(&fs::read_to_string(path).ok()?)
+}
+
 /// The session a background job ran as, which `--resume` takes.
 fn resume_id(id: &str) -> Option<String> {
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct State {
-        #[serde(default)]
-        resume_session_id: Option<String>,
-        #[serde(default)]
-        session_id: Option<String>,
-    }
-    let path = config_dir()?.join("jobs").join(id).join("state.json");
-    let state: State = serde_json::from_str(&fs::read_to_string(path).ok()?).ok()?;
-    state.resume_session_id.or(state.session_id)
+    read_job(id)?.session().map(str::to_string)
 }
 
 /// Sends `text` to a cold session by starting it again in the background
@@ -629,6 +739,63 @@ fn send(args: &Value) -> Result<Value, Error> {
         .ok_or_else(|| Error::new(Code::NotFound, format!("no background job {id}")))?;
     claude(&["--bg", "--resume", &session, "--", message], None)?;
     Ok(json!({ "delivered": true }))
+}
+
+/// Starts a stopped or failed job again where it was started, with its
+/// conversation and the flags it was started with: job `id`, else the job
+/// that last worked in `dir` and is not running, written since `since`
+/// seconds after the epoch when that is given.
+fn resume(args: &Value) -> Result<Value, Error> {
+    let seen = find();
+    let is_live = |id: &str| seen.iter().any(|s| s.live && s.id.as_deref() == Some(id));
+    let id = match text(args, "id") {
+        Some(id) => id.to_string(),
+        None => {
+            let dir = PathBuf::from(required(args, "dir")?);
+            let since = args.get("since").and_then(Value::as_u64).unwrap_or(0);
+            let since = SystemTime::UNIX_EPOCH + Duration::from_secs(since);
+            worked_in(&dir)
+                .into_iter()
+                .filter(|(id, at)| *at >= since && !is_live(id))
+                .max_by_key(|(_, at)| *at)
+                .map(|(id, _)| id)
+                .ok_or_else(|| {
+                    Error::new(
+                        Code::NotFound,
+                        format!("no stopped agent worked in {}", dir.display()),
+                    )
+                })?
+        }
+    };
+    if is_live(&id) {
+        return Err(Error::new(
+            Code::Conflict,
+            format!("{id} is running; open its chat"),
+        ));
+    }
+    let state = read_job(&id)
+        .ok_or_else(|| Error::new(Code::NotFound, format!("no background job {id}")))?;
+    let projects = config_dir()
+        .map(|config| dirs(&config.join("projects")))
+        .unwrap_or_default();
+    let session = state
+        .session()
+        .filter(|session| transcript(&projects, session).is_some())
+        .ok_or_else(|| {
+            Error::new(
+                Code::NotFound,
+                format!("{id} has no conversation to resume"),
+            )
+        })?;
+    let mut argv = vec!["--bg", "--resume", session];
+    argv.extend(state.respawn_flags.iter().map(String::as_str));
+    let dir = state.cwd.as_deref().filter(|dir| dir.is_dir());
+    let out = claude(&argv, dir)?;
+    let started = attach_id(&out)
+        .ok_or_else(|| Error::new(Code::Failed, "claude printed no session id"))?
+        .to_string();
+    confirm(&started)?;
+    Ok(json!({ "id": started, "resumed": id }))
 }
 
 /// Claude Code's lock on `pins.json`: a directory beside it, as the lock
@@ -811,30 +978,27 @@ fn remove(args: &Value) -> Result<Value, Error> {
 /// Every background job that worked in `dir` or under it, in any state:
 /// failed ones too, which no report shows.
 fn jobs_in(dir: &Path) -> Vec<String> {
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct State {
-        #[serde(default)]
-        worktree_path: Option<PathBuf>,
-        #[serde(default)]
-        cwd: Option<PathBuf>,
-    }
+    let mut ids: Vec<String> = worked_in(dir).into_iter().map(|(id, _)| id).collect();
+    ids.sort();
+    ids
+}
+
+/// Every background job that worked in `dir` or under it, with when its
+/// state was last written.
+fn worked_in(dir: &Path) -> Vec<(String, SystemTime)> {
     let Some(jobs) = config_dir().map(|config| config.join("jobs")) else {
         return Vec::new();
     };
-    let mut ids: Vec<String> = dirs(&jobs)
+    dirs(&jobs)
         .into_iter()
-        .filter(|job| {
-            fs::read_to_string(job.join("state.json"))
-                .ok()
-                .and_then(|text| serde_json::from_str::<State>(&text).ok())
-                .and_then(|state| state.worktree_path.or(state.cwd))
-                .is_some_and(|worked| worked.starts_with(dir))
+        .filter_map(|job| {
+            let state = job.join("state.json");
+            let worked = job_state(&fs::read_to_string(&state).ok()?)?.dir()?;
+            let at = fs::metadata(&state).and_then(|m| m.modified()).ok()?;
+            let id = job.file_name()?.to_str()?.to_string();
+            worked.starts_with(dir).then_some((id, at))
         })
-        .filter_map(|job| Some(job.file_name()?.to_str()?.to_string()))
-        .collect();
-    ids.sort();
-    ids
+        .collect()
 }
 
 /// Deletes every background job that worked in `dir`, running or not, so a
@@ -856,6 +1020,165 @@ fn clear(args: &Value) -> Result<Value, Error> {
     Ok(json!({ "removed": removed, "failed": failed }))
 }
 
+/// Where Claude Code asks how much of the plan is used, as `/usage` does.
+const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+
+/// How long a reading of the plan is used before it is asked for again.
+const USAGE_EVERY: Duration = Duration::from_secs(60);
+
+/// How long after a failed ask the plan is not asked for again, so an
+/// outage or a rate limit is never pressed on.
+const USAGE_BACKOFF: Duration = Duration::from_secs(5 * 60);
+
+/// How long one ask gets.
+const USAGE_LIMIT: Duration = Duration::from_secs(10);
+
+/// `name` in `CLAUDE_CONFIG_DIR`, else in the home directory under
+/// `inside`, as Claude Code keeps its account files.
+fn account_path(name: &str, inside: &str) -> Option<PathBuf> {
+    match std::env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(dir) => Some(Path::new(&dir).join(name)),
+        None => std::env::var_os("HOME").map(|home| Path::new(&home).join(inside).join(name)),
+    }
+}
+
+/// A limit's name on screen, from its kind and the model it is scoped to.
+fn limit_name(kind: &str, model: Option<&str>) -> String {
+    let name = match kind {
+        "session" => "5-hour".to_string(),
+        "weekly_all" | "weekly_scoped" => "weekly".to_string(),
+        other => other.replace('_', " "),
+    };
+    match model {
+        Some(model) => format!("{name} {model}"),
+        None => name,
+    }
+}
+
+/// The plan's limits from `utilization`, as the usage endpoint answers and
+/// Claude Code caches it, read at `at`.
+fn plan(utilization: &Value, at: Option<u64>) -> Option<Plan> {
+    let limits = utilization
+        .get("limits")?
+        .as_array()?
+        .iter()
+        .filter_map(|limit| {
+            let model = limit
+                .pointer("/scope/model/display_name")
+                .and_then(Value::as_str);
+            let percent = limit.get("percent")?.as_f64()?;
+            Some(Limit {
+                name: limit_name(limit.get("kind")?.as_str()?, model),
+                percent: percent.round().clamp(0.0, 1000.0) as u64,
+                resets_at: limit
+                    .get("resets_at")
+                    .and_then(Value::as_str)
+                    .and_then(crate::pool::seconds),
+            })
+        })
+        .collect();
+    Some(Plan { limits, at })
+}
+
+/// The plan as Claude Code last fetched it for `/usage`, from the text of
+/// its `.claude.json`.
+fn cached_plan(text: &str) -> Option<Plan> {
+    let account: Value = serde_json::from_str(text).ok()?;
+    let cached = account.get("cachedUsageUtilization")?;
+    let at = cached
+        .get("fetchedAtMs")
+        .and_then(Value::as_u64)
+        .map(|ms| ms / 1000);
+    plan(cached.get("utilization")?, at)
+}
+
+/// Claude Code's login, from the text of its `.credentials.json`, while it
+/// has not expired at `now_ms`. It is never refreshed here: a refresh
+/// replaces the token Claude Code holds, and would sign it out.
+fn token(text: &str, now_ms: u64) -> Option<String> {
+    let credentials: Value = serde_json::from_str(text).ok()?;
+    let oauth = credentials.get("claudeAiOauth")?;
+    let expires = oauth.get("expiresAt").and_then(Value::as_u64)?;
+    (expires > now_ms)
+        .then(|| oauth.get("accessToken")?.as_str().map(str::to_string))
+        .flatten()
+}
+
+fn now() -> Duration {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+}
+
+/// Asks how much of the plan is used now, with Claude Code's login.
+fn fetch_plan() -> Result<Plan, String> {
+    let credentials = account_path(".credentials.json", ".claude")
+        .and_then(|path| fs::read_to_string(path).ok())
+        .ok_or("no Claude Code login to ask with")?;
+    let token = token(
+        &credentials,
+        u64::try_from(now().as_millis()).unwrap_or(u64::MAX),
+    )
+    .ok_or("Claude Code's login has expired; it renews it when next used")?;
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(USAGE_LIMIT))
+        .build()
+        .into();
+    let mut response = agent
+        .get(USAGE_URL)
+        .header("Authorization", &format!("Bearer {token}"))
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .call()
+        .map_err(|err| format!("{USAGE_URL}: {err}"))?;
+    let text = response
+        .body_mut()
+        .read_to_string()
+        .map_err(|err| format!("{USAGE_URL}: {err}"))?;
+    let body: Value = serde_json::from_str(&text).map_err(|err| format!("{USAGE_URL}: {err}"))?;
+    plan(&body, Some(now().as_secs())).ok_or_else(|| format!("{USAGE_URL} gave no limits"))
+}
+
+/// The last plan read here, and when the next ask may go.
+struct Asked {
+    plan: Option<Plan>,
+    next: Instant,
+}
+
+static ASKED: LazyLock<Mutex<Option<Asked>>> = LazyLock::new(Mutex::default);
+
+/// How much of the plan is used: asked of Anthropic as `/usage` asks, at
+/// most every USAGE_EVERY, else the latest reading, here or Claude Code's;
+/// none when there is neither.
+fn usage() -> Result<Value, Error> {
+    let mut asked = ASKED.lock().unwrap_or_else(PoisonError::into_inner);
+    if asked.as_ref().is_none_or(|a| Instant::now() >= a.next) {
+        let fetched = fetch_plan();
+        let wait = if fetched.is_ok() {
+            USAGE_EVERY
+        } else {
+            USAGE_BACKOFF
+        };
+        let last = asked.take().and_then(|a| a.plan);
+        *asked = Some(Asked {
+            plan: fetched.ok().or(last),
+            next: Instant::now() + wait,
+        });
+    }
+    let cached = || {
+        account_path(".claude.json", "")
+            .and_then(|path| fs::read_to_string(path).ok())
+            .as_deref()
+            .and_then(cached_plan)
+    };
+    // Whichever reading is newer: Claude Code may have asked since.
+    let plan = [asked.as_ref().and_then(|a| a.plan.clone()), cached()]
+        .into_iter()
+        .flatten()
+        .max_by_key(|plan| plan.at)
+        .unwrap_or_default();
+    serde_json::to_value(plan).map_err(|err| Error::new(Code::Failed, err.to_string()))
+}
+
 /// Answers one request as the Claude Code plugin.
 pub fn op(op: &str, args: &Value) -> Result<Value, Error> {
     match op {
@@ -863,7 +1186,10 @@ pub fn op(op: &str, args: &Value) -> Result<Value, Error> {
             "protocol": PROTOCOL,
             "name": "claude",
             "kind": "agent",
-            "ops": ["start", "find", "attach", "send", "stop", "remove", "keep", "clear"],
+            "ops": [
+                "start", "find", "attach", "send", "resume", "stop", "remove", "keep", "clear",
+                "usage",
+            ],
             // The prompt box sits between two rules; a permission or
             // question dialog takes its place and numbers its choices. The
             // agent view, which `claude attach` goes back to, prompts for a
@@ -879,6 +1205,8 @@ pub fn op(op: &str, args: &Value) -> Result<Value, Error> {
         "start" => start(args),
         "attach" => Ok(json!({ "argv": attach(required(args, "id")?) })),
         "send" => send(args),
+        "resume" => resume(args),
+        "usage" => usage(),
         "stop" => stop(args),
         "remove" => remove(args),
         "keep" => keep(args),
@@ -1000,6 +1328,51 @@ mod tests {
         let output = "started\n  claude attach cbcfd8c8    open in this terminal\n";
         assert_eq!(attach_id(output), Some("cbcfd8c8"));
         assert_eq!(attach_id("claude attach <id>"), None);
+    }
+
+    #[test]
+    fn a_login_is_used_only_until_it_expires_and_never_refreshed() {
+        let credentials =
+            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat","refreshToken":"r","expiresAt":2000}}"#;
+        assert_eq!(token(credentials, 1999).as_deref(), Some("sk-ant-oat"));
+        assert_eq!(
+            token(credentials, 2000),
+            None,
+            "expired: left for Claude Code"
+        );
+        assert_eq!(token("{}", 0), None);
+        assert_eq!(token("not json", 0), None);
+    }
+
+    #[test]
+    fn reads_the_limits_as_the_usage_endpoint_answers() {
+        let body = json!({
+            "five_hour": { "utilization": 21.0 },
+            "limits": [
+                { "kind": "session", "percent": 21, "resets_at": "2026-10-27T22:00:00+00:00" },
+                { "kind": "weekly_scoped", "percent": 0.4, "resets_at": null,
+                  "scope": { "model": { "display_name": "Fable" } } },
+                { "kind": "monthly_spend", "percent": 3 },
+                { "percent": 9 },
+            ],
+        });
+        let plan = plan(&body, Some(7)).unwrap();
+        assert_eq!(plan.at, Some(7));
+        let read: Vec<(&str, u64, Option<u64>)> = plan
+            .limits
+            .iter()
+            .map(|l| (l.name.as_str(), l.percent, l.resets_at))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                ("5-hour", 21, Some(1_793_138_400)),
+                ("weekly Fable", 0, None),
+                ("monthly spend", 3, None),
+            ],
+            "a limit with no kind is left out"
+        );
+        assert_eq!(super::plan(&json!({}), None), None);
     }
 
     #[test]
