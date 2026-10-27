@@ -2,8 +2,9 @@
 //! tree reaches for another: a tree is given back only by whoever holds it,
 //! or once its work is finished, and never from under a live process.
 //!
-//! Needs `treehouse` on PATH. Its config and Claude Code's are pointed at
-//! scratch directories, so no hook runs and no real agent is touched.
+//! Needs `treehouse` on PATH, and says so and passes where it is not, as on
+//! the release runners. Its config and Claude Code's are pointed at scratch
+//! directories, so no hook runs and no real agent is touched.
 
 use std::fs;
 use std::io::Write;
@@ -20,7 +21,13 @@ struct Pool {
 }
 
 impl Pool {
-    fn new(test: &str) -> Pool {
+    /// A fresh pool for `test`, or None where there is no treehouse to
+    /// lease from.
+    fn new(test: &str) -> Option<Pool> {
+        if Command::new("treehouse").arg("--version").output().is_err() {
+            eprintln!("skipped: no treehouse on PATH");
+            return None;
+        }
         let root =
             std::env::temp_dir().join(format!("treetop-guard-{}-{test}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -43,7 +50,7 @@ impl Pool {
             &["remote", "add", "origin", origin.to_str().unwrap()],
         );
         pool.git(&pool.repo, &["push", "-q", "-u", "origin", "main"]);
-        pool
+        Some(pool)
     }
 
     /// `program` run in `dir` with this pool's environment.
@@ -166,7 +173,9 @@ fn session_in(dir: &Path) -> Child {
 
 #[test]
 fn a_session_cannot_return_a_tree_another_session_is_working_in() {
-    let pool = Pool::new("foreign");
+    let Some(pool) = Pool::new("foreign") else {
+        return;
+    };
     let theirs = pool.lease("claude:feature/theirs");
     let mine = pool.lease("claude:feature/mine");
     pool.git(&theirs, &["switch", "-q", "-c", "feature/theirs"]);
@@ -212,7 +221,9 @@ fn a_session_cannot_return_a_tree_another_session_is_working_in() {
 
 #[test]
 fn a_finished_tree_nobody_runs_in_may_be_returned_from_anywhere() {
-    let pool = Pool::new("finished");
+    let Some(pool) = Pool::new("finished") else {
+        return;
+    };
     let done = pool.lease("claude:done");
     let name = pool.name(&done);
 
@@ -227,7 +238,9 @@ fn a_finished_tree_nobody_runs_in_may_be_returned_from_anywhere() {
 /// tree's own session ran on.
 #[test]
 fn an_agent_is_kept_from_another_trees_stack_and_lease_by_the_hook() {
-    let pool = Pool::new("hook");
+    let Some(pool) = Pool::new("hook") else {
+        return;
+    };
     fs::create_dir_all(pool.root.join("home/.config/treetop")).unwrap();
     fs::write(
         pool.root.join("home/.config/treetop/config.toml"),
@@ -268,7 +281,9 @@ fn an_agent_is_kept_from_another_trees_stack_and_lease_by_the_hook() {
 
 #[test]
 fn guard_says_what_this_caller_may_do_to_a_tree() {
-    let pool = Pool::new("check");
+    let Some(pool) = Pool::new("check") else {
+        return;
+    };
     let theirs = pool.lease("claude:feature/theirs");
     let mine = pool.lease("claude:feature/mine");
     pool.git(&theirs, &["switch", "-q", "-c", "feature/theirs"]);
