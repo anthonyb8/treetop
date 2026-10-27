@@ -365,3 +365,56 @@ fn an_agent_that_died_is_found_cold_and_woken_with_its_conversation() {
         ["--bg --resume 0aaaaaaa-1111-2222-3333-444444444444"]
     );
 }
+
+#[test]
+fn a_live_agent_says_how_full_its_context_is_and_roughly_from_where() {
+    let root = scratch("context");
+    let tree = root.join("tree");
+    running(&root, "0ccccccc", &tree);
+    let projects = root.join("claude/projects/-tree");
+    fs::create_dir_all(&projects).unwrap();
+    let usage = |input: u64, read: u64| {
+        json!({ "input_tokens": input, "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": read })
+    };
+    let reply = |used: Value, sidechain: bool| {
+        json!({ "type": "assistant", "isSidechain": sidechain, "cwd": tree,
+                "message": { "model": "claude-sonnet-4-5", "usage": used } })
+    };
+    // As Claude Code writes them: the memory files and skills listing go in
+    // before the first request, then the conversation grows; a subagent's
+    // turn has a context of its own.
+    let entries = [
+        json!({ "type": "attachment", "attachment": { "type": "instructions" },
+                "rendered": "m".repeat(4_000) }),
+        json!({ "type": "attachment", "attachment": { "type": "skill_listing" },
+                "rendered": "s".repeat(8_000) }),
+        reply(usage(10, 19_990), false),
+        reply(usage(5, 54_995), false),
+        reply(usage(1, 150_000), true),
+        json!({ "type": "user", "cwd": tree }),
+    ];
+    let transcript: String = entries.iter().map(|e| format!("{e}\n")).collect();
+    fs::write(
+        projects.join("0ccccccc-1111-2222-3333-444444444444.jsonl"),
+        transcript,
+    )
+    .unwrap();
+
+    let found = call(&root, "find", json!({ "dirs": [tree] }));
+    let agents = found["agents"].as_array().unwrap();
+    assert_eq!(agents.len(), 1, "{found}");
+    assert_eq!(
+        agents[0]["context"],
+        json!({
+            "used": 55_000,
+            "window": 200_000,
+            "parts": [
+                { "name": "conversation", "tokens": 35_000 },
+                { "name": "system & tools", "tokens": 17_000 },
+                { "name": "skills", "tokens": 2_000 },
+                { "name": "memory files", "tokens": 1_000 },
+            ],
+        })
+    );
+}

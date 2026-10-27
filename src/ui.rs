@@ -10,7 +10,9 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Cell, Clear, Padding, Paragraph, Row, Table, TableState, Wrap,
+};
 
 use crate::agents::{Agent, Status};
 use crate::app::{
@@ -21,6 +23,7 @@ use crate::assistant;
 use crate::chat::Chat;
 use crate::diff::{Change, FileDiff, Layout as DiffLayout, Row as DiffRow, Side, ViewRow};
 use crate::dispatch::{Prompt, Purpose, Target};
+use crate::plugin::Context;
 use crate::pool::{Tree, Work};
 use crate::popup;
 use crate::reports::{self, State};
@@ -1824,7 +1827,8 @@ fn draw_diff_view(frame: &mut Frame, app: &App, view: &DiffView) {
 /// branch comes from the latest listing, so it follows the agent if it
 /// switches branches.
 fn draw_chat(frame: &mut Frame, app: &App, chat: &Chat) {
-    let body = chat_frame(frame, app, &chat.agent, &chat.tree);
+    let context = context_of(app, Some(chat.command()), &chat.agent, &chat.tree);
+    let body = chat_frame(frame, app, &chat.agent, &chat.tree, context);
     if !chat.is_ready() {
         draw_note(frame, body, &opening_note(&chat.agent));
         return;
@@ -1837,7 +1841,8 @@ fn draw_chat(frame: &mut Frame, app: &App, chat: &Chat) {
 /// The popup a chat on its way stands in with: the frame the chat opens in,
 /// so the hand-over from the compose box to the chat never leaves the popup.
 fn draw_opening(frame: &mut Frame, app: &App, opening: &Opening) {
-    let body = chat_frame(frame, app, &opening.agent, &opening.tree);
+    let context = context_of(app, None, &opening.agent, &opening.tree);
+    let body = chat_frame(frame, app, &opening.agent, &opening.tree, context);
     let note = if opening.tree == "new" {
         "leasing a tree for the agent...".to_string()
     } else {
@@ -1855,8 +1860,15 @@ fn opening_note(agent: &str) -> String {
 }
 
 /// A chat's popup: its frame and bar, cleared, with the keys out at the
-/// right of the bar. Returns where the chat's screen goes.
-fn chat_frame(frame: &mut Frame, app: &App, agent: &str, tree: &str) -> Rect {
+/// right of the bar, and its sidebar where there is room for one. Returns
+/// where the chat's screen goes.
+fn chat_frame(
+    frame: &mut Frame,
+    app: &App,
+    agent: &str,
+    tree: &str,
+    context: Option<&Context>,
+) -> Rect {
     let t = theme();
     let title = if assistant::is_assistant(agent) {
         vec![Span::styled(" assistant ", t.badge)]
@@ -1885,7 +1897,117 @@ fn chat_frame(frame: &mut Frame, app: &App, agent: &str, tree: &str) -> Rect {
         ]
     };
     let keys = key_bar(&[("^Q", "back to treetop"), ("^\\", "next chat")]);
-    bar_popup(frame, title, keys)
+    bar_popup(frame, title, keys);
+    if let Some(side) = popup::sidebar(frame.area()) {
+        let block = Block::new()
+            .borders(Borders::LEFT)
+            .border_style(fg(theme().border))
+            .padding(Padding::horizontal(1));
+        let inner = block.inner(side);
+        frame.render_widget(block, side);
+        frame.render_widget(Paragraph::new(sidebar_lines(context, inner.width)), inner);
+    }
+    popup::chat(frame.area())
+}
+
+/// The context of the chat's agent: the one its command attaches to, else
+/// the one of its name in its tree.
+fn context_of<'a>(
+    app: &'a App,
+    command: Option<&[String]>,
+    agent: &str,
+    tree: &str,
+) -> Option<&'a Context> {
+    let agents = || app.trees.iter().flat_map(|t| &t.agents);
+    command
+        .and_then(|command| agents().find(|a| a.attach.as_deref() == Some(command)))
+        .or_else(|| {
+            app.trees
+                .iter()
+                .filter(|t| t.name == tree)
+                .flat_map(|t| &t.agents)
+                .find(|a| a.name == agent)
+        })?
+        .context
+        .as_ref()
+}
+
+/// A count of tokens in a few characters: `850`, `97k`, `1M`.
+fn tokens(count: u64) -> String {
+    match count {
+        0..1_000 => count.to_string(),
+        1_000..1_000_000 => format!("{}k", count / 1_000),
+        _ if count.is_multiple_of(1_000_000) => format!("{}M", count / 1_000_000),
+        _ => format!("{:.1}M", count as f64 / 1_000_000.0),
+    }
+}
+
+fn percent(context: &Context) -> u64 {
+    (context.used * 100)
+        .checked_div(context.window)
+        .unwrap_or(0)
+}
+
+/// How a context reads: loud as it nears the end of its window, where the
+/// agent compacts it and forgets the detail.
+fn context_style(context: &Context) -> Style {
+    let t = theme();
+    match percent(context) {
+        90.. => fg(t.danger).add_modifier(Modifier::BOLD),
+        75.. => fg(t.warning),
+        _ => fg(t.muted),
+    }
+}
+
+/// A bar `width` cells long, filled for `share` of 100.
+fn meter(share: u64, width: u16) -> (String, String) {
+    let width = usize::from(width);
+    let filled = (usize::try_from(share.min(100)).unwrap_or(100) * width).div_ceil(100);
+    ("█".repeat(filled), "░".repeat(width - filled))
+}
+
+/// The chat's sidebar: how full its agent's context is, and an estimate of
+/// where it comes from, each part with its share of what is used.
+fn sidebar_lines(context: Option<&Context>, width: u16) -> Vec<Line<'static>> {
+    let t = theme();
+    let mut lines = vec![Line::styled(
+        "Context",
+        fg(t.title).add_modifier(Modifier::BOLD),
+    )];
+    let Some(context) = context else {
+        lines.push(Line::styled("not known for this agent", fg(t.muted)));
+        return lines;
+    };
+    let share = percent(context);
+    let (filled, empty) = meter(share, width.saturating_sub(5));
+    lines.extend([
+        Line::from(vec![
+            Span::raw(tokens(context.used)),
+            Span::styled(format!(" of {}", tokens(context.window)), fg(t.muted)),
+        ]),
+        Line::from(vec![
+            Span::styled(filled, context_style(context)),
+            Span::styled(empty, fg(t.border)),
+            Span::styled(format!("{share:>4}%"), context_style(context)),
+        ]),
+    ]);
+    if context.parts.is_empty() {
+        return lines;
+    }
+    lines.extend([Line::raw(""), Line::styled("Estimated split", fg(t.muted))]);
+    let name_width = usize::from(width).saturating_sub(11);
+    lines.extend(context.parts.iter().map(|part| {
+        let of = match (part.tokens * 100).checked_div(context.used).unwrap_or(0) {
+            0 => "<1%".to_string(),
+            of => format!("{of}%"),
+        };
+        Line::from(vec![
+            Span::raw(format!("{:<name_width$}", part.name)),
+            Span::raw(format!("{:>5}", tokens(part.tokens))),
+            Span::styled(format!("{of:>6}"), fg(t.muted)),
+        ])
+    }));
+    lines
 }
 
 /// A popup with a bar on the first row inside its border, drawn like a

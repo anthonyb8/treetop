@@ -8,7 +8,10 @@
 //! - `<config>/sessions/<pid>.json`: one per running session, with its id,
 //!   name, status, kind (`interactive` or `bg`) and process start time.
 //! - `<config>/projects/<dir>/<sessionId>.jsonl`: the transcript. Every entry
-//!   carries the session's `cwd`, which after `EnterWorktree` is the tree.
+//!   carries the session's `cwd`, which after `EnterWorktree` is the tree,
+//!   and every reply the tokens its request sent, which is how full the
+//!   context is. The attachments before the first request say how much of
+//!   it is memory files and skills.
 //! - `<config>/jobs/<id>/state.json`: every background job, running or not,
 //!   which `reports` reads. One with no running session is a cold agent.
 //!
@@ -38,7 +41,7 @@ use serde_json::{Value, json};
 
 use crate::child::{self, End};
 use crate::live;
-use crate::plugin::{Code, Error, PROTOCOL, Seen};
+use crate::plugin::{Code, Context, Error, PROTOCOL, Part, Seen};
 use crate::reports::Reader;
 
 /// How much of a transcript's end is read for its latest `cwd`. One entry is
@@ -123,6 +126,7 @@ fn live_session(session: &Session, start: Option<u64>, dir: PathBuf) -> Option<S
         background: is_background,
         attach: short.map(attach),
         active_at: None,
+        context: None,
     })
 }
 
@@ -149,6 +153,207 @@ fn tail(path: &Path) -> Option<String> {
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).ok()?;
     Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// How much of a transcript's start is read for its first request, which
+/// follows the session's opening attachments and first message.
+const HEAD: u64 = 1024 * 1024;
+
+/// The window of a model run with Claude Code's long context, and of the
+/// rest.
+const LONG_WINDOW: u64 = 1_000_000;
+const WINDOW: u64 = 200_000;
+
+/// A transcript entry, as far as its context is concerned.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Entry {
+    #[serde(rename = "type")]
+    kind: String,
+    /// A subagent's turn, whose context is its own.
+    #[serde(default)]
+    is_sidechain: bool,
+    #[serde(default)]
+    message: Option<Message>,
+    #[serde(default)]
+    attachment: Option<Attachment>,
+    /// The text an attachment puts in the context.
+    #[serde(default)]
+    rendered: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct Message {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    usage: Option<Usage>,
+}
+
+#[derive(Deserialize)]
+struct Attachment {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+/// The input of one request: every token of it was in the context.
+#[derive(Deserialize)]
+struct Usage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    cache_creation_input_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: u64,
+}
+
+impl Entry {
+    /// The context of the session's own request this entry answers, in
+    /// tokens, and the model it went to.
+    fn request(&self) -> Option<(u64, Option<&str>)> {
+        if self.kind != "assistant" || self.is_sidechain {
+            return None;
+        }
+        let message = self.message.as_ref()?;
+        let usage = message.usage.as_ref()?;
+        let used =
+            usage.input_tokens + usage.cache_creation_input_tokens + usage.cache_read_input_tokens;
+        Some((used, message.model.as_deref()))
+    }
+
+    /// The attachment's type and roughly how many tokens it adds, at four
+    /// characters a token.
+    fn attached(&self) -> Option<(&str, u64)> {
+        let kind = &self.attachment.as_ref()?.kind;
+        let chars = match self.rendered.as_ref()? {
+            Value::String(text) => text.chars().count(),
+            other => other.to_string().chars().count(),
+        };
+        Some((kind, u64::try_from(chars).unwrap_or(u64::MAX) / 4))
+    }
+}
+
+/// What the session's first request held: everything that is there before
+/// the conversation is, and of it, the memory files and the skills listing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Opening {
+    used: u64,
+    memory: u64,
+    skills: u64,
+}
+
+/// The opening read from the start of a transcript, None while it has had
+/// no request.
+fn opening(head: &str) -> Option<Opening> {
+    let (mut memory, mut skills) = (0, 0);
+    for line in head.lines() {
+        let Ok(entry) = serde_json::from_str::<Entry>(line) else {
+            continue;
+        };
+        if let Some((used, _)) = entry.request() {
+            return Some(Opening {
+                used,
+                memory,
+                skills,
+            });
+        }
+        match entry.attached() {
+            Some(("instructions", tokens)) => memory += tokens,
+            Some(("skill_listing", tokens)) => skills += tokens,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The context of the latest request in a transcript's tail, and its
+/// model. The tail can begin mid-entry, which is skipped.
+fn latest(tail: &str) -> Option<(u64, Option<String>)> {
+    tail.lines()
+        .rev()
+        .filter(|line| line.contains("\"usage\""))
+        .filter_map(|line| serde_json::from_str::<Entry>(line).ok())
+        .find_map(|entry| {
+            entry
+                .request()
+                .map(|(used, model)| (used, model.map(str::to_string)))
+        })
+}
+
+/// The window a session's model has. Claude Code runs a model with a
+/// million tokens when its id says `[1m]`, and Claude 5 models with one by
+/// default; a context already past the shorter window had the longer one.
+fn window(model: Option<&str>, used: u64) -> u64 {
+    let is_long = model.is_some_and(|m| m.ends_with("[1m]") || m.contains("-5-"));
+    if is_long || used > WINDOW {
+        LONG_WINDOW
+    } else {
+        WINDOW
+    }
+}
+
+/// How full the context is and where it comes from: the conversation is
+/// what it has grown by since the first request, and the rest of that
+/// request is the system prompt and tools.
+fn split(used: u64, window: u64, opening: Option<Opening>) -> Context {
+    let mut parts = Vec::new();
+    if let Some(o) = opening {
+        let start = [
+            ("memory files", o.memory),
+            ("skills", o.skills),
+            ("system & tools", o.used.saturating_sub(o.memory + o.skills)),
+        ];
+        parts.push(("conversation", used.saturating_sub(o.used)));
+        parts.extend(start);
+    }
+    parts.retain(|(_, tokens)| *tokens > 0);
+    parts.sort_by_key(|(_, tokens)| std::cmp::Reverse(*tokens));
+    Context {
+        used,
+        window,
+        parts: parts
+            .into_iter()
+            .map(|(name, tokens)| Part {
+                name: name.into(),
+                tokens,
+            })
+            .collect(),
+    }
+}
+
+/// What is known of each transcript: its opening once it has one, and its
+/// latest request, kept for a tail that holds none.
+#[derive(Default)]
+struct Known {
+    opening: Option<Opening>,
+    latest: Option<(u64, Option<String>)>,
+}
+
+static KNOWN: LazyLock<Mutex<HashMap<PathBuf, Known>>> = LazyLock::new(Mutex::default);
+
+fn head(path: &Path) -> Option<String> {
+    let mut bytes = Vec::new();
+    File::open(path)
+        .ok()?
+        .take(HEAD)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// How full the session's context is, from its transcript at `path`, whose
+/// tail is `end`. The opening is read once.
+fn context(path: &Path, end: &str) -> Option<Context> {
+    let mut known = KNOWN.lock().unwrap_or_else(PoisonError::into_inner);
+    let known = known.entry(path.to_path_buf()).or_default();
+    if known.opening.is_none() {
+        known.opening = head(path).as_deref().and_then(opening);
+    }
+    if let Some(latest) = latest(end) {
+        known.latest = Some(latest);
+    }
+    let (used, model) = known.latest.as_ref()?;
+    Some(split(*used, window(model.as_deref(), *used), known.opening))
 }
 
 /// The session's transcript: the most recently written `<sessionId>.jsonl`
@@ -187,18 +392,25 @@ fn live_sessions(config: &Path) -> Vec<Seen> {
             // A session that has had no message yet has no transcript; until
             // it does, it works where its process runs.
             let transcript = transcript(&projects, &session.session_id);
-            let cwd = transcript
+            let end = transcript.as_deref().and_then(tail);
+            let cwd = end
                 .as_deref()
-                .and_then(tail)
-                .and_then(|tail| last_cwd(&tail))
+                .and_then(last_cwd)
                 .or_else(|| fs::read_link(format!("/proc/{}/cwd", session.pid)).ok())?;
+            let context = transcript
+                .as_deref()
+                .zip(end.as_deref())
+                .and_then(|(path, end)| context(path, end));
             // It last worked when its transcript last grew.
             let active_at = transcript
                 .and_then(|path| fs::metadata(path).and_then(|m| m.modified()).ok())
                 .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|since| since.as_secs());
-            live_session(&session, live::stat(session.pid).map(|s| s.start), cwd)
-                .map(|seen| Seen { active_at, ..seen })
+            live_session(&session, live::stat(session.pid).map(|s| s.start), cwd).map(|seen| Seen {
+                active_at,
+                context,
+                ..seen
+            })
         })
         .collect()
 }
@@ -233,6 +445,7 @@ fn cold(live: &[Seen]) -> Vec<Seen> {
                 pid: None,
                 status: None,
                 background: true,
+                context: None,
             })
         })
         .collect()
@@ -737,6 +950,15 @@ mod tests {
         );
         assert_eq!(last_cwd(tail), Some(PathBuf::from("/p/11/app/ui")));
         assert_eq!(last_cwd("no entries"), None);
+    }
+
+    #[test]
+    fn a_long_context_is_measured_against_a_million_tokens() {
+        assert_eq!(window(Some("claude-sonnet-4-5"), 150_000), 200_000);
+        assert_eq!(window(Some("claude-sonnet-4-5"), 250_000), 1_000_000);
+        assert_eq!(window(Some("claude-sonnet-4-5[1m]"), 50_000), 1_000_000);
+        assert_eq!(window(Some("claude-opus-5-5"), 50_000), 1_000_000);
+        assert_eq!(window(None, 50_000), 200_000);
     }
 
     #[test]

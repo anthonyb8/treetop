@@ -313,6 +313,26 @@ pub struct Seen {
     /// tree's lease began.
     #[serde(default)]
     pub active_at: Option<u64>,
+    /// How full its context window is, where the plugin can tell.
+    #[serde(default)]
+    pub context: Option<Context>,
+}
+
+/// How full an agent's context window is: `used` of `window` tokens, and
+/// `parts`, an estimate of where they come from, largest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Context {
+    pub used: u64,
+    pub window: u64,
+    #[serde(default)]
+    pub parts: Vec<Part>,
+}
+
+/// One source of an agent's context and its estimated size in tokens.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Part {
+    pub name: String,
+    pub tokens: u64,
 }
 
 fn running() -> bool {

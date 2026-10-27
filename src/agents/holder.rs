@@ -42,6 +42,7 @@ fn parse(text: &str) -> Option<Agent> {
         job: None,
         plugin: None,
         active_at: None,
+        context: None,
     })
 }
 
