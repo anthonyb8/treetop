@@ -2,9 +2,17 @@
 //! tree table, with a margin of it left showing round the edge, so treetop
 //! stays on screen and a chat never passes for a terminal of its own. The
 //! chat and the diff say what they show in a bar on the first row inside the
-//! border, and the chat's terminal is sized from the rows under it.
+//! border, and the chat's terminal is sized from the rows under it, less
+//! the sidebar at its right where the popup is wide enough for one.
 
 use ratatui::layout::Rect;
+
+/// How wide a chat's sidebar is, its border included.
+const SIDEBAR: u16 = 30;
+
+/// How wide the popup's body must be for a chat to have a sidebar: below
+/// it, the chat gets every column.
+const SIDEBAR_FROM: u16 = 100;
 
 /// The popup over a screen of `screen`: a margin of about a sixteenth of the
 /// width at each side and a twelfth of the height at the top and bottom, at
@@ -49,11 +57,29 @@ pub fn body(screen: Rect) -> Rect {
     )
 }
 
-/// The size of a terminal drawn inside the popup, `(rows, cols)`, for a
-/// screen of `rows` by `cols`.
+/// The chat's sidebar at the right of the body, where it is wide enough
+/// for one.
+pub fn sidebar(screen: Rect) -> Option<Rect> {
+    let body = body(screen);
+    (body.width >= SIDEBAR_FROM)
+        .then(|| Rect::new(body.right() - SIDEBAR, body.y, SIDEBAR, body.height))
+}
+
+/// Where a chat's terminal goes: the body, less its sidebar.
+pub fn chat(screen: Rect) -> Rect {
+    let body = body(screen);
+    let width = sidebar(screen).map_or(0, |side| side.width);
+    Rect {
+        width: body.width - width,
+        ..body
+    }
+}
+
+/// The size of a chat's terminal, `(rows, cols)`, for a screen of `rows` by
+/// `cols`.
 pub fn terminal_size(rows: u16, cols: u16) -> (u16, u16) {
-    let body = body(Rect::new(0, 0, cols, rows));
-    (body.height.max(1), body.width.max(1))
+    let chat = chat(Rect::new(0, 0, cols, rows));
+    (chat.height.max(1), chat.width.max(1))
 }
 
 /// A box of `width` by `height` in the middle of `area`, shrunk to fit.
@@ -79,7 +105,17 @@ mod tests {
         assert_eq!(inner(screen), Rect::new(11, 5, 138, 38));
         assert_eq!(bar(screen), Rect::new(11, 5, 138, 1));
         assert_eq!(body(screen), Rect::new(11, 6, 138, 37));
-        assert_eq!(terminal_size(48, 160), (37, 138));
+    }
+
+    #[test]
+    fn a_chat_shares_a_wide_popup_with_its_sidebar_and_fills_a_narrow_one() {
+        let wide = Rect::new(0, 0, 160, 48);
+        assert_eq!(sidebar(wide), Some(Rect::new(119, 6, 30, 37)));
+        assert_eq!(chat(wide), Rect::new(11, 6, 108, 37));
+        assert_eq!(terminal_size(48, 160), (37, 108));
+        let narrow = Rect::new(0, 0, 100, 30);
+        assert_eq!(sidebar(narrow), None);
+        assert_eq!(chat(narrow), body(narrow));
     }
 
     #[test]

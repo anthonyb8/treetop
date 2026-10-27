@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::plugin::{self, Kind, Seen};
+use crate::plugin::{self, Context, Kind, Seen};
 use crate::pool::{self, Process, Tree};
 use crate::sidecar::Sidecar;
 
@@ -100,6 +100,8 @@ pub struct Agent {
     /// When it last worked, in seconds since the epoch, where its source
     /// can tell.
     pub active_at: Option<u64>,
+    /// How full its context window is, where its source can tell.
+    pub context: Option<Context>,
 }
 
 /// An agent and the directory it works in, before it is placed in a tree.
@@ -126,6 +128,7 @@ fn from_plugin(plugin: &str, seen: Seen) -> Sighting {
         job: seen.id,
         plugin: Some(plugin.to_string()),
         active_at: seen.active_at,
+        context: seen.context,
     };
     (seen.dir, agent)
 }
@@ -264,6 +267,7 @@ mod tests {
             job: None,
             plugin: None,
             active_at: None,
+            context: None,
         }
     }
 
@@ -330,6 +334,7 @@ mod tests {
                     background: true,
                     attach: None,
                     active_at: None,
+                    context: None,
                 },
             )
         };
@@ -378,6 +383,7 @@ mod tests {
                     background: true,
                     attach: None,
                     active_at: None,
+                    context: None,
                 },
             )
         };
@@ -431,6 +437,7 @@ mod tests {
                     background: true,
                     attach: None,
                     active_at: None,
+                    context: None,
                 },
             )
         };
@@ -489,6 +496,7 @@ mod tests {
                 background: true,
                 attach: None,
                 active_at: None,
+                context: None,
             },
         );
         let active = HashMap::from([("83f4be50".to_string(), at("2026-10-18T17:14:24Z"))]);

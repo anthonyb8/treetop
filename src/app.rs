@@ -2838,6 +2838,7 @@ mod tests {
             job: Some(job.into()),
             plugin: Some("claude".into()),
             active_at: None,
+            context: None,
         };
         let interactive = Agent {
             is_background: false,
@@ -3513,6 +3514,7 @@ mod tests {
             job: None,
             plugin: None,
             active_at: None,
+            context: None,
         }
     }
 

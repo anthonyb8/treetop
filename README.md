@@ -223,7 +223,7 @@ An agent plugin answers these ops:
 | Op | Args | Result |
 |---|---|---|
 | `start` | `dir`, `name`, `prompt`, `isolated` (`dir` is a tree of the agent's own, to stay in) | `id`, once the agent runs |
-| `find` | `dirs` | `agents`: each with `id`, `name`, `dir`, `live`, and optionally `pid`, `status` (`busy`, `idle` or `waiting`), `background` and `attach` |
+| `find` | `dirs` | `agents`: each with `id`, `name`, `dir`, `live`, and optionally `pid`, `status` (`busy`, `idle` or `waiting`), `background`, `attach` and `context`: `{ "used", "window", "parts" }`, `parts` each `{ "name", "tokens" }`, largest first |
 | `attach` | `id` | `argv`, the command that opens its chat in a terminal |
 | `send` | `id`, `text` | `delivered`, for an agent that is not running |
 
@@ -287,6 +287,10 @@ The tree treetop was started in is never a target, because returning or destroyi
 Enter opens the chat of the agent in the tree under the cursor in a popup over treetop, the way `d` opens the diff.
 The pool stays on screen, dimmed, round the popup's border, so a chat never passes for a Claude Code session of your own; a bar on the popup's first row, inside its border, names the tree, branch and agent, with the keys out at its right.
 The chat's terminal is the size of the inside of the popup, and follows it when the terminal is resized.
+Where the popup is at least 100 columns wide, a sidebar at its right takes 30 of them and shows how full the agent's context is: tokens used, the window, and a bar that turns to warning colours from 75%, as the agent nears compacting it.
+Under that is an estimate of where those tokens come from: the memory files and skills listing Claude Code put in before the first request, the rest of that request as the system prompt and tools, and everything since as the conversation.
+Claude Code's numbers come from its transcript: the tokens its latest request sent, against a window of a million tokens for a Claude 5 model, a `[1m]` one or one already past 200k, else 200k.
+An agent that cannot say shows "not known for this agent".
 **Ctrl+Q** always comes back to the list as you left it, whatever the chat is doing, and Enter on another tree opens that one.
 **Ctrl+\\** goes straight to the next agent's chat, down the list as filtered, skipping trees with none and wrapping at the end; the cursor follows, so Ctrl+Q lands on the tree you were last in.
 Neither key is a Claude Code default.
