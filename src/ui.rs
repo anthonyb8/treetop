@@ -2216,32 +2216,61 @@ fn usage_lines(
     lines
 }
 
-/// Where the chat's tree stands: its branch, its uncommitted and unpushed
-/// work, and its PR.
+/// Where the chat's tree stands: its git state and PR as the list's columns
+/// show them, then the ports it serves, then its PR's link and what its
+/// plugin says about it.
 fn tree_lines(tree: &Tree, width: u16) -> Vec<Line<'static>> {
     let t = theme();
+    let width = usize::from(width);
     let mut lines = vec![heading(&format!("Tree {}", tree.name))];
-    let branch = tree.branch.as_deref().unwrap_or("(detached)");
-    lines.extend(
-        wrap_chars(branch, usize::from(width))
-            .into_iter()
-            .map(Line::raw),
-    );
-    lines.push(match tree.work {
-        None => Line::styled("changes not known", fg(t.muted)),
-        Some(w) if w.changed + w.unpushed == 0 => Line::styled("clean", fg(t.success)),
-        Some(w) => Line::styled(
-            format!("{} uncommitted, {} unpushed", w.changed, w.unpushed),
-            fg(t.warning),
-        ),
-    });
-    lines.push(match &tree.ship {
-        Some(ship) => Line::from(vec![
-            Span::styled("PR ", fg(t.muted)),
-            Span::styled(ship.label.clone(), stage_style(ship.stage)),
-        ]),
-        None => Line::styled("no PR", fg(t.muted)),
-    });
+    let mut state = match tree.work {
+        None => vec![Span::styled("─", fg(t.warning))],
+        Some(work) if work.changed + work.unpushed == 0 => {
+            vec![Span::styled("clean", fg(t.success))]
+        }
+        Some(work) => git_spans(work),
+    };
+    if let Some(ship) = &tree.ship {
+        state.push(Span::raw("  "));
+        state.push(Span::styled(ship.label.clone(), stage_style(ship.stage)));
+    }
+    lines.extend([Line::from(state), Line::raw(""), heading("Ports")]);
+    let served = tree.served();
+    if served.is_empty() {
+        lines.push(Line::styled("none", fg(t.muted)));
+    }
+    for (port, name) in served {
+        let address = format!("localhost:{port}");
+        let room = width.saturating_sub(address.chars().count() + 1);
+        lines.push(Line::from(vec![
+            Span::styled(address, fg(t.info)),
+            Span::styled(
+                format!(" {}", name.chars().take(room).collect::<String>()),
+                fg(t.muted),
+            ),
+        ]));
+    }
+    lines.extend([Line::raw(""), heading("PR")]);
+    let Some(ship) = &tree.ship else {
+        lines.push(Line::styled("none", fg(t.muted)));
+        return lines;
+    };
+    if let Some(url) = &ship.url {
+        let url = url.strip_prefix("https://").unwrap_or(url);
+        lines.extend(
+            wrap_chars(url, width)
+                .into_iter()
+                .filter(|row| !row.is_empty())
+                .map(|row| Line::styled(row, fg(t.info))),
+        );
+    }
+    for detail in &ship.detail {
+        lines.extend(
+            word_wrap(detail, width)
+                .into_iter()
+                .map(|row| Line::styled(row, fg(t.muted))),
+        );
+    }
     lines
 }
 
@@ -2409,6 +2438,7 @@ mod tests {
 mod sidebar_tests {
     use super::*;
     use crate::plugin::{Limit, Part};
+    use crate::pool::Process;
     use crate::ship::Ship;
 
     const NOW: u64 = 1_793_052_000;
@@ -2447,6 +2477,7 @@ mod sidebar_tests {
             branch: Some("anthonyb8/fix-four-gaps-in-treetop-and-treehouse".into()),
             work: Some(Work {
                 changed: 12,
+                unstaged: 12,
                 unpushed: 3,
                 ..Work::default()
             }),
@@ -2454,11 +2485,23 @@ mod sidebar_tests {
                 branch: "b".into(),
                 stage: Stage::Merged,
                 label: "#12 merged".into(),
-                url: None,
+                url: Some("https://github.com/anthonyb8/treetop/pull/12".into()),
                 head: None,
-                detail: Vec::new(),
+                detail: vec!["checks 3 passed, 1 failed".into(), "review approved".into()],
                 plugin: "github".into(),
             })),
+            processes: vec![
+                Process {
+                    pid: 41,
+                    name: "vite".into(),
+                    ports: vec![5173],
+                },
+                Process {
+                    pid: 40,
+                    name: "node".into(),
+                    ports: vec![3000, 3000],
+                },
+            ],
             ..crate::pool::stand_in(std::path::PathBuf::from("/p/1/app"))
         }
     }
@@ -2514,12 +2557,29 @@ mod sidebar_tests {
                 "output                  88k",
                 "",
                 "Tree 1",
-                "anthonyb8/fix-four-gaps-in-",
-                "treetop-and-treehouse",
-                "12 uncommitted, 3 unpushed",
-                "PR #12 merged",
+                "⇡3 !12  #12 merged",
+                "",
+                "Ports",
+                "localhost:3000 node",
+                "localhost:5173 vite",
+                "",
+                "PR",
+                "github.com/anthonyb8/treeto",
+                "p/pull/12",
+                "checks 3 passed, 1 failed",
+                "review approved",
             ]
         );
+    }
+
+    #[test]
+    fn a_tree_serving_nothing_with_no_pr_says_so() {
+        let tree = Tree {
+            ship: None,
+            ..crate::pool::stand_in(std::path::PathBuf::from("/p/1/app"))
+        };
+        let text = text(&tree_lines(&tree, 27));
+        assert_eq!(text[2..], ["", "Ports", "none", "", "PR", "none"]);
     }
 
     #[test]

@@ -305,7 +305,7 @@ An agent that cannot say shows "not known for this agent".
 Below it, Usage shows how much of your plan is used, a bar for each limit, such as the five-hour and weekly ones, with when each resets and how old the reading is, then what this session has spent: its fresh input, cache reads, cache writes and output, each request counted once, its subagents' included.
 Claude Code's limits are asked of Anthropic as `/usage` asks, with Claude Code's login from `~/.claude/.credentials.json`, once a minute and every five minutes while that fails.
 treetop only reads the login: an expired one is left for Claude Code to renew, since renewing it here would sign Claude Code out, and until then the sidebar shows the reading Claude Code last kept in `~/.claude.json`, with its age.
-At the bottom is the chat's tree: its branch, its uncommitted and unpushed counts, and its PR.
+At the bottom is the chat's tree: its git state and PR as the list's columns show them, then under Ports each port it serves with the process listening on it, then under PR its link and what its plugin says of it, such as its checks and review.
 **Ctrl+Q** always comes back to the list as you left it, whatever the chat is doing, and Enter on another tree opens that one.
 **Ctrl+\\** goes straight to the next agent's chat, down the list as filtered, skipping trees with none and wrapping at the end; the cursor follows, so Ctrl+Q lands on the tree you were last in.
 Neither key is a Claude Code default.
