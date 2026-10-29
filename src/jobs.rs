@@ -71,6 +71,9 @@ pub enum Kind {
     /// Starts the tree's stopped or failed agent again, with its
     /// conversation and the flags it was started with.
     Resume,
+    /// Starts a new agent in the tree on the handoff its agent wrote, then
+    /// stops the old one.
+    Handoff,
 }
 
 impl Kind {
@@ -87,6 +90,7 @@ impl Kind {
             Kind::Land => "following up",
             Kind::Ship => "shipping",
             Kind::Resume => "resuming",
+            Kind::Handoff => "starting",
         }
     }
 
@@ -103,6 +107,7 @@ impl Kind {
             Kind::Land => "followed up",
             Kind::Ship => "run started",
             Kind::Resume => "resumed",
+            Kind::Handoff => "handed off",
         }
     }
 
@@ -118,6 +123,7 @@ impl Kind {
             Kind::Land => "merge follow-up",
             Kind::Ship => "ship run",
             Kind::Resume => "resume",
+            Kind::Handoff => "handoff",
         }
     }
 }
@@ -213,6 +219,17 @@ pub struct Job {
     pub ready: Vec<String>,
     /// What a Ship asks of which ship plugin.
     pub shipping: Option<ShipCall>,
+    /// The agent a Handoff's new agent takes over from, stopped once the new
+    /// one runs.
+    pub replaces: Option<Replaced>,
+}
+
+/// An agent another takes over from, as its plugin knows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Replaced {
+    pub agent: String,
+    pub plugin: String,
+    pub id: String,
 }
 
 /// A ship plugin's run of a tree's branch: started, or shown.
@@ -245,6 +262,7 @@ impl Job {
             landing: None,
             ready: Vec::new(),
             shipping: None,
+            replaces: None,
         }
     }
 }
@@ -487,8 +505,12 @@ fn checked_out(tree: &Path) -> Option<String> {
 /// Leases a tree, then names its branch, checks it, writes its sidecar,
 /// starts the agent and confirms it runs, recording each step in `undone`.
 /// A tree someone already holds is only started in: its branch and lease
-/// stay theirs.
-fn start_steps(job: &mut Job, log: &mut String, undone: &mut Vec<Undo>) -> Result<(), String> {
+/// stay theirs. Says the agent's id, where its plugin gave one.
+fn start_steps(
+    job: &mut Job,
+    log: &mut String,
+    undone: &mut Vec<Undo>,
+) -> Result<Option<String>, String> {
     let mut launch = job
         .launch
         .clone()
@@ -605,7 +627,7 @@ fn start_steps(job: &mut Job, log: &mut String, undone: &mut Vec<Undo>) -> Resul
                 log,
             )
             .map_err(|why| format!("start: {why}"))?;
-            return Ok(());
+            return Ok(None);
         }
         Starter::Assistant(command, plugin) => {
             let (program, args) = command.split_first().ok_or("start: no agent command")?;
@@ -651,12 +673,12 @@ fn start_steps(job: &mut Job, log: &mut String, undone: &mut Vec<Undo>) -> Resul
         .ok()
         .and_then(|reply| serde_json::from_value(reply["argv"].clone()).ok());
     if is_leasing {
-        record.job = Some(id);
+        record.job = Some(id.clone());
         if let Err(err) = sidecar::write(&job.tree.path, &record) {
             let _ = writeln!(log, "could not record the job in {}: {err}", sidecar::FILE);
         }
     }
-    Ok(())
+    Ok(Some(id))
 }
 
 /// Fills `launch` from the ticket it picks up: the prompt from the config's
@@ -699,21 +721,107 @@ fn mark_started(pick: &Pick, log: &mut String) {
 /// says which failed and why on the last line, which the status line shows.
 fn start(job: &mut Job, log: &mut String) -> bool {
     let mut undone = Vec::new();
-    let Err(why) = start_steps(job, log, &mut undone) else {
-        if let Some(pick) = job.launch.as_ref().and_then(|l| l.ticket.as_ref()) {
-            mark_started(pick, log);
+    match start_steps(job, log, &mut undone) {
+        Ok(_) => {
+            if let Some(pick) = job.launch.as_ref().and_then(|l| l.ticket.as_ref()) {
+                mark_started(pick, log);
+            }
+            run_hook("on_dispatch", &hooks(log).on_dispatch, &job.tree.path, log);
+            true
         }
-        run_hook("on_dispatch", &hooks(log).on_dispatch, &job.tree.path, log);
-        return true;
-    };
+        Err(why) => {
+            roll_back(undone, &job.tree.path, &why, log);
+            false
+        }
+    }
+}
+
+/// Undoes the steps a failed start took, in reverse, then says why it
+/// failed on the last line.
+fn roll_back(undone: Vec<Undo>, tree: &Path, why: &str, log: &mut String) {
     if !undone.is_empty() {
         let _ = writeln!(log, "rolling back");
     }
     for step in undone.into_iter().rev() {
-        undo(step, &job.tree.path, log);
+        undo(step, tree, log);
     }
     let _ = writeln!(log, "{why}");
-    false
+}
+
+/// Starts the job's agent in its tree on the handoff the agent it replaces
+/// wrote, points the tree's record at the new one, so its reports and `R`
+/// follow it, then stops the old one, whose conversation is kept. A start
+/// that fails leaves the old agent working as it was.
+fn hand_off(job: &mut Job, log: &mut String) -> bool {
+    let Some(old) = job.replaces.clone() else {
+        let _ = writeln!(log, "no agent to hand off from");
+        return false;
+    };
+    // The tree's record must name the new agent, or the old one, stopped,
+    // would still count in the tree and be woken to keep it awake. A
+    // custom command starts an agent with no id to name, so it is refused
+    // before it starts one beside the old.
+    if let Some(launch) = &job.launch
+        && let Ok(Starter::Command(_)) = starter(launch, &job.tree.path)
+    {
+        let _ = writeln!(
+            log,
+            "TREETOP_NEW_AGENT starts agents treetop cannot name in the tree, so it cannot hand off; {} keeps working",
+            old.agent
+        );
+        return false;
+    }
+    let Some(mut record) = sidecar::read(&job.tree.path) else {
+        let _ = writeln!(
+            log,
+            "tree {} has no {} to name the new agent in",
+            job.tree.name,
+            sidecar::FILE
+        );
+        return false;
+    };
+    let mut undone = Vec::new();
+    let id = match start_steps(job, log, &mut undone) {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            let _ = writeln!(
+                log,
+                "the new agent has no id to record, so {} keeps working too; stop one of them",
+                old.agent
+            );
+            return false;
+        }
+        Err(why) => {
+            roll_back(undone, &job.tree.path, &why, log);
+            return false;
+        }
+    };
+    record.job = Some(id);
+    if let Err(err) = sidecar::write(&job.tree.path, &record) {
+        let _ = writeln!(
+            log,
+            "could not record the new agent in {}: {err}, so {} keeps working too",
+            sidecar::FILE,
+            old.agent
+        );
+        return false;
+    }
+    let stopped = plugin::named(PluginKind::Agent, &old.plugin)
+        .ok_or_else(|| format!("no agent plugin {}", old.plugin))
+        .and_then(|plugin| {
+            plugin
+                .call("stop", json!({ "id": old.id }))
+                .map_err(|err| err.to_string())
+        });
+    let _ = match stopped {
+        Ok(_) => writeln!(
+            log,
+            "stopped {} ({}); its conversation is kept",
+            old.agent, old.id
+        ),
+        Err(why) => writeln!(log, "could not stop {} ({}): {why}", old.agent, old.id),
+    };
+    true
 }
 
 /// The agent a command starts, as the sidecar names it: the program's file
@@ -1197,6 +1305,7 @@ pub fn run(job: &mut Job) -> (bool, String) {
         Kind::Land => land(job, &mut log),
         Kind::Ship => ship_run(job, &mut log),
         Kind::Resume => resume_in(&job.tree, &mut log),
+        Kind::Handoff => hand_off(job, &mut log),
         Kind::Preview => capture(
             treehouse("destroy", &job.tree.path).args(INCLUDE),
             TREEHOUSE_LIMIT,
@@ -1459,5 +1568,170 @@ mod tests {
         unsafe { std::env::remove_var("TREETOP_NEW_AGENT") };
         assert!(failed.unwrap_err().starts_with("start: /nonexistent/agent"));
         assert!(undone.is_empty(), "nothing was leased, branched or written");
+    }
+
+    /// A held tree treetop leased, its record naming agent `old00001`, and
+    /// an agent plugin named `claude` in a config directory of its own that
+    /// starts `new00001`, or fails to where `fail-start` exists, and records
+    /// each id it is asked to stop. In the process `in_own_process` runs
+    /// the test in, the one this process made.
+    fn handoff_fixture(test: &str) -> (PathBuf, Tree) {
+        if let Some(root) = std::env::var_os("TREETOP_HANDOFF_CHILD") {
+            let root = PathBuf::from(root);
+            let tree = Tree {
+                name: "4".into(),
+                status: "leased".into(),
+                ..pool::stand_in(root.join("4/app"))
+            };
+            return (root, tree);
+        }
+        let root =
+            std::env::temp_dir().join(format!("treetop-handoff-{}-{test}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (path, git_dir) = (root.join("4/app"), root.join("main/.git/worktrees/app4"));
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(
+            path.join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .unwrap();
+        let record = Sidecar {
+            job: Some("old00001".into()),
+            task: Some("fix the login redirect".into()),
+            ..Sidecar::leased_now()
+        };
+        sidecar::write(&path, &record).unwrap();
+        let plugins = root.join("config/treetop/plugins");
+        std::fs::create_dir_all(&plugins).unwrap();
+        let plugin = plugins.join("claude");
+        std::fs::write(
+            &plugin,
+            format!(
+                r#"#!/bin/sh
+req=$(cat)
+case "$req" in
+  *'"op":"describe"'*) echo '{{"ok":true,"result":{{"protocol":1,"name":"claude","kind":"agent","ops":["start","attach","stop"]}}}}' ;;
+  *'"op":"start"'*)
+    if [ -f {root}/fail-start ]; then echo '{{"ok":false,"error":{{"code":"failed","message":"no session"}}}}'; exit 0; fi
+    echo "$req" > {root}/started
+    echo '{{"ok":true,"result":{{"id":"new00001"}}}}' ;;
+  *'"op":"attach"'*) echo '{{"ok":true,"result":{{"argv":["claude","attach","new00001"]}}}}' ;;
+  *'"op":"stop"'*) echo "$req" >> {root}/stopped; echo '{{"ok":true,"result":{{}}}}' ;;
+esac
+"#,
+                root = root.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&plugin, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let tree = Tree {
+            name: "4".into(),
+            status: "leased".into(),
+            ..pool::stand_in(path)
+        };
+        (root, tree)
+    }
+
+    /// Runs test `name` again in a process of its own, on the fixture at
+    /// `root`, with its config directory there, where it finds its agent
+    /// plugin, since every test in this one shares the environment. True in
+    /// that process, where the test goes on; false here, once it has passed
+    /// there.
+    fn in_own_process(name: &str, root: &Path) -> bool {
+        if std::env::var_os("TREETOP_HANDOFF_CHILD").is_some() {
+            return true;
+        }
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("jobs::tests::{name}"), "--nocapture"])
+            .env("TREETOP_HANDOFF_CHILD", root)
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env_remove("TREETOP_NEW_AGENT")
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{said}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(said.contains("1 passed"), "the test ran there: {said}");
+        false
+    }
+
+    fn handoff_job(tree: Tree) -> Job {
+        Job {
+            launch: Some(Launch {
+                name: Some("fix login".into()),
+                ..launch("Carry on with the login redirect: the test is left.")
+            }),
+            replaces: Some(Replaced {
+                agent: "fix login".into(),
+                plugin: "claude".into(),
+                id: "old00001".into(),
+            }),
+            ..Job::new(Kind::Handoff, tree)
+        }
+    }
+
+    #[test]
+    fn a_handoff_starts_the_new_agent_in_the_tree_names_it_there_then_stops_the_old() {
+        let (root, tree) = handoff_fixture("hands-off");
+        if !in_own_process(
+            "a_handoff_starts_the_new_agent_in_the_tree_names_it_there_then_stops_the_old",
+            &root,
+        ) {
+            return;
+        }
+        let path = tree.path.clone();
+        let (is_ok, log) = run(&mut handoff_job(tree));
+        assert!(is_ok, "{log}");
+        let started = std::fs::read_to_string(root.join("started")).unwrap();
+        assert!(
+            started.contains("Carry on with the login redirect"),
+            "{started}"
+        );
+        assert!(
+            started.contains(&format!(r#""dir":"{}""#, path.display())),
+            "{started}"
+        );
+        let record = sidecar::read(&path).unwrap();
+        assert_eq!(
+            record.job.as_deref(),
+            Some("new00001"),
+            "the tree is the new agent's"
+        );
+        assert_eq!(
+            record.task.as_deref(),
+            Some("fix the login redirect"),
+            "the task a ship run gives as its intent stays the tree's"
+        );
+        let stopped = std::fs::read_to_string(root.join("stopped")).unwrap();
+        assert!(stopped.contains(r#""id":"old00001""#), "{stopped}");
+    }
+
+    #[test]
+    fn a_handoff_whose_new_agent_fails_to_start_leaves_the_old_one_working() {
+        let (root, tree) = handoff_fixture("fails");
+        if !in_own_process(
+            "a_handoff_whose_new_agent_fails_to_start_leaves_the_old_one_working",
+            &root,
+        ) {
+            return;
+        }
+        std::fs::write(root.join("fail-start"), "").unwrap();
+        let path = tree.path.clone();
+        let (is_ok, log) = run(&mut handoff_job(tree));
+        assert!(!is_ok);
+        assert!(log.trim_end().ends_with("start: no session"), "{log}");
+        assert!(
+            !root.join("stopped").exists(),
+            "the old agent was not stopped"
+        );
+        assert_eq!(
+            sidecar::read(&path).unwrap().job.as_deref(),
+            Some("old00001")
+        );
     }
 }

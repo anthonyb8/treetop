@@ -21,6 +21,7 @@ mod diff;
 mod dispatch;
 mod github_plugin;
 mod guard;
+mod handoff;
 mod hook;
 mod jobs;
 mod keeper;
@@ -316,6 +317,16 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             send(term, app, &mut chats, &worker, to, &text)?;
             refresher.refresh_ship();
         }
+        // A handoff is read once its agent has written it and stopped, and
+        // taken out of the tree, so the new agent never finds it there.
+        if !chats.is_open()
+            && let Some(file) = app.wanted_handoff()
+            && let Ok(text) = std::fs::read_to_string(&file)
+        {
+            let _ = std::fs::remove_file(&file);
+            app.handoff_written(text);
+            is_stale = true;
+        }
         while let Ok((path, diff)) = diffs.results.try_recv() {
             is_stale = true;
             app.diff_loaded(path, diff);
@@ -468,6 +479,9 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
         if let Some((agent, tree, why)) = pumped.failed.first() {
             app.message = Some(format!("not sent to {agent} in {tree}: {why}"));
             is_stale = true;
+        }
+        for (agent, tree, _) in &pumped.failed {
+            app.handoff_unsent(agent, tree);
         }
         if let Some((agent, _)) = &pumped.kept {
             app.message = Some(format!(
@@ -632,6 +646,22 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                 refresher.refresh();
             }
             Outcome::Send { to, text } => send(term, app, &mut chats, &worker, to, &text)?,
+            Outcome::Editor => {
+                let text = app
+                    .prompt
+                    .as_ref()
+                    .map(|p| p.text.clone())
+                    .unwrap_or_default();
+                let edited = edit_in_editor(term, &text);
+                match (edited, app.prompt.as_mut()) {
+                    (Ok(edited), Some(prompt)) => {
+                        prompt.text = edited.trim_end().to_string();
+                        prompt.is_from_top = true;
+                    }
+                    (Err(err), _) => app.message = Some(format!("could not edit it: {err}")),
+                    (Ok(_), None) => {}
+                }
+            }
             Outcome::Queue(jobs) => {
                 for job in jobs {
                     worker.push(job);

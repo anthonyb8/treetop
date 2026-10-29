@@ -51,7 +51,7 @@ const KEYS: [(&str, &str); 13] = [
 ];
 
 /// Every key on the list, for the `?` overlay.
-const HELP: [(&str, &str); 28] = [
+const HELP: [(&str, &str); 29] = [
     (
         "Enter",
         "open the agent: its chat, a cold one started again, else its tree; on a heading, fold or open its group",
@@ -97,6 +97,10 @@ const HELP: [(&str, &str); 28] = [
     ),
     ("O", "open the tree's PR"),
     ("f", "send what failed on the tree's PR to its agent"),
+    (
+        "h",
+        "hand the agent's work to a new one in this tree, on a handoff it writes",
+    ),
     (
         "R",
         "resume the tree's stopped or failed agent, with its conversation",
@@ -382,6 +386,9 @@ fn status_cell(app: &App, tree: &Tree) -> Cell<'static> {
             (kind.done().to_string(), fg(t.success).add_modifier(bold))
         }
         Some(JobState::Failed(_)) => ("failed".to_string(), fg(t.danger).add_modifier(bold)),
+        None if app.is_handing_off(&tree.path) => {
+            ("handoff...".to_string(), fg(t.info).add_modifier(bold))
+        }
         None => {
             let color = match tree.status.as_str() {
                 "leased" => t.success,
@@ -1221,9 +1228,16 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
     let width = screen.width.saturating_sub(4).min(116);
     let text_width = usize::from(width.saturating_sub(4));
     let rows = wrap_chars(&prompt.text, text_width);
+    // A handoff is long and read over before it goes, so its box takes
+    // what the screen has.
+    let most = if prompt.is_handoff() {
+        screen.height.saturating_sub(8).max(COMPOSE_ROWS.0)
+    } else {
+        COMPOSE_ROWS.1
+    };
     let text_height = u16::try_from(rows.len())
         .unwrap_or(u16::MAX)
-        .clamp(COMPOSE_ROWS.0, COMPOSE_ROWS.1);
+        .clamp(COMPOSE_ROWS.0, most);
     // Borders, then the branch, the base for a fresh tree, and a blank line
     // when the box names a branch.
     let fields = u16::from(prompt.names_branch()) + u16::from(prompt.names_base());
@@ -1254,11 +1268,34 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
             format!(" Rename the branch of tree {} ", tree.name),
             "the branch's new name",
         ),
+        (None, Purpose::Handoff { tree, from }) => {
+            // An agent's name can be long, so the title is cut short of the
+            // box's corner rather than running into it.
+            let most = usize::from(width.saturating_sub(4));
+            let mut title = format!(" Handoff from {}, tree {} ", from.agent, tree.name);
+            if title.chars().count() > most {
+                title = format!(
+                    " {}… ",
+                    title
+                        .trim()
+                        .chars()
+                        .take(most.saturating_sub(3))
+                        .collect::<String>()
+                );
+            }
+            (title, "the new agent's prompt")
+        }
     };
     let mut keys = vec![("Enter", "send"), ("Esc", "cancel")];
     let is_editing_field = prompt.is_editing_branch || prompt.is_editing_base;
     if !matches!(prompt.purpose, Purpose::Rename { .. }) && !is_editing_field {
         keys.insert(1, ("Alt+Enter", "new line"));
+    }
+    // A handoff is read over rather than typed, so the editor comes before
+    // a new line, and after the way out.
+    if prompt.is_handoff() {
+        keys.retain(|(key, _)| *key != "Alt+Enter");
+        keys.extend([("^E", "editor"), ("Alt+Enter", "new line")]);
     }
     if prompt.is_editing_base {
         keys.insert(0, ("type", "narrow"));
@@ -1327,12 +1364,22 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
         }
         return;
     }
-    // The end of a long text stays in view, since that is where it is typed.
+    // The end of a long text stays in view, since that is where it is
+    // typed, unless it is to be read from the top.
     let shown = usize::from(text_area.height);
-    let first = rows.len().saturating_sub(shown);
-    let lines: Vec<Line> = rows[first..].iter().map(|r| Line::raw(r.clone())).collect();
+    let first = if prompt.is_from_top {
+        0
+    } else {
+        rows.len().saturating_sub(shown)
+    };
+    let lines: Vec<Line> = rows[first..]
+        .iter()
+        .take(shown)
+        .map(|r| Line::raw(r.clone()))
+        .collect();
     frame.render_widget(Paragraph::new(lines), text_area);
-    if is_editing_field {
+    // The cursor shows only where the end is in view, since it types there.
+    if is_editing_field || first + shown < rows.len() {
         return;
     }
     let last = rows.last().map_or(0, |row| row.chars().count());
@@ -2021,7 +2068,17 @@ fn sidebar_lines(
     now: u64,
     width: u16,
 ) -> Vec<Line<'static>> {
-    let mut lines = context_lines(agent.and_then(|a| a.context.as_ref()), width);
+    let context = agent.and_then(|a| a.context.as_ref());
+    let mut lines = context_lines(context, width);
+    // Nearing its compaction, an agent in a pool tree can hand its work to
+    // a fresh one instead.
+    if context.is_some_and(|c| percent(c) >= 75) && tree.is_some_and(|t| t.is_held() && !t.is_main)
+    {
+        lines.push(Line::styled(
+            "Ctrl+Q, then h hands off",
+            fg(theme().warning),
+        ));
+    }
     lines.push(Line::raw(""));
     lines.extend(usage_lines(usage, agent.and_then(|a| a.spend), now, width));
     if let Some(tree) = tree {

@@ -1,8 +1,8 @@
 //! The compose box where you write to agents: a word with the assistant
 //! (`:`), a task for a new agent in a fresh tree (`n`) or in the tree
-//! under the cursor (`N`), a line for agents already working (`m`), or a
-//! branch's new name (`b`). Kept free of terminal
-//! I/O, like `app`.
+//! under the cursor (`N`), a line for agents already working (`m`), a
+//! branch's new name (`b`), or the handoff an agent wrote for the one that
+//! takes over from it (`h`). Kept free of terminal I/O, like `app`.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -76,6 +76,9 @@ pub enum Purpose {
     /// The text is the task of a new agent in this tree, leased first if
     /// it is free.
     Start { tree: Box<Tree> },
+    /// The text is the handoff `from` wrote, the task of the new agent that
+    /// takes over its work in this tree.
+    Handoff { tree: Box<Tree>, from: Recipient },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +107,10 @@ pub struct Prompt {
     pub bases: Vec<String>,
     /// Whose branches these are, for the name a task gives.
     pub user: String,
+    /// The text shows from its start, as a handoff does until it is typed
+    /// in, since it is read from the top; otherwise its end stays in view,
+    /// where it is typed.
+    pub is_from_top: bool,
 }
 
 /// What a key did to the box.
@@ -112,6 +119,9 @@ pub enum Edit {
     Continue,
     Submit,
     Cancel,
+    /// Open the text in the editor, for a handoff too long to read over in
+    /// the box.
+    Editor,
 }
 
 impl Prompt {
@@ -127,6 +137,7 @@ impl Prompt {
             default_base: None,
             bases: Vec::new(),
             user: String::new(),
+            is_from_top: false,
         }
     }
 
@@ -161,11 +172,31 @@ impl Prompt {
         }
     }
 
+    /// The handoff `from` wrote in `tree`, to read over before a new
+    /// agent starts on it.
+    pub fn handoff(tree: Tree, from: Recipient, text: String) -> Self {
+        Prompt {
+            text,
+            is_from_top: true,
+            ..Prompt::new(Purpose::Handoff {
+                tree: Box::new(tree),
+                from,
+            })
+        }
+    }
+
     pub fn target(&self) -> Option<Target> {
         match &self.purpose {
             Purpose::Dispatch { target } => Some(*target),
-            Purpose::Message { .. } | Purpose::Rename { .. } | Purpose::Start { .. } => None,
+            Purpose::Message { .. }
+            | Purpose::Rename { .. }
+            | Purpose::Start { .. }
+            | Purpose::Handoff { .. } => None,
         }
+    }
+
+    pub fn is_handoff(&self) -> bool {
+        matches!(self.purpose, Purpose::Handoff { .. })
     }
 
     /// The target gets a branch named for it: a new agent's tree does, and
@@ -278,6 +309,7 @@ impl Prompt {
     /// Pasted text is kept whole, line breaks and all: the agent reads it as
     /// one message. A branch or base takes it as one line.
     pub fn paste(&mut self, text: &str) {
+        self.is_from_top = false;
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         if self.is_editing_base {
             let line = text.replace('\n', "");
@@ -321,9 +353,18 @@ impl Prompt {
 
     pub fn edit(&mut self, key: KeyEvent) -> Edit {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Typing happens at the end, so the end comes into view.
+        if matches!(
+            key.code,
+            KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Enter
+        ) && !(ctrl && key.code == KeyCode::Char('e'))
+        {
+            self.is_from_top = false;
+        }
         match key.code {
             KeyCode::Esc => return Edit::Cancel,
             KeyCode::Char('c') if ctrl => return Edit::Cancel,
+            KeyCode::Char('e') if ctrl && self.is_handoff() => return Edit::Editor,
             // A terminal reports Shift+Enter as Enter unless it is asked for
             // extended keys, so Alt+Enter is the break that always arrives.
             KeyCode::Enter
