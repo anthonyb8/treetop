@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
@@ -12,7 +12,8 @@ use crate::agents::{Agent, Status};
 use crate::assistant;
 use crate::diff::Layout;
 use crate::dispatch::{Edit, Prompt, Purpose, Recipient, Target};
-use crate::jobs::{Job, Kind, Launch, Message, Pick, ShipAction, ShipCall};
+use crate::handoff;
+use crate::jobs::{Job, Kind, Launch, Message, Pick, Replaced, ShipAction, ShipCall};
 use crate::keeper::Kept;
 use crate::plugin::{Plugin, Usage};
 use crate::pool::{self, Process, Tree, Work};
@@ -263,6 +264,9 @@ pub enum Outcome {
         to: Vec<Recipient>,
         text: String,
     },
+    /// Open the compose box's text in the editor, and put back what is
+    /// saved.
+    Editor,
 }
 
 #[derive(Default)]
@@ -389,6 +393,8 @@ pub struct App {
     /// The cursor has been put on a tree once, so a listing that moves it
     /// keeps it near where it was rather than on the first tree.
     is_cursor_placed: bool,
+    /// An agent writing the handoff for the one that takes over from it.
+    handing: Option<Handing>,
 }
 
 /// How long a started agent may take to show up before treetop stops
@@ -409,6 +415,16 @@ pub struct Opening {
 struct Awaiting {
     path: PathBuf,
     known: Vec<Option<u32>>,
+    since: Instant,
+}
+
+/// An agent asked to write its handoff to `file`, and the tree it hands on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Handing {
+    path: PathBuf,
+    tree: String,
+    from: Recipient,
+    file: PathBuf,
     since: Instant,
 }
 
@@ -985,6 +1001,14 @@ impl App {
             self.jobs
                 .insert(path.clone(), JobState::Done(job.kind, Instant::now()));
             self.send_failure(&path, &output);
+        } else if job.kind == Kind::Handoff {
+            self.jobs
+                .insert(path.clone(), JobState::Done(job.kind, Instant::now()));
+            self.message = Some(format!(
+                "tree {}'s work is with a new agent; Enter opens its chat  ({})",
+                job.tree.name,
+                last_line(&output)
+            ));
         } else if job.kind == Kind::Preview {
             self.jobs.remove(&path);
             self.reviews.push_back(Review {
@@ -1608,6 +1632,125 @@ impl App {
         Outcome::Continue
     }
 
+    /// `h`: asks the agent in the tree under the cursor to write a handoff,
+    /// the prompt of a new agent to take its work over in the same tree,
+    /// for when its context has filled. Once written, the handoff opens in
+    /// the compose box to be read over before the new agent starts on it.
+    /// `h` again while it is written stops waiting.
+    fn hand_off(&mut self) -> Outcome {
+        let Some(tree) = self.current() else {
+            return Outcome::Continue;
+        };
+        let (name, path) = (tree.name.clone(), tree.path.clone());
+        if let Some(handing) = &self.handing {
+            self.message = Some(if handing.path == path {
+                self.handing = None;
+                format!("stopped waiting for tree {name}'s handoff")
+            } else {
+                format!(
+                    "tree {}'s handoff is being written; one at a time",
+                    handing.tree
+                )
+            });
+            return Outcome::Continue;
+        }
+        let agent = Self::agents_of(tree).into_iter().next();
+        let why = if tree.is_main || !tree.is_held() {
+            format!("no agent's work in tree {name} to hand off")
+        } else if tree.sidecar.is_none() {
+            format!("treetop did not lease tree {name}, so it cannot hand its work on")
+        } else if self.jobs.get(&path).is_some_and(|s| s.is_active()) {
+            format!("tree {name} already has an action queued")
+        } else {
+            match agent {
+                None => format!("no agent in tree {name} to hand off from"),
+                Some(agent) if agent.pid.is_none() => {
+                    format!("{} is not running; R starts it again first", agent.name)
+                }
+                Some(agent) => match Recipient::of(agent, &name) {
+                    Some(from) if from.plugin.is_some() && from.job.is_some() => {
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map_or(0, |since| since.as_secs());
+                        let file = handoff::file(&path, now);
+                        let text = handoff::request(&file);
+                        self.message = Some(format!(
+                            "asking {} for a handoff; it opens here once written, h again stops waiting",
+                            from.agent
+                        ));
+                        self.handing = Some(Handing {
+                            path,
+                            tree: name,
+                            from: from.clone(),
+                            file,
+                            since: Instant::now(),
+                        });
+                        return Outcome::Send {
+                            to: vec![from],
+                            text,
+                        };
+                    }
+                    _ => format!("{} has no chat to ask for a handoff", agent.name),
+                },
+            }
+        };
+        self.message = Some(why);
+        Outcome::Continue
+    }
+
+    /// The tree at `path` is waiting on its agent's handoff.
+    pub fn is_handing_off(&self, path: &PathBuf) -> bool {
+        self.handing.as_ref().is_some_and(|h| &h.path == path)
+    }
+
+    /// The file to read the handoff from, once its agent has stopped working
+    /// and you are free on the list to read it over. Gives up after
+    /// `handoff::WAIT`, saying so.
+    pub fn wanted_handoff(&mut self) -> Option<PathBuf> {
+        let handing = self.handing.as_ref()?;
+        if handing.since.elapsed() >= handoff::WAIT {
+            self.message = Some(format!(
+                "{} wrote no handoff to {}; h asks again",
+                handing.from.agent,
+                handing.file.display()
+            ));
+            self.handing = None;
+            return None;
+        }
+        let is_working = self
+            .trees
+            .iter()
+            .filter(|t| t.path == handing.path)
+            .flat_map(|t| &t.agents)
+            .any(|a| a.job == handing.from.job && a.status == Some(Status::Busy));
+        (!is_working && self.is_free()).then(|| handing.file.clone())
+    }
+
+    /// Opens the handoff read from its file in the compose box, to read
+    /// over, change, or send to a new agent in its tree.
+    pub fn handoff_written(&mut self, text: String) {
+        let Some(handing) = self.handing.take() else {
+            return;
+        };
+        let Some(tree) = self.trees.iter().find(|t| t.path == handing.path).cloned() else {
+            self.message = Some(format!("tree {} has left the pool", handing.tree));
+            return;
+        };
+        self.prompt = Some(Prompt::handoff(tree, handing.from, text.trim().to_string()));
+    }
+
+    /// The request for a handoff never reached `agent` in `tree`, so there
+    /// is nothing to wait for.
+    pub fn handoff_unsent(&mut self, agent: &str, tree: &str) {
+        if self
+            .handing
+            .as_ref()
+            .is_some_and(|h| h.from.agent == agent && h.tree == tree)
+        {
+            self.handing = None;
+        }
+    }
+
     /// Sends `text`, what failed on the PR of the tree at `path`, to the
     /// agents working there, led by a line saying what it is.
     fn send_failure(&mut self, path: &PathBuf, text: &str) {
@@ -2127,6 +2270,7 @@ impl App {
                 Some(prompt) => self.submit(prompt),
                 None => Outcome::Continue,
             },
+            Edit::Editor => Outcome::Editor,
         }
     }
 
@@ -2162,6 +2306,7 @@ impl App {
                 self.message = Some(format!("starting an agent in tree {}...", tree.name));
                 self.start(*tree, launch)
             }
+            Purpose::Handoff { tree, from } => self.take_over(*tree, from, text),
             Purpose::Dispatch { target } => match target {
                 Target::Ask => self.ask(text),
                 Target::NewTree => self.dispatch(text, branch, base),
@@ -2240,6 +2385,41 @@ impl App {
         };
         self.jobs
             .insert(job.key.clone(), JobState::Queued(Kind::Start));
+        Outcome::Queue(vec![job])
+    }
+
+    /// Queues a new agent in `tree` on `handoff`, under the name of `from`,
+    /// whose work it takes over, and which stops once it runs.
+    fn take_over(&mut self, tree: Tree, from: Recipient, handoff: String) -> Outcome {
+        if handoff.is_empty() {
+            self.message = Some("nothing to hand off".into());
+            return Outcome::Continue;
+        }
+        if self.jobs.get(&tree.path).is_some_and(|s| s.is_active()) {
+            self.message = Some(format!("tree {} already has an action queued", tree.name));
+            return Outcome::Continue;
+        }
+        let (Some(plugin), Some(id)) = (from.plugin, from.job) else {
+            return Outcome::Continue;
+        };
+        self.message = Some(format!(
+            "starting a new agent in tree {} on {}'s handoff...",
+            tree.name, from.agent
+        ));
+        let job = Job {
+            launch: Some(Launch {
+                name: Some(from.agent.clone()),
+                ..Launch::agent(handoff, false)
+            }),
+            replaces: Some(Replaced {
+                agent: from.agent,
+                plugin,
+                id,
+            }),
+            ..Job::new(Kind::Handoff, tree)
+        };
+        self.jobs
+            .insert(job.key.clone(), JobState::Queued(Kind::Handoff));
         Outcome::Queue(vec![job])
     }
 
@@ -2644,6 +2824,7 @@ impl App {
             KeyCode::Char('O') => return self.open_pr(),
             KeyCode::Char('f') => return self.read_failure(),
             KeyCode::Char('R') => return self.resume(),
+            KeyCode::Char('h') => return self.hand_off(),
             KeyCode::Char('s') => return self.ship(),
             KeyCode::Char('z') => return self.toggle_park(),
             KeyCode::Char('Z') => {
@@ -4467,6 +4648,103 @@ mod tests {
             None,
             "a running one is typed to"
         );
+    }
+
+    #[test]
+    fn h_asks_the_agent_for_a_handoff_shows_it_once_written_and_hands_its_tree_on() {
+        let mut app = app();
+        app.apply_sidecars(HashMap::from([(
+            PathBuf::from("/p/4/app"),
+            Sidecar::leased_now(),
+        )]));
+        let working = |status| Agent {
+            job: Some("0000aaaa".into()),
+            plugin: Some("claude".into()),
+            status: Some(status),
+            ..attachable("fix login")
+        };
+        app.apply_agents(&HashMap::from([(
+            PathBuf::from("/p/4/app"),
+            vec![working(Status::Idle)],
+        )]));
+        select(&mut app, "4");
+        let Outcome::Send { to, text } = press(&mut app, KeyCode::Char('h')) else {
+            panic!("expected the agent to be asked");
+        };
+        assert_eq!(to[0].agent, "fix login");
+        assert!(text.contains("/p/4/app/.treetop-handoff-"), "{text}");
+        assert!(app.is_handing_off(&PathBuf::from("/p/4/app")));
+        app.apply_agents(&HashMap::from([(
+            PathBuf::from("/p/4/app"),
+            vec![working(Status::Busy)],
+        )]));
+        assert_eq!(app.wanted_handoff(), None, "not while it writes");
+        app.apply_agents(&HashMap::from([(
+            PathBuf::from("/p/4/app"),
+            vec![working(Status::Idle)],
+        )]));
+        let file = app.wanted_handoff().expect("read once it has stopped");
+        assert!(
+            text.contains(&file.display().to_string()),
+            "it asked for this file"
+        );
+        app.handoff_written("Carry on with the login redirect.\n".into());
+        assert!(!app.is_handing_off(&PathBuf::from("/p/4/app")));
+        assert!(
+            app.prompt.as_ref().is_some_and(Prompt::is_handoff),
+            "read over first"
+        );
+        type_in(&mut app, " Add the test.");
+        let job = queued(press(&mut app, KeyCode::Enter)).remove(0);
+        assert_eq!((job.kind, job.tree.name.as_str()), (Kind::Handoff, "4"));
+        let launch = job.launch.unwrap();
+        assert_eq!(
+            launch.task,
+            "Carry on with the login redirect. Add the test."
+        );
+        assert_eq!(
+            launch.name.as_deref(),
+            Some("fix login"),
+            "the row keeps its name"
+        );
+        assert!(
+            !launch.is_new_tree,
+            "the same tree, with its branch and work"
+        );
+        assert_eq!(
+            job.replaces,
+            Some(Replaced {
+                agent: "fix login".into(),
+                plugin: "claude".into(),
+                id: "0000aaaa".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_handoff_request_that_never_reached_its_agent_is_not_waited_on() {
+        let mut app = app();
+        app.apply_sidecars(HashMap::from([(
+            PathBuf::from("/p/4/app"),
+            Sidecar::leased_now(),
+        )]));
+        let idle = Agent {
+            job: Some("0000aaaa".into()),
+            plugin: Some("claude".into()),
+            status: Some(Status::Idle),
+            ..attachable("fix login")
+        };
+        app.apply_agents(&HashMap::from([(PathBuf::from("/p/4/app"), vec![idle])]));
+        select(&mut app, "4");
+        press(&mut app, KeyCode::Char('h'));
+        app.handoff_unsent("someone else", "4");
+        assert!(
+            app.is_handing_off(&PathBuf::from("/p/4/app")),
+            "not its request"
+        );
+        app.handoff_unsent("fix login", "4");
+        assert!(!app.is_handing_off(&PathBuf::from("/p/4/app")));
+        assert_eq!(app.wanted_handoff(), None);
     }
 
     #[test]

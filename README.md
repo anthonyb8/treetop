@@ -53,6 +53,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | `O` | open the tree's PR the same way (see [After the agent](#after-the-agent)) |
 | `f` | send what failed on the tree's PR, a check's log or a review's requested changes, to its agent |
 | `R` | resume the tree's stopped or failed agent in the tree, with its conversation and the flags it was started with, rather than a fresh dispatch that loses them |
+| `h` | hand the work of the tree's agent to a new agent in the same tree, on a handoff the old one writes and you read over first (see [Handoffs](#handoffs)) |
 | `s` | start a ship run of the tree's branch, such as no-mistakes', after a dialog; on a run under way, show it |
 | `b` | rename the branch of the tree under the cursor |
 | `w` | switch to another workspace: the pool of another repository treetop has been opened in |
@@ -429,6 +430,20 @@ A dialog on screen, or a draft already in the box, stops it rather than typing i
 An agent mid-turn queues it, as Claude Code queues anything typed while it works.
 A cold agent gets it through its plugin instead, which for Claude Code is `claude --bg --resume`: the session starts again with the message as its next turn, under the same job.
 Agents with no chat to type into, such as an interactive session or a bare process, are left out, and the status line says how many.
+
+### Handoffs
+
+An agent whose context has filled with more than its work needs can hand that work to a fresh one, in the same tree and on the same branch, rather than compacting.
+`h` on its tree types a request into its chat, as `m` would, asking it to write the prompt it would want to be handed to `.treetop-handoff-<time>.md` in the tree, and to stop there.
+The row's STATUS says `handoff...` meanwhile, and `h` again stops waiting.
+Once the agent has stopped working and you are free on the list, treetop reads the file, takes it out of the tree, and opens it in the compose box, which grows to the screen for it and shows it from the top until you type, which brings its end into view.
+Read it over there, add to it, or press Ctrl+E to edit it in `$VISUAL`, else `$EDITOR`; Enter starts the new agent on it, and Esc drops it.
+The new agent runs under the old one's name, and once it runs, the tree's `treetop.json` names it and the old one is stopped, so `R`, the reports and keeping the tree awake follow the new one.
+The old conversation is kept: `claude attach <id>`, with the id the detail pane's last action names, opens it.
+A start that fails leaves the old agent working, as it was.
+Only a tree treetop leased can hand off, since its `treetop.json` is what moves the tree to the new agent, and only a running background agent can be asked; a stopped one is started again with `R` first.
+With `TREETOP_NEW_AGENT` set, a handoff is refused before it starts anything, since treetop cannot name a custom command's agent in the tree.
+In an agent's chat, from 75% of its context the sidebar says so: Ctrl+Q, then `h`.
 
 ### What agents say
 
