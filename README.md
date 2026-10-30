@@ -81,7 +81,7 @@ Within a group, trees waiting on you come first, then those with the most recent
 An agent's last activity is its latest report, or when its Claude Code transcript last grew.
 The cursor stops on headings too, and Enter on one folds its group to the heading, which then says how many of its trees wait on you, or opens it again; a filter opens every group and leaves out those it finds nothing in.
 Trees held for later but not worked on now can be parked with `z`: they go under the Parked heading at the bottom, folded, and `Z` opens it.
-A parked tree that comes to need you goes back to its base's group, a filter still finds parked trees, and returning a tree clears it, since parking is kept in its `treetop.json` as `parked`.
+A parked tree stays under Parked even when it needs you, sorting to the top of it, a filter still finds parked trees, and returning a tree clears it, since parking is kept in its `treetop.json` as `parked`.
 PR is where the tree's branch stands after its agent: its pull request's number and stage, or the step of a pipeline it is going through (see [After the agent](#after-the-agent)).
 The pane below shows the tree under the cursor in full: its path and holder, its agents, ports and processes, everything its agent last said with its latest steps, and the outcome of its last action with the end of its output.
 

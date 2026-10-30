@@ -548,15 +548,15 @@ impl App {
         bases
     }
 
-    /// The group `tree` is listed under: Parked for one set aside that does
-    /// not wait on you, the free trees, else the base it was cut from. None
+    /// The group `tree` is listed under: Parked for one set aside, even when
+    /// it waits on you, the free trees, else the base it was cut from. None
     /// for the main checkout, which heads its branch's group rather than
     /// being a row, so no agent is ever started or shown there.
     pub fn group_of(&self, tree: &Tree) -> Option<Group> {
         if tree.is_main {
             return None;
         }
-        Some(if Self::is_parked(tree) && !self.needs_you(tree) {
+        Some(if Self::is_parked(tree) {
             Group::Parked
         } else if !tree.is_held() {
             Group::Free
@@ -3554,23 +3554,41 @@ mod tests {
     }
 
     #[test]
-    fn a_parked_tree_that_needs_you_comes_back_to_its_group() {
+    fn a_parked_tree_that_needs_you_stays_parked_at_the_top_of_parked() {
         let mut app = app();
         press(&mut app, KeyCode::Char('z'));
-        let mut sidecars = HashMap::new();
-        sidecars.insert(PathBuf::from("/p/4/app"), {
+        select(&mut app, "8");
+        press(&mut app, KeyCode::Char('z'));
+        let parked = |job: Option<&str>| {
             let mut record = Sidecar::leased_now();
             record.parked = true;
-            record.job = Some("ask".into());
+            record.job = job.map(Into::into);
             record
-        });
-        app.apply_sidecars(sidecars);
-        app.apply_reports(vec![report("ask", State::Blocked, "/p/4/app", 1)]);
+        };
+        app.apply_sidecars(HashMap::from([
+            (PathBuf::from("/p/4/app"), parked(None)),
+            (PathBuf::from("/p/8/app"), parked(Some("ask"))),
+        ]));
+        app.apply_reports(vec![report("ask", State::Blocked, "/p/8/app", 1)]);
+        assert_eq!(shape(&app), ["▾free 1", "7", "▸parked 2"]);
+        assert!(
+            app.rows().iter().any(|row| matches!(
+                row,
+                ListRow::Heading {
+                    group: Group::Parked,
+                    waiting: 1,
+                    ..
+                }
+            )),
+            "the folded heading says one waits on you"
+        );
+        press(&mut app, KeyCode::Char('Z'));
         assert_eq!(
             shape(&app),
-            ["▾ 2", "4", "8", "▾free 1", "7"],
-            "first, and not set aside"
+            ["▾free 1", "7", "▾parked 2", "8", "4"],
+            "first, and still set aside"
         );
+        assert_eq!(app.needing_you(), 1);
     }
 
     fn scratch(job: &str, name: &str) -> Scratch {
