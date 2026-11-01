@@ -5,13 +5,14 @@
    * A reply from Claude, written out word by word when it is new, as a
    * chat with Claude reads. Claude Code writes a reply to its transcript
    * once it is finished, so this paces the finished reply rather than
-   * following it as it is made; it takes at most about a second however
-   * long the reply, and none at all for a reader who asked for less motion.
+   * following it as it is made: at a reading pace, and never more than a
+   * few seconds however long the reply; none at all for a reader who asked
+   * for less motion.
    */
   let { text, isNew, ongrow }: { text: string; isNew: boolean; ongrow?: () => void } = $props();
 
-  const LONGEST_MS = 1000;
-  const WORDS_PER_SECOND = 60;
+  const LONGEST_MS = 4000;
+  const WORDS_PER_SECOND = 25;
 
   let shown = $state("");
 

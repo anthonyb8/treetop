@@ -242,7 +242,12 @@
   }
 
   let card = $derived(tree?.card);
-  let needs = $derived(tree?.report?.state === "blocked" ? tree.report.says : null);
+  // The agent's own status is read every few seconds and its report only
+  // when it writes one, so a report can still say it waits on you after it
+  // has been answered and gone back to work: busy wins.
+  let isBusy = $derived(tree?.agents[0]?.status === "busy");
+  let isWaiting = $derived(!!card?.needs_you && !isBusy);
+  let needs = $derived(tree?.report?.state === "blocked" && !isBusy ? tree.report.says : null);
 
   /** The prompt just answered, and what the agent said it needed then, kept
    * out of sight until the transcript and the agent's state catch up. */
@@ -254,7 +259,7 @@
   // yet and the agent waits on you. A question carries its choices; any
   // other is a permission to give or refuse.
   let promptMessage = $derived.by(() => {
-    if (!card?.needs_you) return null;
+    if (!isWaiting) return null;
     let last: ChatMessage | undefined;
     for (let i = messages.length - 1; i >= 0 && !last; i--) if (messages[i]?.kind === "tool") last = messages[i];
     return last?.tool?.status === "running" && last.id !== answeredId ? last : null;
@@ -282,9 +287,8 @@
   // The agent at work, and what on: its running tool call, else what its
   // report says it is doing. Nothing while it waits on you.
   let working = $derived.by(() => {
-    if (!card || card.needs_you || promptTool) return null;
-    const isBusy = tree?.agents[0]?.status === "busy" || tree?.report?.state === "working";
-    if (!isBusy) return null;
+    if (!card || isWaiting || promptTool) return null;
+    if (!isBusy && tree?.report?.state !== "working") return null;
     const last = messages.at(-1);
     if (last?.kind === "tool" && last.tool?.status === "running") {
       return { step: doing(last.tool.verb, last.tool.what) };

@@ -67,7 +67,13 @@ test("while the agent works, the dots say what it is doing", async ({ page }) =>
 });
 
 test("an agent waiting on you shows no dots, though its last report says it is working", async ({ page }) => {
-  const waiting: Tree = { ...busy, card: { ...busy.card, needs_you: true } };
+  // As a session shows a permission prompt: its live status waiting, its
+  // report still the working one it wrote before.
+  const waiting: Tree = {
+    ...busy,
+    card: { ...busy.card, needs_you: true },
+    agents: [{ ...busy.agents[0]!, status: "waiting" }],
+  };
   await chat(page, waiting, events(["backlog", [{ id: "u1", kind: "you", text: "Fix it." }, running]]));
   await expect(page.getByRole("region", { name: "Waiting on you" })).toBeVisible();
   await expect(page.getByRole("status", { name: /Claude is working/ })).toHaveCount(0);
@@ -102,4 +108,16 @@ test("with less motion asked for, a new reply is there at once", async ({ page }
   await expect(page.locator(".claude")).toHaveText(reply);
   const drawn = await lengths(page);
   expect(drawn.filter((length) => length > 0 && length < reply.length)).toEqual([]);
+});
+
+test("an agent back at work after an answer shows dots, not its stale question", async ({ page }) => {
+  // Its report still says it waits on you; its live status says it is busy.
+  const answered: Tree = {
+    ...busy,
+    card: { ...busy.card, mark: "waiting", needs_you: true },
+    report: { state: "blocked", says: "Which auth provider?", steps: [] },
+  };
+  await chat(page, answered, events(["backlog", [{ id: "u1", kind: "you", text: "Use Clerk." }]]));
+  await expect(page.getByRole("status", { name: /Claude is working/ })).toBeVisible();
+  await expect(page.getByRole("region", { name: "Waiting on you" })).toHaveCount(0);
 });
