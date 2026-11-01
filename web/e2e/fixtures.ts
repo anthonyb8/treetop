@@ -48,6 +48,7 @@ export const pool: Pool = {
     },
   ],
   free: 3,
+  bases: ["main", "feature/billing"],
   parked: [card("6", { title: "END-152 invoices", mark: "cold", active_ago: 172800 })],
 };
 

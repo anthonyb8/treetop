@@ -126,6 +126,12 @@ impl Refresher {
         let _ = self.kick.send(());
     }
 
+    /// A handle that lists the pool now, for a thread that does not hold
+    /// the refresher, as `refresh` does.
+    pub fn kicker(&self) -> Sender<()> {
+        self.kick.clone()
+    }
+
     /// Asks the ship plugins now rather than at the next minute.
     pub fn refresh_ship(&self) {
         let _ = self.ship_kick.send(());

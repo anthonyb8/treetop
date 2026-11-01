@@ -72,7 +72,8 @@ The marks are the TUI's: `●` busy, bold when it needs you, `○` idle, `◌` c
 The page refreshes every five seconds while it is open, and on pull-down.
 
 **Tree**, a tap on a card: the agent's state and, when it is blocked, its question; Open chat; then git, ports, the PR and its checks, and the agent's timeline; Resume and Return at the bottom.
-Return asks first, naming the branch and its unpushed and uncommitted counts, as the TUI's dialog does, and is refused by the same guard as `treetop return`.
+Return asks first, naming the branch and its unpushed and uncommitted counts, as the TUI's dialog does, then returns the tree as `r` does, stopping its agents first.
+Anything else running in the tree, such as a dev server, keeps it from the phone: `treetop return`'s own guard would refuse any tree with a live agent, which is nearly every tree, and stopping something other than an agent is a call for treetop's return dialog, which lists what would stop.
 
 **Chat**, from Open chat or a long-press on a card:
 
@@ -215,7 +216,7 @@ Rollback is the previous release, or stopping `treetop serve`.
 
 - **Claude Code's transcript format changes.** The chat view is built on undocumented records. An unknown record is skipped, and the terminal view, which shows the session as Claude Code draws it, still works whatever the format.
 - **The terminal view is cramped.** Claude Code's prompts are drawn for a desktop terminal; at 44 columns some wrap. It is for answering prompts, not for working in, and the chat view carries the rest.
-- **An action from the phone does the wrong thing.** Return keeps the CLI's guard and asks first; destroy is not offered at all; the terminal view writes only the keys you tap.
+- **An action from the phone does the wrong thing.** Return asks first and stops nothing but the tree's agents; destroy is not offered at all; the terminal view writes only the keys you tap.
 - **Someone else on the tailnet reaches the server.** Only the configured owner's Tailscale login is answered, and the server is not bound to any other address.
 - **A lost phone.** It reaches the server only while signed in to the tailnet; removing the device in Tailscale's admin console cuts it off.
 - **iOS clears a web app's storage** after weeks unused. It stores nothing but the push subscription, which it registers again on next open.

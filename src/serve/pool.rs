@@ -53,6 +53,7 @@ pub fn pool_json(app: &App, workspace: &str) -> Value {
         "groups": groups,
         "free": members(app, &Group::Free).len(),
         "parked": parked,
+        "bases": app.bases_in_use(),
     })
 }
 

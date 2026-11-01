@@ -134,16 +134,30 @@
     }
   }
 
-  // The footer grows when a question comes in: a chat that was at its end
-  // stays there rather than the newest message slipping under it.
+  // The conversation's box shrinks when a question comes in under it: a
+  // chat that was at its end stays there rather than the newest message
+  // slipping out of sight.
   $effect(() => {
-    void footerHeight;
-    if (isAtEnd && scroller) scroller.scrollTop = scroller.scrollHeight;
+    if (!scroller) return;
+    const box = scroller;
+    const observer = new ResizeObserver(() => {
+      if (isAtEnd) box.scrollTop = box.scrollHeight;
+    });
+    observer.observe(box);
+    return () => observer.disconnect();
   });
 
+  // Whether the chat follows new messages is what you did, not where the
+  // layout left it: scrolling up yourself stops it, reaching the end again
+  // starts it, and a box that shrank under it changes nothing.
+  let lastTop = 0;
   function onScroll() {
     if (!scroller) return;
-    isAtEnd = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 48;
+    const isNearEnd = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 48;
+    const wentUp = scroller.scrollTop < lastTop;
+    lastTop = scroller.scrollTop;
+    if (isNearEnd) isAtEnd = true;
+    else if (wentUp) isAtEnd = false;
     if (isAtEnd) unseen = 0;
   }
 

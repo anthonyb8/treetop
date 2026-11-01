@@ -7,14 +7,17 @@ export type Route =
   | { screen: "pool" }
   | { screen: "tree"; tree: string }
   | { screen: "chat"; tree: string }
-  | { screen: "terminal"; tree: string };
+  | { screen: "terminal"; tree: string }
+  | { screen: "new"; tree: string | null };
 
 export function parse(path: string): Route {
-  const found = /^\/trees\/([^/]+)(?:\/(chat|terminal))?\/?$/.exec(path);
+  if (/^\/new\/?$/.test(path)) return { screen: "new", tree: null };
+  const found = /^\/trees\/([^/]+)(?:\/(chat|terminal|new))?\/?$/.exec(path);
   if (!found?.[1]) return { screen: "pool" };
   const tree = decodeURIComponent(found[1]);
   if (found[2] === "chat") return { screen: "chat", tree };
   if (found[2] === "terminal") return { screen: "terminal", tree };
+  if (found[2] === "new") return { screen: "new", tree };
   return { screen: "tree", tree };
 }
 
@@ -38,6 +41,7 @@ function parent(path: string): string {
   const route = parse(path);
   if (route.screen === "terminal") return `/trees/${encodeURIComponent(route.tree)}/chat`;
   if (route.screen === "chat") return `/trees/${encodeURIComponent(route.tree)}`;
+  if (route.screen === "new" && route.tree) return `/trees/${encodeURIComponent(route.tree)}`;
   return "/";
 }
 

@@ -73,6 +73,8 @@ export interface Pool {
   groups: Group[];
   free: number;
   parked: Card[];
+  /** The bases trees are cut from, the pool's own first. */
+  bases: string[];
 }
 
 export type ReportState = "blocked" | "working" | "done" | "stopped" | "failed";
@@ -257,4 +259,38 @@ export async function sendKeys(workspace: string | null, tree: string, keys: str
     const body = (await response.json().catch(() => null)) as { error?: string } | null;
     throw new ApiError(body?.error ?? `The server said ${response.status}`, response.status);
   }
+}
+
+async function post<T>(path: string, body: unknown): Promise<T> {
+  let response: Response;
+  try {
+    response = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch {
+    throw new ApiError("Can't reach the server", null);
+  }
+  const answer = (await response.json().catch(() => null)) as (T & { error?: string }) | null;
+  if (!response.ok) throw new ApiError(answer?.error ?? `The server said ${response.status}`, response.status);
+  return answer as T;
+}
+
+/** Starts an agent on `task`, in a fresh tree cut from `base`, or in `tree`. */
+export function dispatch(
+  workspace: string | null,
+  asked: { task: string; tree: string | null; base: string | null },
+): Promise<{ tree: string }> {
+  return post<{ tree: string }>(`/api/dispatch${workspaceQuery(workspace)}`, asked);
+}
+
+/** Starts the tree's stopped or failed agent again. */
+export function resume(workspace: string | null, tree: string): Promise<void> {
+  return post<void>(`/api/trees/${encodeURIComponent(tree)}/resume${workspaceQuery(workspace)}`, {});
+}
+
+/** Gives the tree back to the pool, stopping its agents. */
+export function giveBack(workspace: string | null, tree: string): Promise<void> {
+  return post<void>(`/api/trees/${encodeURIComponent(tree)}/return${workspaceQuery(workspace)}`, {});
 }

@@ -664,6 +664,11 @@ Answer, and the terminal button at the top of a chat, open the agent's own scree
 It is the same `claude attach` the chat popup runs, in a terminal the server opens sized to the phone, drawn with its colours and kept current as it changes.
 Under it a row of keys, `1` to `4`, `↑` `↓`, Tab, Esc and Enter, and a field to type into it, are pressed on the agent's screen in the order you tap them.
 A terminal nobody has looked at for five minutes is closed, which leaves the agent running.
+
+New agent, at the foot of the pool, starts an agent on a task in a fresh tree cut from the base you pick, as `n` does, and opens its tree once it is going; New agent here, on a tree, starts one in that tree on its branch, as `N` does.
+On a tree whose agent has stopped or died, Resume starts it again with its conversation, as `R` does.
+Return… gives the tree back to the pool, as `r` does, after a sheet that names its branch and what it holds that is not pushed or committed; its agents are stopped first.
+Anything else running in the tree, such as a dev server, keeps it from the phone, and the refusal says what, since stopping it is a call to make at treetop with the return dialog's list of what would stop.
 The pool refreshes every five seconds while the app is open, and when you pull down.
 With the server out of reach, it opens on the pool as it last saw it and says so.
 

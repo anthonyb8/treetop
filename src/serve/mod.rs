@@ -11,6 +11,7 @@
 //! people are turned away. A process on this machine can still reach the
 //! port and claim any login: those run as the owner already.
 
+mod actions;
 mod chat;
 mod pool;
 mod terminal;
@@ -56,6 +57,8 @@ const LOGIN: &str = "Tailscale-User-Login";
 pub struct Pool {
     pub name: String,
     pub checkout: PathBuf,
+    /// Lists the pool again now, after an action changed it.
+    kick: Mutex<std::sync::mpsc::Sender<()>>,
     pub app: Mutex<App>,
 }
 
@@ -76,6 +79,7 @@ impl Pool {
         let pool = Arc::new(Pool {
             name: workspaces::name(&checkout),
             checkout,
+            kick: Mutex::new(refresher.kicker()),
             app: Mutex::new(app),
         });
         thread::spawn({
@@ -87,6 +91,21 @@ impl Pool {
             }
         });
         pool
+    }
+
+    /// Lists the pool again now rather than at the next trigger.
+    pub fn refresh(&self) {
+        let _ = self
+            .kick
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .send(());
+    }
+
+    /// The tree called `name` as the pool last read it.
+    pub fn tree(&self, name: &str) -> Option<crate::pool::Tree> {
+        let app = self.app.lock().unwrap_or_else(PoisonError::into_inner);
+        app.trees.iter().find(|t| t.name == name).cloned()
     }
 
     fn apply(&self, update: Update) {
@@ -405,6 +424,13 @@ pub fn route(state: &State, asked: &Asked) -> Reply {
             let app = pool.app.lock().unwrap_or_else(PoisonError::into_inner);
             Reply::json(200, &pool::pool_json(&app, &pool.name))
         }
+        (Method::Post, "/api/dispatch") => {
+            if !is_same_site(asked) {
+                return Reply::error(403, "only treetop's own page can act");
+            }
+            let pool = state.pool(asked.query.get("workspace").map(String::as_str));
+            actions::dispatch(&pool, asked.body)
+        }
         (method, path) if path.starts_with("/api/trees/") => {
             let pool = state.pool(asked.query.get("workspace").map(String::as_str));
             tree_route(state, &pool, method, &path["/api/trees/".len()..], asked)
@@ -491,6 +517,14 @@ fn tree_route(state: &State, pool: &Pool, method: &Method, rest: &str, asked: &A
                 Ok(()) => Reply::json(200, &json!({})),
                 Err(err) => Reply::error(400, &format!("{err:#}")),
             }
+        }
+        (Method::Post, "resume") => {
+            drop(app);
+            actions::resume(pool, &name)
+        }
+        (Method::Post, "return") => {
+            drop(app);
+            actions::give_back(pool, &name)
         }
         (Method::Post, "send") => {
             drop(app);
@@ -730,6 +764,27 @@ mod tests {
             Some("null"),
         ] {
             assert!(!is_same_site(&asked(origin)), "{origin:?}");
+        }
+    }
+
+    #[test]
+    fn another_site_cannot_start_an_agent() {
+        let state = State::new("me".into(), PathBuf::from("/nowhere"));
+        for origin in [None, Some("https://evil.example")] {
+            let reply = route(
+                &state,
+                &Asked {
+                    method: &Method::Post,
+                    origin,
+                    host: Some("server.tailnet.ts.net:7777"),
+                    // A task the server turns down before any job runs, so
+                    // that if the guard were gone this would still start
+                    // nothing.
+                    body: br#"{"task": ""}"#,
+                    ..asked("/api/dispatch", Some("me"))
+                },
+            );
+            assert_eq!(reply.status, 403, "{origin:?}");
         }
     }
 

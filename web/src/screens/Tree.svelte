@@ -1,9 +1,9 @@
 <script lang="ts">
-  import { ApiError, fetchTree, type ReportState, type Tree } from "../api";
+  import { ApiError, fetchTree, giveBack, resume, type ReportState, type Tree } from "../api";
   import GitCounts from "../components/GitCounts.svelte";
   import Mark from "../components/Mark.svelte";
   import PrBadge from "../components/PrBadge.svelte";
-  import { back, link, nav } from "../nav.svelte";
+  import { back, go, link, nav } from "../nav.svelte";
   import { ago } from "../time";
 
   let { name }: { name: string } = $props();
@@ -55,7 +55,37 @@
     return new Date(at * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
   }
 
+  /** The action under way, and why the last one failed. */
+  let doing = $state<"resume" | "return" | null>(null);
+  let actionFailure = $state<string | null>(null);
+  let isConfirming = $state(false);
+
+  async function act(what: "resume" | "return") {
+    doing = what;
+    actionFailure = null;
+    try {
+      if (what === "resume") {
+        await resume(nav.workspace, name);
+        await load();
+      } else {
+        await giveBack(nav.workspace, name);
+        isConfirming = false;
+        go("/");
+      }
+    } catch (err) {
+      actionFailure = err instanceof ApiError ? err.message : "It did not go through";
+      isConfirming = false;
+    } finally {
+      doing = null;
+    }
+  }
+
   let card = $derived(tree?.card);
+  // An agent that is not running can be started again with its
+  // conversation; one that is has nothing to resume.
+  let canResume = $derived(
+    !!tree && tree.agents.length > 0 && !tree.agents.some((a) => a.status && a.status !== "cold"),
+  );
   let agent = $derived(tree?.agents[0] ?? null);
   let isDirty = $derived(
     card?.git === "unknown" ||
@@ -208,6 +238,54 @@
       {/if}
     {/if}
   </main>
+
+  {#if tree && card}
+    <footer>
+      {#if actionFailure}<p class="failure" role="alert">{actionFailure}</p>{/if}
+      <div class="actions">
+        {#if canResume}
+          <button type="button" class="action" disabled={doing !== null} onclick={() => act("resume")}>
+            {doing === "resume" ? "Resuming…" : "Resume"}
+          </button>
+        {:else}
+          <a class="action" href="/trees/{encodeURIComponent(name)}/new" onclick={link}>New agent here</a>
+        {/if}
+        <button type="button" class="action danger" disabled={doing !== null} onclick={() => (isConfirming = true)}>
+          Return…
+        </button>
+      </div>
+    </footer>
+  {/if}
+
+  {#if isConfirming && tree && card}
+    <div class="sheet-back" role="presentation" onclick={() => (isConfirming = false)}></div>
+    <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="return-title">
+      <h2 id="return-title">Return tree {name}?</h2>
+      <p class="mono branch-line">{card.branch ?? "no branch"}</p>
+      <ul>
+        {#if card.git === "unknown"}
+          <li class="warn">git could not read it, so what it holds is not known</li>
+        {:else if card.git && (card.git.unpushed || card.git.staged || card.git.unstaged || card.git.untracked)}
+          {#if card.git.unpushed}<li class="warn">{card.git.unpushed} commit{card.git.unpushed === 1 ? "" : "s"} on no remote</li>{/if}
+          {#if card.git.staged + card.git.unstaged + card.git.untracked}
+            <li class="warn">
+              {card.git.staged + card.git.unstaged + card.git.untracked} uncommitted file{card.git.staged + card.git.unstaged + card.git.untracked === 1 ? "" : "s"}
+            </li>
+          {/if}
+        {:else}
+          <li>Nothing uncommitted or unpushed.</li>
+        {/if}
+        {#if tree.agents.length}<li>Its agent{tree.agents.length === 1 ? " is" : "s are"} stopped first.</li>{/if}
+      </ul>
+      <p class="note">The tree goes back to the pool for the next agent.</p>
+      <div class="actions">
+        <button type="button" class="action" onclick={() => (isConfirming = false)}>Cancel</button>
+        <button type="button" class="action danger solid" disabled={doing !== null} onclick={() => act("return")}>
+          {doing === "return" ? "Returning…" : "Return"}
+        </button>
+      </div>
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -217,6 +295,7 @@
     flex-shrink: 0;
   }
   .screen {
+    position: relative;
     height: 100%;
     display: flex;
     flex-direction: column;
@@ -416,7 +495,7 @@
     text-transform: uppercase;
     color: var(--muted);
   }
-  ol {
+  .timeline ol {
     margin: 0;
     padding: 0;
     list-style: none;
@@ -424,7 +503,7 @@
     flex-direction: column;
     gap: 8px;
   }
-  li {
+  .timeline li {
     display: grid;
     grid-template-columns: 44px 60px minmax(0, 1fr);
     gap: 8px;
@@ -436,6 +515,97 @@
   }
   .detail {
     overflow-wrap: anywhere;
+  }
+  footer {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px 16px calc(var(--safe-bottom) + 12px);
+    border-top: 1px solid var(--bg-high);
+  }
+  .actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+  }
+  .action {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 48px;
+    border-radius: 12px;
+    border: 1px solid var(--line-strong);
+    background: var(--bg-high);
+    color: var(--fg-strong);
+    font-size: 15px;
+    font-weight: 600;
+  }
+  .action.danger {
+    border-color: var(--red);
+    background: transparent;
+    color: var(--red);
+  }
+  .action.danger.solid {
+    background: var(--red);
+    color: var(--on-accent);
+  }
+  .action:disabled {
+    opacity: 0.6;
+  }
+  .failure {
+    margin: 0;
+    padding: 10px 12px;
+    border-radius: 10px;
+    background: var(--red-bg);
+    color: var(--red);
+    font-size: 14px;
+  }
+  .sheet-back {
+    position: absolute;
+    inset: 0;
+    background: rgb(0 0 0 / 0.5);
+  }
+  .sheet {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 20px 16px calc(var(--safe-bottom) + 16px);
+    border-radius: 18px 18px 0 0;
+    background: var(--bg-raised);
+    box-shadow: 0 -8px 24px rgb(0 0 0 / 0.4);
+  }
+  .sheet h2 {
+    margin: 0;
+    font-size: 18px;
+    letter-spacing: 0;
+    text-transform: none;
+    color: var(--fg-strong);
+  }
+  .branch-line {
+    margin: 0;
+    font-size: 12px;
+    color: var(--muted);
+    overflow-wrap: anywhere;
+  }
+  .sheet ul {
+    margin: 0;
+    padding-left: 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 15px;
+  }
+  .warn {
+    color: var(--yellow);
+  }
+  .note {
+    margin: 0 0 6px;
+    font-size: 13px;
+    color: var(--muted);
   }
   .banner {
     margin: 0;

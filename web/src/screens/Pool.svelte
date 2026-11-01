@@ -3,7 +3,7 @@
   import { ApiError, fetchPool, fetchWorkspaces, type Pool } from "../api";
   import Card from "../components/Card.svelte";
   import GitCounts from "../components/GitCounts.svelte";
-  import { chooseWorkspace, nav } from "../nav.svelte";
+  import { chooseWorkspace, link, nav } from "../nav.svelte";
   import { remember, recall } from "../store";
 
   /** How often the pool is asked for while the screen is open. */
@@ -220,6 +220,14 @@
       </section>
     {/if}
   </main>
+
+  <footer>
+    <a class="new" href="/new" onclick={link}>
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+        stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+      New agent
+    </a>
+  </footer>
 </div>
 
 <style>
@@ -282,6 +290,23 @@
     width: 100%;
     font-size: 16px;
   }
+  footer {
+    padding: 12px 16px calc(var(--safe-bottom) + 12px);
+    border-top: 1px solid var(--bg-high);
+    background: var(--bg);
+  }
+  .new {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    min-height: 50px;
+    border-radius: 12px;
+    background: var(--green);
+    color: var(--on-accent);
+    font-size: 16px;
+    font-weight: 600;
+  }
   .banner {
     margin: 0;
     padding: 8px 16px;
@@ -306,7 +331,7 @@
     display: flex;
     flex-direction: column;
     gap: 20px;
-    padding: 16px 16px calc(var(--safe-bottom) + 24px);
+    padding: 16px 16px 24px;
     transform: translateY(var(--pulled));
     transition: transform 0.2s;
   }

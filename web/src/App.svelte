@@ -3,6 +3,7 @@
   import { fly } from "svelte/transition";
   import { nav, parse } from "./nav.svelte";
   import Chat from "./screens/Chat.svelte";
+  import NewAgent from "./screens/NewAgent.svelte";
   import Pool from "./screens/Pool.svelte";
   import Terminal from "./screens/Terminal.svelte";
   import Tree from "./screens/Tree.svelte";
@@ -15,7 +16,7 @@
 
 <div class="stack">
   <div class="layer" inert={route.screen !== "pool"}><Pool /></div>
-  {#if route.screen !== "pool"}
+  {#if route.screen !== "pool" && route.tree !== null}
     {#key route.tree}
       <div class="layer over" transition:fly={slide} inert={route.screen !== "tree"}>
         <Tree name={route.tree} />
@@ -28,6 +29,11 @@
         <Chat name={route.tree} />
       </div>
     {/key}
+  {/if}
+  {#if route.screen === "new"}
+    <div class="layer over" transition:fly={{ ...slide, x: 0, y: window.innerHeight }}>
+      <NewAgent tree={route.tree} />
+    </div>
   {/if}
   {#if route.screen === "terminal"}
     {#key route.tree}
