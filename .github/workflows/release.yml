@@ -41,6 +41,20 @@ jobs:
 
       - run: rustup target add ${{ matrix.target }}
 
+      # The web app `treetop serve` hands out is built first, so the build
+      # below embeds it in the binary.
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 24
+      - name: Build the web app
+        working-directory: web
+        run: |
+          npm ci
+          npm run check
+          npm run build
+          npx playwright install --with-deps chromium
+          npm run e2e
+
       # rustls's crypto (ring) compiles C, which a static musl build needs a
       # musl C compiler for.
       - name: Install a musl C compiler

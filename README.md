@@ -6,6 +6,7 @@ Ask an assistant where every agent stands and what to do next, send an agent a t
 Switch between the pools of every repository you use it in without leaving it.
 Mark trees, then return them to the pool or destroy them, with git's view of each tree on screen so nothing unpushed goes by accident.
 Follow each tree's pull request through CI and review to the merge, send a failure back to its agent in one key, and see which issues a merge leaves ready.
+Check on it all from your phone too, with `treetop serve` (see [On your phone](#on-your-phone)).
 
 treetop only talks to treehouse through its CLI (`treehouse status --json`, `get --lease`, `lease`, `return`, `destroy`), so a treehouse upgrade keeps working without a fork.
 
@@ -29,7 +30,7 @@ Bump `version` in `Cargo.toml`, then push a matching tag:
 git tag v0.1.0 && git push origin v0.1.0
 ```
 
-`.github/workflows/release.yml` refuses a tag that does not match `Cargo.toml`, runs the tests, builds static musl binaries for x86_64 and arm64, and publishes them with checksums as a GitHub release.
+`.github/workflows/release.yml` refuses a tag that does not match `Cargo.toml`, builds and tests the web app in `web/`, runs the tests, builds static musl binaries for x86_64 and arm64 with the web app embedded, and publishes them with checksums as a GitHub release.
 
 ## Use
 
@@ -600,6 +601,89 @@ treetop never scans treehouse's own directories for pools, keeping to treehouse'
 A switch waits while an action is running in the pool on screen.
 The chats left open in the old pool are ended, which leaves their agents running.
 Each workspace has its own assistant; a stopped one is only ever taken up again in the pool it works in.
+
+## On your phone
+
+`treetop serve` puts treetop on your phone as an app on its home screen: every tree in the list's groups and order, with its agent's mark, what the agent last said, its git state, ports and PR, the trees waiting on you first.
+It is a web app served by treetop itself, with nothing to install on the phone but Tailscale.
+
+On the server, name your Tailscale login in the config, since the server answers no one else:
+
+```toml
+[mobile]
+owner = "you@example.com"   # `tailscale status --json` shows it as LoginName
+port = 7777                 # the default
+```
+
+Then start it, and share it with your tailnet over HTTPS, which iOS needs before it installs a web app:
+
+```sh
+treetop serve
+tether share 7777        # with tether; prints the address and a QR code
+# or, without it:
+tailscale serve --bg --https 7777 http://127.0.0.1:7777
+```
+
+`treetop serve` listens on 127.0.0.1 only and shows the pool treetop would open where it is started, with every workspace a tap away.
+It answers a request only when `tailscale serve` names the owner as the one asking, in `Tailscale-User-Login`; anyone else on the tailnet gets nothing.
+A process on the server itself can reach the port and claim to be anyone, but those already run as you.
+To keep it running, a systemd user unit such as `~/.config/systemd/user/treetop-serve.service` does:
+
+```ini
+[Unit]
+Description=treetop for your phone
+
+[Service]
+ExecStart=%h/.local/bin/treetop serve
+WorkingDirectory=%h/code/app
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+`systemctl --user enable --now treetop-serve`, and `loginctl enable-linger` so it runs while you are logged out.
+
+On the iPhone:
+
+1. Install Tailscale, sign in to the same tailnet, and turn it on.
+2. In Safari, open the address `tether share` printed, such as `https://server.your-tailnet.ts.net:7777`, or scan its QR code with the camera.
+3. Tap Share, then Add to Home Screen, then Add.
+4. Open treetop from its icon. It runs full screen, and a new treetop on the server reaches it the next time it opens.
+
+Tap a tree for what the terminal's detail pane says about it: its agent and what it asks or last said, its git state, the ports it serves and what serves them, its PR with its checks and a link to it, and its agent's timeline, each status line it wrote once.
+Back, the button or the phone's own gesture, lands on the pool where you left it.
+
+Open chat, on a tree whose agent is a background Claude Code session, shows its conversation as it happens, read from the session's transcript on the server: what you sent, what Claude wrote, and each tool call folded to one line, such as `Edited src/guard.ts +12 −4` or `Ran the tests ✗`, that opens to what it printed.
+Scrolled to the end it follows new messages; scrolled up, it stays put and a pill says how many came in.
+While the agent works, dots at the foot of the chat say what it is doing, such as `Run the tests` or `Editing src/guard.ts`; a message that comes in eases into place, and a new reply from Claude is written out word by word.
+Claude Code writes a reply down only once it is finished, so this paces the finished reply rather than following it as it is made; asking the phone for less motion shows each at once.
+A line typed at the bottom goes to the agent as `treetop send` sends it, typed into its chat, or starting a stopped agent again with it; it shows at once as sending, and as failed with why and a retry if it could not go.
+What you were typing is kept when you leave the chat.
+While the agent waits on you, what it waits on sits above the box, and you answer it there.
+A question with options shows them as buttons, several questions at once each under its header, and Answer sends your picks; a command it wants to run, or a file it wants to change, shows with Allow and Deny.
+Typing in the box answers in your own words instead.
+Allow and Deny press Enter and Esc in the agent's session, and only once its screen shows the prompt has the keys; an option, or your own words, put the prompt away with Esc and go in as a message, so an answer holds however Claude Code lays its options out.
+Each answer attaches to the session only for that moment, so the chat popup on your desktop keeps its size.
+
+New agent, at the foot of the pool, starts an agent on a task in a fresh tree cut from the base you pick, as `n` does, and opens its tree once it is going; New agent here, on a tree, starts one in that tree on its branch, as `N` does.
+On a tree whose agent has stopped or died, Resume starts it again with its conversation, as `R` does.
+Return… gives the tree back to the pool, as `r` does, after a sheet that names its branch and what it holds that is not pushed or committed; its agents are stopped first.
+Anything else running in the tree, such as a dev server, keeps it from the phone, and the refusal says what, since stopping it is a call to make at treetop with the return dialog's list of what would stop.
+The pool refreshes every five seconds while the app is open, and when you pull down.
+
+The bell in the pool's header turns on notifications, which iOS offers only to the app opened from the home screen.
+Your phone then buzzes when an agent comes to need you, finishes or dies, and when a tree's PR fails its checks or merges, each once; tapping one opens that tree's chat, or the tree for a PR.
+A notification names the tree and what happened, such as `17 · END-123 fix-login` and `Needs you`, never what the agent wrote, and goes encrypted for your phone through Apple's push service, the one thing the server sends off your tailnet.
+The server keeps its push key and the phones that turned notifications on in `push/` beside the config, readable by you alone; a phone that turns them off in Settings is dropped the next time a push finds it gone.
+With the server out of reach, it opens on the pool as it last saw it and says so.
+
+### Working on the app
+
+The app is Svelte and TypeScript in `web/`; `npm run build` there builds it into `web/dist`, which the next `cargo build` embeds.
+A treetop built without it serves a page saying so.
+`npm run dev` serves it on port 5173 with live reload, passing `/api` to a `treetop serve` on 7777, so with `TREETOP_SHARED=1 npm run dev` and `tether share 5173` each save shows on the phone.
+`npm run check` type-checks it, and `npm run e2e` runs its journeys in a browser at an iPhone's size against the built app, which on a server without a browser's libraries runs in Playwright's image as `web/playwright.config.ts` shows.
 
 ## Entering a tree
 
