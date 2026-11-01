@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Card } from "../api";
+  import { link } from "../nav.svelte";
   import { ago } from "../time";
   import GitCounts from "./GitCounts.svelte";
   import Mark from "./Mark.svelte";
@@ -19,7 +20,7 @@
   );
 </script>
 
-<article class="card" class:loud aria-label="tree {card.tree}">
+<a class="card" class:loud href="/trees/{encodeURIComponent(card.tree)}" onclick={link} aria-label="tree {card.tree}">
   <div class="top">
     <Mark mark={card.mark} />
     <span class="tree mono">{card.tree}</span>
@@ -41,15 +42,19 @@
       {#if loud && card.active_ago !== null}<span class="when">{ago(card.active_ago)}</span>{/if}
     </div>
   {/if}
-</article>
+</a>
 
 <style>
   .card {
+    color: inherit;
     display: flex;
     flex-direction: column;
     gap: 6px;
     padding: 14px;
     min-width: 0;
+  }
+  .card:active {
+    background: var(--bg-high);
   }
   .loud {
     gap: 8px;

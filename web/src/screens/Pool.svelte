@@ -3,6 +3,7 @@
   import { ApiError, fetchPool, fetchWorkspaces, type Pool } from "../api";
   import Card from "../components/Card.svelte";
   import GitCounts from "../components/GitCounts.svelte";
+  import { chooseWorkspace, nav } from "../nav.svelte";
   import { remember, recall } from "../store";
 
   /** How often the pool is asked for while the screen is open. */
@@ -10,10 +11,8 @@
   /** How far a pull at the top must go before it refreshes. */
   const PULL_PX = 70;
 
-  const chosen = recall<string>("workspace");
-  let workspace = $state<string | null>(chosen);
   let workspaces = $state<string[]>([]);
-  let pool = $state<Pool | null>(recall<Pool>(poolKey(chosen)));
+  let pool = $state<Pool | null>(recall<Pool>(poolKey(nav.workspace)));
   // Why the last ask failed; the pool on show is then the last one seen.
   let failure = $state<string | null>(null);
   let isLoading = $state(false);
@@ -28,10 +27,13 @@
   async function load() {
     isLoading = true;
     try {
-      const fresh = await fetchPool(workspace);
+      const asked = nav.workspace;
+      const fresh = await fetchPool(asked);
+      // A switch while this was on its way shows the new workspace, not this.
+      if (asked !== nav.workspace) return;
       pool = fresh;
       failure = null;
-      remember(poolKey(workspace), fresh);
+      remember(poolKey(asked), fresh);
     } catch (err) {
       failure = err instanceof ApiError ? err.message : "Something went wrong";
     } finally {
@@ -43,15 +45,14 @@
     try {
       const list = await fetchWorkspaces();
       workspaces = list.workspaces;
-      if (workspace && !list.workspaces.includes(workspace)) workspace = null;
+      if (nav.workspace && !list.workspaces.includes(nav.workspace)) nav.workspace = null;
     } catch {
       // The pool's own failure says why; the switcher just stays as it was.
     }
   }
 
   function choose(name: string) {
-    workspace = name;
-    remember("workspace", name);
+    chooseWorkspace(name);
     pool = recall<Pool>(poolKey(name));
     void load();
   }
@@ -96,7 +97,7 @@
       pool.groups.every((g) => g.cards.length === 0) &&
       pool.parked.length === 0,
   );
-  let shownName = $derived(pool?.workspace ?? workspace ?? "treetop");
+  let shownName = $derived(pool?.workspace ?? nav.workspace ?? "treetop");
 </script>
 
 <div class="screen">
@@ -222,6 +223,11 @@
 </div>
 
 <style>
+  /* In a scrolling column, a section that clips its corners would shrink to
+     nothing once the content outgrows the screen. */
+  main > :global(*) {
+    flex-shrink: 0;
+  }
   .screen {
     height: 100%;
     display: flex;

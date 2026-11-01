@@ -14,9 +14,7 @@ use crate::reports::State;
 
 /// The whole Pool screen.
 pub fn pool_json(app: &App, workspace: &str) -> Value {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+    let now = now();
     let main = app.trees.iter().find(|t| t.is_main);
     let mut needs_you = Vec::new();
     let mut groups = Vec::new();
@@ -56,6 +54,13 @@ pub fn pool_json(app: &App, workspace: &str) -> Value {
         "free": members(app, &Group::Free).len(),
         "parked": parked,
     })
+}
+
+/// Seconds since the epoch, which `active_ago` counts back from.
+pub fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// The trees of `group` in the list's order, folded or not.
@@ -169,7 +174,7 @@ fn leading_ticket(segment: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     #[test]
@@ -218,7 +223,7 @@ mod tests {
     use crate::pool::Work;
     use crate::reports::Report;
 
-    fn tree(name: &str, branch: &str) -> Tree {
+    pub fn tree(name: &str, branch: &str) -> Tree {
         Tree {
             name: name.into(),
             status: "leased".into(),
@@ -253,7 +258,7 @@ mod tests {
 
     /// A pool of four held trees and one free: 12 idle, 14 busy and more
     /// recently active, 17 whose agent asks a question, 9 with no agent.
-    fn pool() -> App {
+    pub fn pool() -> App {
         let mut app = App::new(None);
         let free = Tree {
             status: "available".into(),
@@ -321,11 +326,13 @@ mod tests {
         assert_eq!(json["free"], 1);
     }
 
-    /// The fields an interface in `web/src/api.ts` declares, by name.
-    fn declared(interface: &str) -> BTreeSet<String> {
+    /// The fields an interface in `web/src/api.ts` declares itself, by
+    /// name; those it extends are the other interface's.
+    pub fn declared(interface: &str) -> BTreeSet<String> {
         let api = include_str!("../../web/src/api.ts");
-        let start = api
-            .find(&format!("export interface {interface} {{"))
+        let start = [" {", " extends "]
+            .iter()
+            .find_map(|after| api.find(&format!("export interface {interface}{after}")))
             .unwrap_or_else(|| panic!("api.ts has no {interface}"));
         let body = &api[start..];
         let body = &body[body.find('{').unwrap() + 1..body.find("\n}").unwrap()];
@@ -336,7 +343,7 @@ mod tests {
             .collect()
     }
 
-    fn keys(value: &Value) -> BTreeSet<String> {
+    pub fn keys(value: &Value) -> BTreeSet<String> {
         value.as_object().unwrap().keys().cloned().collect()
     }
 

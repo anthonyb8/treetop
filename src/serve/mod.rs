@@ -12,6 +12,7 @@
 //! port and claim any login: those run as the owner already.
 
 mod pool;
+mod tree;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -320,6 +321,15 @@ pub fn route(state: &State, asked: &Asked) -> Reply {
             let pool = state.pool(asked.query.get("workspace").map(String::as_str));
             let app = pool.app.lock().unwrap_or_else(PoisonError::into_inner);
             Reply::json(200, &pool::pool_json(&app, &pool.name))
+        }
+        (Method::Get, path) if path.starts_with("/api/trees/") => {
+            let name = &path["/api/trees/".len()..];
+            let pool = state.pool(asked.query.get("workspace").map(String::as_str));
+            let app = pool.app.lock().unwrap_or_else(PoisonError::into_inner);
+            match app.trees.iter().find(|t| t.name == name && !t.is_main) {
+                Some(found) => Reply::json(200, &tree::tree_json(&app, found, pool::now())),
+                None => Reply::error(404, &format!("no tree {name} in {}", pool.name)),
+            }
         }
         (_, path) if path.starts_with("/api/") => Reply::error(404, "no such call"),
         (Method::Get | Method::Head, path) => asset(path),

@@ -651,6 +651,8 @@ On the iPhone:
 3. Tap Share, then Add to Home Screen, then Add.
 4. Open treetop from its icon. It runs full screen, and a new treetop on the server reaches it the next time it opens.
 
+Tap a tree for what the terminal's detail pane says about it: its agent and what it asks or last said, its git state, the ports it serves and what serves them, its PR with its checks and a link to it, and its agent's timeline, each status line it wrote once.
+Back, the button or the phone's own gesture, lands on the pool where you left it.
 The pool refreshes every five seconds while the app is open, and when you pull down.
 With the server out of reach, it opens on the pool as it last saw it and says so.
 

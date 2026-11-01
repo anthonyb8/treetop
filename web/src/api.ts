@@ -75,6 +75,54 @@ export interface Pool {
   parked: Card[];
 }
 
+export type ReportState = "blocked" | "working" | "done" | "stopped" | "failed";
+
+export interface Step {
+  /** Seconds since the epoch; null when the stamp could not be read. */
+  at: number | null;
+  state: ReportState | null;
+  detail: string;
+}
+
+export interface Report {
+  state: ReportState;
+  says: string;
+  steps: Step[];
+}
+
+export interface AgentRow {
+  name: string;
+  status: "busy" | "idle" | "waiting" | "cold" | null;
+  has_chat: boolean;
+  active_ago: number | null;
+}
+
+export interface Port {
+  port: number;
+  process: string;
+  pid: number;
+}
+
+export interface TreePr extends Pr {
+  detail: string[];
+}
+
+export interface Tree {
+  card: Card;
+  path: string;
+  holder: string | null;
+  /** The branch it was cut from, for a held tree. */
+  base: string | null;
+  /** What its agent was sent to do, when treetop started it. */
+  task: string | null;
+  agents: AgentRow[];
+  ports: Port[];
+  pr: TreePr | null;
+  /** Why no plugin could say where its PR stands. */
+  pr_unknown: string | null;
+  report: Report | null;
+}
+
 export interface Workspaces {
   default: string;
   workspaces: string[];
@@ -105,8 +153,15 @@ async function get<T>(path: string): Promise<T> {
 }
 
 export function fetchPool(workspace: string | null): Promise<Pool> {
-  const query = workspace ? `?workspace=${encodeURIComponent(workspace)}` : "";
-  return get<Pool>(`/api/pool${query}`);
+  return get<Pool>(`/api/pool${workspaceQuery(workspace)}`);
+}
+
+function workspaceQuery(workspace: string | null): string {
+  return workspace ? `?workspace=${encodeURIComponent(workspace)}` : "";
+}
+
+export function fetchTree(workspace: string | null, tree: string): Promise<Tree> {
+  return get<Tree>(`/api/trees/${encodeURIComponent(tree)}${workspaceQuery(workspace)}`);
 }
 
 export function fetchWorkspaces(): Promise<Workspaces> {
