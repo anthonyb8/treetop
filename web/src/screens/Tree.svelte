@@ -122,12 +122,21 @@
           <p class="says">{tree.task}</p>
         {/if}
         {#if agent?.has_chat}
-          <a class="open-chat" class:loud={card.needs_you} href="/trees/{encodeURIComponent(name)}/chat" onclick={link}>
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
-              stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"
-              ><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z" /></svg>
-            Open chat
-          </a>
+          <div class="ways" class:two={card.needs_you}>
+            <a class="open-chat" class:loud={card.needs_you} href="/trees/{encodeURIComponent(name)}/chat" onclick={link}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+                stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"
+                ><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z" /></svg>
+              Open chat
+            </a>
+            {#if card.needs_you}
+              <a class="open-chat answer" href="/trees/{encodeURIComponent(name)}/terminal" onclick={link}>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+                  stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 17l6-5-6-5M12 19h8" /></svg>
+                Answer
+              </a>
+            {/if}
+          </div>
         {/if}
         {#if tree.agents.length > 1}
           <p class="others">
@@ -329,6 +338,18 @@
     color: var(--fg-strong);
     font-size: 15px;
     font-weight: 600;
+  }
+  .ways {
+    display: grid;
+    gap: 8px;
+  }
+  .ways.two {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .open-chat.answer {
+    border-color: var(--yellow);
+    background: transparent;
+    color: var(--yellow);
   }
   .open-chat.loud {
     border: 0;

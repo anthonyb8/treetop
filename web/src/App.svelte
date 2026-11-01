@@ -4,6 +4,7 @@
   import { nav, parse } from "./nav.svelte";
   import Chat from "./screens/Chat.svelte";
   import Pool from "./screens/Pool.svelte";
+  import Terminal from "./screens/Terminal.svelte";
   import Tree from "./screens/Tree.svelte";
 
   // The screens stack as a native app's do: the pool stays underneath,
@@ -21,9 +22,16 @@
       </div>
     {/key}
   {/if}
-  {#if route.screen === "chat"}
+  {#if route.screen === "chat" || route.screen === "terminal"}
     {#key route.tree}
-      <div class="layer over" transition:fly={slide}><Chat name={route.tree} /></div>
+      <div class="layer over" transition:fly={slide} inert={route.screen !== "chat"}>
+        <Chat name={route.tree} />
+      </div>
+    {/key}
+  {/if}
+  {#if route.screen === "terminal"}
+    {#key route.tree}
+      <div class="layer over" transition:fly={slide}><Terminal name={route.tree} /></div>
     {/key}
   {/if}
 </div>

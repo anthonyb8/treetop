@@ -658,7 +658,12 @@ Open chat, on a tree whose agent is a background Claude Code session, shows its 
 Scrolled to the end it follows new messages; scrolled up, it stays put and a pill says how many came in.
 A line typed at the bottom goes to the agent as `treetop send` sends it, typed into its chat, or starting a stopped agent again with it; it shows at once as sending, and as failed with why and a retry if it could not go.
 What you were typing is kept when you leave the chat.
-While the agent waits on a question, the question sits above the box.
+While the agent waits on a question, the question sits above the box, with Answer beside it.
+
+Answer, and the terminal button at the top of a chat, open the agent's own screen, for what a line of chat cannot answer: a permission prompt, a question with options, a menu.
+It is the same `claude attach` the chat popup runs, in a terminal the server opens sized to the phone, drawn with its colours and kept current as it changes.
+Under it a row of keys, `1` to `4`, `↑` `↓`, Tab, Esc and Enter, and a field to type into it, are pressed on the agent's screen in the order you tap them.
+A terminal nobody has looked at for five minutes is closed, which leaves the agent running.
 The pool refreshes every five seconds while the app is open, and when you pull down.
 With the server out of reach, it opens on the pool as it last saw it and says so.
 

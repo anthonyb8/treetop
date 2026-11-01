@@ -3,7 +3,7 @@
   import { ApiError, chatUrl, fetchTree, sendLine, type ChatMessage, type Tree } from "../api";
   import Mark from "../components/Mark.svelte";
   import { markdown } from "../markdown";
-  import { back, nav } from "../nav.svelte";
+  import { back, link, nav } from "../nav.svelte";
   import { recall, remember } from "../store";
 
   let { name }: { name: string } = $props();
@@ -218,6 +218,10 @@
         <span>{tree?.agents[0]?.name ?? "agent"}{isLive ? "" : " · connecting…"}</span>
       </div>
     </div>
+    <a class="icon" href="/trees/{encodeURIComponent(name)}/terminal" onclick={link} aria-label="Open the terminal">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+        stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 17l6-5-6-5M12 19h8" /></svg>
+    </a>
   </header>
 
   <main bind:this={scroller} onscroll={onScroll} aria-label="Conversation" aria-live="polite">
@@ -283,7 +287,8 @@
     {#if question}
       <div class="needs" role="status">
         <Mark mark="waiting" />
-        <span><strong>Needs you:</strong> {question}</span>
+        <span class="ask"><strong>Needs you:</strong> {question}</span>
+        <a class="answer" href="/trees/{encodeURIComponent(name)}/terminal" onclick={link}>Answer</a>
       </div>
     {/if}
     <form onsubmit={send}>
@@ -597,6 +602,32 @@
   }
   .needs :global(.mark) {
     margin-top: 2px;
+  }
+  .ask {
+    flex: 1;
+    min-width: 0;
+  }
+  .answer {
+    flex: none;
+    align-self: center;
+    display: flex;
+    align-items: center;
+    min-height: 36px;
+    padding: 0 12px;
+    border-radius: 8px;
+    background: var(--yellow);
+    color: var(--on-accent);
+    font-size: 14px;
+    font-weight: 600;
+  }
+  .icon {
+    flex: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 44px;
+    height: 44px;
+    color: var(--muted);
   }
   form {
     display: flex;

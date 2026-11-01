@@ -148,6 +148,26 @@ export interface ChatMessage {
   output?: string;
 }
 
+/** A run of characters on the agent's screen that look the same. */
+export interface Run {
+  t: string;
+  fg?: string;
+  bg?: string;
+  b?: boolean;
+  d?: boolean;
+  i?: boolean;
+  u?: boolean;
+}
+
+/** The agent's own screen, as `src/serve/terminal.rs` sends it. */
+export interface TerminalScreen {
+  rows: number;
+  cols: number;
+  lines: Run[][];
+  /** Row and column of the cursor, when it shows. */
+  cursor: [number, number] | null;
+}
+
 export interface Workspaces {
   default: string;
   workspaces: string[];
@@ -205,6 +225,30 @@ export async function sendLine(workspace: string | null, tree: string, text: str
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text }),
+    });
+  } catch {
+    throw new ApiError("Can't reach the server", null);
+  }
+  if (!response.ok) {
+    const body = (await response.json().catch(() => null)) as { error?: string } | null;
+    throw new ApiError(body?.error ?? `The server said ${response.status}`, response.status);
+  }
+}
+
+export function terminalUrl(workspace: string | null, tree: string, cols: number, rows: number): string {
+  const query = new URLSearchParams({ cols: String(cols), rows: String(rows) });
+  if (workspace) query.set("workspace", workspace);
+  return `/api/trees/${encodeURIComponent(tree)}/terminal?${query}`;
+}
+
+/** Presses keys on the agent's screen, by name ("1", "Up", "Enter"), and types `text`. */
+export async function sendKeys(workspace: string | null, tree: string, keys: string[], text?: string): Promise<void> {
+  let response: Response;
+  try {
+    response = await fetch(`/api/trees/${encodeURIComponent(tree)}/keys${workspaceQuery(workspace)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ keys, text }),
     });
   } catch {
     throw new ApiError("Can't reach the server", null);

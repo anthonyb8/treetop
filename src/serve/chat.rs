@@ -200,10 +200,7 @@ fn first_question(input: &Value) -> Option<String> {
 pub fn stream(path: PathBuf) -> impl Read + Send + 'static {
     let (tx, rx) = sync_channel::<Vec<u8>>(64);
     thread::spawn(move || follow(&path, &tx));
-    Events {
-        rx,
-        pending: Vec::new(),
-    }
+    Events::new(rx)
 }
 
 fn follow(path: &Path, tx: &SyncSender<Vec<u8>>) {
@@ -278,16 +275,25 @@ pub fn fold(messages: Vec<Value>) -> Vec<Value> {
     out
 }
 
-fn event(name: &str, data: &Value) -> Vec<u8> {
+pub(super) fn event(name: &str, data: &Value) -> Vec<u8> {
     format!("event: {name}\ndata: {data}\n\n").into_bytes()
 }
 
-/// The events a following thread sends, as the body tiny_http writes out.
+/// The events a following thread sends, as the body written out.
 /// It ends when the thread does; the thread ends when the phone has gone,
 /// which the next write after that tells it.
-struct Events {
+pub(super) struct Events {
     rx: Receiver<Vec<u8>>,
     pending: Vec<u8>,
+}
+
+impl Events {
+    pub(super) fn new(rx: Receiver<Vec<u8>>) -> Events {
+        Events {
+            rx,
+            pending: Vec::new(),
+        }
+    }
 }
 
 impl Read for Events {
