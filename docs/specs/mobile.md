@@ -115,7 +115,7 @@ The first build had a fourth screen, the agent's own terminal, for answering pro
 
 ### The server
 
-`treetop serve [--port 7777]` runs the server in the foreground; a systemd user unit keeps it up, and the README gives one.
+`treetop serve [--port 7777]` runs the server in the foreground and shares itself; `treetop serve --install` keeps it up as a systemd user unit.
 It is built on `tiny_http`, which is synchronous like the rest of treetop, so it calls the same blocking code the CLI does, refreshing the pool and running treehouse, git and `claude`, with no async runtime added to the binary.
 Each request is handled on a thread from a small pool; a live view holds one thread while it is open, which one phone never runs short of.
 
@@ -180,7 +180,7 @@ It never carries the agent's words.
 
 What a user does, for the README:
 
-1. On the server: start `treetop serve`, then `tether share 7777`, or `tailscale serve --bg --https 7777 http://127.0.0.1:7777` without tether.
+1. On the server: run `treetop serve --install`, which shares it with `tether share`; without tether, `tailscale serve --bg --https 7777 http://127.0.0.1:7777` does that part.
 2. On the iPhone: install the Tailscale app, sign in to the same tailnet, and turn the VPN on.
 3. Open Safari, not another browser, at the address `tether share` printed, such as `https://server.<tailnet>.ts.net:7777`, or scan its QR code with the camera.
 4. Tap Share, then Add to Home Screen, and Add.

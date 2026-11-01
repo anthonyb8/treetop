@@ -221,7 +221,7 @@ Being a top-level key, it goes above the first `[table]` in the file:
 browser = ["tether", "open"]
 ```
 
-`share` is the command `p` shares a port with so the phone can reach it, `tether share` when the config names none.
+`share` is the command `p` shares a port with so the phone can reach it, and `treetop serve` its own, `tether share` when the config names none.
 Each `{port}` in its words becomes the port, else the port is added last.
 It runs off the screen's thread, and the first line it prints that starts with `http` is the address treetop draws as a QR code, in black on white whatever the theme, so the phone's camera reads it.
 With [tether](https://github.com/anthonyb8/tether), that address is the port on your tailnet over HTTPS, so the phone needs only the Tailscale app; `tether unshare <port>` stops sharing it.
@@ -615,39 +615,37 @@ owner = "you@example.com"   # `tailscale status --json` shows it as LoginName
 port = 7777                 # the default
 ```
 
-Then start it, and share it with your tailnet over HTTPS, which iOS needs before it installs a web app:
+Then install it as a service, which starts it now, at every boot and again after a crash:
 
 ```sh
-treetop serve
-tether share 7777        # with tether; prints the address and a QR code
-# or, without it:
+treetop serve --install
+```
+
+It runs in the workspace treetop would open where you run this, with the `PATH` you ran it with, since systemd's own lacks `~/.local/bin` and the commands the server starts.
+It says whether lingering is on, which the service needs to run at boot and while you are logged out; `loginctl enable-linger` turns it on.
+It then shares the port with your tailnet over HTTPS, which iOS needs before it installs a web app, with the `share` the config names, `tether share` by default, and prints the address and a QR code to scan.
+Where sharing fails, it says why and the server keeps running on 127.0.0.1.
+
+The service is the systemd user unit `~/.config/systemd/user/treetop-serve.service`, which runs this binary; a unit of that name you wrote yourself is left alone, and the install stops and says so.
+After installing a new treetop, `systemctl --user restart treetop-serve` picks it up without stopping your agents.
+`treetop serve --uninstall` stops and removes it, and leaves the port shared until `tether unshare <port>`.
+`--port N` picks another port for the service.
+
+To run it in a terminal instead, `treetop serve` shares itself the same way and stops when you stop it.
+Without tether it says sharing failed and serves on 127.0.0.1, and this shares it instead:
+
+```sh
 tailscale serve --bg --https 7777 http://127.0.0.1:7777
 ```
 
 `treetop serve` listens on 127.0.0.1 only and shows the pool treetop would open where it is started, with every workspace a tap away.
 It answers a request only when `tailscale serve` names the owner as the one asking, in `Tailscale-User-Login`; anyone else on the tailnet gets nothing.
 A process on the server itself can reach the port and claim to be anyone, but those already run as you.
-To keep it running, a systemd user unit such as `~/.config/systemd/user/treetop-serve.service` does:
-
-```ini
-[Unit]
-Description=treetop for your phone
-
-[Service]
-ExecStart=%h/.local/bin/treetop serve
-WorkingDirectory=%h/code/app
-Restart=on-failure
-
-[Install]
-WantedBy=default.target
-```
-
-`systemctl --user enable --now treetop-serve`, and `loginctl enable-linger` so it runs while you are logged out.
 
 On the iPhone:
 
 1. Install Tailscale, sign in to the same tailnet, and turn it on.
-2. In Safari, open the address `tether share` printed, such as `https://server.your-tailnet.ts.net:7777`, or scan its QR code with the camera.
+2. Scan the QR code `treetop serve --install` printed with the camera, which opens Safari, or open its address there, such as `https://server.your-tailnet.ts.net:7777`.
 3. Tap Share, then Add to Home Screen, then Add.
 4. Open treetop from its icon. It runs full screen, and a new treetop on the server reaches it the next time it opens.
 

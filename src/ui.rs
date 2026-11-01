@@ -25,6 +25,7 @@ use crate::chat::Chat;
 use crate::diff::{Change, FileDiff, Layout as DiffLayout, Row as DiffRow, Side, ViewRow};
 use crate::dispatch::{Prompt, Purpose, Target};
 use crate::guard;
+use crate::phone::QUIET_ZONE;
 use crate::plugin::{Context, Spend, Usage};
 use crate::pool::{Tree, Work};
 use crate::popup;
@@ -1196,10 +1197,6 @@ fn draw_port_menu(frame: &mut Frame, menu: &PortMenu) {
     let mut state = TableState::default().with_selected(Some(menu.selected));
     frame.render_stateful_widget(table, inner, &mut state);
 }
-
-/// How many modules of light margin a QR code wants round it to scan, as
-/// the standard asks; less where the screen has no room for them.
-const QUIET_ZONE: usize = 4;
 
 /// The port `p` shares, as a QR code of its address for the phone's camera
 /// to scan, with the address under it; or that it is being shared, or why

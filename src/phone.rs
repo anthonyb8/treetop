@@ -21,6 +21,13 @@ const DEFAULT: [&str; 2] = ["tether", "share"];
 /// link to enable it and waits, which treetop cannot click for you.
 const GRACE: Duration = Duration::from_secs(30);
 
+/// How many modules of light margin a QR code wants round it to scan, as
+/// the standard asks; the popup draws less where the screen has no room.
+pub const QUIET_ZONE: usize = 4;
+
+const BLACK_ON_WHITE: &str = "\x1b[38;5;16;48;5;231m";
+const RESET: &str = "\x1b[0m";
+
 /// A share command running on a worker thread, so the screen keeps drawing
 /// while it works.
 pub struct Sharing {
@@ -47,6 +54,13 @@ pub fn start(share: &[String], port: u16) -> Sharing {
         let _ = done.send(run(&program, &args, GRACE));
     });
     Sharing { port, result }
+}
+
+/// Shares `port` with `share`, the configured command, and returns its
+/// address, or why there is none, once the command has answered.
+pub fn share(share: &[String], port: u16) -> Result<String, String> {
+    let (program, args) = command(share, port);
+    run(&program, &args, GRACE)
 }
 
 /// The program and arguments that share `port`: each `{port}` in the
@@ -137,6 +151,29 @@ impl Code {
         };
         x < self.width && y < self.width && self.modules[y * self.width + x]
     }
+
+    /// The code for a terminal, two modules to a character, with its quiet
+    /// zone. Black on white whatever the terminal's colours, as the popup
+    /// draws it, which every camera reads.
+    pub fn text(&self) -> String {
+        let quiet = QUIET_ZONE as isize;
+        let side = self.width as isize + quiet;
+        let mut text = String::new();
+        for y in (-quiet..side).step_by(2) {
+            text.push_str(BLACK_ON_WHITE);
+            for x in -quiet..side {
+                text.push(match (self.is_dark(x, y), self.is_dark(x, y + 1)) {
+                    (false, false) => ' ',
+                    (true, false) => '▀',
+                    (false, true) => '▄',
+                    (true, true) => '█',
+                });
+            }
+            text.push_str(RESET);
+            text.push('\n');
+        }
+        text
+    }
 }
 
 #[cfg(test)]
@@ -213,5 +250,33 @@ mod tests {
         assert!(code.is_dark(0, 0));
         assert!(!code.is_dark(-1, 0));
         assert!(!code.is_dark(0, code.width as isize));
+    }
+
+    #[test]
+    fn the_terminal_code_reads_back_as_the_code() {
+        let code = Code::new("https://box.tail1.ts.net:7777").unwrap();
+        let text = code.text();
+        let rows: Vec<Vec<char>> = text
+            .lines()
+            .map(|line| {
+                let line = line.strip_prefix(BLACK_ON_WHITE).unwrap();
+                line.strip_suffix(RESET).unwrap().chars().collect()
+            })
+            .collect();
+        let quiet = QUIET_ZONE as isize;
+        // Every module of the code and its quiet zone, top then bottom half
+        // of the character it falls in.
+        for y in -quiet..code.width as isize + quiet {
+            for x in -quiet..code.width as isize + quiet {
+                let row = usize::try_from((y + quiet) / 2).unwrap();
+                let shown = rows[row][usize::try_from(x + quiet).unwrap()];
+                let dark = if (y + quiet) % 2 == 0 {
+                    "▀█"
+                } else {
+                    "▄█"
+                };
+                assert_eq!(dark.contains(shown), code.is_dark(x, y), "({x}, {y})");
+            }
+        }
     }
 }
