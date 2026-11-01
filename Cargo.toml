@@ -24,6 +24,7 @@ linear = { path = "crates/linear" }
 ratatui = "0.30.2"
 serde.workspace = true
 serde_json.workspace = true
+tiny_http = "0.12"
 toml = { version = "1.1.6", default-features = false, features = ["parse", "serde"] }
 ureq = "3"
 vt100 = "0.16.2"

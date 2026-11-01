@@ -35,6 +35,7 @@ mod popup;
 mod refresh;
 mod reports;
 mod scratch;
+mod serve;
 mod ship;
 mod sidecar;
 mod theme;
@@ -767,6 +768,15 @@ fn main() -> Result<()> {
         && command == "hook"
     {
         return hook::run(event);
+    }
+    // `treetop serve` serves the pool treetop would open here, as the
+    // screen does from outside any repository.
+    if let [command, rest @ ..] = args.as_slice()
+        && command == "serve"
+    {
+        let checkout = checkout_for(&start, true)?;
+        std::env::set_current_dir(&checkout)?;
+        return serve::run(rest, checkout);
     }
     // `treetop issues` opens the screen on the Issues screen.
     let is_issues = args == ["issues"];

@@ -6,6 +6,7 @@ Ask an assistant where every agent stands and what to do next, send an agent a t
 Switch between the pools of every repository you use it in without leaving it.
 Mark trees, then return them to the pool or destroy them, with git's view of each tree on screen so nothing unpushed goes by accident.
 Follow each tree's pull request through CI and review to the merge, send a failure back to its agent in one key, and see which issues a merge leaves ready.
+Check on it all from your phone too, with `treetop serve` (see [On your phone](#on-your-phone)).
 
 treetop only talks to treehouse through its CLI (`treehouse status --json`, `get --lease`, `lease`, `return`, `destroy`), so a treehouse upgrade keeps working without a fork.
 
@@ -29,7 +30,7 @@ Bump `version` in `Cargo.toml`, then push a matching tag:
 git tag v0.1.0 && git push origin v0.1.0
 ```
 
-`.github/workflows/release.yml` refuses a tag that does not match `Cargo.toml`, runs the tests, builds static musl binaries for x86_64 and arm64, and publishes them with checksums as a GitHub release.
+`.github/workflows/release.yml` refuses a tag that does not match `Cargo.toml`, builds and tests the web app in `web/`, runs the tests, builds static musl binaries for x86_64 and arm64 with the web app embedded, and publishes them with checksums as a GitHub release.
 
 ## Use
 
@@ -600,6 +601,65 @@ treetop never scans treehouse's own directories for pools, keeping to treehouse'
 A switch waits while an action is running in the pool on screen.
 The chats left open in the old pool are ended, which leaves their agents running.
 Each workspace has its own assistant; a stopped one is only ever taken up again in the pool it works in.
+
+## On your phone
+
+`treetop serve` puts treetop on your phone as an app on its home screen: every tree in the list's groups and order, with its agent's mark, what the agent last said, its git state, ports and PR, the trees waiting on you first.
+It is a web app served by treetop itself, with nothing to install on the phone but Tailscale.
+
+On the server, name your Tailscale login in the config, since the server answers no one else:
+
+```toml
+[mobile]
+owner = "you@example.com"   # `tailscale status --json` shows it as LoginName
+port = 7777                 # the default
+```
+
+Then start it, and share it with your tailnet over HTTPS, which iOS needs before it installs a web app:
+
+```sh
+treetop serve
+tether share 7777        # with tether; prints the address and a QR code
+# or, without it:
+tailscale serve --bg --https 7777 http://127.0.0.1:7777
+```
+
+`treetop serve` listens on 127.0.0.1 only and shows the pool treetop would open where it is started, with every workspace a tap away.
+It answers a request only when `tailscale serve` names the owner as the one asking, in `Tailscale-User-Login`; anyone else on the tailnet gets nothing.
+A process on the server itself can reach the port and claim to be anyone, but those already run as you.
+To keep it running, a systemd user unit such as `~/.config/systemd/user/treetop-serve.service` does:
+
+```ini
+[Unit]
+Description=treetop for your phone
+
+[Service]
+ExecStart=%h/.local/bin/treetop serve
+WorkingDirectory=%h/code/app
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+`systemctl --user enable --now treetop-serve`, and `loginctl enable-linger` so it runs while you are logged out.
+
+On the iPhone:
+
+1. Install Tailscale, sign in to the same tailnet, and turn it on.
+2. In Safari, open the address `tether share` printed, such as `https://server.your-tailnet.ts.net:7777`, or scan its QR code with the camera.
+3. Tap Share, then Add to Home Screen, then Add.
+4. Open treetop from its icon. It runs full screen, and a new treetop on the server reaches it the next time it opens.
+
+The pool refreshes every five seconds while the app is open, and when you pull down.
+With the server out of reach, it opens on the pool as it last saw it and says so.
+
+### Working on the app
+
+The app is Svelte and TypeScript in `web/`; `npm run build` there builds it into `web/dist`, which the next `cargo build` embeds.
+A treetop built without it serves a page saying so.
+`npm run dev` serves it on port 5173 with live reload, passing `/api` to a `treetop serve` on 7777, so with `TREETOP_SHARED=1 npm run dev` and `tether share 5173` each save shows on the phone.
+`npm run check` type-checks it, and `npm run e2e` runs its journeys in a browser at an iPhone's size against the built app, which on a server without a browser's libraries runs in Playwright's image as `web/playwright.config.ts` shows.
 
 ## Entering a tree
 

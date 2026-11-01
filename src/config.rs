@@ -42,6 +42,15 @@
 //! ship = ["no-mistakes", "github"] # its ship plugins; github alone by default
 //! ```
 //!
+//! `[mobile]` is `treetop serve`'s: the Tailscale login it answers, and
+//! the port it listens on, on 127.0.0.1 only:
+//!
+//! ```toml
+//! [mobile]
+//! owner = "me@example.com"
+//! port = 7777
+//! ```
+//!
 //! `browser` is the command `o` and `O` open a URL with, in place of the
 //! desktop's opener, with `{url}` in its words replaced by the URL, else the
 //! URL added last:
@@ -109,6 +118,19 @@ impl Source {
     }
 }
 
+/// `treetop serve`'s settings: who it answers, and where it listens.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Mobile {
+    /// The Tailscale login the server answers, as `tailscale serve` hands
+    /// it over in `Tailscale-User-Login`; with none, it does not start.
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// The port on 127.0.0.1 it listens on; 7777 when unset.
+    #[serde(default)]
+    pub port: Option<u16>,
+}
+
 /// What a repository uses, keyed by its main checkout's path.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -148,6 +170,9 @@ pub struct Config {
     /// address it is reached at; empty for `tether share`.
     #[serde(default)]
     pub share: Vec<String>,
+    /// `treetop serve`, the web app for a phone.
+    #[serde(default)]
+    pub mobile: Mobile,
 }
 
 /// `path` with a leading `~` as the home directory.

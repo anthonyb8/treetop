@@ -640,13 +640,7 @@ impl App {
             .filter(|t| Self::is_found(t, &needle))
             .filter_map(|t| Some((self.group_of(t)?, t)))
             .collect();
-        trees.sort_by_cached_key(|(group, t)| {
-            (
-                rank(group),
-                !self.needs_you(t),
-                std::cmp::Reverse(self.active_at(t)),
-            )
-        });
+        trees.sort_by_cached_key(|(group, t)| (rank(group), self.order_in_group(t)));
         let main = self
             .trees
             .iter()
@@ -679,6 +673,12 @@ impl App {
             }
         }
         rows
+    }
+
+    /// Where a tree goes within its group: waiting on you first, then the
+    /// most recently active, the rest keeping pool order.
+    pub fn order_in_group(&self, tree: &Tree) -> (bool, std::cmp::Reverse<Option<u64>>) {
+        (!self.needs_you(tree), std::cmp::Reverse(self.active_at(tree)))
     }
 
     /// The trees the list shows, in its order: those in open groups.
