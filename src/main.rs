@@ -28,6 +28,7 @@ mod keeper;
 mod linear_plugin;
 mod live;
 mod nomistakes_plugin;
+mod phone;
 mod plugin;
 mod pool;
 mod popup;
@@ -259,6 +260,8 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
     // URLs a configured browser is opening, off this thread, each with
     // whether the Issues screen asked, so its outcome is said there.
     let mut opening_urls: Vec<(actions::Pending, bool)> = Vec::new();
+    // The port `p` is sharing with the phone, off this thread.
+    let mut sharing: Option<phone::Sharing> = None;
     loop {
         while let Ok(update) = refresher.updates.try_recv() {
             is_stale = true;
@@ -441,6 +444,13 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             is_stale = true;
             false
         });
+        if let Some(share) = &sharing
+            && let Some(shared) = share.poll()
+        {
+            app.set_shared(share.port, shared);
+            sharing = None;
+            is_stale = true;
+        }
         removing_scratch.retain(|result| match result.try_recv() {
             Ok(Ok(name)) => {
                 app.message = Some(format!("deleted {name}"));
@@ -650,6 +660,10 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                 if let actions::Opening::Pending(pending) = opening {
                     opening_urls.push((pending, false));
                 }
+            }
+            Outcome::Share(port) => {
+                let share = config::load().map(|c| c.share).unwrap_or_default();
+                sharing = Some(phone::start(&share, port));
             }
             Outcome::Browse { port, tree } => {
                 let opening = actions::browse(port, &tree);

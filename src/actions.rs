@@ -186,19 +186,7 @@ fn run_browser(program: &str, args: &[String], grace: Duration) -> Result<()> {
                 if let Some(mut stderr) = child.stderr.take() {
                     let _ = stderr.read_to_string(&mut said);
                 }
-                let reason = said.lines().map(str::trim).find(|l| !l.is_empty());
-                // A reason that already names the program, as
-                // `tether: no browser connected` does, is said as it is.
-                let named = Path::new(program)
-                    .file_name()
-                    .map(|name| format!("{}:", name.to_string_lossy()));
-                return Err(match reason {
-                    Some(reason) if named.is_some_and(|n| reason.starts_with(&n)) => {
-                        anyhow!("{reason}")
-                    }
-                    Some(reason) => anyhow!("{program} failed: {reason}"),
-                    None => anyhow!("{program} failed ({status})"),
-                });
+                return Err(anyhow!("{}", failure(program, &said, &status.to_string())));
             }
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
             // Still running, as a browser it started itself does: leave it,
@@ -211,6 +199,22 @@ fn run_browser(program: &str, args: &[String], grace: Duration) -> Result<()> {
             }
             Err(err) => return Err(err).with_context(|| format!("waiting on {program}")),
         }
+    }
+}
+
+/// Why `program` exited with `status`: the first line it wrote to `stderr`,
+/// else the status.
+pub fn failure(program: &str, stderr: &str, status: &str) -> String {
+    let reason = stderr.lines().map(str::trim).find(|l| !l.is_empty());
+    // A reason that already names the program, as
+    // `tether: no browser connected` does, is said as it is.
+    let named = Path::new(program)
+        .file_name()
+        .map(|name| format!("{}:", name.to_string_lossy()));
+    match reason {
+        Some(reason) if named.is_some_and(|n| reason.starts_with(&n)) => reason.to_string(),
+        Some(reason) => format!("{program} failed: {reason}"),
+        None => format!("{program} failed ({status})"),
     }
 }
 

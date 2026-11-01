@@ -50,6 +50,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | `z` | park the tree under the cursor, setting it aside under Parked, or bring it back; `Z` opens or folds Parked |
 | `/` | filter by number, branch, holder or agent; Enter keeps it, Esc clears it |
 | `o` | open the port the tree serves, `http://localhost:<port>`, in the browser, or the `browser` the config names (see [Config](#config)), or copy it to the clipboard where there is no desktop; a tree serving several, such as a frontend and a backend, offers a menu of them |
+| `p` | share the port the tree serves with your phone and show its address as a QR code to scan with the phone's camera; it runs `tether share <port>`, or the `share` the config names (see [Config](#config)); a tree serving several offers the same menu as `o` |
 | `O` | open the tree's PR the same way (see [After the agent](#after-the-agent)) |
 | `f` | send what failed on the tree's PR, a check's log or a review's requested changes, to its agent |
 | `R` | resume the tree's stopped or failed agent in the tree, with its conversation and the flags it was started with, rather than a fresh dispatch that loses them |
@@ -217,6 +218,17 @@ Being a top-level key, it goes above the first `[table]` in the file:
 
 ```toml
 browser = ["tether", "open"]
+```
+
+`share` is the command `p` shares a port with so the phone can reach it, `tether share` when the config names none.
+Each `{port}` in its words becomes the port, else the port is added last.
+It runs off the screen's thread, and the first line it prints that starts with `http` is the address treetop draws as a QR code, in black on white whatever the theme, so the phone's camera reads it.
+With [tether](https://github.com/anthonyb8/tether), that address is the port on your tailnet over HTTPS, so the phone needs only the Tailscale app; `tether unshare <port>` stops sharing it.
+Where the command fails, or prints no address within 30 seconds, as `tether share` does on a tailnet without Serve while it waits for you to enable it, the popup says what it wrote instead.
+Like `browser`, it goes above the first `[table]`:
+
+```toml
+share = ["tether", "share"]
 ```
 
 `treetop tickets` lists the repository's open tickets from its source, `--mine` those assigned to you, and any other words search their titles; it is the quickest check that a key and team are right.
