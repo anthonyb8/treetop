@@ -59,7 +59,8 @@
 //! browser = ["chromium", "--user-data-dir=/home/me/.config/devproxy-browser"]
 //! ```
 //!
-//! `share` is the command `p` shares a port with, so the phone can reach it,
+//! `share` is the command `p` shares a port with, and `treetop serve` its
+//! own, so the phone can reach it,
 //! `tether share` when it names none, with `{port}` in its words replaced by
 //! the port, else the port added last. It prints the address the phone opens,
 //! which treetop shows as a QR code:

@@ -4,9 +4,9 @@
 //! an `App` kept current by the screen's own refresh clocks, so the phone
 //! sees the rows, order and marks the list does.
 //!
-//! It is reached through `tether share` or `tailscale serve`, which give it
-//! HTTPS on the tailnet and hand over who is asking in
-//! `Tailscale-User-Login`. It answers only the login `[mobile] owner` names,
+//! It shares itself on start, with the `share` command `p` uses, `tether
+//! share` by default, which gives it HTTPS on the tailnet and hands over who
+//! is asking in `Tailscale-User-Login`. It answers only the login `[mobile] owner` names,
 //! and anything without one gets nothing, so the tailnet's other devices and
 //! people are turned away. A process on this machine can still reach the
 //! port and claim any login: those run as the owner already.
@@ -14,12 +14,13 @@
 mod actions;
 mod answer;
 mod chat;
+mod install;
 mod pool;
 mod push;
 mod tree;
 
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{IsTerminal as _, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -33,6 +34,7 @@ use crate::app::App;
 use crate::cache;
 use crate::config;
 use crate::diff;
+use crate::phone;
 use crate::pool as treehouse;
 use crate::refresh::{Refresher, Update};
 use crate::ship;
@@ -239,22 +241,111 @@ impl State {
     }
 }
 
-/// `treetop serve [--port N]`, from the checkout treetop would open in
-/// `start`. Runs until it is stopped.
-pub fn run(args: &[String], checkout: PathBuf) -> Result<()> {
-    let config = config::load().map_err(|err| anyhow!(err))?;
-    let port = match args {
-        [] => config.mobile.port.unwrap_or(PORT),
-        [flag, port] if flag == "--port" => port.parse().context("--port takes a number")?,
-        _ => bail!("usage: treetop serve [--port N]"),
-    };
-    let Some(owner) = config.mobile.owner.filter(|o| !o.is_empty()) else {
-        bail!(
+/// What `treetop serve` was asked to do.
+#[derive(Debug, PartialEq, Eq)]
+enum Mode {
+    /// Serve here, on this `--port` or the config's.
+    Serve(Option<u16>),
+    /// Serve as a service from now on, likewise.
+    Install(Option<u16>),
+}
+
+const USAGE: &str = "usage: treetop serve [--port N] [--install] | treetop serve --uninstall";
+
+fn parse(args: &[String]) -> Result<Mode> {
+    let mut port = None;
+    let mut is_install = false;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--port" => {
+                let number = args.next().ok_or_else(|| anyhow!(USAGE))?;
+                port = Some(number.parse().context("--port takes a number")?);
+            }
+            "--install" => is_install = true,
+            _ => bail!(USAGE),
+        }
+    }
+    Ok(if is_install {
+        Mode::Install(port)
+    } else {
+        Mode::Serve(port)
+    })
+}
+
+/// `treetop serve --uninstall`: needs no workspace, since the service may
+/// outlast every one.
+pub fn uninstall() -> Result<()> {
+    install::uninstall()
+}
+
+/// The login the config says to answer, without which there is nothing to
+/// serve.
+fn owner(config: &config::Config) -> Result<String> {
+    match config.mobile.owner.as_deref() {
+        Some(owner) if !owner.is_empty() => Ok(owner.to_string()),
+        _ => bail!(
             "treetop serve answers only its owner: set your Tailscale login as `owner` \
              under [mobile] in {}",
             config::path().map_or_else(|| "the config".into(), |p| p.display().to_string())
-        );
+        ),
+    }
+}
+
+/// Shares `port` and says where the phone reaches it, with a QR code to scan
+/// when someone is at a terminal to scan it; a service's goes to its journal.
+fn share(command: &[String], port: u16) {
+    match phone::share(command, port) {
+        Ok(address) => {
+            let code = std::io::stderr()
+                .is_terminal()
+                .then(|| phone::Code::new(&address));
+            eprintln!("treetop serve: on your tailnet at {address}");
+            match code {
+                Some(Ok(code)) => eprintln!("{}", code.text()),
+                Some(Err(why)) => eprintln!("treetop serve: {why}"),
+                None => {}
+            }
+        }
+        Err(why) => {
+            eprintln!("treetop serve: not shared, so only on 127.0.0.1:{port}: {why}");
+        }
+    }
+}
+
+/// `treetop serve --install`, from the checkout treetop would open in
+/// `start`: the service, then the phone's way in.
+fn install_service(
+    config: &config::Config,
+    asked: Option<u16>,
+    port: u16,
+    checkout: PathBuf,
+) -> Result<()> {
+    // A service with no owner would only fail, over and over, out of sight.
+    owner(config)?;
+    let unit = install::Unit {
+        binary: std::env::current_exe().context("finding this binary")?,
+        workspace: checkout,
+        port: asked,
+        path: std::env::var("PATH").unwrap_or_default(),
     };
+    install::install(&unit, port)?;
+    println!("{}", install::lingering());
+    share(&config.share, port);
+    Ok(())
+}
+
+/// `treetop serve [--port N] [--install]`, from the checkout treetop would
+/// open in `start`. Serving runs until it is stopped.
+pub fn run(args: &[String], checkout: PathBuf) -> Result<()> {
+    let config = config::load().map_err(|err| anyhow!(err))?;
+    let mode = parse(args)?;
+    let (Mode::Serve(chosen) | Mode::Install(chosen)) = mode;
+    let port = chosen.or(config.mobile.port).unwrap_or(PORT);
+    if let Mode::Install(_) = mode {
+        return install_service(&config, chosen, port, checkout);
+    }
+    let owner = owner(&config)?;
     let server = Server::http(("127.0.0.1", port))
         .map_err(|err| anyhow!("listening on 127.0.0.1:{port}: {err}"))?;
     workspaces::record(&checkout);
@@ -270,8 +361,7 @@ pub fn run(args: &[String], checkout: PathBuf) -> Result<()> {
     // one that waits for it.
     state.pool(None);
     eprintln!(
-        "treetop serve: http://127.0.0.1:{port}, for {} through `tether share {port}` \
-         or `tailscale serve`",
+        "treetop serve: http://127.0.0.1:{port}, for {}",
         state.owner
     );
     let server = Arc::new(server);
@@ -285,6 +375,9 @@ pub fn run(args: &[String], checkout: PathBuf) -> Result<()> {
             })
         })
         .collect();
+    // Once it listens, since `tether share` can take its 30 seconds and the
+    // server answers 127.0.0.1 meanwhile, whatever it comes to.
+    thread::spawn(move || share(&config.share, port));
     for worker in workers {
         let _ = worker.join();
     }
@@ -730,6 +823,26 @@ fn content_type(file: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serve_takes_a_port_and_install_in_either_order() {
+        let words = |list: &[&str]| list.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let asked = |list: &[&str]| parse(&words(list)).ok();
+        assert_eq!(asked(&[]), Some(Mode::Serve(None)));
+        assert_eq!(asked(&["--port", "8123"]), Some(Mode::Serve(Some(8123))));
+        assert_eq!(asked(&["--install"]), Some(Mode::Install(None)));
+        assert_eq!(
+            asked(&["--install", "--port", "8123"]),
+            Some(Mode::Install(Some(8123)))
+        );
+        assert_eq!(
+            asked(&["--port", "8123", "--install"]),
+            Some(Mode::Install(Some(8123)))
+        );
+        assert_eq!(asked(&["--port"]), None);
+        assert_eq!(asked(&["--port", "many"]), None);
+        assert_eq!(asked(&["--instal"]), None);
+    }
 
     fn asked<'a>(path: &'a str, login: Option<&'a str>) -> Asked<'a> {
         Asked {

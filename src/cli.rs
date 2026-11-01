@@ -33,8 +33,11 @@ use crate::watch::Check;
 const USAGE: &str = "usage:
   treetop                          open the pool view
   treetop issues                   open it on the Issues screen
-  treetop serve [--port N]         serve treetop to a phone, on 127.0.0.1, for
-                                   `tether share` or `tailscale serve`
+  treetop serve [--port N]         serve treetop to a phone, on 127.0.0.1, shared
+                                   with the config's `share`, `tether share` by default
+  treetop serve --install [--port N]
+                                   keep it running as a systemd user service
+  treetop serve --uninstall        stop and remove the service
   treetop status                   every tree, agent, report and PR, as JSON
   treetop send <tree|agent> <msg>  type a message into an agent's chat and send it
   treetop dispatch <new|main|N> <task>

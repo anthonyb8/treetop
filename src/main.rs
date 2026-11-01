@@ -774,6 +774,9 @@ fn main() -> Result<()> {
     if let [command, rest @ ..] = args.as_slice()
         && command == "serve"
     {
+        if rest == ["--uninstall"] {
+            return serve::uninstall();
+        }
         let checkout = checkout_for(&start, true)?;
         std::env::set_current_dir(&checkout)?;
         return serve::run(rest, checkout);
