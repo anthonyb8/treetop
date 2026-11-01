@@ -256,6 +256,9 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
     // A scratch chat starting, and those being deleted, off this thread.
     let mut starting_scratch: Option<mpsc::Receiver<Result<scratch::Scratch, String>>> = None;
     let mut removing_scratch: Vec<mpsc::Receiver<Result<String, String>>> = Vec::new();
+    // URLs a configured browser is opening, off this thread, each with
+    // whether the Issues screen asked, so its outcome is said there.
+    let mut opening_urls: Vec<(actions::Pending, bool)> = Vec::new();
     loop {
         while let Ok(update) = refresher.updates.try_recv() {
             is_stale = true;
@@ -427,6 +430,17 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                 }
             }
         }
+        opening_urls.retain(|(pending, from_issues)| {
+            let Some(said) = pending.poll() else {
+                return true;
+            };
+            match issues.as_mut().filter(|_| *from_issues) {
+                Some(screen) => screen.say(said),
+                None => app.message = Some(said),
+            }
+            is_stale = true;
+            false
+        });
         removing_scratch.retain(|result| match result.try_recv() {
             Ok(Ok(name)) => {
                 app.message = Some(format!("deleted {name}"));
@@ -586,7 +600,11 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                     Outcome::Continue
                 }
                 issues::Action::Open(url) => {
-                    screen.say(actions::open_url(&url).unwrap_or_else(|err| format!("{err:#}")));
+                    let opening = actions::open_url(&url);
+                    screen.say(opening.said_now());
+                    if let actions::Opening::Pending(pending) = opening {
+                        opening_urls.push((pending, true));
+                    }
                     Outcome::Continue
                 }
             },
@@ -627,12 +645,18 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                 }
             }
             Outcome::OpenUrl(url) => {
-                app.message =
-                    Some(actions::open_url(&url).unwrap_or_else(|err| format!("{err:#}")));
+                let opening = actions::open_url(&url);
+                app.message = Some(opening.said_now());
+                if let actions::Opening::Pending(pending) = opening {
+                    opening_urls.push((pending, false));
+                }
             }
             Outcome::Browse { port, tree } => {
-                app.message =
-                    Some(actions::browse(port, &tree).unwrap_or_else(|err| format!("{err:#}")));
+                let opening = actions::browse(port, &tree);
+                app.message = Some(opening.said_now());
+                if let actions::Opening::Pending(pending) = opening {
+                    opening_urls.push((pending, false));
+                }
             }
             Outcome::Enter(tree) if tmux::is_inside() => {
                 app.message = Some(tmux::open(&tree).unwrap_or_else(|err| format!("{err:#}")));

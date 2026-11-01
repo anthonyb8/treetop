@@ -73,7 +73,7 @@ It goes.
 
 - **Schema:** N/A - treetop has no database.
 - **Data:** N/A - no backend; the interfaces are `/proc`, files the agents write, and `treehouse`, `git` and `tmux` on PATH.
-- **Edge / vendors / env:** reads `TREETOP_AGENTS` and `CLAUDE_CONFIG_DIR` (default `~/.claude`); opens URLs with `xdg-open`, or `open` on macOS.
+- **Edge / vendors / env:** reads `TREETOP_AGENTS` and `CLAUDE_CONFIG_DIR` (default `~/.claude`); opens URLs with the config's `browser` when it names one, else `xdg-open`, or `open` on macOS.
 
 ## Breakdown
 
@@ -143,7 +143,7 @@ N/A - not a bug.
 - **UI:** a PORTS column; the Info pane grows from 4 rows to fit its lines; `o` and its status line; the bottom bar count.
 - **Data:** `Process` gains `ports: Vec<u16>`; `live::processes` fills it.
 - **Schema:** N/A - no database.
-- **Edge / vendors / env:** `xdg-open` or `open` on PATH for `o`.
+- **Edge / vendors / env:** the config's `browser`, else `xdg-open` or `open` on PATH, for `o`.
 - **Tests:** a pure `parse_listen` on literal `tcp` and `tcp6` text (LISTEN rows kept, others dropped, IPv4 and IPv6 hex ports decoded); matching a fixed set of fd links to inodes; the PORTS cell for no ports, one, and several.
 - **Risk:** CPU cost of the fd reads (see the project's Risks).
 

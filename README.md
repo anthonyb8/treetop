@@ -49,7 +49,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | Space | mark or unmark the tree under the cursor |
 | `z` | park the tree under the cursor, setting it aside under Parked, or bring it back; `Z` opens or folds Parked |
 | `/` | filter by number, branch, holder or agent; Enter keeps it, Esc clears it |
-| `o` | open the port the tree serves, `http://localhost:<port>`, in the browser, or copy it to the clipboard where there is no desktop; a tree serving several, such as a frontend and a backend, offers a menu of them |
+| `o` | open the port the tree serves, `http://localhost:<port>`, in the browser, or the `browser` the config names (see [Config](#config)), or copy it to the clipboard where there is no desktop; a tree serving several, such as a frontend and a backend, offers a menu of them |
 | `O` | open the tree's PR the same way (see [After the agent](#after-the-agent)) |
 | `f` | send what failed on the tree's PR, a check's log or a review's requested changes, to its agent |
 | `R` | resume the tree's stopped or failed agent in the tree, with its conversation and the flags it was started with, rather than a fresh dispatch that loses them |
@@ -206,6 +206,17 @@ With no `ship`, a repository uses GitHub's alone, and `ship = []` leaves the PR 
 [repos."~/endo/app"]
 issues = "work"
 ship = ["no-mistakes", "github"]
+```
+
+`browser` is the command `o` and `O` open a URL with, in place of `xdg-open` (or `open` on macOS).
+Each `{url}` in its words becomes the URL, else the URL is added last.
+It runs whether or not there is a desktop session, so on a server reached over SSH it can hand the URL to the browser on the computer you are typing at, as [tether](https://github.com/anthonyb8/tether)'s `tether open` does.
+It runs off the screen's thread, with the status line saying it is opening until it is done.
+Where it will not start, or exits unsuccessfully within five seconds, the URL is copied to the clipboard instead, with the first line of its error on the status line, such as `tether: no browser connected; copied http://localhost:5173`; one still running by then, as a browser it started itself is, counts as opened.
+Being a top-level key, it goes above the first `[table]` in the file:
+
+```toml
+browser = ["tether", "open"]
 ```
 
 `treetop tickets` lists the repository's open tickets from its source, `--mine` those assigned to you, and any other words search their titles; it is the quickest check that a key and team are right.

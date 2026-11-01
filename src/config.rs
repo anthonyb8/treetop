@@ -41,6 +41,14 @@
 //! issues = "work"
 //! ship = ["no-mistakes", "github"] # its ship plugins; github alone by default
 //! ```
+//!
+//! `browser` is the command `o` and `O` open a URL with, in place of the
+//! desktop's opener, with `{url}` in its words replaced by the URL, else the
+//! URL added last:
+//!
+//! ```toml
+//! browser = ["chromium", "--user-data-dir=/home/me/.config/devproxy-browser"]
+//! ```
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -123,6 +131,10 @@ pub struct Config {
     /// `{title}`, `{description}`, `{url}` and `{branch}` filled in.
     #[serde(default)]
     pub prompt: Option<String>,
+    /// The command a URL is opened with, run even with no desktop session;
+    /// empty for the desktop's opener.
+    #[serde(default)]
+    pub browser: Vec<String>,
 }
 
 /// `path` with a leading `~` as the home directory.
@@ -259,6 +271,13 @@ mod tests {
     fn views_are_named_filter_lines() {
         let config = parse("[views]\nbugs = \"label:Bug group:status\"\n").unwrap();
         assert_eq!(config.views["bugs"], "label:Bug group:status");
+    }
+
+    #[test]
+    fn browser_is_a_command_or_nothing() {
+        assert!(Config::default().browser.is_empty());
+        let config = parse("browser = [\"chromium\", \"--new-window\", \"{url}\"]\n").unwrap();
+        assert_eq!(config.browser, ["chromium", "--new-window", "{url}"]);
     }
 
     #[test]
