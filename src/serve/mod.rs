@@ -14,6 +14,7 @@
 mod actions;
 mod chat;
 mod pool;
+mod push;
 mod terminal;
 mod tree;
 
@@ -59,13 +60,18 @@ pub struct Pool {
     pub checkout: PathBuf,
     /// Lists the pool again now, after an action changed it.
     kick: Mutex<std::sync::mpsc::Sender<()>>,
+    /// Where pushes go, when the server can send them.
+    push: Option<Arc<push::Push>>,
+    /// What pushes are judged against: the pool as last seen, once it has
+    /// been read in full, and what of it has been read so far.
+    seen: Mutex<Watch>,
     pub app: Mutex<App>,
 }
 
 impl Pool {
     /// The pool of `checkout`, set up as the screen sets one up, with its
     /// clocks started and their updates applied as they come.
-    fn spawn(checkout: PathBuf) -> Arc<Pool> {
+    fn spawn(checkout: PathBuf, push: Option<Arc<push::Push>>) -> Arc<Pool> {
         let mut app = App::new(None);
         app.checkout = checkout.clone();
         app.user = crate::branch::user();
@@ -80,6 +86,8 @@ impl Pool {
             name: workspaces::name(&checkout),
             checkout,
             kick: Mutex::new(refresher.kicker()),
+            push,
+            seen: Mutex::new(Watch::default()),
             app: Mutex::new(app),
         });
         thread::spawn({
@@ -110,6 +118,12 @@ impl Pool {
 
     fn apply(&self, update: Update) {
         let mut app = self.app.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut watch = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        match &update {
+            Update::Reports(_) => watch.has_reports = true,
+            Update::Ship(_) => watch.has_ship = true,
+            _ => {}
+        }
         match update {
             Update::ListingStarted => app.start_listing(),
             Update::Listing(Ok(listing)) => app.set_trees(listing),
@@ -129,6 +143,56 @@ impl Pool {
             Update::Usage(usage) => app.usage = usage,
             Update::Agents(agents) => app.apply_agents(&agents),
         }
+        // Pushes are judged once the pool has been read in full: agents,
+        // reports and PRs. Until then a change is only the reading catching
+        // up, and pushing it would buzz the phone with the whole pool.
+        let Some(push) = &self.push else {
+            return;
+        };
+        let is_read = app.is_agents_read
+            && watch.has_reports
+            && (watch.has_ship || watch.started.elapsed() >= SHIP_WAIT);
+        if !is_read {
+            return;
+        }
+        let now = push::Seen::of(&app);
+        let notices = watch
+            .last
+            .as_ref()
+            .map(|last| last.notices(&now, &app))
+            .unwrap_or_default();
+        watch.last = Some(now);
+        if !notices.is_empty() {
+            let push = Arc::clone(push);
+            thread::spawn(move || {
+                for notice in &notices {
+                    push.send(notice);
+                }
+            });
+        }
+    }
+}
+
+/// How long pushes wait on the PRs' first reading, for a repository whose
+/// ship plugins cannot say.
+const SHIP_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How much of the pool has been read, and how it last looked.
+struct Watch {
+    started: std::time::Instant,
+    has_reports: bool,
+    has_ship: bool,
+    last: Option<push::Seen>,
+}
+
+impl Default for Watch {
+    fn default() -> Watch {
+        Watch {
+            started: std::time::Instant::now(),
+            has_reports: false,
+            has_ship: false,
+            last: None,
+        }
     }
 }
 
@@ -144,6 +208,8 @@ pub struct State {
     pools: Mutex<HashMap<PathBuf, Arc<Pool>>>,
     /// The agents' terminals open for the phone.
     terminals: terminal::Terminals,
+    /// Where pushes go; None when the server could not set them up.
+    push: Option<Arc<push::Push>>,
 }
 
 impl State {
@@ -153,6 +219,7 @@ impl State {
             default,
             pools: Mutex::new(HashMap::new()),
             terminals: terminal::Terminals::default(),
+            push: None,
         }
     }
 
@@ -170,7 +237,7 @@ impl State {
         Arc::clone(
             pools
                 .entry(checkout.clone())
-                .or_insert_with(|| Pool::spawn(checkout)),
+                .or_insert_with(|| Pool::spawn(checkout, self.push.clone())),
         )
     }
 }
@@ -194,7 +261,14 @@ pub fn run(args: &[String], checkout: PathBuf) -> Result<()> {
     let server = Server::http(("127.0.0.1", port))
         .map_err(|err| anyhow!("listening on 127.0.0.1:{port}: {err}"))?;
     workspaces::record(&checkout);
-    let state = Arc::new(State::new(owner, checkout));
+    let mut state = State::new(owner.clone(), checkout);
+    let push_dir = config::path().and_then(|p| p.parent().map(|dir| dir.join("push")));
+    match push_dir.map(|dir| push::Push::open(dir, &owner)) {
+        Some(Ok(push)) => state.push = Some(Arc::new(push)),
+        Some(Err(why)) => eprintln!("treetop serve: no pushes: {why}"),
+        None => eprintln!("treetop serve: no pushes: no config directory"),
+    }
+    let state = Arc::new(state);
     // The default pool starts listing now, so the first page is not the
     // one that waits for it.
     state.pool(None);
@@ -423,6 +497,35 @@ pub fn route(state: &State, asked: &Asked) -> Reply {
             let pool = state.pool(asked.query.get("workspace").map(String::as_str));
             let app = pool.app.lock().unwrap_or_else(PoisonError::into_inner);
             Reply::json(200, &pool::pool_json(&app, &pool.name))
+        }
+        (Method::Get, "/api/push/key") => match &state.push {
+            Some(push) => Reply::json(200, &json!({ "key": push.public_key() })),
+            None => Reply::error(404, "this server cannot send pushes"),
+        },
+        (Method::Post, "/api/push/subscribe" | "/api/push/unsubscribe") => {
+            if !is_same_site(asked) {
+                return Reply::error(403, "only treetop's own page can act");
+            }
+            let Some(push) = &state.push else {
+                return Reply::error(404, "this server cannot send pushes");
+            };
+            let done = if asked.path.ends_with("unsubscribe") {
+                #[derive(serde::Deserialize)]
+                struct Gone {
+                    endpoint: String,
+                }
+                serde_json::from_slice::<Gone>(asked.body)
+                    .map_err(|_| "unsubscribe takes {\"endpoint\": \"...\"}".to_string())
+                    .and_then(|gone| push.unsubscribe(&gone.endpoint))
+            } else {
+                serde_json::from_slice::<push::Subscription>(asked.body)
+                    .map_err(|_| "subscribe takes the browser's subscription".to_string())
+                    .and_then(|subscription| push.subscribe(subscription))
+            };
+            match done {
+                Ok(()) => Reply::json(200, &json!({})),
+                Err(why) => Reply::error(400, &why),
+            }
         }
         (Method::Post, "/api/dispatch") => {
             if !is_same_site(asked) {
@@ -786,6 +889,50 @@ mod tests {
             );
             assert_eq!(reply.status, 403, "{origin:?}");
         }
+    }
+
+    #[test]
+    fn another_site_cannot_subscribe_or_unsubscribe_a_device() {
+        let dir = std::env::temp_dir().join(format!("treetop-serve-push-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut state = State::new("me".into(), PathBuf::from("/nowhere"));
+        state.push = Some(Arc::new(push::Push::open(dir.clone(), "me").unwrap()));
+        // Nothing here sends a push, and the endpoint is one no push service has.
+        let device: &[u8] =
+            br#"{"endpoint": "https://push.invalid/phone", "keys": {"p256dh": "k", "auth": "a"}}"#;
+        let gone: &[u8] = br#"{"endpoint": "https://push.invalid/phone"}"#;
+        let ask = |path: &str, origin: Option<&str>, body: &[u8]| {
+            route(
+                &state,
+                &Asked {
+                    method: &Method::Post,
+                    origin,
+                    host: Some("server.tailnet.ts.net:7777"),
+                    body,
+                    ..asked(path, Some("me"))
+                },
+            )
+            .status
+        };
+        let is_kept = || {
+            std::fs::read_to_string(dir.join("subscriptions.json"))
+                .is_ok_and(|text| text.contains("push.invalid/phone"))
+        };
+        let own = Some("https://server.tailnet.ts.net:7777");
+        for other in [None, Some("https://evil.example")] {
+            assert_eq!(ask("/api/push/subscribe", other, device), 403, "{other:?}");
+            assert!(!is_kept(), "{other:?}");
+        }
+        // The same ask from the server's own page is heard.
+        assert_eq!(ask("/api/push/subscribe", own, device), 200);
+        assert!(is_kept());
+        for other in [None, Some("https://evil.example")] {
+            assert_eq!(ask("/api/push/unsubscribe", other, gone), 403, "{other:?}");
+            assert!(is_kept(), "{other:?}");
+        }
+        assert_eq!(ask("/api/push/unsubscribe", own, gone), 200);
+        assert!(!is_kept());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

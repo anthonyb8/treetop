@@ -58,3 +58,37 @@ self.addEventListener("fetch", (event) => {
     ),
   );
 });
+
+// A push from treetop serve: a tree and what happened to it. Tapping it
+// opens that tree's screen in the app, or the app if it is not open.
+self.addEventListener("push", (event) => {
+  let notice = { title: "treetop", body: "", url: "/" };
+  try {
+    notice = { ...notice, ...event.data.json() };
+  } catch {
+    // A push that is not treetop's own shape still shows, plainly.
+  }
+  event.waitUntil(
+    self.registration.showNotification(notice.title, {
+      body: notice.body,
+      tag: notice.url,
+      data: { url: notice.url },
+      icon: "/icons/icon-192.png",
+      badge: "/icons/icon-192.png",
+    }),
+  );
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const url = new URL(event.notification.data?.url ?? "/", self.location.origin).href;
+  event.waitUntil(
+    self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((windows) => {
+      const open = windows.find((w) => new URL(w.url).origin === self.location.origin);
+      if (open) {
+        return open.focus().then((w) => w.navigate(url));
+      }
+      return self.clients.openWindow(url);
+    }),
+  );
+});

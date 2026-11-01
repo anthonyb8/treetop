@@ -2069,11 +2069,13 @@ name = "treetop"
 version = "0.1.46"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "issues",
  "libc",
  "linear",
  "qrcode",
  "ratatui",
+ "ring",
  "serde",
  "serde_json",
  "tiny_http",

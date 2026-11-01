@@ -294,3 +294,19 @@ export function resume(workspace: string | null, tree: string): Promise<void> {
 export function giveBack(workspace: string | null, tree: string): Promise<void> {
   return post<void>(`/api/trees/${encodeURIComponent(tree)}/return${workspaceQuery(workspace)}`, {});
 }
+
+/** The server's key a browser subscribes to pushes with; null when it sends none. */
+export async function fetchPushKey(): Promise<string | null> {
+  try {
+    const response = await fetch("/api/push/key", { cache: "no-store" });
+    if (!response.ok) return null;
+    return ((await response.json()) as { key: string }).key;
+  } catch {
+    return null;
+  }
+}
+
+/** Tells the server where to push to this device. */
+export function subscribePush(subscription: PushSubscriptionJSON): Promise<void> {
+  return post<void>("/api/push/subscribe", subscription);
+}

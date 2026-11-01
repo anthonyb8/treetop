@@ -670,6 +670,11 @@ On a tree whose agent has stopped or died, Resume starts it again with its conve
 Return… gives the tree back to the pool, as `r` does, after a sheet that names its branch and what it holds that is not pushed or committed; its agents are stopped first.
 Anything else running in the tree, such as a dev server, keeps it from the phone, and the refusal says what, since stopping it is a call to make at treetop with the return dialog's list of what would stop.
 The pool refreshes every five seconds while the app is open, and when you pull down.
+
+The bell in the pool's header turns on notifications, which iOS offers only to the app opened from the home screen.
+Your phone then buzzes when an agent comes to need you, finishes or dies, and when a tree's PR fails its checks or merges, each once; tapping one opens that tree's chat, or the tree for a PR.
+A notification names the tree and what happened, such as `17 · END-123 fix-login` and `Needs you`, never what the agent wrote, and goes encrypted for your phone through Apple's push service, the one thing the server sends off your tailnet.
+The server keeps its push key and the phones that turned notifications on in `push/` beside the config, readable by you alone; a phone that turns them off in Settings is dropped the next time a push finds it gone.
 With the server out of reach, it opens on the pool as it last saw it and says so.
 
 ### Working on the app

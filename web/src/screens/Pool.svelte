@@ -3,6 +3,7 @@
   import { ApiError, fetchPool, fetchWorkspaces, type Pool } from "../api";
   import Card from "../components/Card.svelte";
   import GitCounts from "../components/GitCounts.svelte";
+  import Notifications from "../components/Notifications.svelte";
   import { chooseWorkspace, link, nav } from "../nav.svelte";
   import { remember, recall } from "../store";
 
@@ -112,6 +113,8 @@
         {/if}
       </p>
     </div>
+    <div class="tools">
+    <Notifications />
     <label class="switcher">
       <span class="visually-hidden">Workspace</span>
       <span class="current">{shownName}</span>
@@ -123,6 +126,7 @@
         {/each}
       </select>
     </label>
+    </div>
   </header>
 
   {#if failure && pool}
@@ -263,13 +267,19 @@
     font-size: 13px;
     color: var(--muted);
   }
+  .tools {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
   .switcher {
     position: relative;
     display: flex;
     align-items: center;
     gap: 6px;
     min-height: 44px;
-    max-width: 50%;
+    max-width: 160px;
     padding: 0 12px;
     border-radius: 10px;
     border: 1px solid var(--line-strong);
