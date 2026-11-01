@@ -1,9 +1,13 @@
 <script lang="ts">
   import { tick } from "svelte";
+  import { cubicOut } from "svelte/easing";
+  import { SvelteSet } from "svelte/reactivity";
+  import { fly } from "svelte/transition";
   import { answer, ApiError, chatUrl, fetchTree, sendLine, type Answer, type ChatMessage, type Tree } from "../api";
   import Mark from "../components/Mark.svelte";
   import PromptCard from "../components/PromptCard.svelte";
-  import { markdown } from "../markdown";
+  import Reveal from "../components/Reveal.svelte";
+  import Working from "../components/Working.svelte";
   import { back, nav } from "../nav.svelte";
   import { recall, remember } from "../store";
 
@@ -20,6 +24,13 @@
   }
 
   let messages = $state<ChatMessage[]>([]);
+  /** Messages that came in while the chat was open, which ease in; those
+   * shown on opening are just there. */
+  const fresh = new SvelteSet<string>();
+  const isStill = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  function arrive(id: string) {
+    return { y: 10, duration: fresh.has(id) && !isStill ? 240 : 0, easing: cubicOut };
+  }
   let pending = $state<Pending[]>([]);
   let tree = $state<Tree | null>(null);
   let isLive = $state(false);
@@ -56,7 +67,9 @@
         void stickToEnd(true);
       });
       source.addEventListener("message", (event) => {
-        const isNew = take(JSON.parse((event as MessageEvent<string>).data) as ChatMessage);
+        const message = JSON.parse((event as MessageEvent<string>).data) as ChatMessage;
+        const isNew = take(message);
+        if (isNew) fresh.add(message.id);
         settle();
         void stickToEnd(false, isNew);
       });
@@ -164,6 +177,11 @@
     if (isAtEnd) unseen = 0;
   }
 
+  /** A reply being written out grows the conversation; one at its end stays there. */
+  function followGrowth() {
+    if (isAtEnd && scroller) scroller.scrollTop = scroller.scrollHeight;
+  }
+
   function toEnd() {
     scroller?.scrollTo({ top: scroller.scrollHeight, behavior: "smooth" });
     unseen = 0;
@@ -244,6 +262,36 @@
   let promptTool = $derived(promptMessage?.tool ? { ...promptMessage.tool, id: promptMessage.id } : null);
   let answerFailure = $state<string | null>(null);
 
+  // What a running tool call is doing, as the dots say it: a command's own
+  // description, else the verb as it is happening.
+  const now: Record<string, string> = {
+    Edited: "Editing",
+    Wrote: "Writing",
+    Read: "Reading",
+    Searched: "Searching for",
+    Fetched: "Fetching",
+    "Searched the web": "Searching the web for",
+    "Asked an agent": "Asking an agent to",
+    "Used skill": "Using the skill",
+  };
+  function doing(verb: string, what: string | null): string {
+    if (verb === "Ran") return what ?? "Running a command";
+    return [now[verb] ?? verb, what].filter(Boolean).join(" ");
+  }
+
+  // The agent at work, and what on: its running tool call, else what its
+  // report says it is doing. Nothing while it waits on you.
+  let working = $derived.by(() => {
+    if (!card || card.needs_you || promptTool) return null;
+    const isBusy = tree?.agents[0]?.status === "busy" || tree?.report?.state === "working";
+    if (!isBusy) return null;
+    const last = messages.at(-1);
+    if (last?.kind === "tool" && last.tool?.status === "running") {
+      return { step: doing(last.tool.verb, last.tool.what) };
+    }
+    return { step: tree?.report?.state === "working" ? tree.report.says || null : null };
+  });
+
   async function answerPrompt(given: Answer) {
     if (given.action === "say") {
       const line: Pending = { id: nextId++, text: given.text, state: "sending", answers: promptTool?.id };
@@ -290,17 +338,17 @@
     {/if}
     {#each messages as message (message.id)}
       {#if message.kind === "you"}
-        <div class="you">
+        <div class="you" in:fly={arrive(message.id)}>
           <div class="bubble">{message.text}</div>
           <span class="at">{time(message.at)}</span>
         </div>
       {:else if message.kind === "claude"}
-        <div class="claude">
-          <div class="prose">{@html markdown(message.text ?? "")}</div>
+        <div class="claude" in:fly={arrive(message.id)}>
+          <Reveal text={message.text ?? ""} isNew={fresh.has(message.id)} ongrow={followGrowth} />
         </div>
       {:else if message.kind === "tool" && message.tool}
         {@const tool = message.tool}
-        <div class="tool" class:failed={tool.status === "error"}>
+        <div class="tool" class:failed={tool.status === "error"} in:fly={arrive(message.id)}>
           <button type="button" class="tool-row" aria-expanded={opened.has(message.id)} onclick={() => toggle(message.id)}>
             <svg class="chevron" class:open={opened.has(message.id)} width="12" height="12" viewBox="0 0 24 24"
               fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true"
@@ -319,7 +367,7 @@
       {/if}
     {/each}
     {#each pending as line (line.id)}
-      <div class="you" class:sending={line.state !== "failed"}>
+      <div class="you" class:sending={line.state !== "failed"} in:fly={{ y: 10, duration: isStill ? 0 : 240, easing: cubicOut }}>
         <div class="bubble" class:failed={line.state === "failed"}>{line.text}</div>
         {#if line.state === "failed"}
           <span class="at error">
@@ -331,6 +379,7 @@
         {/if}
       </div>
     {/each}
+    {#if working}<Working step={working.step} />{/if}
   </main>
 
   {#if unseen > 0}
@@ -485,58 +534,6 @@
   }
   .claude {
     max-width: 96%;
-  }
-  .prose {
-    font-size: 15px;
-    line-height: 1.5;
-    color: var(--fg);
-    overflow-wrap: anywhere;
-  }
-  .prose :global(p) {
-    margin: 0 0 8px;
-  }
-  .prose :global(p:last-child) {
-    margin-bottom: 0;
-  }
-  .prose :global(.h) {
-    font-weight: 700;
-    color: var(--fg-strong);
-  }
-  .prose :global(ul),
-  .prose :global(ol) {
-    margin: 0 0 8px;
-    padding-left: 20px;
-  }
-  .prose :global(li + li) {
-    margin-top: 2px;
-  }
-  .prose :global(code) {
-    font-family: var(--mono);
-    font-size: 13px;
-    padding: 1px 4px;
-    border-radius: 4px;
-    background: var(--bg-high);
-    color: var(--fg-strong);
-  }
-  .prose :global(pre) {
-    margin: 0 0 8px;
-    padding: 10px;
-    border-radius: 8px;
-    background: #1d2021;
-    overflow-x: auto;
-  }
-  .prose :global(pre code) {
-    padding: 0;
-    background: none;
-  }
-  .prose :global(blockquote) {
-    margin: 0 0 8px;
-    padding-left: 10px;
-    border-left: 2px solid var(--line-strong);
-    color: var(--muted);
-  }
-  .prose :global(strong) {
-    color: var(--fg-strong);
   }
   .tool {
     display: flex;

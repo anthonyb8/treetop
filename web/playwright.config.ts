@@ -18,7 +18,9 @@ export default defineConfig({
     serviceWorkers: "block",
   },
   webServer: {
-    command: "npx vite preview --host 127.0.0.1 --port 4173 --strictPort",
+    // Every call the app makes is answered by the test; one that is not
+    // goes nowhere, never to a treetop serve running on this machine.
+    command: "TREETOP_API=http://127.0.0.1:9 npx vite preview --host 127.0.0.1 --port 4173 --strictPort",
     url: "http://127.0.0.1:4173",
     reuseExistingServer: false,
   },

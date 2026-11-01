@@ -656,6 +656,8 @@ Back, the button or the phone's own gesture, lands on the pool where you left it
 
 Open chat, on a tree whose agent is a background Claude Code session, shows its conversation as it happens, read from the session's transcript on the server: what you sent, what Claude wrote, and each tool call folded to one line, such as `Edited src/guard.ts +12 −4` or `Ran the tests ✗`, that opens to what it printed.
 Scrolled to the end it follows new messages; scrolled up, it stays put and a pill says how many came in.
+While the agent works, dots at the foot of the chat say what it is doing, such as `Run the tests` or `Editing src/guard.ts`; a message that comes in eases into place, and a new reply from Claude is written out word by word.
+Claude Code writes a reply down only once it is finished, so this paces the finished reply rather than following it as it is made; asking the phone for less motion shows each at once.
 A line typed at the bottom goes to the agent as `treetop send` sends it, typed into its chat, or starting a stopped agent again with it; it shows at once as sending, and as failed with why and a retry if it could not go.
 What you were typing is kept when you leave the chat.
 While the agent waits on you, what it waits on sits above the box, and you answer it there.
