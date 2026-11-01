@@ -1,9 +1,10 @@
 <script lang="ts">
   import { tick } from "svelte";
-  import { ApiError, chatUrl, fetchTree, sendLine, type ChatMessage, type Tree } from "../api";
+  import { answer, ApiError, chatUrl, fetchTree, sendLine, type Answer, type ChatMessage, type Tree } from "../api";
   import Mark from "../components/Mark.svelte";
+  import PromptCard from "../components/PromptCard.svelte";
   import { markdown } from "../markdown";
-  import { back, link, nav } from "../nav.svelte";
+  import { back, nav } from "../nav.svelte";
   import { recall, remember } from "../store";
 
   let { name }: { name: string } = $props();
@@ -14,6 +15,8 @@
     text: string;
     state: "sending" | "sent" | "failed";
     why?: string;
+    /** The prompt these words answer, when one was waiting. */
+    answers?: string;
   }
 
   let messages = $state<ChatMessage[]>([]);
@@ -170,7 +173,15 @@
     line.state = "sending";
     line.why = undefined;
     try {
-      await sendLine(nav.workspace, name, line.text);
+      // While a prompt has the keys a message would not land, so the words
+      // answer it: the prompt is put away and they go in as a message.
+      if (line.answers) {
+        await answer(nav.workspace, name, { action: "say", text: line.text });
+        answeredId = line.answers;
+        answeredNeeds = needs;
+      } else {
+        await sendLine(nav.workspace, name, line.text);
+      }
       line.state = "sent";
     } catch (err) {
       line.state = "failed";
@@ -182,7 +193,7 @@
     event.preventDefault();
     const text = draft.trim();
     if (!text) return;
-    const line: Pending = { id: nextId++, text, state: "sending" };
+    const line: Pending = { id: nextId++, text, state: "sending", answers: promptTool?.id };
     pending.push(line);
     draft = "";
     isAtEnd = true;
@@ -213,7 +224,44 @@
   }
 
   let card = $derived(tree?.card);
-  let question = $derived(tree?.report?.state === "blocked" ? tree.report.says : null);
+  let needs = $derived(tree?.report?.state === "blocked" ? tree.report.says : null);
+
+  /** The prompt just answered, and what the agent said it needed then, kept
+   * out of sight until the transcript and the agent's state catch up. */
+  let answeredId = $state<string | null>(null);
+  let answeredNeeds = $state<string | null>(null);
+  let shownNeeds = $derived(needs !== answeredNeeds ? needs : null);
+
+  // What the agent waits on: its newest tool call, when it has no result
+  // yet and the agent waits on you. A question carries its choices; any
+  // other is a permission to give or refuse.
+  let promptMessage = $derived.by(() => {
+    if (!card?.needs_you) return null;
+    let last: ChatMessage | undefined;
+    for (let i = messages.length - 1; i >= 0 && !last; i--) if (messages[i]?.kind === "tool") last = messages[i];
+    return last?.tool?.status === "running" && last.id !== answeredId ? last : null;
+  });
+  let promptTool = $derived(promptMessage?.tool ? { ...promptMessage.tool, id: promptMessage.id } : null);
+  let answerFailure = $state<string | null>(null);
+
+  async function answerPrompt(given: Answer) {
+    if (given.action === "say") {
+      const line: Pending = { id: nextId++, text: given.text, state: "sending", answers: promptTool?.id };
+      pending.push(line);
+      isAtEnd = true;
+      void stickToEnd(true);
+      await deliver(pending[pending.length - 1]!);
+      return;
+    }
+    answerFailure = null;
+    try {
+      await answer(nav.workspace, name, given);
+      answeredId = promptTool?.id ?? null;
+      answeredNeeds = needs;
+    } catch (err) {
+      answerFailure = err instanceof ApiError ? err.message : "The answer did not go through";
+    }
+  }
 </script>
 
 <div class="screen">
@@ -232,10 +280,6 @@
         <span>{tree?.agents[0]?.name ?? "agent"}{isLive ? "" : " · connecting…"}</span>
       </div>
     </div>
-    <a class="icon" href="/trees/{encodeURIComponent(name)}/terminal" onclick={link} aria-label="Open the terminal">
-      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-        stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 17l6-5-6-5M12 19h8" /></svg>
-    </a>
   </header>
 
   <main bind:this={scroller} onscroll={onScroll} aria-label="Conversation" aria-live="polite">
@@ -298,16 +342,14 @@
   {/if}
 
   <footer bind:clientHeight={footerHeight}>
-    {#if question}
-      <div class="needs" role="status">
-        <Mark mark="waiting" />
-        <span class="ask"><strong>Needs you:</strong> {question}</span>
-        <a class="answer" href="/trees/{encodeURIComponent(name)}/terminal" onclick={link}>Answer</a>
-      </div>
+    {#if promptTool || shownNeeds}
+      <PromptCard tool={promptTool} needs={shownNeeds} onanswer={answerPrompt} />
     {/if}
+    {#if answerFailure}<p class="failure" role="alert">{answerFailure}</p>{/if}
     <form onsubmit={send}>
       <label class="visually-hidden" for="line-{name}">Message {name}</label>
-      <textarea id="line-{name}" rows="1" placeholder="Message {name}…" bind:value={draft} onkeydown={onKey}
+      <textarea id="line-{name}" rows="1" placeholder={promptTool ? "Answer in your own words…" : `Message ${name}…`}
+        bind:value={draft} onkeydown={onKey}
         enterkeyhint="send"></textarea>
       <button type="submit" class="send" aria-label="Send" disabled={!draft.trim()}>
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
@@ -602,46 +644,13 @@
     border-top: 1px solid var(--bg-high);
     background: var(--bg);
   }
-  .needs {
-    display: flex;
-    align-items: flex-start;
-    gap: 8px;
-    padding: 10px 12px;
-    border-radius: 12px;
-    border: 1px solid var(--yellow);
-    background: var(--yellow-bg);
-    color: var(--fg-strong);
-    font-size: 14px;
-    line-height: 1.4;
-  }
-  .needs :global(.mark) {
-    margin-top: 2px;
-  }
-  .ask {
-    flex: 1;
-    min-width: 0;
-  }
-  .answer {
-    flex: none;
-    align-self: center;
-    display: flex;
-    align-items: center;
-    min-height: 36px;
-    padding: 0 12px;
-    border-radius: 8px;
-    background: var(--yellow);
-    color: var(--on-accent);
-    font-size: 14px;
-    font-weight: 600;
-  }
-  .icon {
-    flex: none;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 44px;
-    height: 44px;
-    color: var(--muted);
+  .failure {
+    margin: 0;
+    padding: 8px 12px;
+    border-radius: 10px;
+    background: var(--red-bg);
+    color: var(--red);
+    font-size: 13px;
   }
   form {
     display: flex;

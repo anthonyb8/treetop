@@ -5,7 +5,6 @@
   import Chat from "./screens/Chat.svelte";
   import NewAgent from "./screens/NewAgent.svelte";
   import Pool from "./screens/Pool.svelte";
-  import Terminal from "./screens/Terminal.svelte";
   import Tree from "./screens/Tree.svelte";
 
   // The screens stack as a native app's do: the pool stays underneath,
@@ -23,22 +22,15 @@
       </div>
     {/key}
   {/if}
-  {#if route.screen === "chat" || route.screen === "terminal"}
+  {#if route.screen === "chat"}
     {#key route.tree}
-      <div class="layer over" transition:fly={slide} inert={route.screen !== "chat"}>
-        <Chat name={route.tree} />
-      </div>
+      <div class="layer over" transition:fly={slide}><Chat name={route.tree} /></div>
     {/key}
   {/if}
   {#if route.screen === "new"}
     <div class="layer over" transition:fly={{ ...slide, x: 0, y: window.innerHeight }}>
       <NewAgent tree={route.tree} />
     </div>
-  {/if}
-  {#if route.screen === "terminal"}
-    {#key route.tree}
-      <div class="layer over" transition:fly={slide}><Terminal name={route.tree} /></div>
-    {/key}
   {/if}
 </div>
 

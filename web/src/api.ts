@@ -136,6 +136,22 @@ export interface ToolCall {
   status: "running" | "ok" | "error";
   /** The start of what it printed, once it has finished. */
   output: string | null;
+  /** For a question the agent asks you: what it asks and the choices. */
+  ask: Question[] | null;
+}
+
+export interface Question {
+  question: string;
+  /** A word or two that names it, as a chip. */
+  header: string;
+  /** It takes several of the options rather than one. */
+  multi: boolean;
+  options: Choice[];
+}
+
+export interface Choice {
+  label: string;
+  description: string;
 }
 
 /** One entry of an agent's conversation, as `src/serve/chat.rs` reads it. */
@@ -148,26 +164,6 @@ export interface ChatMessage {
   /** A result's, which finishes the tool call of the same id. */
   status?: "ok" | "error";
   output?: string;
-}
-
-/** A run of characters on the agent's screen that look the same. */
-export interface Run {
-  t: string;
-  fg?: string;
-  bg?: string;
-  b?: boolean;
-  d?: boolean;
-  i?: boolean;
-  u?: boolean;
-}
-
-/** The agent's own screen, as `src/serve/terminal.rs` sends it. */
-export interface TerminalScreen {
-  rows: number;
-  cols: number;
-  lines: Run[][];
-  /** Row and column of the cursor, when it shows. */
-  cursor: [number, number] | null;
 }
 
 export interface Workspaces {
@@ -237,30 +233,6 @@ export async function sendLine(workspace: string | null, tree: string, text: str
   }
 }
 
-export function terminalUrl(workspace: string | null, tree: string, cols: number, rows: number): string {
-  const query = new URLSearchParams({ cols: String(cols), rows: String(rows) });
-  if (workspace) query.set("workspace", workspace);
-  return `/api/trees/${encodeURIComponent(tree)}/terminal?${query}`;
-}
-
-/** Presses keys on the agent's screen, by name ("1", "Up", "Enter"), and types `text`. */
-export async function sendKeys(workspace: string | null, tree: string, keys: string[], text?: string): Promise<void> {
-  let response: Response;
-  try {
-    response = await fetch(`/api/trees/${encodeURIComponent(tree)}/keys${workspaceQuery(workspace)}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ keys, text }),
-    });
-  } catch {
-    throw new ApiError("Can't reach the server", null);
-  }
-  if (!response.ok) {
-    const body = (await response.json().catch(() => null)) as { error?: string } | null;
-    throw new ApiError(body?.error ?? `The server said ${response.status}`, response.status);
-  }
-}
-
 async function post<T>(path: string, body: unknown): Promise<T> {
   let response: Response;
   try {
@@ -309,4 +281,12 @@ export async function fetchPushKey(): Promise<string | null> {
 /** Tells the server where to push to this device. */
 export function subscribePush(subscription: PushSubscriptionJSON): Promise<void> {
   return post<void>("/api/push/subscribe", subscription);
+}
+
+/** How a prompt the agent waits on is answered: let it run, stop it, or in words. */
+export type Answer = { action: "allow" } | { action: "deny" } | { action: "say"; text: string };
+
+/** Answers the prompt the tree's agent waits on. */
+export function answer(workspace: string | null, tree: string, given: Answer): Promise<void> {
+  return post<void>(`/api/trees/${encodeURIComponent(tree)}/answer${workspaceQuery(workspace)}`, given);
 }

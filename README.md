@@ -658,12 +658,11 @@ Open chat, on a tree whose agent is a background Claude Code session, shows its 
 Scrolled to the end it follows new messages; scrolled up, it stays put and a pill says how many came in.
 A line typed at the bottom goes to the agent as `treetop send` sends it, typed into its chat, or starting a stopped agent again with it; it shows at once as sending, and as failed with why and a retry if it could not go.
 What you were typing is kept when you leave the chat.
-While the agent waits on a question, the question sits above the box, with Answer beside it.
-
-Answer, and the terminal button at the top of a chat, open the agent's own screen, for what a line of chat cannot answer: a permission prompt, a question with options, a menu.
-It is the same `claude attach` the chat popup runs, in a terminal the server opens sized to the phone, drawn with its colours and kept current as it changes.
-Under it a row of keys, `1` to `4`, `↑` `↓`, Tab, Esc and Enter, and a field to type into it, are pressed on the agent's screen in the order you tap them.
-A terminal nobody has looked at for five minutes is closed, which leaves the agent running.
+While the agent waits on you, what it waits on sits above the box, and you answer it there.
+A question with options shows them as buttons, several questions at once each under its header, and Answer sends your picks; a command it wants to run, or a file it wants to change, shows with Allow and Deny.
+Typing in the box answers in your own words instead.
+Allow and Deny press Enter and Esc in the agent's session, and only once its screen shows the prompt has the keys; an option, or your own words, put the prompt away with Esc and go in as a message, so an answer holds however Claude Code lays its options out.
+Each answer attaches to the session only for that moment, so the chat popup on your desktop keeps its size.
 
 New agent, at the foot of the pool, starts an agent on a task in a fresh tree cut from the base you pick, as `n` does, and opens its tree once it is going; New agent here, on a tree, starts one in that tree on its branch, as `N` does.
 On a tree whose agent has stopped or died, Resume starts it again with its conversation, as `R` does.

@@ -12,10 +12,10 @@
 //! port and claim any login: those run as the owner already.
 
 mod actions;
+mod answer;
 mod chat;
 mod pool;
 mod push;
-mod terminal;
 mod tree;
 
 use std::collections::HashMap;
@@ -206,8 +206,6 @@ pub struct State {
     /// Each workspace's pool, by checkout, started the first time it is
     /// asked for.
     pools: Mutex<HashMap<PathBuf, Arc<Pool>>>,
-    /// The agents' terminals open for the phone.
-    terminals: terminal::Terminals,
     /// Where pushes go; None when the server could not set them up.
     push: Option<Arc<push::Push>>,
 }
@@ -218,7 +216,6 @@ impl State {
             owner,
             default,
             pools: Mutex::new(HashMap::new()),
-            terminals: terminal::Terminals::default(),
             push: None,
         }
     }
@@ -277,13 +274,6 @@ pub fn run(args: &[String], checkout: PathBuf) -> Result<()> {
          or `tailscale serve`",
         state.owner
     );
-    thread::spawn({
-        let state = Arc::clone(&state);
-        move || loop {
-            thread::sleep(std::time::Duration::from_secs(30));
-            state.terminals.sweep();
-        }
-    });
     let server = Arc::new(server);
     let workers: Vec<_> = (0..THREADS)
         .map(|_| {
@@ -536,7 +526,7 @@ pub fn route(state: &State, asked: &Asked) -> Reply {
         }
         (method, path) if path.starts_with("/api/trees/") => {
             let pool = state.pool(asked.query.get("workspace").map(String::as_str));
-            tree_route(state, &pool, method, &path["/api/trees/".len()..], asked)
+            tree_route(&pool, method, &path["/api/trees/".len()..], asked)
         }
         (_, path) if path.starts_with("/api/") => Reply::error(404, "no such call"),
         (Method::Get | Method::Head, path) => asset(path),
@@ -545,7 +535,7 @@ pub fn route(state: &State, asked: &Asked) -> Reply {
 }
 
 /// A call on one tree: `<name>`, `<name>/chat` or `<name>/send`.
-fn tree_route(state: &State, pool: &Pool, method: &Method, rest: &str, asked: &Asked) -> Reply {
+fn tree_route(pool: &Pool, method: &Method, rest: &str, asked: &Asked) -> Reply {
     let (name, call) = rest.split_once('/').unwrap_or((rest, ""));
     let name = decode(name);
     if *method != Method::Get && !is_same_site(asked) {
@@ -570,55 +560,37 @@ fn tree_route(state: &State, pool: &Pool, method: &Method, rest: &str, asked: &A
                 ),
             }
         }
-        (Method::Get, "terminal") => {
-            let Some(agent) = App::agents_of(found)
-                .into_iter()
-                .find(|a| a.attach.is_some())
-            else {
-                return Reply::error(404, "this tree's agent has no terminal to open");
-            };
-            let size = |key: &str, default: u16, range: std::ops::RangeInclusive<u16>| {
-                asked
-                    .query
-                    .get(key)
-                    .and_then(|v| v.parse().ok())
-                    .map_or(default, |v: u16| v.clamp(*range.start(), *range.end()))
-            };
-            let (cols, rows) = (
-                size("cols", terminal::COLS, 30..=120),
-                size("rows", terminal::ROWS, 12..=80),
-            );
-            let command = agent.attach.clone().unwrap_or_default();
-            let (agent, tree) = (agent.name.clone(), found.name.clone());
-            drop(app);
-            match state
-                .terminals
-                .get((pool.checkout.clone(), command), rows, cols, &agent, &tree)
-            {
-                Ok(open) => Reply::events(open.stream()),
-                Err(err) => Reply::error(502, &format!("{err:#}")),
-            }
-        }
-        (Method::Post, "keys") => {
+        (Method::Post, "answer") => {
             #[derive(serde::Deserialize)]
-            struct Keys {
-                #[serde(default)]
-                keys: Vec<String>,
+            struct Answer {
+                action: String,
                 #[serde(default)]
                 text: Option<String>,
             }
-            let Ok(Keys { keys, text }) = serde_json::from_slice::<Keys>(asked.body) else {
-                return Reply::error(400, "keys takes {\"keys\": [...], \"text\": \"...\"}");
+            let Ok(answer) = serde_json::from_slice::<Answer>(asked.body) else {
+                return Reply::error(
+                    400,
+                    "answer takes {\"action\": \"allow\" | \"deny\" | \"say\", \"text\": \"...\"}",
+                );
             };
             let Some(command) = App::agents_of(found).iter().find_map(|a| a.attach.clone()) else {
-                return Reply::error(404, "this tree's agent has no terminal");
+                return Reply::error(404, "this tree's agent has no chat to answer in");
             };
-            let Some(open) = state.terminals.find(&(pool.checkout.clone(), command)) else {
-                return Reply::error(409, "the agent's terminal is not open");
+            drop(app);
+            let Some(hints) = crate::plugin::screen_of("claude") else {
+                return Reply::error(500, "the Claude Code plugin says nothing of its screen");
             };
-            match open.write(&keys, text.as_deref()) {
+            let Some((press, says)) = answer_of(&answer.action) else {
+                return Reply::error(400, &format!("no answer called {}", answer.action));
+            };
+            match answer::press(&command, &hints, press) {
+                Err(why) => Reply::error(409, &why),
+                // The prompt is put away; the answer goes in as a message.
+                Ok(()) if says => {
+                    let body = json!({ "text": answer.text.unwrap_or_default() }).to_string();
+                    send(pool, &name, body.as_bytes())
+                }
                 Ok(()) => Reply::json(200, &json!({})),
-                Err(err) => Reply::error(400, &format!("{err:#}")),
             }
         }
         (Method::Post, "resume") => {
@@ -634,6 +606,18 @@ fn tree_route(state: &State, pool: &Pool, method: &Method, rest: &str, asked: &A
             send(pool, &name, asked.body)
         }
         _ => Reply::error(404, "no such call"),
+    }
+}
+
+/// What an answer presses on the prompt, and whether words follow it as a
+/// message: only Allow lets the prompt's own choice stand; words always put
+/// the prompt away first, so they never approve what they argue against.
+fn answer_of(action: &str) -> Option<(answer::Press, bool)> {
+    match action {
+        "allow" => Some((answer::Press::Allow, false)),
+        "deny" => Some((answer::Press::Deny, false)),
+        "say" => Some((answer::Press::Deny, true)),
+        _ => None,
     }
 }
 
@@ -933,6 +917,15 @@ mod tests {
         assert_eq!(ask("/api/push/unsubscribe", own, gone), 200);
         assert!(!is_kept());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_allow_lets_a_prompt_s_choice_stand() {
+        use answer::Press::{Allow, Deny};
+        assert_eq!(answer_of("allow"), Some((Allow, false)));
+        assert_eq!(answer_of("deny"), Some((Deny, false)));
+        assert_eq!(answer_of("say"), Some((Deny, true)));
+        assert_eq!(answer_of("yes"), None);
     }
 
     #[test]

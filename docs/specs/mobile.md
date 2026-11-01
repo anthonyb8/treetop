@@ -29,7 +29,7 @@ It is for one developer, on their own server, reached over their own tailnet.
 - The web app, in Svelte and TypeScript under `web/`.
 - An installable web app (a PWA) with four screens: the pool, a tree, its agent's chat, and a new agent.
 - A chat view of each agent's conversation, read from its session transcript, with a reply box.
-- A terminal view of the agent's session for what the chat view cannot answer: permission prompts, multiple-choice questions, menus.
+- Answering what the agent waits on in the chat: a question's options as buttons, a permission with Allow and Deny, or your own words (ANB-21, which replaced ANB-18's terminal view).
 - The actions `send`, `dispatch`, `resume` and `return`, and switching workspaces, as `w` does.
 - Web push: an agent needing you, finishing or dying; a PR's checks failing or merging.
 
@@ -96,8 +96,9 @@ Anything else running in the tree, such as a dev server, keeps it from the phone
 │ Which auth provider should the     │
 │ login use, Clerk or Supabase?      │
 ├────────────────────────────────────┤
-│ ┌ Needs you: a question ─────────┐ │
-│ │ [ Answer in terminal ]         │ │
+│ ┌ Auth  Which auth provider? ────┐ │
+│ │ [ Clerk ]  [ Supabase ]        │ │
+│ │ [ Answer ]                     │ │
 │ └────────────────────────────────┘ │
 │ [ Message 17…               ] [→]  │
 └────────────────────────────────────┘
@@ -106,10 +107,9 @@ Anything else running in the tree, such as a dev server, keeps it from the phone
 Messages are yours and the agent's, in order, with each tool call folded to one line (`Edited`, `Ran`, `Read`) that expands on a tap.
 It follows the conversation live while open, scrolled to the end unless you have scrolled up.
 The reply box sends with `treetop send`, so a line typed here reaches the agent the way `m` does, whether it is busy, idle or cold.
-When the agent is blocked on a permission prompt or a question, a card above the reply box says so and opens the terminal view.
+When the agent waits on you, a card above the reply box shows what on, and answers it: a question's options as buttons, a permission with Allow and Deny, and the reply box for your own words.
 
-**Terminal**, from that card or the chat's menu: the agent's own screen, as treetop's chat popup shows it, drawn as text with its colours, and a row of keys under it, `1` `2` `3` `4`, `↑` `↓`, Enter, Esc, Tab and a text field, enough to answer any prompt Claude Code shows.
-It is the same session the chat shows, not a second one, so an answer here unblocks the chat.
+The first build had a fourth screen, the agent's own terminal, for answering prompts. It attached a second client to the session at phone width, and Claude Code draws a session at one size for every client, so the chat popup on the desktop shrank while it was open; it was dropped for answers in the chat (ANB-21).
 
 **New agent**, from the pool's button: a text box for the task, a choice of a fresh tree or a tree you pick, the base and an optional ticket, as `n` and `N` offer.
 
@@ -133,14 +133,14 @@ It reuses what the TUI reads, not a second copy of it:
 - Workspaces from `src/workspaces.rs`.
 
 The server speaks JSON and server-sent events; the screens are drawn on the phone by the web app below.
-Its routes: `GET /api/pool` and `GET /api/trees/<n>`, each the matching part of `status_json`; `GET /api/trees/<n>/chat` and `/terminal`, live streams of server-sent events; and a POST per action.
+Its routes: `GET /api/pool` and `GET /api/trees/<n>`, each the matching part of `status_json`; `GET /api/trees/<n>/chat`, a live stream of server-sent events; and a POST per action.
 The built web app, the manifest and the icons are embedded in the binary with `include_bytes!`, so installing treetop stays one file.
 Every action is a POST that checks `Origin` against the server's own host.
 
 ### The web app
 
 The web app is Svelte 5 with TypeScript, in `web/` at the repository's root, built by Vite to static files; there is no SvelteKit and no server-side rendering, since `treetop serve` only hands out the built files and the API.
-It is one page whose four screens slide over each other as a stack, Pool, Tree, Chat, Terminal, with Svelte's built-in transitions, so moving between them keeps each screen's scroll and state the way a native app does.
+It is one page whose screens slide over each other as a stack, Pool, Tree, Chat, with Svelte's built-in transitions, so moving between them keeps each screen's scroll and state the way a native app does.
 The API's shapes are TypeScript types in `web/src/api.ts`, written to match `status_json`; a test on the Rust side checks a sample of the JSON against the fields those types read, so a renamed field fails the build rather than the phone.
 
 What makes it feel like an app, and each is part of the issue that adds the screen:
@@ -149,7 +149,6 @@ What makes it feel like an app, and each is part of the issue that adds the scre
 - A chat holds its place: scrolled to the end it follows new messages, scrolled up it stays put and shows a "new messages" pill; a tool call you opened stays open, and what you are typing is kept.
 - The pool's cards move into their new order when a tree's state changes, rather than the list jumping.
 - The service worker keeps the app shell, so it opens instantly and shows the last pool it saw, marked as stale, while the server is out of reach.
-- Taps on the terminal's keys are sent in order without waiting for each screen to come back.
 
 ### Developing on the phone
 
@@ -163,13 +162,12 @@ The server renders the user and assistant messages from it, folding each tool ca
 While a chat is open the server follows the file and sends each new message as a server-sent event, which the web app appends; there is no polling.
 Like every other field read from Claude Code's files, the records are undocumented, so one it does not recognise is skipped rather than failing the view.
 
-### The terminal view
+### Answering prompts
 
-treetop's chat popup already runs `claude attach <id>` in a pseudo-terminal it owns and keeps its screen with the `vt100` parser (`src/chat.rs`).
-The server reuses that: one attached terminal per agent with a terminal view open, sized for a phone, about 44 columns by 30 rows.
-Its screen is sent as rows of text runs with their colours, as a server-sent event whenever it changes and at most ten times a second, and the web app draws them in a monospace grid.
-Keys from the row under it, and the text field, are POSTed and written to the terminal as the keys they name.
-A terminal nobody has looked at for five minutes is closed; the agent keeps running, as it does when you leave its chat in the TUI.
+What the agent waits on comes from the transcript: its newest tool call with no result yet, while the agent waits on you. An `AskUserQuestion` call carries its questions and options, which the chat shows as buttons; any other is a permission.
+`POST /api/trees/<n>/answer` takes `allow`, `deny` or `say` with words. It attaches to the session with `claude attach` in a terminal of its own, as `treetop send` does, waits until `chat::input` reads the screen as a dialog, presses Enter or Esc, waits for the dialog to go, and detaches.
+`say` presses Esc, then sends its words as `treetop send` does: a question's picks, or your own words, go in as a message, so the answer does not depend on how Claude Code numbers and lays out its options.
+With no dialog on the screen nothing is pressed, and the answer fails with why.
 
 ### Push
 
@@ -190,7 +188,7 @@ What a user does, for the README:
 6. Tap Allow when it asks for notifications; iOS only offers push to a web app opened from the home screen.
 
 - **Schema:** none. Push subscriptions and the VAPID keys are files in treetop's config directory, as the workspace list is.
-- **Data:** the pool snapshot the refresh clocks keep, read by every page; actions invalidate it by asking the slow clock to run, as the TUI does after a return. Chats and terminals are read live, never cached.
+- **Data:** the pool snapshot the refresh clocks keep, read by every page; actions invalidate it by asking the slow clock to run, as the TUI does after a return. Chats are read live, never cached.
 - **Services / vendors / env:** Tailscale (`tailscale serve`, through `tether share` where tether is installed, and the `Tailscale-User-Login` header); Apple's Web Push service. New config: a `[mobile]` table with `owner` and `port`. No env vars.
 
 ## Breakdown
@@ -200,7 +198,7 @@ What a user does, for the README:
 | 1 | _ID once created_ | `treetop serve` shared with `tether share` or `tailscale serve`, owner-only; the `web/` Svelte app and its release build; the read-only Pool screen with the workspace switcher; installable to the home screen | None |
 | 2 | _ID once created_ | The Tree screen: agent state and question, git, ports, PR, timeline | 1 |
 | 3 | _ID once created_ | The Chat screen: the conversation live from the transcript, tool calls folded, and the reply box through `send` | 2 |
-| 4 | _ID once created_ | The Terminal view: the agent's own screen and a key row, for permission prompts and questions | 3 |
+| 4 | _ID once created_ | The Terminal view: the agent's own screen and a key row, for permission prompts and questions; replaced by ANB-21, answers in the chat | 3 |
 | 5 | _ID once created_ | Actions: new agent in a fresh tree or a picked one, resume, return with its confirm and guard | 2 |
 | 6 | _ID once created_ | Web push for needs-you, done, dead, CI failing and merged, opening the tree's chat | 3 |
 
@@ -214,14 +212,13 @@ Rollback is the previous release, or stopping `treetop serve`.
 
 ## Risks
 
-- **Claude Code's transcript format changes.** The chat view is built on undocumented records. An unknown record is skipped, and the terminal view, which shows the session as Claude Code draws it, still works whatever the format.
-- **The terminal view is cramped.** Claude Code's prompts are drawn for a desktop terminal; at 44 columns some wrap. It is for answering prompts, not for working in, and the chat view carries the rest.
-- **An action from the phone does the wrong thing.** Return asks first and stops nothing but the tree's agents; destroy is not offered at all; the terminal view writes only the keys you tap.
+- **Claude Code's transcript format changes.** The chat view is built on undocumented records. An unknown record is skipped, and a question or permission it cannot read still shows as the agent's own "needs you" words, answered in the reply box.
+- **An action from the phone does the wrong thing.** Return asks first and stops nothing but the tree's agents; destroy is not offered at all; an answer presses a key only on a screen showing a prompt.
 - **Someone else on the tailnet reaches the server.** Only the configured owner's Tailscale login is answered, and the server is not bound to any other address.
 - **A lost phone.** It reaches the server only while signed in to the tailnet; removing the device in Tailscale's admin console cuts it off.
 - **iOS clears a web app's storage** after weeks unused. It stores nothing but the push subscription, which it registers again on next open.
 
 ## Open decisions
 
-- **Technical: buttons for prompts instead of the terminal view?** The server could read a permission prompt or question off the agent's screen and draw its options as buttons in the chat. It is nicer, but it parses Claude Code's drawing, which changes between releases. Recommendation: the terminal view first, and buttons later for the two prompts that come up most, if the terminal proves awkward.
+- **Technical: buttons for prompts instead of the terminal view?** Decided in ANB-21: buttons in the chat, read from the transcript rather than the screen, and the terminal view dropped.
 - **Product: native app instead of a PWA?** Native feels a little better and pushes more reliably, but needs a Mac with Xcode, a paid Apple developer account, and TestFlight or re-signing every 7 days, for an app with one user. Recommendation: PWA.

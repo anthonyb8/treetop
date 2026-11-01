@@ -16,12 +16,12 @@ const backlog: ChatMessage[] = [
   {
     id: "t1",
     kind: "tool",
-    tool: { verb: "Edited", what: "src/auth/guard.ts", added: 12, removed: 4, status: "ok", output: "ok" },
+    tool: { verb: "Edited", what: "src/auth/guard.ts", added: 12, removed: 4, status: "ok", output: "ok", ask: null },
   },
   {
     id: "t2",
     kind: "tool",
-    tool: { verb: "Ran", what: "Run the tests", added: null, removed: null, status: "error", output: "1 failed: expects a Clerk session" },
+    tool: { verb: "Ran", what: "Run the tests", added: null, removed: null, status: "error", output: "1 failed: expects a Clerk session", ask: null },
   },
   { id: "a2:0", kind: "claude", text: "Which auth provider should the login use, Clerk or Supabase?" },
 ];
@@ -47,7 +47,7 @@ test("the chat shows the conversation, each tool call a line that opens", async 
   await serve(page, () => pool);
   await stream(page, events(["backlog", backlog]));
   await page.goto("/trees/17");
-  await page.getByRole("link", { name: "Open chat" }).click();
+  await page.getByRole("link", { name: "Answer in chat" }).click();
   await expect(page).toHaveURL(/\/trees\/17\/chat$/);
 
   const chat = page.getByRole("main", { name: "Conversation" });
@@ -61,7 +61,7 @@ test("the chat shows the conversation, each tool call a line that opens", async 
   await expect(chat.getByText("1 failed: expects a Clerk session")).toHaveCount(0);
   await run.click();
   await expect(chat.getByText("1 failed: expects a Clerk session")).toBeVisible();
-  await expect(page.getByRole("status")).toContainText(
+  await expect(page.getByRole("region", { name: "Waiting on you" })).toContainText(
     "Needs you: Which auth provider should the login use, Clerk or Supabase?",
   );
   await page.screenshot({ path: "test-results/chat.png" });
@@ -149,6 +149,6 @@ test("what you were typing is still there when you come back", async ({ page }) 
   await page.goto("/trees/17/chat");
   await page.getByRole("textbox", { name: "Message 17" }).fill("Half a thought");
   await page.getByRole("button", { name: "Back to tree 17" }).click();
-  await page.getByRole("link", { name: "Open chat" }).click();
+  await page.getByRole("link", { name: "Answer in chat" }).click();
   await expect(page.getByRole("textbox", { name: "Message 17" })).toHaveValue("Half a thought");
 });

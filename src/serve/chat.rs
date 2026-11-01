@@ -160,6 +160,7 @@ fn called(block: &Value, at: &str) -> Value {
             "removed": change.map(|c| c.1),
             "status": "running",
             "output": Value::Null,
+            "ask": (name == "AskUserQuestion").then(|| questions(input)),
         },
     })
 }
@@ -182,6 +183,33 @@ fn finished(block: &Value) -> Value {
         "status": if block["is_error"] == true { "error" } else { "ok" },
         "output": output,
     })
+}
+
+/// A question's choices, as the chat shows them for you to pick: each
+/// question with its short header, whether it takes several, and its
+/// options' labels and descriptions.
+fn questions(input: &Value) -> Value {
+    let text = |value: &Value| value.as_str().unwrap_or_default().to_string();
+    Value::Array(
+        input["questions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|q| {
+                json!({
+                    "question": text(&q["question"]),
+                    "header": text(&q["header"]),
+                    "multi": q["multiSelect"] == true,
+                    "options": q["options"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|o| json!({ "label": text(&o["label"]), "description": text(&o["description"]) }))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect(),
+    )
 }
 
 fn first_line(text: Option<String>) -> Option<String> {
@@ -455,5 +483,21 @@ mod tests {
             assert!(keys(value).is_subset(&message), "{value}");
         }
         assert_eq!(keys(&read[2]["tool"]), declared("ToolCall"));
+        let asked = read_line(
+            &json!({"type": "assistant", "uuid": "a2", "message": {"content": [
+                {"type": "tool_use", "id": "t2", "name": "AskUserQuestion", "input": {"questions": [
+                    {"question": "Which provider?", "header": "Auth", "multiSelect": true,
+                     "options": [{"label": "Clerk", "description": "Keep the SDK"}]},
+                ]}},
+            ]}})
+            .to_string(),
+        );
+        let question = &asked[0]["tool"]["ask"][0];
+        assert_eq!(keys(question), declared("Question"));
+        assert_eq!(keys(&question["options"][0]), declared("Choice"));
+        assert_eq!(
+            (&question["multi"], &question["options"][0]["label"]),
+            (&json!(true), &json!("Clerk"))
+        );
     }
 }
