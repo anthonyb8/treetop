@@ -2,7 +2,7 @@
 members = ["crates/issues", "crates/linear"]
 
 [workspace.package]
-version = "0.1.45"
+version = "0.1.46"
 edition = "2024"
 
 [workspace.dependencies]
@@ -19,6 +19,7 @@ description = "An htop-style view of a treehouse worktree pool, for returning an
 anyhow = "1.0.104"
 issues = { path = "crates/issues" }
 libc = "0.2.190"
+qrcode = { version = "0.14.1", default-features = false }
 linear = { path = "crates/linear" }
 ratatui = "0.30.2"
 serde.workspace = true

@@ -17,8 +17,8 @@ use ratatui::widgets::{
 
 use crate::agents::{Agent, Status};
 use crate::app::{
-    App, DiffView, Group, Item, JobState, ListRow, LogEntry, Opening, Pending, Picker, PortMenu,
-    Review, SCRATCH, ScratchMenu, Shipping,
+    App, DiffView, Group, Item, JobState, ListRow, LogEntry, Opening, Pending, Phone, Picker,
+    PortMenu, Review, SCRATCH, ScratchMenu, Shipping,
 };
 use crate::assistant;
 use crate::chat::Chat;
@@ -51,7 +51,7 @@ const KEYS: [(&str, &str); 13] = [
 ];
 
 /// Every key on the list, for the `?` overlay.
-const HELP: [(&str, &str); 29] = [
+const HELP: [(&str, &str); 30] = [
     (
         "Enter",
         "open the agent: its chat, a cold one started again, else its tree; on a heading, fold or open its group",
@@ -94,6 +94,10 @@ const HELP: [(&str, &str); 29] = [
     (
         "o",
         "open the port the tree serves, or choose one where it serves several",
+    ),
+    (
+        "p",
+        "share the port with your phone, as a QR code to scan; tether share by default",
     ),
     ("O", "open the tree's PR"),
     ("f", "send what failed on the tree's PR to its agent"),
@@ -191,6 +195,7 @@ pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>, issues: Option<&i
         || app.opening.is_some()
         || app.picker.is_some()
         || app.port_menu.is_some()
+        || app.phone.is_some()
         || app.scratch_menu.is_some()
         || app.is_help
     {
@@ -211,6 +216,8 @@ pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>, issues: Option<&i
         draw_picker(frame, app, picker);
     } else if let Some(menu) = &app.port_menu {
         draw_port_menu(frame, menu);
+    } else if let Some(phone) = &app.phone {
+        draw_phone(frame, phone);
     } else if let Some(menu) = &app.scratch_menu {
         draw_scratch_menu(frame, app, menu);
     } else if app.is_issues {
@@ -1188,6 +1195,118 @@ fn draw_port_menu(frame: &mut Frame, menu: &PortMenu) {
     let table = Table::new(rows, widths).row_highlight_style(t.cursor);
     let mut state = TableState::default().with_selected(Some(menu.selected));
     frame.render_stateful_widget(table, inner, &mut state);
+}
+
+/// How many modules of light margin a QR code wants round it to scan, as
+/// the standard asks; less where the screen has no room for them.
+const QUIET_ZONE: usize = 4;
+
+/// The port `p` shares, as a QR code of its address for the phone's camera
+/// to scan, with the address under it; or that it is being shared, or why
+/// it could not be.
+fn draw_phone(frame: &mut Frame, phone: &Phone) {
+    let t = theme();
+    let screen = frame.area();
+    let title = Line::styled(
+        format!(" Tree {} on your phone ", phone.tree),
+        fg(t.title).add_modifier(Modifier::BOLD),
+    );
+    let keys = [("Esc", "close")];
+    let local = format!("localhost:{}", phone.port);
+    let (url, code) = match &phone.shared {
+        Some(Ok((url, code))) => (url, code),
+        pending_or_failed => {
+            let (said, colour) = match pending_or_failed {
+                Some(Err(err)) => (format!("could not share {local}: {err}"), t.danger),
+                _ => (format!("sharing {local}..."), t.muted),
+            };
+            return draw_phone_note(frame, title, &keys, said, colour);
+        }
+    };
+    // Each cell is two modules, one over the other, drawn as an upper half
+    // block: its foreground the top module, its background the bottom one.
+    // Under the code, a blank line, the address, and how to use it.
+    let note = "scan it with the phone's camera";
+    let text_width = url.chars().count().max(note.len());
+    let fits = |quiet: usize| {
+        let side = code.width + 2 * quiet;
+        let (cols, rows) = (side.max(text_width) + 5, side.div_ceil(2) + 5);
+        cols <= usize::from(screen.width) && rows <= usize::from(screen.height)
+    };
+    let Some(quiet) = (1..=QUIET_ZONE).rev().find(|&quiet| fits(quiet)) else {
+        let said = format!("the screen is too small for the code; {url}");
+        return draw_phone_note(frame, title, &keys, said, t.text);
+    };
+    let side = code.width + 2 * quiet;
+    let rows = side.div_ceil(2);
+    // As wide as the code or the address, with a column of air each side,
+    // and a column more where that leaves the code off centre.
+    let inside = side.max(text_width) + 2;
+    let inside = inside + (inside - side) % 2;
+    let width = u16::try_from(inside + 2).unwrap_or(u16::MAX);
+    let height = u16::try_from(rows + 5).unwrap_or(u16::MAX);
+    let area = popup::centered(screen, width, height);
+    let block =
+        popup_block(title).title_bottom(Line::from(fitting_keys(&keys, width.saturating_sub(2))));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    // Black on white whatever the theme, which every camera reads.
+    let colour = |x: usize, y: usize| {
+        let (x, y) = (x as isize - quiet as isize, y as isize - quiet as isize);
+        if code.is_dark(x, y) {
+            Color::Black
+        } else {
+            Color::White
+        }
+    };
+    let left = inner.x + (inner.width - side as u16) / 2;
+    let buffer = frame.buffer_mut();
+    for row in 0..rows {
+        for x in 0..side {
+            let position = Position::new(left + x as u16, inner.y + row as u16);
+            let bottom = if 2 * row + 1 < side {
+                colour(x, 2 * row + 1)
+            } else {
+                Color::Reset
+            };
+            if let Some(cell) = buffer.cell_mut(position) {
+                cell.set_symbol("▀")
+                    .set_style(Style::new().fg(colour(x, 2 * row)).bg(bottom));
+            }
+        }
+    }
+    let under = Rect::new(inner.x, inner.y + rows as u16 + 1, inner.width, 2);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(url.clone(), fg(t.info).add_modifier(Modifier::BOLD)),
+            Line::styled(note, fg(t.muted)),
+        ])
+        .centered(),
+        under,
+    );
+}
+
+/// The phone's popup with a line of text in place of the code, wrapped.
+fn draw_phone_note(
+    frame: &mut Frame,
+    title: Line<'static>,
+    keys: &[(&str, &str)],
+    said: String,
+    colour: Color,
+) {
+    let screen = frame.area();
+    let width = screen.width.saturating_sub(4).min(64);
+    let text = Paragraph::new(said)
+        .style(fg(colour))
+        .wrap(Wrap { trim: true });
+    let lines = u16::try_from(text.line_count(width.saturating_sub(4))).unwrap_or(1);
+    let area = popup::centered(screen, width, lines.saturating_add(2));
+    let block = popup_block(title)
+        .title_bottom(Line::from(fitting_keys(keys, width.saturating_sub(2))))
+        .padding(Padding::horizontal(1));
+    frame.render_widget(Clear, area);
+    frame.render_widget(text.block(block), area);
 }
 
 /// A popup's frame over the dimmed table: a border in the accent colour and

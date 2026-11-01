@@ -49,6 +49,15 @@
 //! ```toml
 //! browser = ["chromium", "--user-data-dir=/home/me/.config/devproxy-browser"]
 //! ```
+//!
+//! `share` is the command `p` shares a port with, so the phone can reach it,
+//! `tether share` when it names none, with `{port}` in its words replaced by
+//! the port, else the port added last. It prints the address the phone opens,
+//! which treetop shows as a QR code:
+//!
+//! ```toml
+//! share = ["tether", "share"]
+//! ```
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -135,6 +144,10 @@ pub struct Config {
     /// empty for the desktop's opener.
     #[serde(default)]
     pub browser: Vec<String>,
+    /// The command a port is shared with for the phone, which prints the
+    /// address it is reached at; empty for `tether share`.
+    #[serde(default)]
+    pub share: Vec<String>,
 }
 
 /// `path` with a leading `~` as the home directory.

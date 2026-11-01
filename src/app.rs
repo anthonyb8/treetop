@@ -15,6 +15,7 @@ use crate::dispatch::{Edit, Prompt, Purpose, Recipient, Target};
 use crate::handoff;
 use crate::jobs::{Job, Kind, Launch, Message, Pick, Replaced, ShipAction, ShipCall};
 use crate::keeper::Kept;
+use crate::phone::Code;
 use crate::plugin::{Plugin, Usage};
 use crate::pool::{self, Process, Tree, Work};
 use crate::reports::{Report, State};
@@ -119,13 +120,26 @@ pub struct Picker {
     pub selected: usize,
 }
 
-/// The ports of a tree serving several, for `o` to choose from.
+/// The ports of a tree serving several, for `o` or `p` to choose from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortMenu {
     pub tree: String,
     /// Each port and the process listening on it, lowest first.
     pub ports: Vec<(u16, String)>,
     pub selected: usize,
+    /// The port chosen goes to the phone, as `p` does, not the browser.
+    pub is_phone: bool,
+}
+
+/// A tree's port on its way to the phone, as `p` shares it: its address as
+/// a QR code once the share command prints one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Phone {
+    pub tree: String,
+    pub port: u16,
+    /// None while the share command runs; then the address and its code,
+    /// or why there is none.
+    pub shared: Option<Result<(String, Code), String>>,
 }
 
 /// A group of the list, under a heading of its own.
@@ -247,6 +261,8 @@ pub enum Outcome {
     },
     /// Open `url`, such as a tree's PR, in the browser.
     OpenUrl(String),
+    /// Share `port` with the phone, for the code `phone` shows.
+    Share(u16),
     /// Write `record` as the treetop.json of the tree at `path`.
     Record {
         path: PathBuf,
@@ -340,6 +356,8 @@ pub struct App {
     pub picker: Option<Picker>,
     /// The ports `o` offers, while its menu is open.
     pub port_menu: Option<PortMenu>,
+    /// The port `p` shares with the phone, and its code, while shown.
+    pub phone: Option<Phone>,
     /// The scratch chats `C` lists, while the list is open.
     pub scratch_menu: Option<ScratchMenu>,
     /// Where scratch chats run, whose reports are nobody's news.
@@ -1317,6 +1335,7 @@ impl App {
             && self.prompt.is_none()
             && self.picker.is_none()
             && self.port_menu.is_none()
+            && self.phone.is_none()
             && self.scratch_menu.is_none()
             && self.opening.is_none()
             && self.awaiting_chat.is_none()
@@ -2569,9 +2588,10 @@ impl App {
         self.start(tree, Launch::pick(id, self.checkout.clone()))
     }
 
-    /// Opens the port the tree under the cursor serves, or, where it
-    /// serves several, such as a frontend and a backend, a menu of them.
-    fn browse(&mut self) -> Outcome {
+    /// Opens the port the tree under the cursor serves in the browser, or
+    /// with `is_phone` shares it with the phone, or, where it serves
+    /// several, such as a frontend and a backend, offers a menu of them.
+    fn choose_port(&mut self, is_phone: bool) -> Outcome {
         let Some(tree) = self.current() else {
             return Outcome::Continue;
         };
@@ -2582,19 +2602,51 @@ impl App {
                 self.message = Some(format!("tree {tree_name} serves no port"));
                 Outcome::Continue
             }
-            [(port, _)] => Outcome::Browse {
-                port: *port,
-                tree: tree_name,
-            },
+            [(port, _)] => self.use_port(*port, tree_name, is_phone),
             _ => {
                 self.port_menu = Some(PortMenu {
                     tree: tree_name,
                     ports,
                     selected: 0,
+                    is_phone,
                 });
                 Outcome::Continue
             }
         }
+    }
+
+    /// Opens `port` of tree `tree` in the browser, or shares it with the
+    /// phone, showing its code once it has an address.
+    fn use_port(&mut self, port: u16, tree: String, is_phone: bool) -> Outcome {
+        if !is_phone {
+            return Outcome::Browse { port, tree };
+        }
+        self.phone = Some(Phone {
+            tree,
+            port,
+            shared: None,
+        });
+        Outcome::Share(port)
+    }
+
+    /// What sharing `port` with the phone came to: the code of its address,
+    /// or why there is none. Ignored once its popup is closed or shows
+    /// another port.
+    pub fn set_shared(&mut self, port: u16, shared: Result<String, String>) {
+        if let Some(phone) = self.phone.as_mut().filter(|p| p.port == port) {
+            phone.shared = Some(shared.and_then(|url| Code::new(&url).map(|code| (url, code))));
+        }
+    }
+
+    /// Keys while the phone's code is shown: any of its ways out closes it.
+    fn handle_phone_key(&mut self, key: KeyEvent) -> Outcome {
+        if matches!(
+            key.code,
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q' | 'p')
+        ) {
+            self.phone = None;
+        }
+        Outcome::Continue
     }
 
     /// Keys while the port menu is open: a number or Enter opens a port,
@@ -2621,17 +2673,14 @@ impl App {
                 }
                 at
             }
-            KeyCode::Esc | KeyCode::Char('q' | 'o') => {
+            KeyCode::Esc | KeyCode::Char('q' | 'o' | 'p') => {
                 self.port_menu = None;
                 return Outcome::Continue;
             }
             _ => return Outcome::Continue,
         };
         match self.port_menu.take() {
-            Some(menu) => Outcome::Browse {
-                port: menu.ports[chosen].0,
-                tree: menu.tree,
-            },
+            Some(menu) => self.use_port(menu.ports[chosen].0, menu.tree, menu.is_phone),
             None => Outcome::Continue,
         }
     }
@@ -2662,6 +2711,9 @@ impl App {
         }
         if self.port_menu.is_some() {
             return self.handle_port_key(key);
+        }
+        if self.phone.is_some() {
+            return self.handle_phone_key(key);
         }
         if self.scratch_menu.is_some() {
             return self.handle_scratch_key(key);
@@ -2820,7 +2872,8 @@ impl App {
                     self.move_by(1);
                 }
             }
-            KeyCode::Char('o') => return self.browse(),
+            KeyCode::Char('o') => return self.choose_port(false),
+            KeyCode::Char('p') => return self.choose_port(true),
             KeyCode::Char('O') => return self.open_pr(),
             KeyCode::Char('f') => return self.read_failure(),
             KeyCode::Char('R') => return self.resume(),
@@ -3931,6 +3984,57 @@ mod tests {
         assert_eq!(press(&mut app, KeyCode::Char('9')), Outcome::Continue);
         press(&mut app, KeyCode::Esc);
         assert!(app.port_menu.is_none(), "Esc closes it");
+    }
+
+    #[test]
+    fn p_shares_the_port_and_shows_its_address_as_a_code() {
+        let mut app = app();
+        let process = |pid, name: &str, ports| Process {
+            pid,
+            name: name.into(),
+            ports,
+        };
+        app.apply_processes(&HashMap::from([(
+            PathBuf::from("/p/4/app"),
+            vec![process(1, "node", vec![5173])],
+        )]));
+        assert_eq!(press(&mut app, KeyCode::Char('p')), Outcome::Share(5173));
+        let phone = app.phone.as_ref().unwrap();
+        assert_eq!((phone.tree.as_str(), phone.shared.as_ref()), ("4", None));
+        assert_eq!(app.next_ask(), None, "the code keeps chats shut");
+        // An answer for a port no longer shown is dropped.
+        app.set_shared(8000, Ok("https://box.ts.net:8000".into()));
+        assert_eq!(app.phone.as_ref().unwrap().shared, None);
+        let url = "https://box.tail1.ts.net:5173";
+        app.set_shared(5173, Ok(url.into()));
+        let shared = app.phone.as_ref().unwrap().shared.clone();
+        assert_eq!(shared, Some(Ok((url.into(), Code::new(url).unwrap()))));
+        assert_eq!(press(&mut app, KeyCode::Char('j')), Outcome::Continue);
+        assert!(app.phone.is_some(), "only a way out closes it");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.phone.is_none());
+
+        press(&mut app, KeyCode::Char('p'));
+        app.set_shared(5173, Err("tether: tailscale is not running".into()));
+        assert_eq!(
+            app.phone.as_ref().unwrap().shared,
+            Some(Err("tether: tailscale is not running".into()))
+        );
+        press(&mut app, KeyCode::Char('p'));
+        assert!(app.phone.is_none(), "p closes it again");
+
+        // A tree serving several asks which, as `o` does, then shares it.
+        app.apply_processes(&HashMap::from([(
+            PathBuf::from("/p/4/app"),
+            vec![
+                process(1, "uvicorn", vec![8000]),
+                process(2, "node", vec![5173]),
+            ],
+        )]));
+        assert_eq!(press(&mut app, KeyCode::Char('p')), Outcome::Continue);
+        assert!(app.port_menu.as_ref().unwrap().is_phone);
+        assert_eq!(press(&mut app, KeyCode::Char('2')), Outcome::Share(8000));
+        assert_eq!(app.phone.as_ref().unwrap().port, 8000);
     }
 
     fn type_in(app: &mut App, text: &str) {
