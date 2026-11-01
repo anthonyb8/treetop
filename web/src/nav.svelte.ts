@@ -3,12 +3,16 @@
 // the same screen.
 import { recall, remember } from "./store";
 
-export type Route = { screen: "pool" } | { screen: "tree"; tree: string };
+export type Route =
+  | { screen: "pool" }
+  | { screen: "tree"; tree: string }
+  | { screen: "chat"; tree: string };
 
 export function parse(path: string): Route {
-  const tree = /^\/trees\/([^/]+)\/?$/.exec(path);
-  if (tree?.[1]) return { screen: "tree", tree: decodeURIComponent(tree[1]) };
-  return { screen: "pool" };
+  const found = /^\/trees\/([^/]+)(\/chat)?\/?$/.exec(path);
+  if (!found?.[1]) return { screen: "pool" };
+  const tree = decodeURIComponent(found[1]);
+  return found[2] ? { screen: "chat", tree } : { screen: "tree", tree };
 }
 
 export const nav = $state({
@@ -26,13 +30,20 @@ export function go(path: string): void {
   nav.path = path;
 }
 
-/** Back a screen; to the pool when the app was opened on this one. */
+/** The screen under this one: a chat's tree, a tree's pool. */
+function parent(path: string): string {
+  const route = parse(path);
+  return route.screen === "chat" ? `/trees/${encodeURIComponent(route.tree)}` : "/";
+}
+
+/** Back a screen; to the one under it when the app was opened on this one. */
 export function back(): void {
   if (depth > 0) {
     history.back();
   } else {
-    history.replaceState({ depth: 0 }, "", "/");
-    nav.path = "/";
+    const to = parent(nav.path);
+    history.replaceState({ depth: 0 }, "", to);
+    nav.path = to;
   }
 }
 

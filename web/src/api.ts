@@ -123,6 +123,31 @@ export interface Tree {
   report: Report | null;
 }
 
+export interface ToolCall {
+  /** What it did, as "Ran", "Edited", "Read". */
+  verb: string;
+  /** What it did it to, in a few words: a file, a command's description. */
+  what: string | null;
+  /** Lines an edit or write added and took away. */
+  added: number | null;
+  removed: number | null;
+  status: "running" | "ok" | "error";
+  /** The start of what it printed, once it has finished. */
+  output: string | null;
+}
+
+/** One entry of an agent's conversation, as `src/serve/chat.rs` reads it. */
+export interface ChatMessage {
+  id: string;
+  kind: "you" | "claude" | "tool" | "result";
+  at?: string;
+  text?: string;
+  tool?: ToolCall;
+  /** A result's, which finishes the tool call of the same id. */
+  status?: "ok" | "error";
+  output?: string;
+}
+
 export interface Workspaces {
   default: string;
   workspaces: string[];
@@ -166,4 +191,26 @@ export function fetchTree(workspace: string | null, tree: string): Promise<Tree>
 
 export function fetchWorkspaces(): Promise<Workspaces> {
   return get<Workspaces>("/api/workspaces");
+}
+
+export function chatUrl(workspace: string | null, tree: string): string {
+  return `/api/trees/${encodeURIComponent(tree)}/chat${workspaceQuery(workspace)}`;
+}
+
+/** Sends a line to the tree's agent, as `treetop send` does. */
+export async function sendLine(workspace: string | null, tree: string, text: string): Promise<void> {
+  let response: Response;
+  try {
+    response = await fetch(`/api/trees/${encodeURIComponent(tree)}/send${workspaceQuery(workspace)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+  } catch {
+    throw new ApiError("Can't reach the server", null);
+  }
+  if (!response.ok) {
+    const body = (await response.json().catch(() => null)) as { error?: string } | null;
+    throw new ApiError(body?.error ?? `The server said ${response.status}`, response.status);
+  }
 }

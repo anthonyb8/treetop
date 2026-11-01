@@ -2,6 +2,7 @@
   import { cubicOut } from "svelte/easing";
   import { fly } from "svelte/transition";
   import { nav, parse } from "./nav.svelte";
+  import Chat from "./screens/Chat.svelte";
   import Pool from "./screens/Pool.svelte";
   import Tree from "./screens/Tree.svelte";
 
@@ -13,9 +14,16 @@
 
 <div class="stack">
   <div class="layer" inert={route.screen !== "pool"}><Pool /></div>
-  {#if route.screen === "tree"}
+  {#if route.screen !== "pool"}
     {#key route.tree}
-      <div class="layer over" transition:fly={slide}><Tree name={route.tree} /></div>
+      <div class="layer over" transition:fly={slide} inert={route.screen !== "tree"}>
+        <Tree name={route.tree} />
+      </div>
+    {/key}
+  {/if}
+  {#if route.screen === "chat"}
+    {#key route.tree}
+      <div class="layer over" transition:fly={slide}><Chat name={route.tree} /></div>
     {/key}
   {/if}
 </div>

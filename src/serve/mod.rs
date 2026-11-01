@@ -11,11 +11,14 @@
 //! people are turned away. A process on this machine can still reach the
 //! port and claim any login: those run as the owner already.
 
+mod chat;
 mod pool;
 mod tree;
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 
@@ -51,6 +54,7 @@ const LOGIN: &str = "Tailscale-User-Login";
 /// first time it is asked for until the server stops.
 pub struct Pool {
     pub name: String,
+    pub checkout: PathBuf,
     pub app: Mutex<App>,
 }
 
@@ -70,6 +74,7 @@ impl Pool {
         let refresher = Refresher::spawn(checkout.clone(), app.trees.clone());
         let pool = Arc::new(Pool {
             name: workspaces::name(&checkout),
+            checkout,
             app: Mutex::new(app),
         });
         thread::spawn({
@@ -192,12 +197,16 @@ pub fn run(args: &[String], checkout: PathBuf) -> Result<()> {
     Ok(())
 }
 
+/// The largest request body read, far more than a line to an agent needs.
+const BODY_LIMIT: u64 = 64 * 1024;
+
 /// What a request is answered with, before it becomes a tiny_http response.
-#[derive(Debug)]
 pub struct Reply {
     pub status: u16,
     pub content_type: &'static str,
     pub body: Vec<u8>,
+    /// A body written as it comes, for a live view, in place of `body`.
+    pub stream: Option<Box<dyn Read + Send>>,
     /// How long a browser may keep it: None never, Some for a file whose
     /// name changes with its contents.
     pub immutable: bool,
@@ -209,6 +218,17 @@ impl Reply {
             status,
             content_type: "application/json",
             body: serde_json::to_vec(value).unwrap_or_default(),
+            stream: None,
+            immutable: false,
+        }
+    }
+
+    fn events(stream: impl Read + Send + 'static) -> Reply {
+        Reply {
+            status: 200,
+            content_type: "text/event-stream",
+            body: Vec::new(),
+            stream: Some(Box::new(stream)),
             immutable: false,
         }
     }
@@ -226,12 +246,22 @@ pub struct Asked<'a> {
     pub query: HashMap<String, String>,
     /// Who `tailscale serve` says is asking.
     pub login: Option<&'a str>,
+    /// The page that sent it, which for anything that acts must be this
+    /// server's own, so another site open on the phone cannot act through it.
+    pub origin: Option<&'a str>,
+    /// The address the request was sent to.
+    pub host: Option<&'a str>,
+    pub body: &'a [u8],
 }
 
-fn handle(state: &State, request: Request) {
+fn handle(state: &State, mut request: Request) {
     let url = request.url().to_string();
     let (path, query) = url.split_once('?').unwrap_or((&url, ""));
     let login = header(&request, LOGIN);
+    let origin = header(&request, "Origin");
+    let host = header(&request, "Host");
+    let mut body = Vec::new();
+    let _ = request.as_reader().take(BODY_LIMIT).read_to_end(&mut body);
     let method = request.method().clone();
     let reply = route(
         state,
@@ -240,8 +270,15 @@ fn handle(state: &State, request: Request) {
             path,
             query: parse_query(query),
             login: login.as_deref(),
+            origin: origin.as_deref(),
+            host: host.as_deref(),
+            body: &body,
         },
     );
+    if let Some(stream) = reply.stream {
+        write_stream(request, reply.content_type, stream);
+        return;
+    }
     let mut response = Response::from_data(reply.body)
         .with_status_code(reply.status)
         .with_header(header_of("Content-Type", reply.content_type))
@@ -258,6 +295,41 @@ fn handle(state: &State, request: Request) {
         response = response.with_header(header_of("X-Frame-Options", "DENY"));
     }
     let _ = request.respond(response);
+}
+
+/// Writes a live view straight to the connection, each piece as soon as it
+/// comes: tiny_http's chunked body holds pieces back until it has 8 KiB,
+/// which would keep a short message from the phone until more followed. The
+/// body runs to the connection's close, as HTTP allows.
+fn write_stream(request: Request, content_type: &str, mut stream: Box<dyn Read + Send>) {
+    use std::io::Write;
+    let mut socket = request.into_writer();
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nCache-Control: no-cache\r\n\
+         X-Accel-Buffering: no\r\nConnection: close\r\n\r\n"
+    );
+    if socket
+        .write_all(head.as_bytes())
+        .and_then(|()| socket.flush())
+        .is_err()
+    {
+        return;
+    }
+    let mut buf = vec![0; 64 * 1024];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                if socket
+                    .write_all(&buf[..n])
+                    .and_then(|()| socket.flush())
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 fn header(request: &Request, name: &'static str) -> Option<String> {
@@ -322,18 +394,97 @@ pub fn route(state: &State, asked: &Asked) -> Reply {
             let app = pool.app.lock().unwrap_or_else(PoisonError::into_inner);
             Reply::json(200, &pool::pool_json(&app, &pool.name))
         }
-        (Method::Get, path) if path.starts_with("/api/trees/") => {
-            let name = &path["/api/trees/".len()..];
+        (method, path) if path.starts_with("/api/trees/") => {
             let pool = state.pool(asked.query.get("workspace").map(String::as_str));
-            let app = pool.app.lock().unwrap_or_else(PoisonError::into_inner);
-            match app.trees.iter().find(|t| t.name == name && !t.is_main) {
-                Some(found) => Reply::json(200, &tree::tree_json(&app, found, pool::now())),
-                None => Reply::error(404, &format!("no tree {name} in {}", pool.name)),
-            }
+            tree_route(&pool, method, &path["/api/trees/".len()..], asked)
         }
         (_, path) if path.starts_with("/api/") => Reply::error(404, "no such call"),
         (Method::Get | Method::Head, path) => asset(path),
         _ => Reply::error(405, "only GET here"),
+    }
+}
+
+/// A call on one tree: `<name>`, `<name>/chat` or `<name>/send`.
+fn tree_route(pool: &Pool, method: &Method, rest: &str, asked: &Asked) -> Reply {
+    let (name, call) = rest.split_once('/').unwrap_or((rest, ""));
+    let name = decode(name);
+    if *method != Method::Get && !is_same_site(asked) {
+        return Reply::error(403, "only treetop's own page can act");
+    }
+    let app = pool.app.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(found) = app.trees.iter().find(|t| t.name == name && !t.is_main) else {
+        return Reply::error(404, &format!("no tree {name} in {}", pool.name));
+    };
+    match (method, call) {
+        (Method::Get, "") => Reply::json(200, &tree::tree_json(&app, found, pool::now())),
+        (Method::Get, "chat") => {
+            let transcript = App::agents_of(found)
+                .iter()
+                .filter_map(|a| a.job.as_deref())
+                .find_map(|job| chat::transcript_of(&crate::agents::claude::config_dir()?, job));
+            match transcript {
+                Some(path) => Reply::events(chat::stream(path)),
+                None => Reply::error(
+                    404,
+                    "no conversation treetop can read for this tree's agent",
+                ),
+            }
+        }
+        (Method::Post, "send") => {
+            drop(app);
+            send(pool, &name, asked.body)
+        }
+        _ => Reply::error(404, "no such call"),
+    }
+}
+
+/// The request comes from this server's own page: its Origin names the
+/// host it was sent to.
+fn is_same_site(asked: &Asked) -> bool {
+    match (asked.origin, asked.host) {
+        (Some(origin), Some(host)) => origin
+            .split_once("://")
+            .is_some_and(|(_, rest)| rest.eq_ignore_ascii_case(host)),
+        _ => false,
+    }
+}
+
+/// Sends a line to the tree's agent the way `treetop send` does, by running
+/// it: the chat is typed into in a terminal of its own, or a cold agent is
+/// started again with the line.
+fn send(pool: &Pool, tree: &str, body: &[u8]) -> Reply {
+    #[derive(serde::Deserialize)]
+    struct Line {
+        text: String,
+    }
+    let Ok(Line { text }) = serde_json::from_slice::<Line>(body) else {
+        return Reply::error(400, "send takes {\"text\": \"...\"}");
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        return Reply::error(400, "nothing to send");
+    }
+    let output = std::env::current_exe().and_then(|treetop| {
+        Command::new(treetop)
+            .args(["send", tree, text])
+            .current_dir(&pool.checkout)
+            .output()
+    });
+    match output {
+        Ok(out) if out.status.success() => Reply::json(
+            200,
+            &json!({ "said": String::from_utf8_lossy(&out.stdout).trim() }),
+        ),
+        Ok(out) => {
+            let why = String::from_utf8_lossy(&out.stderr);
+            let why = why
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("not sent");
+            Reply::error(502, why.trim_start_matches("Error: "))
+        }
+        Err(err) => Reply::error(500, &format!("could not run treetop send: {err}")),
     }
 }
 
@@ -356,6 +507,7 @@ fn asset(path: &str) -> Reply {
             status: 200,
             content_type: content_type(file),
             body: bytes.to_vec(),
+            stream: None,
             // Vite names what it builds under assets/ for its contents.
             immutable: file.starts_with("assets/"),
         },
@@ -369,6 +521,7 @@ fn asset(path: &str) -> Reply {
                 status: 200,
                 content_type: "text/html; charset=utf-8",
                 body: page.to_vec(),
+                stream: None,
                 immutable: false,
             }
         }
@@ -401,6 +554,9 @@ mod tests {
             path,
             query: HashMap::new(),
             login,
+            origin: None,
+            host: None,
+            body: &[],
         }
     }
 
@@ -440,6 +596,79 @@ mod tests {
         assert_eq!(route(&state, &asked("/", me)).body, index.body);
         assert_eq!(route(&state, &asked("/assets/gone.js", me)).status, 404);
         assert_eq!(route(&state, &asked("/api/nothing", me)).status, 404);
+    }
+
+    #[test]
+    fn a_live_view_s_short_event_reaches_the_phone_without_waiting_for_more() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpStream;
+        use std::time::Duration;
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        // A stream that sends one short event, then stays open with nothing
+        // more to say, as a quiet chat does.
+        struct Quiet(std::sync::mpsc::Receiver<Vec<u8>>);
+        impl Read for Quiet {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                match self.0.recv() {
+                    Ok(bytes) => {
+                        buf[..bytes.len()].copy_from_slice(&bytes);
+                        Ok(bytes.len())
+                    }
+                    Err(_) => Ok(0),
+                }
+            }
+        }
+        thread::spawn(move || {
+            let request = server.recv().unwrap();
+            write_stream(request, "text/event-stream", Box::new(Quiet(rx)));
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        client
+            .write_all(b"GET /api/trees/1/chat HTTP/1.1\r\nHost: x\r\n\r\n")
+            .unwrap();
+        tx.send(b"event: message\ndata: {}\n\n".to_vec()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut lines = BufReader::new(client).lines();
+        let mut seen = Vec::new();
+        while let Some(Ok(line)) = lines.next() {
+            let is_event = line == "event: message";
+            seen.push(line);
+            if is_event {
+                break;
+            }
+        }
+        assert_eq!(seen.first().map(String::as_str), Some("HTTP/1.1 200 OK"));
+        assert_eq!(
+            seen.last().map(String::as_str),
+            Some("event: message"),
+            "{seen:?}"
+        );
+        drop(tx);
+    }
+
+    #[test]
+    fn only_this_server_s_own_page_can_act() {
+        let asked = |origin: Option<&'static str>| Asked {
+            origin,
+            host: Some("server.tailnet.ts.net:7777"),
+            ..asked("/api/trees/17/send", Some("me"))
+        };
+        assert!(is_same_site(&asked(Some(
+            "https://server.tailnet.ts.net:7777"
+        ))));
+        for origin in [
+            None,
+            Some("https://evil.example"),
+            Some("https://server.tailnet.ts.net:7778"),
+            Some("https://server.tailnet.ts.net:7777.evil.example"),
+            Some("null"),
+        ] {
+            assert!(!is_same_site(&asked(origin)), "{origin:?}");
+        }
     }
 
     #[test]

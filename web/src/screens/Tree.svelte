@@ -3,7 +3,7 @@
   import GitCounts from "../components/GitCounts.svelte";
   import Mark from "../components/Mark.svelte";
   import PrBadge from "../components/PrBadge.svelte";
-  import { back, nav } from "../nav.svelte";
+  import { back, link, nav } from "../nav.svelte";
   import { ago } from "../time";
 
   let { name }: { name: string } = $props();
@@ -120,6 +120,14 @@
           </p>
         {:else if tree.task}
           <p class="says">{tree.task}</p>
+        {/if}
+        {#if agent?.has_chat}
+          <a class="open-chat" class:loud={card.needs_you} href="/trees/{encodeURIComponent(name)}/chat" onclick={link}>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+              stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"
+              ><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z" /></svg>
+            Open chat
+          </a>
         {/if}
         {#if tree.agents.length > 1}
           <p class="others">
@@ -308,6 +316,24 @@
   }
   .says.question {
     color: var(--fg-strong);
+  }
+  .open-chat {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    min-height: 46px;
+    border-radius: 10px;
+    border: 1px solid var(--line-strong);
+    background: var(--bg-high);
+    color: var(--fg-strong);
+    font-size: 15px;
+    font-weight: 600;
+  }
+  .open-chat.loud {
+    border: 0;
+    background: var(--yellow);
+    color: var(--on-accent);
   }
   .others {
     margin: 0;
