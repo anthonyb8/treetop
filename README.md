@@ -22,6 +22,10 @@ It installs the latest release to `~/.local/bin` when that is on PATH, else `/us
 Set `TREETOP_VERSION=v0.1.0` before `sh` to install a specific release.
 From source: `cargo install --git https://github.com/anthonyb8/treetop`.
 
+Once installed, `treetop update` installs the latest release over itself in one step, checked against its SHA-256 as the script checks it, and `treetop update v0.1.0` a given one.
+It restarts `treetop serve`'s service where `treetop serve --install` set one up, so the phone gets the new version too.
+A treetop already open notices the binary was replaced and says `treetop updated: U restarts` in its summary; `U` starts the new one in its place, on the same workspace, once no action is under way.
+
 ## Release
 
 Bump `version` in `Cargo.toml`, then push a matching tag:
@@ -63,6 +67,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | Tab | switch to the Issues screen, and back (see [Issues](#issues)) |
 | `j` `k` / arrows, `g` `G` | move |
 | Esc | clear the filter, then the marks |
+| `U` | restart on a newer treetop, once one is installed over the running one (see [Install](#install)) |
 | `?` | show every key |
 | `q` | quit |
 

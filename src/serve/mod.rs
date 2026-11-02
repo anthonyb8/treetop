@@ -319,6 +319,12 @@ pub fn uninstall() -> Result<()> {
     install::uninstall()
 }
 
+/// Restarts the service on the binary now on disk, after an update. False
+/// when it is not installed.
+pub fn restart_service() -> Result<bool> {
+    install::restart_if_installed()
+}
+
 /// The login the config says to answer, without which there is nothing to
 /// serve.
 fn owner(config: &config::Config) -> Result<String> {

@@ -254,6 +254,8 @@ pub enum Outcome {
     RemoveScratch(Scratch),
     /// Show the pool of the repository checked out here instead.
     Switch(PathBuf),
+    /// Start the newer treetop installed over this one, on this workspace.
+    Restart,
     /// Open `http://localhost:<port>`, served from tree `tree`, in the browser.
     Browse {
         port: u16,
@@ -391,6 +393,9 @@ pub struct App {
     /// How many commits the main checkout sits behind its upstream, left
     /// there because it has work of its own or a busy agent.
     pub behind: usize,
+    /// The newer treetop installed over the running one since it started,
+    /// which `U` restarts on.
+    pub replaced: Option<PathBuf>,
     /// Each tree's stage at the last ask, so a change can be announced; None
     /// until the first ask, which announces nothing.
     last_stages: Option<HashMap<PathBuf, Stage>>,
@@ -2755,6 +2760,22 @@ impl App {
     }
 
     /// Quits, or waits for running actions to finish first.
+    /// Restarts on the treetop installed over this one, once no action is
+    /// under way, since a restart would cut one off.
+    fn restart(&mut self) -> Outcome {
+        if self.replaced.is_none() {
+            self.message = Some("treetop is current; `treetop update` installs a newer one".into());
+            return Outcome::Continue;
+        }
+        match self.active_jobs() {
+            0 => Outcome::Restart,
+            n => {
+                self.message = Some(format!("{n} action(s) still running; U again once done"));
+                Outcome::Continue
+            }
+        }
+    }
+
     pub fn quit(&mut self) -> Outcome {
         match self.active_jobs() {
             0 => Outcome::Quit,
@@ -2926,6 +2947,7 @@ impl App {
             KeyCode::Char('I') => self.choose_issue(),
             KeyCode::Char('m') => self.open_message(),
             KeyCode::Char('q') => return self.quit(),
+            KeyCode::Char('U') => return self.restart(),
             KeyCode::Char('?') => self.is_help = true,
             KeyCode::Esc if !self.filter.is_empty() => {
                 self.filter.clear();
@@ -4454,6 +4476,22 @@ mod tests {
             name: crate::workspaces::name(std::path::Path::new(path)),
             held,
         }
+    }
+
+    #[test]
+    fn u_restarts_only_on_a_newer_treetop_and_never_mid_action() {
+        let mut app = app();
+        assert_eq!(press(&mut app, KeyCode::Char('U')), Outcome::Continue);
+        assert!(app.message.as_deref().unwrap().contains("treetop update"));
+
+        app.replaced = Some(PathBuf::from("/home/me/.local/bin/treetop"));
+        app.jobs
+            .insert(PathBuf::from("/p/4/app"), JobState::Queued(Kind::Return));
+        assert_eq!(press(&mut app, KeyCode::Char('U')), Outcome::Continue);
+        assert!(app.message.as_deref().unwrap().contains("still running"));
+
+        app.jobs.clear();
+        assert_eq!(press(&mut app, KeyCode::Char('U')), Outcome::Restart);
     }
 
     #[test]

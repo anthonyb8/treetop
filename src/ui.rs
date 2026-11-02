@@ -52,7 +52,7 @@ const KEYS: [(&str, &str); 13] = [
 ];
 
 /// Every key on the list, for the `?` overlay.
-const HELP: [(&str, &str); 30] = [
+const HELP: [(&str, &str); 31] = [
     (
         "Enter",
         "open the agent: its chat, a cold one started again, else its tree; a heading folds, or opens main's agent",
@@ -129,6 +129,7 @@ const HELP: [(&str, &str); 30] = [
     ("j k ↑ ↓", "move"),
     ("g G", "top, bottom"),
     ("Esc", "clear the filter, then the marks"),
+    ("U", "restart on a newer treetop, once one is installed"),
     ("?", "this help"),
     ("q", "quit"),
 ];
@@ -292,6 +293,12 @@ fn summary(app: &App, is_compact: bool) -> Vec<Span<'static>> {
         }
         if !app.marked.is_empty() {
             spans.push(Span::raw(format!("  {} marked", app.marked.len())));
+        }
+        if app.replaced.is_some() {
+            spans.push(Span::styled(
+                "  treetop updated: U restarts",
+                fg(t.special).add_modifier(Modifier::BOLD),
+            ));
         }
         if let n @ 1.. = app.active_jobs() {
             spans.push(Span::styled(
