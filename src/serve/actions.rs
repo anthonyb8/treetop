@@ -1,13 +1,18 @@
 //! What the phone can do to the pool: start an agent, start a stopped one
-//! again, and give a finished tree back. Each runs as treetop's own keys
-//! run it, through `jobs`, so the phone and the terminal never differ in
-//! what an action does; the pool is listed again once it is done.
+//! again, give a finished tree back, set a tree aside, and reach a port a
+//! tree serves. Each runs as treetop's own keys run it, through `jobs`,
+//! `sidecar` and `phone`, so the phone and the terminal never differ in what
+//! an action does; the pool is listed again once it is done.
+
+use std::sync::PoisonError;
 
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::jobs::{self, Job, Kind, Launch};
+use crate::phone;
 use crate::pool::{Tree, stand_in};
+use crate::sidecar::{self, Sidecar};
 
 use super::{Pool, Reply};
 
@@ -123,6 +128,61 @@ pub fn may_give_back(tree: &Tree) -> Result<(), String> {
     }
 }
 
+/// Sets the tree aside under Parked, or brings it back, as `z` does. The
+/// phone says which it wants rather than asking for a flip, so a second tap
+/// on a screen that had not caught up changes nothing.
+pub fn park(pool: &Pool, name: &str, body: &[u8]) -> Reply {
+    #[derive(Deserialize)]
+    struct Park {
+        parked: bool,
+    }
+    let Ok(Park { parked }) = serde_json::from_slice(body) else {
+        return Reply::error(400, "park takes {\"parked\": true | false}");
+    };
+    let Some(tree) = pool.tree(name) else {
+        return Reply::error(404, &format!("no tree {name} in {}", pool.name));
+    };
+    if tree.is_main || !tree.is_held() {
+        return Reply::error(409, &format!("tree {name} is not leased: nothing to park"));
+    }
+    match set_parked(&tree, parked) {
+        Ok(record) => {
+            let mut app = pool.app.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(tree) = app.trees.iter_mut().find(|t| t.name == name) {
+                tree.sidecar = Some(Box::new(record));
+            }
+            drop(app);
+            pool.refresh();
+            Reply::json(200, &json!({}))
+        }
+        Err(err) => Reply::error(500, &format!("could not record it: {err}")),
+    }
+}
+
+/// Records `parked` in the tree's `treetop.json`, over what the file says
+/// now rather than what the pool last read, so nothing written since is lost.
+fn set_parked(tree: &Tree, parked: bool) -> std::io::Result<Sidecar> {
+    let mut record = sidecar::read(&tree.path)
+        .or_else(|| tree.sidecar.as_deref().cloned())
+        .unwrap_or_else(Sidecar::leased_now);
+    record.parked = parked;
+    sidecar::write(&tree.path, &record)?;
+    Ok(record)
+}
+
+/// Shares a port one of the pool's trees serves with the phone, as `p` does,
+/// and says where to reach it. Only those: nothing else listening on the
+/// server goes onto the tailnet from a tap.
+pub fn share_port(pool: &Pool, share: &[String], port: u16) -> Reply {
+    if !pool.serves(port) {
+        return Reply::error(404, &format!("no tree in {} serves port {port}", pool.name));
+    }
+    match phone::share(share, port) {
+        Ok(url) => Reply::json(200, &json!({ "url": url })),
+        Err(why) => Reply::error(502, &why),
+    }
+}
+
 /// The last line a job wrote, which says why it failed; `otherwise` when it
 /// wrote none.
 fn last_line(output: &str, otherwise: &str) -> String {
@@ -141,6 +201,8 @@ mod tests {
     use crate::agents::{Agent, Source, Status};
     use crate::pool::Process;
     use crate::serve::pool::tests::tree;
+    use std::fs;
+    use std::path::PathBuf;
 
     fn process(pid: u32, name: &str) -> Process {
         Process {
@@ -194,5 +256,52 @@ mod tests {
             ..tree("main", "main")
         };
         assert!(may_give_back(&main).unwrap_err().contains("never returned"));
+    }
+
+    /// A tree on disk as a pool worktree is, with its own git directory.
+    fn tree_on_disk(test: &str) -> (PathBuf, Tree) {
+        let root = std::env::temp_dir().join(format!("treetop-park-{}-{test}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let path = root.join("7/app");
+        fs::create_dir_all(root.join("gitdir")).unwrap();
+        fs::create_dir_all(&path).unwrap();
+        fs::write(
+            path.join(".git"),
+            format!("gitdir: {}\n", root.join("gitdir").display()),
+        )
+        .unwrap();
+        let tree = Tree {
+            path,
+            ..tree("7", "me/END-7-x")
+        };
+        (root, tree)
+    }
+
+    #[test]
+    fn parking_keeps_what_the_record_says_now_and_undoes_itself() {
+        let (root, tree) = tree_on_disk("keeps");
+        // Written after the pool last read the tree.
+        let on_disk = Sidecar {
+            job: Some("written-since".into()),
+            ..Sidecar::leased_now()
+        };
+        sidecar::write(&tree.path, &on_disk).unwrap();
+        let parked = set_parked(&tree, true).unwrap();
+        assert!(parked.parked);
+        assert_eq!(parked.job.as_deref(), Some("written-since"));
+        assert_eq!(sidecar::read(&tree.path), Some(parked));
+        // Asked twice over, it stays what was asked.
+        assert!(set_parked(&tree, true).unwrap().parked);
+        assert!(!set_parked(&tree, false).unwrap().parked);
+        assert!(!sidecar::read(&tree.path).unwrap().parked);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_held_tree_treetop_has_no_record_of_can_still_be_parked() {
+        let (root, tree) = tree_on_disk("unrecorded");
+        assert!(set_parked(&tree, true).unwrap().parked);
+        assert!(sidecar::read(&tree.path).unwrap().parked);
+        let _ = fs::remove_dir_all(root);
     }
 }

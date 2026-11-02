@@ -1,6 +1,7 @@
 <script lang="ts">
   import { cubicOut } from "svelte/easing";
   import { fly } from "svelte/transition";
+  import PortToast from "./components/PortToast.svelte";
   import { nav, parse } from "./nav.svelte";
   import Chat from "./screens/Chat.svelte";
   import NewAgent from "./screens/NewAgent.svelte";
@@ -32,6 +33,7 @@
       <NewAgent tree={route.tree} />
     </div>
   {/if}
+  <PortToast />
 </div>
 
 <style>

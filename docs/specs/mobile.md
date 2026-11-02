@@ -30,7 +30,7 @@ It is for one developer, on their own server, reached over their own tailnet.
 - An installable web app (a PWA) with four screens: the pool, a tree, its agent's chat, and a new agent.
 - A chat view of each agent's conversation, read from its session transcript, with a reply box.
 - Answering what the agent waits on in the chat: a question's options as buttons, a permission with Allow and Deny, or your own words (ANB-21, which replaced ANB-18's terminal view).
-- The actions `send`, `dispatch`, `resume` and `return`, and switching workspaces, as `w` does.
+- The actions `send`, `dispatch`, `resume` and `return`, parking a tree as `z` does, sharing and opening a port as `p` does, and switching workspaces, as `w` does.
 - Web push: an agent needing you, finishing or dying; a PR's checks failing or merging.
 
 **Out:**
@@ -132,6 +132,8 @@ It reuses what the TUI reads, not a second copy of it:
 - The blocked question from the job's `needs`, as `src/reports.rs:141` reads it.
 - Workspaces from `src/workspaces.rs`.
 
+Parking and ports reach the same code too: `POST /api/trees/<n>/park` takes the state wanted rather than a flip and writes the tree's `treetop.json`, and `POST /api/ports/<port>/share` runs the configured `share` command, for a port one of the pool's trees serves and no other.
+
 The server speaks JSON and server-sent events; the screens are drawn on the phone by the web app below.
 Its routes: `GET /api/pool` and `GET /api/trees/<n>`, each the matching part of `status_json`; `GET /api/trees/<n>/chat`, a live stream of server-sent events; and a POST per action.
 The built web app, the manifest and the icons are embedded in the binary with `include_bytes!`, so installing treetop stays one file.
@@ -146,6 +148,7 @@ The API's shapes are TypeScript types in `web/src/api.ts`, written to match `sta
 What makes it feel like an app, and each is part of the issue that adds the screen:
 
 - A line you send shows in the chat at once, marked as sending until the server takes it, and as failed with a retry if it does not.
+- A new reply is laid out whole, so nothing reflows, and its words fade up in a rhythm taken from their length and punctuation, with what came after it held back until it is done.
 - A chat holds its place: scrolled to the end it follows new messages, scrolled up it stays put and shows a "new messages" pill; a tool call you opened stays open, and what you are typing is kept.
 - The pool's cards move into their new order when a tree's state changes, rather than the list jumping.
 - The service worker keeps the app shell, so it opens instantly and shows the last pool it saw, marked as stale, while the server is out of reach.

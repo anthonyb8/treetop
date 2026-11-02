@@ -12,6 +12,7 @@ export function card(tree: string, fields: Partial<Card> = {}): Card {
     more: 0,
     says: null,
     needs_you: false,
+    parked: false,
     git: { unpushed: 0, staged: 0, unstaged: 0, untracked: 0 },
     ports: [],
     pr: null,
@@ -49,7 +50,7 @@ export const pool: Pool = {
   ],
   free: 3,
   bases: ["main", "feature/billing"],
-  parked: [card("6", { title: "END-152 invoices", mark: "cold", active_ago: 172800 })],
+  parked: [card("6", { title: "END-152 invoices", mark: "cold", parked: true, active_ago: 172800 })],
 };
 
 /** Tree 17 as its screen sees it: blocked on a question, its PR failing. */

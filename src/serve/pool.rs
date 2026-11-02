@@ -109,6 +109,7 @@ pub fn card(app: &App, tree: &Tree, now: u64) -> Value {
         "more": more,
         "says": says.map(|i| i.report.text.clone()).filter(|t| !t.is_empty()),
         "needs_you": app.needs_you(tree),
+        "parked": App::is_parked(tree),
         "git": git(tree),
         "ports": tree.ports(),
         "pr": tree.ship.as_ref().map(|s| json!({

@@ -112,6 +112,12 @@ impl Pool {
             .send(());
     }
 
+    /// A tree of this pool, or its main checkout, listens on `port`.
+    pub fn serves(&self, port: u16) -> bool {
+        let app = self.app.lock().unwrap_or_else(PoisonError::into_inner);
+        app.trees.iter().any(|t| t.ports().contains(&port))
+    }
+
     /// The tree called `name` as the pool last read it.
     pub fn tree(&self, name: &str) -> Option<crate::pool::Tree> {
         let app = self.app.lock().unwrap_or_else(PoisonError::into_inner);
@@ -210,6 +216,8 @@ pub struct State {
     pools: Mutex<HashMap<PathBuf, Arc<Pool>>>,
     /// Where pushes go; None when the server could not set them up.
     push: Option<Arc<push::Push>>,
+    /// The command a port is shared with, as `p` runs it.
+    share: Vec<String>,
 }
 
 impl State {
@@ -219,6 +227,7 @@ impl State {
             default,
             pools: Mutex::new(HashMap::new()),
             push: None,
+            share: Vec::new(),
         }
     }
 
@@ -356,6 +365,7 @@ pub fn run(args: &[String], checkout: PathBuf) -> Result<()> {
         Some(Err(why)) => eprintln!("treetop serve: no pushes: {why}"),
         None => eprintln!("treetop serve: no pushes: no config directory"),
     }
+    state.share.clone_from(&config.share);
     let state = Arc::new(state);
     // The default pool starts listing now, so the first page is not the
     // one that waits for it.
@@ -617,6 +627,19 @@ pub fn route(state: &State, asked: &Asked) -> Reply {
             let pool = state.pool(asked.query.get("workspace").map(String::as_str));
             actions::dispatch(&pool, asked.body)
         }
+        (Method::Post, path) if path.starts_with("/api/ports/") => {
+            if !is_same_site(asked) {
+                return Reply::error(403, "only treetop's own page can act");
+            }
+            let port = path["/api/ports/".len()..]
+                .strip_suffix("/share")
+                .and_then(|port| port.parse().ok());
+            let Some(port) = port else {
+                return Reply::error(404, "no such call");
+            };
+            let pool = state.pool(asked.query.get("workspace").map(String::as_str));
+            actions::share_port(&pool, &state.share, port)
+        }
         (method, path) if path.starts_with("/api/trees/") => {
             let pool = state.pool(asked.query.get("workspace").map(String::as_str));
             tree_route(&pool, method, &path["/api/trees/".len()..], asked)
@@ -685,6 +708,10 @@ fn tree_route(pool: &Pool, method: &Method, rest: &str, asked: &Asked) -> Reply 
                 }
                 Ok(()) => Reply::json(200, &json!({})),
             }
+        }
+        (Method::Post, "park") => {
+            drop(app);
+            actions::park(pool, &name, asked.body)
         }
         (Method::Post, "resume") => {
             drop(app);
@@ -1003,6 +1030,45 @@ mod tests {
             );
             assert_eq!(reply.status, 403, "{origin:?}");
         }
+    }
+
+    #[test]
+    fn another_site_cannot_share_a_port_or_park_a_tree() {
+        let state = State::new("me".into(), PathBuf::from("/nowhere"));
+        for path in ["/api/ports/5173/share", "/api/trees/17/park"] {
+            for origin in [None, Some("https://evil.example")] {
+                let reply = route(
+                    &state,
+                    &Asked {
+                        method: &Method::Post,
+                        origin,
+                        host: Some("server.tailnet.ts.net:7777"),
+                        body: br#"{"parked": true}"#,
+                        ..asked(path, Some("me"))
+                    },
+                );
+                assert_eq!(reply.status, 403, "{path} {origin:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_port_a_tree_serves_goes_onto_the_tailnet() {
+        let mark = std::env::temp_dir().join(format!("treetop-shared-{}", std::process::id()));
+        let _ = std::fs::remove_file(&mark);
+        let mut state = State::new("me".into(), PathBuf::from("/nowhere"));
+        state.share = vec!["touch".into(), mark.display().to_string()];
+        let reply = route(
+            &state,
+            &Asked {
+                method: &Method::Post,
+                origin: Some("https://server.tailnet.ts.net:7777"),
+                host: Some("server.tailnet.ts.net:7777"),
+                ..asked("/api/ports/22/share", Some("me"))
+            },
+        );
+        assert_eq!(reply.status, 404);
+        assert!(!mark.exists(), "the share command never ran");
     }
 
     #[test]

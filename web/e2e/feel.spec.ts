@@ -1,7 +1,7 @@
 // ANB-22. The phone's chat reads like a chat with Claude: dots while the
-// agent works, naming what it is doing; a new reply written out word by
-// word; what was there on opening shown at once; no motion for a reader
-// who asked for less.
+// agent works, naming what it is doing; a new reply coming up word by word;
+// what was there on opening shown at once; no motion for a reader who asked
+// for less.
 import { expect, test, type Page } from "@playwright/test";
 import type { ChatMessage, Tree } from "../src/api";
 import { pool, serve, tree17 } from "./fixtures";
@@ -36,22 +36,19 @@ async function chat(page: Page, tree: Tree, first: string, later: () => string =
   await page.goto("/trees/17/chat");
 }
 
-/** Every length the newest reply's text had, as it was drawn, from the
- * page's first paint; call it before the chat opens. */
-async function watchReplies(page: Page) {
+/** Counts each word that was ever paced, from the page's first paint; call
+ * it before the chat opens. */
+async function watchWords(page: Page) {
   await page.addInitScript(() => {
-    const seen: number[] = [];
-    (window as unknown as { lengths: number[] }).lengths = seen;
+    const seen = { words: 0 };
+    (window as unknown as { seen: typeof seen }).seen = seen;
     new MutationObserver(() => {
-      const replies = document.querySelectorAll(".claude");
-      const last = replies[replies.length - 1];
-      if (last) seen.push(last.textContent?.length ?? 0);
-    }).observe(document, { subtree: true, childList: true, characterData: true });
+      seen.words = Math.max(seen.words, document.querySelectorAll(".claude .word").length);
+    }).observe(document, { subtree: true, childList: true });
   });
 }
 
-const lengths = (page: Page) => page.evaluate(() => (window as unknown as { lengths: number[] }).lengths);
-const forget = (page: Page) => page.evaluate(() => void ((window as unknown as { lengths: number[] }).lengths.length = 0));
+const words = (page: Page) => page.evaluate(() => (window as unknown as { seen: { words: number } }).seen.words);
 
 /** A command under way: running, or waiting on your permission to run. */
 const running: ChatMessage = {
@@ -79,35 +76,33 @@ test("an agent waiting on you shows no dots, though its last report says it is w
   await expect(page.getByRole("status", { name: /Claude is working/ })).toHaveCount(0);
 });
 
-test("a new reply is written out, while what was there on opening is not", async ({ page }) => {
+test("a new reply comes up word by word, while what was there on opening does not", async ({ page }) => {
   let isWritten = false;
-  await watchReplies(page);
+  await watchWords(page);
   await chat(page, busy, events(["backlog", [{ id: "a0", kind: "claude", text: reply }]]), () =>
     isWritten ? events(["message", { id: "a1", kind: "claude", text: reply }]) : ": quiet\n\n",
   );
   await expect(page.locator(".claude")).toHaveText(reply);
-  expect((await lengths(page)).filter((length) => length > 0 && length < reply.length)).toEqual([]);
-  await forget(page);
+  expect(await words(page)).toBe(0);
   isWritten = true;
   await expect(page.locator(".claude")).toHaveCount(2);
   await expect(page.locator(".claude").nth(1)).toHaveText(reply);
-  const drawn = await lengths(page);
-  const growing = drawn.filter((length) => length > 0 && length < reply.length);
-  expect(growing.length).toBeGreaterThan(3);
+  await expect.poll(() => words(page)).toBeGreaterThan(20);
+  // Once it has come up it is plain text again, for copying.
+  await expect(page.locator(".claude .word")).toHaveCount(0, { timeout: 8000 });
 });
 
 test("with less motion asked for, a new reply is there at once", async ({ page }) => {
   await page.emulateMedia({ reducedMotion: "reduce" });
   let isWritten = false;
-  await watchReplies(page);
+  await watchWords(page);
   await chat(page, busy, events(["backlog", []]), () =>
     isWritten ? events(["message", { id: "a1", kind: "claude", text: reply }]) : ": quiet\n\n",
   );
   await expect(page.getByRole("status", { name: /Claude is working/ })).toBeVisible();
   isWritten = true;
   await expect(page.locator(".claude")).toHaveText(reply);
-  const drawn = await lengths(page);
-  expect(drawn.filter((length) => length > 0 && length < reply.length)).toEqual([]);
+  expect(await words(page)).toBe(0);
 });
 
 test("an agent back at work after an answer shows dots, not its stale question", async ({ page }) => {

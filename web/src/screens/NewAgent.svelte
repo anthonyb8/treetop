@@ -229,7 +229,7 @@
     font-size: 14px;
   }
   footer {
-    padding: 12px 16px calc(var(--safe-bottom) + 12px);
+    padding: 8px 16px var(--bottom);
     border-top: 1px solid var(--bg-high);
   }
   .go {
