@@ -2,24 +2,67 @@
   import { cubicOut } from "svelte/easing";
   import { fly } from "svelte/transition";
   import PortToast from "./components/PortToast.svelte";
+  import TabBar from "./components/TabBar.svelte";
   import { nav, parse } from "./nav.svelte";
   import Chat from "./screens/Chat.svelte";
+  import Issue from "./screens/Issue.svelte";
+  import IssueForm from "./screens/IssueForm.svelte";
+  import Issues from "./screens/Issues.svelte";
   import NewAgent from "./screens/NewAgent.svelte";
   import Pool from "./screens/Pool.svelte";
   import Tree from "./screens/Tree.svelte";
 
-  // The screens stack as a native app's do: the pool stays underneath,
-  // scrolled where it was, and each deeper screen slides over it.
+  // The screens stack as a native app's do: the pool and the issues stay
+  // underneath, scrolled where they were, and each deeper screen slides over
+  // them.
   let route = $derived(parse(nav.path));
   const slide = { x: window.innerWidth, duration: 280, easing: cubicOut, opacity: 1 };
+
+  let isIssueRoute = $derived(route.screen === "issues" || route.screen === "issue" || route.screen === "issue-form");
+  // A tree opened from an issue keeps Issues underneath it.
+  let tab = $state<"trees" | "issues">("trees");
+  let hasOpenedIssues = $state(false);
+  $effect(() => {
+    if (route.screen === "pool") tab = "trees";
+    if (isIssueRoute) {
+      tab = "issues";
+      hasOpenedIssues = true;
+    }
+  });
+  let isRoot = $derived(route.screen === "pool" || route.screen === "issues");
+  let tree = $derived(
+    route.screen === "tree" || route.screen === "chat" || (route.screen === "new" && route.tree !== null)
+      ? route.tree
+      : null,
+  );
 </script>
 
 <div class="stack">
-  <div class="layer" inert={route.screen !== "pool"}><Pool /></div>
-  {#if route.screen !== "pool" && route.tree !== null}
-    {#key route.tree}
+  <div class="layer root" inert={!isRoot}>
+    <div class="pages">
+      <div class="page" class:shown={tab === "trees"}><Pool /></div>
+      {#if hasOpenedIssues}
+        <div class="page" class:shown={tab === "issues"}><Issues isActive={route.screen === "issues"} /></div>
+      {/if}
+    </div>
+    <TabBar {tab} />
+  </div>
+  {#if route.screen === "issue"}
+    {#key route.id}
+      <div class="layer over" transition:fly={slide}>
+        <Issue id={route.id} />
+      </div>
+    {/key}
+  {/if}
+  {#if route.screen === "issue-form"}
+    <div class="layer over" transition:fly={{ ...slide, x: 0, y: window.innerHeight }}>
+      <IssueForm id={route.id} />
+    </div>
+  {/if}
+  {#if tree !== null}
+    {#key tree}
       <div class="layer over" transition:fly={slide} inert={route.screen !== "tree"}>
-        <Tree name={route.tree} />
+        <Tree name={tree} />
       </div>
     {/key}
   {/if}
@@ -45,6 +88,23 @@
   .layer {
     position: absolute;
     inset: 0;
+  }
+  .root {
+    display: flex;
+    flex-direction: column;
+  }
+  .pages {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+  }
+  .page {
+    position: absolute;
+    inset: 0;
+    display: none;
+  }
+  .page.shown {
+    display: block;
   }
   .over {
     box-shadow: -8px 0 24px rgb(0 0 0 / 0.35);

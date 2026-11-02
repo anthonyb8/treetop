@@ -15,6 +15,7 @@ mod actions;
 mod answer;
 mod chat;
 mod install;
+mod issues;
 mod pool;
 mod push;
 mod tree;
@@ -67,6 +68,8 @@ pub struct Pool {
     /// What pushes are judged against: the pool as last seen, once it has
     /// been read in full, and what of it has been read so far.
     seen: Mutex<Watch>,
+    /// The merged tickets last looked at, and what they left ready.
+    ready: Mutex<(Merged, Vec<String>)>,
     pub app: Mutex<App>,
 }
 
@@ -90,6 +93,7 @@ impl Pool {
             kick: Mutex::new(refresher.kicker()),
             push,
             seen: Mutex::new(Watch::default()),
+            ready: Mutex::default(),
             app: Mutex::new(app),
         });
         thread::spawn({
@@ -122,6 +126,29 @@ impl Pool {
     pub fn tree(&self, name: &str) -> Option<crate::pool::Tree> {
         let app = self.app.lock().unwrap_or_else(PoisonError::into_inner);
         app.trees.iter().find(|t| t.name == name).cloned()
+    }
+
+    /// The tickets merges have left ready. The screen learns them when it
+    /// follows a merge up, which a server does not do. Reading them takes
+    /// several calls to the ticket system, so they are read again only when
+    /// what has merged changes, not every time the list refreshes.
+    fn ready(&self) -> Vec<String> {
+        let trees = {
+            let app = self.app.lock().unwrap_or_else(PoisonError::into_inner);
+            app.trees.clone()
+        };
+        let merged: Merged = crate::cli::merged_tickets(&trees)
+            .into_iter()
+            .map(|(id, source)| (id.to_string(), source.map(str::to_string)))
+            .collect();
+        let mut ready = self.ready.lock().unwrap_or_else(PoisonError::into_inner);
+        if ready.0 != merged {
+            *ready = (
+                merged,
+                crate::cli::ready_after_merges(&self.checkout, &trees),
+            );
+        }
+        ready.1.clone()
     }
 
     fn apply(&self, update: Update) {
@@ -180,6 +207,9 @@ impl Pool {
         }
     }
 }
+
+/// The tickets of the merged trees, each with its issue source.
+type Merged = Vec<(String, Option<String>)>;
 
 /// How long pushes wait on the PRs' first reading, for a repository whose
 /// ship plugins cannot say.
@@ -640,6 +670,14 @@ pub fn route(state: &State, asked: &Asked) -> Reply {
             let pool = state.pool(asked.query.get("workspace").map(String::as_str));
             actions::share_port(&pool, &state.share, port)
         }
+        (method, path) if path == "/api/issues" || path.starts_with("/api/issues/") => {
+            if *method != Method::Get && !is_same_site(asked) {
+                return Reply::error(403, "only treetop's own page can act");
+            }
+            let pool = state.pool(asked.query.get("workspace").map(String::as_str));
+            let rest = path["/api/issues".len()..].trim_start_matches('/');
+            issues::route(&pool, &decode(rest), asked)
+        }
         (method, path) if path.starts_with("/api/trees/") => {
             let pool = state.pool(asked.query.get("workspace").map(String::as_str));
             tree_route(&pool, method, &path["/api/trees/".len()..], asked)
@@ -1069,6 +1107,40 @@ mod tests {
         );
         assert_eq!(reply.status, 404);
         assert!(!mark.exists(), "the share command never ran");
+    }
+
+    #[test]
+    fn another_site_cannot_change_or_pick_up_an_issue() {
+        let state = State::new("me".into(), PathBuf::from("/nowhere"));
+        let ask = |path: &str, origin: Option<&str>| {
+            route(
+                &state,
+                &Asked {
+                    method: &Method::Post,
+                    // A source no config has, so that whatever gets past the
+                    // guard stops there, having changed and started nothing.
+                    query: HashMap::from([("source".into(), "no-such-source".into())]),
+                    origin,
+                    host: Some("server.tailnet.ts.net:7777"),
+                    body: b"{}",
+                    ..asked(path, Some("me"))
+                },
+            )
+            .status
+        };
+        for path in [
+            "/api/issues",
+            "/api/issues/END-1",
+            "/api/issues/END-1/comment",
+            "/api/issues/END-1/pick",
+        ] {
+            for other in [None, Some("https://evil.example")] {
+                assert_eq!(ask(path, other), 403, "{path} {other:?}");
+            }
+            // The same ask from the server's own page is heard.
+            let own = Some("https://server.tailnet.ts.net:7777");
+            assert_ne!(ask(path, own), 403, "{path}");
+        }
     }
 
     #[test]

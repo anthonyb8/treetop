@@ -42,6 +42,45 @@ pub trait Backend: Send + Sync {
         Err(READ_ONLY.into())
     }
 
+    /// Marks issue `id` started and assigned to the key's user.
+    fn start(&self, _id: &str) -> Result<(), String> {
+        Err(READ_ONLY.into())
+    }
+
+    /// Marks issue `id` done.
+    fn finish(&self, _id: &str) -> Result<(), String> {
+        Err(READ_ONLY.into())
+    }
+
+    /// The source says `finish = true`: an issue is marked done once its
+    /// tree's PR merges.
+    fn finishes(&self) -> bool {
+        false
+    }
+
+    /// The issues `id` blocks that are ready now that it is done: not done
+    /// themselves, and with every other issue blocking them done.
+    fn ready_after(&self, id: &str) -> Result<Vec<String>, String> {
+        let done = self.detail(id)?;
+        let mut ready = Vec::new();
+        for blocked in done
+            .links
+            .iter()
+            .filter(|l| l.kind == "blocks" && !l.is_done)
+        {
+            let detail = self.detail(&blocked.id)?;
+            let is_free = detail
+                .links
+                .iter()
+                .filter(|l| l.kind == "blocked by" && l.id != id)
+                .all(|l| l.is_done);
+            if is_free {
+                ready.push(detail.issue.id);
+            }
+        }
+        Ok(ready)
+    }
+
     /// The file at `url`, such as an image in a description.
     fn fetch(&self, _url: &str) -> Result<Vec<u8>, String> {
         Err("this source's plugin cannot fetch images".into())
@@ -54,21 +93,23 @@ pub struct Linear {
     /// The client, or why there is none, such as a key that is not set.
     client: Result<Client, String>,
     team: Option<String>,
+    is_finishing: bool,
 }
 
 impl Linear {
-    /// The source `name`, with its key in the environment variable `key_env`.
-    pub fn new(name: &str, key_env: Option<&str>, team: Option<String>) -> Self {
-        let client = match key_env {
-            Some(key_env) => Client::from_env(key_env).map_err(|err| err.message),
-            None => Err(format!(
-                "[issues.{name}] needs key_env, the variable holding a Linear API key"
-            )),
-        };
+    /// The source `name`, with its API key or why there is none, marking
+    /// merged issues done when `is_finishing`.
+    pub fn new(
+        name: &str,
+        key: Result<String, String>,
+        team: Option<String>,
+        is_finishing: bool,
+    ) -> Self {
         Linear {
             name: name.to_string(),
-            client,
+            client: key.map(Client::new),
             team,
+            is_finishing,
         }
     }
 
@@ -141,6 +182,18 @@ impl Backend for Linear {
         self.client()?
             .comment(&issue.uuid, body)
             .map_err(|err| err.message)
+    }
+
+    fn start(&self, id: &str) -> Result<(), String> {
+        self.client()?.start(id).map_err(|err| err.message)
+    }
+
+    fn finish(&self, id: &str) -> Result<(), String> {
+        self.client()?.finish(id).map_err(|err| err.message)
+    }
+
+    fn finishes(&self) -> bool {
+        self.is_finishing
     }
 
     fn fetch(&self, url: &str) -> Result<Vec<u8>, String> {

@@ -77,6 +77,60 @@ a {
   font-family: var(--mono);
 }
 
+/* Markdown as an agent or an issue writes it. */
+.prose {
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--fg);
+  overflow-wrap: anywhere;
+}
+.prose p {
+  margin: 0 0 8px;
+}
+.prose p:last-child {
+  margin-bottom: 0;
+}
+.prose .h {
+  font-weight: 700;
+  color: var(--fg-strong);
+}
+.prose ul,
+.prose ol {
+  margin: 0 0 8px;
+  padding-left: 20px;
+}
+.prose li + li {
+  margin-top: 2px;
+}
+.prose code {
+  font-family: var(--mono);
+  font-size: 13px;
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--bg-high);
+  color: var(--fg-strong);
+}
+.prose pre {
+  margin: 0 0 8px;
+  padding: 10px;
+  border-radius: 8px;
+  background: #1d2021;
+  overflow-x: auto;
+}
+.prose pre code {
+  padding: 0;
+  background: none;
+}
+.prose blockquote {
+  margin: 0 0 8px;
+  padding-left: 10px;
+  border-left: 2px solid var(--line-strong);
+  color: var(--muted);
+}
+.prose strong {
+  color: var(--fg-strong);
+}
+
 .visually-hidden {
   position: absolute;
   width: 1px;

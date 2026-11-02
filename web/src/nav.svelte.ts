@@ -7,10 +7,20 @@ export type Route =
   | { screen: "pool" }
   | { screen: "tree"; tree: string }
   | { screen: "chat"; tree: string }
-  | { screen: "new"; tree: string | null };
+  | { screen: "new"; tree: string | null }
+  | { screen: "issues" }
+  | { screen: "issue"; id: string }
+  | { screen: "issue-form"; id: string | null };
 
 export function parse(path: string): Route {
   if (/^\/new\/?$/.test(path)) return { screen: "new", tree: null };
+  if (/^\/issues\/?$/.test(path)) return { screen: "issues" };
+  if (/^\/issues\/new\/?$/.test(path)) return { screen: "issue-form", id: null };
+  const issue = /^\/issues\/([^/]+)(\/edit)?\/?$/.exec(path);
+  if (issue?.[1]) {
+    const id = decodeURIComponent(issue[1]);
+    return issue[2] ? { screen: "issue-form", id } : { screen: "issue", id };
+  }
   const found = /^\/trees\/([^/]+)(?:\/(chat|new))?\/?$/.exec(path);
   if (!found?.[1]) return { screen: "pool" };
   const tree = decodeURIComponent(found[1]);
@@ -22,6 +32,12 @@ export function parse(path: string): Route {
 export const nav = $state({
   path: location.pathname,
   workspace: recall<string>("workspace"),
+  /** The issue source chosen; null for the repository's own. */
+  source: recall<string>("source"),
+  /** How many trees wait on you, for the tab bar. */
+  needs: 0,
+  /** The source on show can create issues, for the tab bar. */
+  canCreate: true,
 });
 
 /** How many screens deep the app went itself, so back never leaves it. */
@@ -39,6 +55,8 @@ function parent(path: string): string {
   const route = parse(path);
   if (route.screen === "chat") return `/trees/${encodeURIComponent(route.tree)}`;
   if (route.screen === "new" && route.tree) return `/trees/${encodeURIComponent(route.tree)}`;
+  if (route.screen === "issue") return "/issues";
+  if (route.screen === "issue-form") return route.id ? `/issues/${encodeURIComponent(route.id)}` : "/issues";
   return "/";
 }
 
@@ -56,6 +74,11 @@ export function back(): void {
 export function chooseWorkspace(name: string): void {
   nav.workspace = name;
   remember("workspace", name);
+}
+
+export function chooseSource(name: string): void {
+  nav.source = name;
+  remember("source", name);
 }
 
 window.addEventListener("popstate", (event) => {

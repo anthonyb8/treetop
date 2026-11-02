@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::Duration;
 
+use issues::Backend;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -28,7 +29,7 @@ use crate::plugin::{self, Kind as PluginKind, Plugin};
 use crate::pool::{self, Tree};
 use crate::ship::{self, Ship};
 use crate::sidecar::{self, Sidecar};
-use crate::tickets::{self, Source};
+use crate::tickets;
 
 /// Jobs that run at once, each on its own tree.
 const WORKERS: usize = 4;
@@ -157,16 +158,25 @@ pub struct Launch {
 pub struct Pick {
     pub id: String,
     pub checkout: PathBuf,
+    /// The issue source it is in; None for the repository's own.
+    pub source: Option<String>,
+}
+
+impl Pick {
+    fn backend(&self) -> Result<Arc<dyn Backend>, String> {
+        tickets::named(self.source.as_deref(), &self.checkout)
+    }
 }
 
 impl Launch {
     /// An agent on ticket `id`, in a new tree; its task, name and branch come
     /// from the ticket when the job runs.
-    pub fn pick(id: String, checkout: PathBuf) -> Self {
+    pub fn pick(id: String, checkout: PathBuf, source: Option<String>) -> Self {
         Launch {
             ticket: Some(Pick {
                 id: id.clone(),
                 checkout,
+                source,
             }),
             name: Some(id),
             ..Launch::agent(String::new(), true)
@@ -539,6 +549,7 @@ fn start_steps(
         .is_some_and(|(pick, name)| has_branch(&pick.checkout, name));
     let mut record = Sidecar::leased_now();
     record.ticket = launch.ticket.as_ref().map(|pick| pick.id.clone());
+    record.source = launch.ticket.as_ref().and_then(|pick| pick.source.clone());
     record.task = Some(launch.task.trim().to_string()).filter(|t| !t.is_empty());
     if launch.is_new_tree {
         let mut command = Command::new("treehouse");
@@ -685,8 +696,7 @@ fn start_steps(
 /// template, a session name led by the ticket's id, and the branch the
 /// ticket system names, unless one was given.
 fn take_up(pick: &Pick, launch: &mut Launch) -> Result<(), String> {
-    let source = Source::of(&pick.checkout)?;
-    let ticket = source.get(&pick.id)?;
+    let ticket = pick.backend()?.detail(&pick.id)?.issue;
     let template = config::load()?.prompt;
     launch.task = tickets::prompt(template.as_deref(), &ticket);
     launch.name = crate::dispatch::session_name(&format!("{} {}", ticket.id, ticket.title));
@@ -710,7 +720,7 @@ fn has_branch(checkout: &Path, branch: &str) -> bool {
 /// Marks the picked ticket started and assigned once its agent runs. The
 /// agent keeps running if this fails, and the log says so.
 fn mark_started(pick: &Pick, log: &mut String) {
-    let marked = Source::of(&pick.checkout).and_then(|source| source.start(&pick.id));
+    let marked = pick.backend().and_then(|source| source.start(&pick.id));
     let _ = match marked {
         Ok(()) => writeln!(log, "marked {} started and assigned to you", pick.id),
         Err(why) => writeln!(log, "could not mark {} started: {why}", pick.id),
@@ -1155,7 +1165,8 @@ fn read_failure(tree: &Tree, log: &mut String) -> bool {
 fn intent(tree: &Path, checkout: &Path) -> Result<String, String> {
     let record = sidecar::read(tree);
     if let Some(id) = record.as_ref().and_then(|r| r.ticket.as_deref()) {
-        let ticket = Source::of(checkout)?.get(id)?;
+        let source = record.as_ref().and_then(|r| r.source.as_deref());
+        let ticket = tickets::named(source, checkout)?.detail(id)?.issue;
         let text = ticket.description.unwrap_or_default();
         return Ok(format!("{}: {}\n\n{text}", ticket.id, ticket.title)
             .trim()
@@ -1218,7 +1229,7 @@ fn land(job: &mut Job, log: &mut String) -> bool {
     let Some(pick) = &job.landing else {
         return false;
     };
-    let source = match Source::of(&pick.checkout) {
+    let source = match pick.backend() {
         Ok(source) => source,
         Err(why) => {
             let _ = writeln!(log, "{why}");
@@ -1326,7 +1337,7 @@ pub fn run(job: &mut Job) -> (bool, String) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn launch(task: &str) -> Launch {
@@ -1640,11 +1651,16 @@ esac
     /// that process, where the test goes on; false here, once it has passed
     /// there.
     fn in_own_process(name: &str, root: &Path) -> bool {
+        in_process_of_its_own(&format!("jobs::tests::{name}"), root)
+    }
+
+    /// `in_own_process` for test `path`, from anywhere in the crate.
+    pub(crate) fn in_process_of_its_own(path: &str, root: &Path) -> bool {
         if std::env::var_os("TREETOP_HANDOFF_CHILD").is_some() {
             return true;
         }
         let out = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", &format!("jobs::tests::{name}"), "--nocapture"])
+            .args(["--exact", path, "--nocapture"])
             .env("TREETOP_HANDOFF_CHILD", root)
             .env("XDG_CONFIG_HOME", root.join("config"))
             .env_remove("TREETOP_NEW_AGENT")
@@ -1658,6 +1674,19 @@ esac
         );
         assert!(said.contains("1 passed"), "the test ran there: {said}");
         false
+    }
+
+    /// An empty config directory for test `test`, at `<root>/config/treetop`,
+    /// and in the process `in_process_of_its_own` made, the same one.
+    pub(crate) fn config_root(test: &str) -> PathBuf {
+        if let Some(root) = std::env::var_os("TREETOP_HANDOFF_CHILD") {
+            return PathBuf::from(root);
+        }
+        let root =
+            std::env::temp_dir().join(format!("treetop-config-{}-{test}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("config/treetop")).unwrap();
+        root
     }
 
     fn handoff_job(tree: Tree) -> Job {
@@ -1732,6 +1761,267 @@ esac
         assert_eq!(
             sidecar::read(&path).unwrap().job.as_deref(),
             Some("old00001")
+        );
+    }
+
+    /// A ticket plugin for the tracker fixture: `name`, recording each change
+    /// it is asked for in `<root>/ops`, with `tickets` the `case` arms that
+    /// answer `get` by the ticket's `$id`.
+    fn tracker_plugin(root: &Path, file: &str, name: &str, tickets: &str) {
+        let plugin = root.join("config/treetop/plugins").join(file);
+        std::fs::write(
+            &plugin,
+            format!(
+                r#"#!/bin/sh
+req=$(cat)
+id=$(echo "$req" | sed 's/.*"args":{{"id":"\([^"]*\)"}}.*/\1/')
+ok() {{ echo "{{\"ok\":true,\"result\":$1}}"; }}
+ticket() {{ ok "{{\"id\":\"$id\",\"title\":\"Fix the login\",\"description\":\"Keep return_to.\",\"branch\":\"me/$id-login\",\"links\":[$1]}}"; }}
+case "$req" in
+  *'"op":"describe"'*) ok '{{"protocol":1,"name":"{name}","kind":"tickets","ops":["get","start","finish"]}}' ;;
+  *'"op":"start"'*|*'"op":"finish"'*) printf '%s %s %s\n' {name} "$(echo "$req" | sed 's/.*"op":"\([a-z]*\)".*/\1/')" "$id" >> {root}/ops; ok '{{}}' ;;
+  *'"op":"get"'*)
+    case "$id" in
+{tickets}
+    esac ;;
+esac
+"#,
+                root = root.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&plugin, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+    }
+
+    /// A repository at `<root>/main` whose own issues come from a ticket
+    /// plugin of your own named `linear`, which replaces the built-in client.
+    /// It knows END-1, which blocks END-2 (blocked by nothing else) and END-3
+    /// (still blocked by END-9). A second source, `personal`, knows PER-1,
+    /// which blocks PER-2, `keeps` is the same plugin without `finish`, and
+    /// another is broken, on a plugin nobody has. A
+    /// tree at `<root>/4/app` is working on END-1. In the process
+    /// `in_own_process` runs the test in, the one this process made.
+    pub(crate) fn tracker_fixture(test: &str) -> PathBuf {
+        if let Some(root) = std::env::var_os("TREETOP_HANDOFF_CHILD") {
+            return PathBuf::from(root);
+        }
+        let root =
+            std::env::temp_dir().join(format!("treetop-tracker-{}-{test}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("config/treetop/plugins")).unwrap();
+        std::fs::create_dir_all(root.join("main")).unwrap();
+        std::fs::write(
+            root.join("config/treetop/config.toml"),
+            format!(
+                "[issues.broken]\nplugin = \"no-such-plugin\"\n\
+                 [issues.keeps]\nplugin = \"side\"\n\
+                 [issues.personal]\nplugin = \"side\"\nfinish = true\n\
+                 [issues.team]\nfinish = true\n\
+                 [repos.\"{}\"]\nissues = \"team\"\n",
+                root.join("main").display()
+            ),
+        )
+        .unwrap();
+        tracker_plugin(
+            &root,
+            "my-linear",
+            "linear",
+            r#"END-1) ticket '{"id":"END-2","kind":"blocks"},{"id":"END-3","kind":"blocks"}' ;;
+END-2) ticket '{"id":"END-1","kind":"blocked by"}' ;;
+END-3) ticket '{"id":"END-1","kind":"blocked by"},{"id":"END-9","kind":"blocked by"}' ;;
+*) echo '{"ok":false,"error":{"code":"not_found","message":"no such ticket"}}' ;;"#,
+        );
+        tracker_plugin(
+            &root,
+            "side",
+            "side",
+            r#"PER-1) ticket '{"id":"PER-2","kind":"blocks"}' ;;
+PER-2) ticket '{"id":"PER-1","kind":"blocked by"}' ;;
+*) echo '{"ok":false,"error":{"code":"not_found","message":"no such ticket"}}' ;;"#,
+        );
+        let tree = root.join("4/app");
+        std::fs::create_dir_all(&tree).unwrap();
+        let git_dir = root.join("main/.git/worktrees/app4");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(
+            tree.join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .unwrap();
+        let record = Sidecar {
+            ticket: Some("END-1".into()),
+            ..Sidecar::leased_now()
+        };
+        sidecar::write(&tree, &record).unwrap();
+        root
+    }
+
+    /// Puts on the `PATH` a `treehouse` that leases `<root>/5/app` and records
+    /// what it was asked in `<root>/leased`, and has agents started by a
+    /// program that records its prompt in `<root>/started`.
+    fn fake_pool_and_agent(root: &Path) -> PathBuf {
+        let (bin, tree) = (root.join("bin"), root.join("5/app"));
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&tree).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&tree)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let script = |name: &str, body: String| {
+            let path = bin.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+            path
+        };
+        script(
+            "treehouse",
+            format!(
+                "echo \"$@\" >> {root}/leased\necho '{{\"path\":\"{tree}\",\"lease_id\":\"l5\"}}'",
+                root = root.display(),
+                tree = tree.display()
+            ),
+        );
+        let agent = script(
+            "agent",
+            format!("printf '%s' \"$1\" > {}/started", root.display()),
+        );
+        let path = std::env::var("PATH").unwrap();
+        // SAFETY: this process runs only this test, on this thread.
+        unsafe {
+            std::env::set_var("PATH", format!("{}:{path}", bin.display()));
+            std::env::set_var("TREETOP_NEW_AGENT", agent);
+        }
+        tree
+    }
+
+    /// ANB-25, and the base of ANB-29: `w` to another source, then `p`, as the
+    /// Issues screen does: the job reads and starts the ticket in that source
+    /// and records it on the tree, and all that follows reads that record.
+    #[test]
+    fn a_ticket_picked_from_another_source_is_worked_in_that_source() {
+        let root = tracker_fixture("other");
+        if !in_own_process(
+            "a_ticket_picked_from_another_source_is_worked_in_that_source",
+            &root,
+        ) {
+            return;
+        }
+        let tree = fake_pool_and_agent(&root);
+        let checkout = root.join("main");
+        let mut launch = Launch::pick("PER-1".into(), checkout.clone(), Some("personal".into()));
+        launch.base = Some("feature/billing".into());
+        let mut job = Job {
+            launch: Some(launch),
+            ..Job::new(Kind::Start, pool::stand_in(PathBuf::from("(new tree)")))
+        };
+        let (is_ok, log) = run(&mut job);
+        assert!(is_ok, "{log}");
+        assert_eq!(job.tree.path, tree);
+        let work = "PER-1: Fix the login\n\nKeep return_to.";
+        assert_eq!(std::fs::read_to_string(root.join("started")).unwrap(), work);
+        let leased = std::fs::read_to_string(root.join("leased")).unwrap();
+        assert!(
+            leased.ends_with("--branch me/PER-1-login --base feature/billing\n"),
+            "{leased}"
+        );
+        let record = sidecar::read(&tree).unwrap();
+        assert_eq!(record.ticket.as_deref(), Some("PER-1"));
+        assert_eq!(record.source.as_deref(), Some("personal"));
+        assert_eq!(intent(&tree, &checkout).unwrap(), work);
+        let mut landing = Job {
+            landing: Some(Pick {
+                id: "PER-1".into(),
+                checkout,
+                source: record.source,
+            }),
+            ..Job::new(Kind::Land, pool::stand_in(tree))
+        };
+        let (is_ok, log) = run(&mut landing);
+        assert!(is_ok, "{log}");
+        assert_eq!(landing.ready, ["PER-2"]);
+        assert_eq!(
+            std::fs::read_to_string(root.join("ops")).unwrap(),
+            "side start PER-1\nside finish PER-1\n"
+        );
+    }
+
+    #[test]
+    fn a_picked_ticket_gives_its_agent_its_work_and_is_marked_started() {
+        let root = tracker_fixture("picked");
+        if !in_own_process(
+            "a_picked_ticket_gives_its_agent_its_work_and_is_marked_started",
+            &root,
+        ) {
+            return;
+        }
+        let pick = Pick {
+            id: "END-1".into(),
+            checkout: root.join("main"),
+            source: None,
+        };
+        let mut launch = Launch::pick(pick.id.clone(), pick.checkout.clone(), None);
+        take_up(&pick, &mut launch).unwrap();
+        assert_eq!(launch.task, "END-1: Fix the login\n\nKeep return_to.");
+        assert_eq!(launch.branch.as_deref(), Some("me/END-1-login"));
+        assert_eq!(launch.name.as_deref(), Some("END-1 Fix the login"));
+        let mut log = String::new();
+        mark_started(&pick, &mut log);
+        assert_eq!(log, "marked END-1 started and assigned to you\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("ops")).unwrap(),
+            "linear start END-1\n"
+        );
+        assert_eq!(
+            intent(&root.join("4/app"), &pick.checkout).unwrap(),
+            "END-1: Fix the login\n\nKeep return_to."
+        );
+    }
+
+    #[test]
+    fn a_merged_ticket_is_finished_and_says_what_it_leaves_ready() {
+        let root = tracker_fixture("merged");
+        if !in_own_process(
+            "a_merged_ticket_is_finished_and_says_what_it_leaves_ready",
+            &root,
+        ) {
+            return;
+        }
+        let mut job = Job {
+            landing: Some(Pick {
+                id: "END-1".into(),
+                checkout: root.join("main"),
+                source: None,
+            }),
+            ..Job::new(Kind::Start, pool::stand_in(root.join("4/app")))
+        };
+        let mut log = String::new();
+        assert!(land(&mut job, &mut log));
+        assert_eq!(job.ready, ["END-2"]);
+        assert_eq!(
+            std::fs::read_to_string(root.join("ops")).unwrap(),
+            "linear finish END-1\n"
+        );
+        assert_eq!(log, "marked END-1 done\nEND-1 merged; ready now: END-2\n");
+        // A source without `finish = true` is left alone, and still says.
+        let mut job = Job {
+            landing: Some(Pick {
+                id: "PER-1".into(),
+                checkout: root.join("main"),
+                source: Some("keeps".into()),
+            }),
+            ..Job::new(Kind::Start, pool::stand_in(root.join("4/app")))
+        };
+        assert!(land(&mut job, &mut log));
+        assert_eq!(job.ready, ["PER-2"]);
+        assert_eq!(
+            std::fs::read_to_string(root.join("ops")).unwrap(),
+            "linear finish END-1\n"
         );
     }
 }

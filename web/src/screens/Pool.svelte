@@ -6,13 +6,12 @@
   import Notifications from "../components/Notifications.svelte";
   import PortButton from "../components/PortButton.svelte";
   import SwipeRow from "../components/SwipeRow.svelte";
-  import { chooseWorkspace, link, nav } from "../nav.svelte";
+  import { chooseWorkspace, nav } from "../nav.svelte";
+  import { Pull, PULL_PX } from "../pull.svelte";
   import { remember, recall } from "../store";
 
   /** How often the pool is asked for while the screen is open. */
   const EVERY_MS = 5000;
-  /** How far a pull at the top must go before it refreshes. */
-  const PULL_PX = 70;
 
   let workspaces = $state<string[]>([]);
   let pool = $state<Pool | null>(recall<Pool>(poolKey(nav.workspace)));
@@ -21,7 +20,6 @@
   let isLoading = $state(false);
   let isParkedOpen = $state(false);
   let parkFailure = $state<string | null>(null);
-  let pulled = $state(0);
   let scroller: HTMLElement | undefined = $state();
 
   function poolKey(name: string | null): string {
@@ -36,6 +34,7 @@
       // A switch while this was on its way shows the new workspace, not this.
       if (asked !== nav.workspace) return;
       pool = fresh;
+      nav.needs = fresh.needs_you.length;
       failure = null;
       remember(poolKey(asked), fresh);
     } catch (err) {
@@ -90,21 +89,7 @@
     };
   });
 
-  // Pull down at the top to refresh, as iOS lists do.
-  let startY: number | null = null;
-  function onTouchStart(event: TouchEvent) {
-    startY = scroller && scroller.scrollTop <= 0 ? (event.touches[0]?.clientY ?? null) : null;
-  }
-  function onTouchMove(event: TouchEvent) {
-    if (startY === null) return;
-    const dy = (event.touches[0]?.clientY ?? startY) - startY;
-    pulled = Math.max(0, Math.min(dy * 0.5, PULL_PX * 1.4));
-  }
-  function onTouchEnd() {
-    if (pulled >= PULL_PX) void load();
-    pulled = 0;
-    startY = null;
-  }
+  const pull = new Pull(() => void load());
 
   let isEmpty = $derived(
     pool !== null &&
@@ -152,13 +137,13 @@
 
   <main
     bind:this={scroller}
-    ontouchstart={onTouchStart}
-    ontouchmove={onTouchMove}
-    ontouchend={onTouchEnd}
-    style:--pulled="{pulled}px"
+    ontouchstart={(event) => pull.start(event, scroller)}
+    ontouchmove={(event) => pull.move(event)}
+    ontouchend={() => pull.end()}
+    style:--pulled="{pull.pulled}px"
   >
-    <div class="pull" class:ready={pulled >= PULL_PX} aria-hidden="true">
-      <svg class:spin={isLoading && pulled > 0} width="18" height="18" viewBox="0 0 24 24" fill="none"
+    <div class="pull" class:ready={pull.pulled >= PULL_PX} aria-hidden="true">
+      <svg class:spin={isLoading && pull.pulled > 0} width="18" height="18" viewBox="0 0 24 24" fill="none"
         stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8" /><path d="M21 3v5h-5" /></svg>
     </div>
 
@@ -245,14 +230,6 @@
       </section>
     {/if}
   </main>
-
-  <footer>
-    <a class="new" href="/new" onclick={link}>
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
-        stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
-      New agent
-    </a>
-  </footer>
 </div>
 
 <style>
@@ -320,23 +297,6 @@
     opacity: 0;
     width: 100%;
     font-size: 16px;
-  }
-  footer {
-    padding: 8px 16px var(--bottom);
-    border-top: 1px solid var(--bg-high);
-    background: var(--bg);
-  }
-  .new {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 8px;
-    min-height: 46px;
-    border-radius: 12px;
-    background: var(--green);
-    color: var(--on-accent);
-    font-size: 16px;
-    font-weight: 600;
   }
   .banner {
     margin: 0;

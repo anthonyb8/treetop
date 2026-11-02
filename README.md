@@ -233,7 +233,7 @@ share = ["tether", "share"]
 ```
 
 `treetop tickets` lists the repository's open tickets from its source, `--mine` those assigned to you, and any other words search their titles; it is the quickest check that a key and team are right.
-The Linear plugin calls `https://api.linear.app/graphql` over HTTPS from treetop itself, so the key never appears in a process list.
+treetop calls `https://api.linear.app/graphql` over HTTPS itself, so the key never appears in a process list.
 
 ## Plugins
 
@@ -296,7 +296,7 @@ A ship plugin says where each tree's branch stands after its agent:
 `idle` means it has nothing current to say, such as a pipeline whose run ended, so the next plugin's answer shows.
 
 Claude Code's plugin is built in, and `treetop plugin claude` serves it on stdin and stdout like any other; a plugin of your own named `claude` replaces it.
-Linear's is built in the same way, as `treetop plugin linear`, and so are two ship plugins, `treetop plugin github` and `treetop plugin no-mistakes`.
+Two ship plugins are built in the same way, `treetop plugin github` and `treetop plugin no-mistakes`.
 treetop starts new agents with it unless `TREETOP_NEW_AGENT` names a command.
 
 ## What the actions run
@@ -607,6 +607,7 @@ Each workspace has its own assistant; a stopped one is only ever taken up again 
 
 `treetop serve` puts treetop on your phone as an app on its home screen: every tree in the list's groups and order, with its agent's mark, what the agent last said, its git state, ports and PR, the trees waiting on you first.
 It is a web app served by treetop itself, with nothing to install on the phone but Tailscale.
+The Issues tab beside the trees is the Issues screen for your thumb: the same views and sources, who is working on each issue, status, assignee, labels, comments and new issues, and Pick up to put an agent on one.
 
 On the server, name your Tailscale login in the config, since the server answers no one else:
 
@@ -623,6 +624,14 @@ treetop serve --install
 ```
 
 It runs in the workspace treetop would open where you run this, with the `PATH` you ran it with, since systemd's own lacks `~/.local/bin` and the commands the server starts.
+A service has none of your shell's variables, so a key an issue source names in `key_env` goes in `~/.config/treetop/env` instead, as `NAME=value` lines, and treetop reads it wherever a variable is not set:
+
+```sh
+install -m 600 /dev/null ~/.config/treetop/env
+echo 'LINEAR_API_KEY_WORK=lin_api_...' >> ~/.config/treetop/env
+```
+
+treetop refuses the file while anyone else can read it.
 It says whether lingering is on, which the service needs to run at boot and while you are logged out; `loginctl enable-linger` turns it on.
 It then shares the port with your tailnet over HTTPS, which iOS needs before it installs a web app, with the `share` the config names, `tether share` by default, and prints the address and a QR code to scan.
 Where sharing fails, it says why and the server keeps running on 127.0.0.1.

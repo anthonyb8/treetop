@@ -173,6 +173,125 @@ export interface Workspaces {
   workspaces: string[];
 }
 
+export interface IssueRow {
+  id: string;
+  title: string;
+  state: string;
+  state_id: string | null;
+  /** 0 none, 1 urgent, 2 high, 3 medium, 4 low. */
+  priority: number;
+  labels: string[];
+  label_ids: string[];
+  assignee: string | null;
+  assignee_id: string | null;
+  project: string | null;
+  project_id: string | null;
+  cycle: string | null;
+  url: string | null;
+  /** The tree working on it, as the pool shows that tree. */
+  card: Card | null;
+  /** Nobody works on it, and a merge has left nothing blocking it. */
+  is_ready: boolean;
+}
+
+export interface IssueSection {
+  /** Empty for a list with no groups. */
+  heading: string;
+  /** Its issues' work is over, so it comes folded. */
+  is_closed: boolean;
+  issues: IssueRow[];
+}
+
+export interface IssueList {
+  sections: IssueSection[];
+}
+
+export interface IssueComment {
+  author: string;
+  body: string;
+  created_at: string;
+}
+
+export interface IssueLink {
+  /** As "blocked by", "blocks", "related", from this issue's side. */
+  kind: string;
+  id: string;
+  title: string;
+  state: string;
+  is_done: boolean;
+}
+
+export interface IssueDetail {
+  issue: IssueRow;
+  description: string | null;
+  comments: IssueComment[];
+  links: IssueLink[];
+}
+
+export interface Named {
+  id: string;
+  name: string;
+}
+
+export interface IssueState extends Named {
+  is_closed: boolean;
+}
+
+export interface IssueCycle {
+  number: number;
+  name: string | null;
+  is_active: boolean;
+}
+
+/** What a source's issues can be set to. */
+export interface IssueTeam {
+  states: IssueState[];
+  labels: Named[];
+  members: Named[];
+  projects: Named[];
+  cycles: IssueCycle[];
+  me: Named | null;
+}
+
+export type IssueGroup = "none" | "project" | "status";
+
+export interface IssueView {
+  name: string;
+  /** Its filter line, as `line` of a list takes it. */
+  line: string;
+  group: IssueGroup;
+}
+
+export interface IssueSources {
+  sources: string[];
+  /** The repository's own, when it has one. */
+  own: string | null;
+  /** Why it has none. */
+  why: string | null;
+  views: IssueView[];
+}
+
+/** What can change on an issue; a field left out is left alone. */
+export interface IssueChange {
+  title?: string;
+  description?: string;
+  state_id?: string;
+  assignee_id?: string | null;
+  label_ids?: string[];
+  project_id?: string | null;
+  priority?: number;
+}
+
+export interface NewIssue {
+  title: string;
+  description: string | null;
+  state_id: string | null;
+  assignee_id: string | null;
+  label_ids: string[];
+  project_id: string | null;
+  priority: number | null;
+}
+
 /** A call the server turned down, or one that never reached it. */
 export class ApiError extends Error {
   constructor(
@@ -301,4 +420,68 @@ export type Answer = { action: "allow" } | { action: "deny" } | { action: "say";
 /** Answers the prompt the tree's agent waits on. */
 export function answer(workspace: string | null, tree: string, given: Answer): Promise<void> {
   return post<void>(`/api/trees/${encodeURIComponent(tree)}/answer${workspaceQuery(workspace)}`, given);
+}
+
+function issuesQuery(workspace: string | null, source: string | null, extra: Record<string, string> = {}): string {
+  const query = new URLSearchParams(extra);
+  if (workspace) query.set("workspace", workspace);
+  if (source) query.set("source", source);
+  const text = query.toString();
+  return text ? `?${text}` : "";
+}
+
+/** The issue sources there are, the views, and the repository's own. */
+export function fetchIssueSources(workspace: string | null): Promise<IssueSources> {
+  return get<IssueSources>(`/api/issues/sources${issuesQuery(workspace, null)}`);
+}
+
+export function fetchIssues(
+  workspace: string | null,
+  source: string | null,
+  line: string,
+  group: IssueGroup,
+): Promise<IssueList> {
+  return get<IssueList>(`/api/issues${issuesQuery(workspace, source, { line, group })}`);
+}
+
+/** What the source's issues can be set to; null for one that cannot change them. */
+export async function fetchIssueTeam(workspace: string | null, source: string | null): Promise<IssueTeam | null> {
+  const answer = await get<{ team: IssueTeam | null }>(`/api/issues/team${issuesQuery(workspace, source)}`);
+  return answer.team;
+}
+
+export function fetchIssue(workspace: string | null, source: string | null, id: string): Promise<IssueDetail> {
+  return get<IssueDetail>(`/api/issues/${encodeURIComponent(id)}${issuesQuery(workspace, source)}`);
+}
+
+export function changeIssue(
+  workspace: string | null,
+  source: string | null,
+  id: string,
+  change: IssueChange,
+): Promise<IssueRow> {
+  return post<IssueRow>(`/api/issues/${encodeURIComponent(id)}${issuesQuery(workspace, source)}`, change);
+}
+
+export function createIssue(workspace: string | null, source: string | null, issue: NewIssue): Promise<IssueRow> {
+  return post<IssueRow>(`/api/issues${issuesQuery(workspace, source)}`, issue);
+}
+
+export function commentOnIssue(
+  workspace: string | null,
+  source: string | null,
+  id: string,
+  body: string,
+): Promise<IssueComment> {
+  return post<IssueComment>(`/api/issues/${encodeURIComponent(id)}/comment${issuesQuery(workspace, source)}`, { body });
+}
+
+/** Puts an agent on the issue in a fresh tree cut from `base`; says which tree. */
+export function pickIssue(
+  workspace: string | null,
+  source: string | null,
+  id: string,
+  base: string | null,
+): Promise<{ tree: string }> {
+  return post<{ tree: string }>(`/api/issues/${encodeURIComponent(id)}/pick${issuesQuery(workspace, source)}`, { base });
 }

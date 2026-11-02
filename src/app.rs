@@ -678,7 +678,10 @@ impl App {
     /// Where a tree goes within its group: waiting on you first, then the
     /// most recently active, the rest keeping pool order.
     pub fn order_in_group(&self, tree: &Tree) -> (bool, std::cmp::Reverse<Option<u64>>) {
-        (!self.needs_you(tree), std::cmp::Reverse(self.active_at(tree)))
+        (
+            !self.needs_you(tree),
+            std::cmp::Reverse(self.active_at(tree)),
+        )
     }
 
     /// The trees the list shows, in its order: those in open groups.
@@ -1585,12 +1588,14 @@ impl App {
             .filter_map(|t| Some((t.clone(), t.sidecar.as_ref()?.ticket.clone()?)))
             .collect();
         for (tree, ticket) in merged {
+            let source = tree.sidecar.as_ref().and_then(|s| s.source.clone());
             self.landed.insert(tree.path.clone());
             self.landings.push(Job {
                 key: PathBuf::from(format!("(merge of {})", tree.path.display())),
                 landing: Some(Pick {
                     id: ticket,
                     checkout: self.checkout.clone(),
+                    source,
                 }),
                 ..Job::new(Kind::Land, tree)
             });
@@ -2525,9 +2530,9 @@ impl App {
     }
 
     /// Records that the tree an issue was being chosen for works on issue
-    /// `id`, at once on screen; returns the tree and its record for the
-    /// program to write.
-    pub fn attach(&mut self, id: String) -> Option<(PathBuf, Sidecar)> {
+    /// `id`, in issue source `source`, at once on screen; returns the tree
+    /// and its record for the program to write.
+    pub fn attach(&mut self, id: String, source: String) -> Option<(PathBuf, Sidecar)> {
         let (path, name) = self.attaching.take()?;
         self.is_issues = false;
         // A tree returned while its issue was chosen is free, or someone
@@ -2548,6 +2553,7 @@ impl App {
             .cloned()
             .unwrap_or_else(Sidecar::leased_now);
         record.ticket = Some(id.clone());
+        record.source = Some(source);
         tree.sidecar = Some(Box::new(record.clone()));
         self.message = Some(format!("tree {name} works on {id}"));
         Some((path, record))
@@ -2559,7 +2565,7 @@ impl App {
     }
 
     /// The tree a ticket has been picked up in, by its sidecar.
-    fn tree_of_ticket(&self, id: &str) -> Option<&Tree> {
+    pub fn tree_of_ticket(&self, id: &str) -> Option<&Tree> {
         self.trees.iter().find(|t| {
             t.sidecar
                 .as_ref()
@@ -2568,10 +2574,10 @@ impl App {
         })
     }
 
-    /// Picks up issue `id`, from the Issues screen: a new agent on it in a
-    /// fresh tree, back on the trees. An issue already in a tree is not
+    /// Picks up issue `id`, in issue source `source`, from the Issues screen:
+    /// a new agent on it in a fresh tree, back on the trees. An issue already in a tree is not
     /// picked up twice; the cursor goes to its tree instead.
-    pub fn pick(&mut self, id: String) -> Outcome {
+    pub fn pick(&mut self, id: String, source: String) -> Outcome {
         self.is_issues = false;
         self.attaching = None;
         if let Some(path) = self.tree_of_ticket(&id).map(|t| t.path.clone()) {
@@ -2585,7 +2591,7 @@ impl App {
         self.new_trees += 1;
         let tree = pool::stand_in(PathBuf::from(format!("(new tree {})", self.new_trees)));
         self.message = Some(format!("picking up {id} in a new tree..."));
-        self.start(tree, Launch::pick(id, self.checkout.clone()))
+        self.start(tree, Launch::pick(id, self.checkout.clone(), Some(source)))
     }
 
     /// Opens the port the tree under the cursor serves in the browser, or
@@ -3205,9 +3211,10 @@ mod tests {
         press(&mut app, KeyCode::Char('i'));
         assert!(app.is_issues, "a tree on no issue chooses one");
         assert_eq!(app.choose_issue_for.as_deref(), Some("8"));
-        let (path, record) = app.attach("END-42".into()).unwrap();
+        let (path, record) = app.attach("END-42".into(), "personal".into()).unwrap();
         assert_eq!(path, PathBuf::from("/p/8/app"));
         assert_eq!(record.ticket.as_deref(), Some("END-42"));
+        assert_eq!(record.source.as_deref(), Some("personal"));
         assert!(!app.is_issues, "back on the trees");
         let tree = app.trees.iter().find(|t| t.name == "8").unwrap();
         assert_eq!(
@@ -3216,7 +3223,11 @@ mod tests {
             "shown at once"
         );
         assert_eq!(app.message.as_deref(), Some("tree 8 works on END-42"));
-        assert_eq!(app.attach("END-43".into()), None, "chosen once");
+        assert_eq!(
+            app.attach("END-43".into(), "work".into()),
+            None,
+            "chosen once"
+        );
         press(&mut app, KeyCode::Char('I'));
         assert_eq!(
             app.choose_issue_for.as_deref(),
@@ -3236,10 +3247,13 @@ mod tests {
         select(&mut app, "8");
         press(&mut app, KeyCode::Char('i'));
         assert_eq!(app.choose_issue_for.as_deref(), Some("8"));
-        assert!(matches!(app.pick("END-9".into()), Outcome::Queue(_)));
+        assert!(matches!(
+            app.pick("END-9".into(), "work".into()),
+            Outcome::Queue(_)
+        ));
         app.returned(&PathBuf::from("/p/8/app"));
         assert_eq!(
-            app.attach("END-7".into()),
+            app.attach("END-7".into(), "work".into()),
             None,
             "picking up ended the choice"
         );
@@ -3253,7 +3267,7 @@ mod tests {
         select(&mut app, "8");
         press(&mut app, KeyCode::Char('I'));
         app.returned(&PathBuf::from("/p/8/app"));
-        assert_eq!(app.attach("END-7".into()), None);
+        assert_eq!(app.attach("END-7".into(), "work".into()), None);
         assert_eq!(
             app.message.as_deref(),
             Some("tree 8 has been returned; END-7 was not recorded on it")
@@ -3297,7 +3311,7 @@ mod tests {
         let mut app = app();
         app.checkout = PathBuf::from("/repo");
         app.is_issues = true;
-        let job = queued(app.pick("END-812".into())).remove(0);
+        let job = queued(app.pick("END-812".into(), "work".into())).remove(0);
         assert!(!app.is_issues, "back on the trees");
         let launch = job.launch.unwrap();
         assert!(launch.is_new_tree);
@@ -3306,13 +3320,14 @@ mod tests {
             Some(crate::jobs::Pick {
                 id: "END-812".into(),
                 checkout: PathBuf::from("/repo"),
+                source: Some("work".into()),
             })
         );
         dispatched(&mut app, "/p/8/app", "j1");
         let mut sidecar = *app.trees[2].sidecar.clone().unwrap();
         sidecar.ticket = Some("END-799".into());
         app.apply_sidecars(HashMap::from([(PathBuf::from("/p/8/app"), sidecar)]));
-        assert_eq!(app.pick("end-799".into()), Outcome::Continue);
+        assert_eq!(app.pick("end-799".into(), "work".into()), Outcome::Continue);
         assert_eq!(
             app.current().unwrap().name,
             "8",
@@ -5070,6 +5085,7 @@ mod tests {
         app.checkout = PathBuf::from("/p/main");
         let mut record = Sidecar::leased_now();
         record.ticket = Some("END-1".into());
+        record.source = Some("personal".into());
         app.apply_sidecars(HashMap::from([(PathBuf::from("/p/4/app"), record)]));
         let merged = ship("feature/end-1-a", Stage::Merged, "#12 merged");
         app.apply_ship(ships(&[("/p/8/app", merged.clone())]));
@@ -5084,6 +5100,7 @@ mod tests {
             Some(Pick {
                 id: "END-1".into(),
                 checkout: PathBuf::from("/p/main"),
+                source: Some("personal".into()),
             })
         );
         assert_ne!(job.key, job.tree.path, "the tree stays free for a return");
