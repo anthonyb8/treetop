@@ -263,6 +263,7 @@ An agent plugin answers these ops:
 | `resume` | `id`, or `dir` and optionally `since`, seconds since the epoch | `id` it runs under now; starts a stopped or failed agent again with its conversation and the flags it was started with: job `id`, else the newest one not running that worked in `dir`, written since `since`; Claude Code's runs `claude --bg --resume` with the job's `respawnFlags`, where it was started |
 
 `describe` may also give `screen`, which tells treetop how to type a message into a running agent's chat: the input box is a line starting with `input` between two lines starting with `rule`, and a screen with no input box but one of `dialogs` on it is waiting on an answer.
+Dim text in the box is the chat's own hint, such as Claude Code's for a queued message, and counts as empty.
 One of `away` on the screen's last few lines means the chat has left its agent for a list of other sessions, which `←` in an empty input box opens; treetop keeps `←` from it there, and opens the agent's chat again when it shows.
 Claude Code's is `{"input": "❯", "rule": "─", "dialogs": ["Do you want to", "❯ 1."], "away": ["describe a task for a new session", "enter to return"]}`; without one, treetop types on a timer.
 | `stop` | `id` | nothing; the agent stops and is no longer kept awake |

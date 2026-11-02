@@ -725,6 +725,16 @@ fn is_same_site(asked: &Asked) -> bool {
     }
 }
 
+/// What `treetop send` wrote about why a line did not go: the reason it gave
+/// for the agent, which the phone can act on, over its closing tally.
+fn why_not_sent(stderr: &str) -> &str {
+    let lines = || stderr.lines().rev().filter(|l| !l.trim().is_empty());
+    lines()
+        .find(|l| l.starts_with("not sent to "))
+        .or_else(|| lines().next())
+        .map_or("not sent", |l| l.trim_start_matches("Error: "))
+}
+
 /// Sends a line to the tree's agent the way `treetop send` does, by running
 /// it: the chat is typed into in a terminal of its own, or a cold agent is
 /// started again with the line.
@@ -753,12 +763,7 @@ fn send(pool: &Pool, tree: &str, body: &[u8]) -> Reply {
         ),
         Ok(out) => {
             let why = String::from_utf8_lossy(&out.stderr);
-            let why = why
-                .lines()
-                .rev()
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or("not sent");
-            Reply::error(502, why.trim_start_matches("Error: "))
+            Reply::error(502, why_not_sent(&why))
         }
         Err(err) => Reply::error(500, &format!("could not run treetop send: {err}")),
     }
@@ -823,6 +828,18 @@ fn content_type(file: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_line_not_sent_says_why_rather_than_the_tally() {
+        let stderr = "not sent to pickup in tree 3: a dialog is open in its chat; answer it there\n\
+                      Error: sent to 0 of 1 agent(s)\n";
+        assert_eq!(
+            why_not_sent(stderr),
+            "not sent to pickup in tree 3: a dialog is open in its chat; answer it there"
+        );
+        assert_eq!(why_not_sent("Error: no agent at 3\n"), "no agent at 3");
+        assert_eq!(why_not_sent(""), "not sent");
+    }
 
     #[test]
     fn serve_takes_a_port_and_install_in_either_order() {
