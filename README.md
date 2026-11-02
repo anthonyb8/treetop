@@ -137,7 +137,7 @@ A pid two sources both see counts once, where the more specific source saw it; a
   This gives the session's name and whether it is busy, idle or waiting on you.
   It also reports every background job in `~/.claude/jobs` with no running session as a **cold** agent, drawn `◌`: Enter attaches to it, which starts it again with its conversation kept.
   An agent a plugin reports, running or cold, shows in the tree whose `treetop.json` names its job, else in the tree it last worked in when that was since the tree's lease began, so one started by hand stays on its tree while a tree that has been returned and handed out again never shows the last lease's agent, even one still running.
-  It stays there however long ago it finished; only the inbox forgets a finished job after a day.
+  It stays there however long ago it finished; only the inbox forgets a finished job after a day, and a question a day old whose session has stopped.
   These files are internal to Claude Code, so a release that changes them blanks this source until treetop catches up.
 - **A process** standing in the tree whose name, or the script its interpreter runs, is a known agent: `claude`, `codex`, `aider`, `opencode`, `gemini`, `goose`, `amp` or `cursor-agent`.
   `TREETOP_AGENTS=one,two` adds names. This sees any agent started inside a tree, by name only.
@@ -500,6 +500,7 @@ When an agent comes to need you, or finishes, treetop rings the terminal bell, a
 Under the list, the pane shows the tree under the cursor in full: where it is, who holds it, its agents, ports and processes, everything its agent last said with its latest steps, its PR, and the outcome of its last action.
 Only this workspace's agents open their chat; agents elsewhere are counted in the summary.
 The summary counts the trees that need you, and, as "elsewhere", agents outside the pool waiting on you, which have no row.
+A question more than a day old whose session no longer runs counts nowhere, since its process ended without saying so and nothing is left to answer it.
 These job files are internal to Claude Code, like its session files, so a release that changes them blanks those marks until treetop catches up.
 
 ## After the agent
