@@ -37,6 +37,7 @@ mod scratch;
 mod serve;
 mod ship;
 mod sidecar;
+mod state;
 mod theme;
 mod tickets;
 mod tmux;
@@ -737,6 +738,9 @@ fn show(term: &mut Term, start: PathBuf, mut checkout: PathBuf, is_issues: bool)
         app.checkout = checkout.clone();
         app.user = branch::user();
         app.scratch_root = scratch::root();
+        if let Some(file) = state::asked_file(&checkout) {
+            app.keep_asked_in(file);
+        }
         app.ship_plugins = ship::plugins(&checkout).0;
         app.is_issues = std::mem::take(&mut is_issues);
         if let Some(mut cached) = cache::read(&checkout) {

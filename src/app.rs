@@ -397,6 +397,9 @@ pub struct App {
     /// opened for it or open while it asked, by their chat's command. One
     /// leaves once it stops asking, so its next ask opens again.
     asked: BTreeSet<String>,
+    /// Where `asked` is kept for this workspace, so a switch back or a new
+    /// run does not open an ask already seen. None keeps it in memory only.
+    asked_file: Option<PathBuf>,
     /// Issues a merge has left with nothing blocking them, by id, until
     /// a tree takes one up.
     pub ready: BTreeSet<String>,
@@ -1381,8 +1384,17 @@ impl App {
                 )
             })
             .collect();
+        // Until agents and reports have both been read, an ask still under
+        // way looks finished, and forgetting it would open it again.
+        if !self.is_agents_read || self.last_states.is_none() {
+            return None;
+        }
+        let before = self.asked.len();
         self.asked
             .retain(|key| asks.iter().any(|(.., command)| command.join(" ") == *key));
+        if self.asked.len() != before {
+            self.save_asked();
+        }
         if !self.is_free() {
             return None;
         }
@@ -1390,6 +1402,7 @@ impl App {
             .into_iter()
             .find(|(.., command)| !self.asked.contains(&command.join(" ")))?;
         self.asked.insert(command.join(" "));
+        self.save_asked();
         if !self.visible().iter().any(|t| t.path == path) {
             self.filter.clear();
             let group = self
@@ -1412,8 +1425,22 @@ impl App {
     /// The chat running `command` is on screen, so whatever its agent asks
     /// now has been seen and does not open again when it closes.
     pub fn saw_chat(&mut self, command: &[String]) {
-        if self.asks().iter().any(|(.., c)| c.as_slice() == command) {
-            self.asked.insert(command.join(" "));
+        if self.asks().iter().any(|(.., c)| c.as_slice() == command)
+            && self.asked.insert(command.join(" "))
+        {
+            self.save_asked();
+        }
+    }
+
+    /// Keeps the asks seen in `file`, starting from those it already holds.
+    pub fn keep_asked_in(&mut self, file: PathBuf) {
+        self.asked = crate::state::read_asked(&file);
+        self.asked_file = Some(file);
+    }
+
+    fn save_asked(&self) {
+        if let Some(file) = &self.asked_file {
+            crate::state::write_asked(file, &self.asked);
         }
     }
 
@@ -4791,10 +4818,48 @@ mod tests {
             ..attachable("asks")
         };
         app.apply_agents(&HashMap::from([(PathBuf::from("/p/8/app"), vec![asking])]));
+        app.apply_reports(Vec::new());
         app.filter = "end-1".into();
         assert_eq!(chat_of(app.next_ask()).as_deref(), Some("asks"));
         assert!(app.filter.is_empty());
         assert_eq!(app.current().unwrap().name, "8");
+    }
+
+    #[test]
+    fn an_ask_seen_before_a_workspace_switch_stays_shut_on_coming_back() {
+        let file = std::env::temp_dir()
+            .join(format!("treetop-asked-{}", std::process::id()))
+            .join("asked-app.json");
+        let _ = std::fs::remove_file(&file);
+        let waiting = || {
+            HashMap::from([(
+                PathBuf::from("/p/8/app"),
+                vec![Agent {
+                    status: Some(Status::Waiting),
+                    ..attachable("asks")
+                }],
+            )])
+        };
+        let mut app = app();
+        app.keep_asked_in(file.clone());
+        app.apply_agents(&waiting());
+        app.apply_reports(Vec::new());
+        assert_eq!(chat_of(app.next_ask()).as_deref(), Some("asks"));
+
+        // Coming back builds the workspace afresh.
+        let mut back = tests::app();
+        back.keep_asked_in(file.clone());
+        assert_eq!(back.next_ask(), None, "nothing is read yet");
+        back.apply_agents(&waiting());
+        back.apply_reports(Vec::new());
+        assert_eq!(back.next_ask(), None, "already seen, it stays shut");
+
+        // Once it stops asking, its next ask opens again.
+        back.apply_agents(&HashMap::new());
+        assert_eq!(back.next_ask(), None);
+        back.apply_agents(&waiting());
+        assert_eq!(chat_of(back.next_ask()).as_deref(), Some("asks"));
+        let _ = std::fs::remove_file(&file);
     }
 
     #[test]

@@ -490,7 +490,8 @@ Leaving a chat with Ctrl+Q opens the next ask, so once you are done with other w
 Each ask opens once: one you have seen, opened for you or asked while its chat was open, stays shut until that agent asks something new, and its row keeps its `●` for Enter.
 A finished agent never opens, nor does a busy one whose last report still asks, nor one with no chat here, such as `claude` in a tmux pane.
 A filter that hides the asking tree is cleared, so the cursor lands on it.
-Opening treetop, or coming back to a workspace, opens what is waiting there.
+Opening treetop, or coming back to a workspace, opens only what is waiting there that you have not seen yet.
+What you have seen is kept per workspace under `$XDG_STATE_HOME/treetop` (else `~/.local/state/treetop`), so neither a switch nor a restart opens it again.
 
 When an agent comes to need you, or finishes, treetop rings the terminal bell, and inside tmux shows it in the status line for five seconds, so it is heard from any window; the assistant finishing an answer rings it too.
 
