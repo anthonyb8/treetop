@@ -388,6 +388,9 @@ pub struct App {
     /// How much of the plan the agents run on is used, as the last agent
     /// plugin that could say reported it.
     pub usage: Option<Usage>,
+    /// How many commits the main checkout sits behind its upstream, left
+    /// there because it has work of its own or a busy agent.
+    pub behind: usize,
     /// Each tree's stage at the last ask, so a change can be announced; None
     /// until the first ask, which announces nothing.
     last_stages: Option<HashMap<PathBuf, Stage>>,
@@ -1429,6 +1432,22 @@ impl App {
             && self.asked.insert(command.join(" "))
         {
             self.save_asked();
+        }
+    }
+
+    /// Takes where the main checkout stands after a catch-up, and says so on
+    /// the status line when it moved.
+    pub fn apply_base(&mut self, standing: crate::base::Standing) {
+        self.behind = standing.behind();
+        if let crate::base::Standing::Forwarded(n) = standing {
+            let branch = self
+                .trees
+                .iter()
+                .find(|t| t.is_main)
+                .and_then(|t| t.branch.clone())
+                .unwrap_or_else(|| "main checkout".into());
+            let commits = if n == 1 { "commit" } else { "commits" };
+            self.message = Some(format!("{branch} fast-forwarded {n} {commits}"));
         }
     }
 

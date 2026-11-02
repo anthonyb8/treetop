@@ -10,6 +10,7 @@ mod actions;
 mod agents;
 mod app;
 mod assistant;
+mod base;
 mod branch;
 mod builtin;
 mod cache;
@@ -292,6 +293,7 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                     }
                 }
                 Update::Usage(usage) => app.usage = usage,
+                Update::Base(standing) => app.apply_base(standing),
                 Update::Agents(agents) => {
                     app.apply_agents(&agents);
                     let live: Vec<&Vec<String>> = agents

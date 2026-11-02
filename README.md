@@ -79,6 +79,9 @@ The assistant is never a tree's agent.
 Its mark is `●` in bold when the tree's agent needs you, `✓` when it is done and `✗` when its process died, as on a restart (see [What agents say](#what-agents-say)), else the agent's own status: `●` busy, `○` idle, `◌` cold.
 The list is in groups, each under a heading with a blank line above it: a group per base the held trees were cut from (see [New agents](#new-agents)), the pool's base first and the rest by name, then the free trees, then Parked.
 The repository's main checkout is no row of its own: it heads its branch's group, `main · main checkout`, with its ports, agent and git state.
+treetop keeps it on its upstream: it fetches every five minutes, and whenever the shared refs move, as an agent's fetch or push moves them, it fast-forwards the checkout and says so on the status line.
+It only ever fast-forwards, and only a checkout on a branch with an upstream, with no tracked changes, no commits of its own and no agent busy in it; one it leaves shows how far behind it is as `⇣25` in its git state.
+`treetop serve` does the same, so the checkout keeps up while no terminal has treetop open.
 Work happens in trees, but `n` on that heading starts an agent in the main checkout itself, on whatever it has checked out and with no branch named for it, for work that needs no tree; Enter on the heading then opens its chat rather than folding the group.
 The assistant is never shown there, and neither is a stopped session, since sessions run there in place are not its agent.
 Within a group, trees waiting on you come first, then those with the most recently active agent, so trees nobody has worked in for a while sink to the bottom.

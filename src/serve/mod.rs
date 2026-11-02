@@ -176,6 +176,7 @@ impl Pool {
                 app.apply_ship(answer);
             }
             Update::Usage(usage) => app.usage = usage,
+            Update::Base(standing) => app.apply_base(standing),
             Update::Agents(agents) => app.apply_agents(&agents),
         }
         // Pushes are judged once the pool has been read in full: agents,

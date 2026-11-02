@@ -348,8 +348,15 @@ fn freshness(app: &App) -> Span<'static> {
 /// no remote, `+` staged, `!` unstaged and `?` untracked files, each only
 /// when there are some. Nothing for a clean tree.
 fn git_spans(work: Work) -> Vec<Span<'static>> {
+    behind_spans(work, 0)
+}
+
+/// `git_spans` with the commits the tree sits behind its upstream first, as
+/// `⇣`, which only the main checkout tracks.
+fn behind_spans(work: Work, behind: usize) -> Vec<Span<'static>> {
     let t = theme();
     [
+        ("⇣", behind, t.info),
         ("⇡", work.unpushed, t.success),
         ("+", work.staged, t.warning),
         ("!", work.unstaged, t.warning),
@@ -371,11 +378,11 @@ fn git_spans(work: Work) -> Vec<Span<'static>> {
 /// The tree's git state, blank when clean or available, and `─`, as
 /// Powerlevel10k writes an unknown count, where git could not read a held
 /// tree.
-fn git_cell(tree: &Tree) -> Cell<'static> {
+fn git_cell(tree: &Tree, behind: usize) -> Cell<'static> {
     match tree.work {
         None if tree.is_held() => Cell::from("─").style(fg(theme().warning)),
         None => Cell::from(""),
-        Some(work) => Cell::from(Line::from(git_spans(work))),
+        Some(work) => Cell::from(Line::from(behind_spans(work, behind))),
     }
 }
 
@@ -519,7 +526,7 @@ fn row(app: &App, tree: &Tree) -> Row<'static> {
         branch,
         agent_cell(app, tree),
         ports_cell(tree),
-        git_cell(tree),
+        git_cell(tree, 0),
     ];
     if app.is_shipping() {
         cells.push(pr_cell(tree));
@@ -646,7 +653,7 @@ fn heading_row(
     ];
     if let Some(main) = main {
         cells.push(ports_cell(main));
-        cells.push(git_cell(main));
+        cells.push(git_cell(main, app.behind));
     }
     Row::new(cells)
 }
