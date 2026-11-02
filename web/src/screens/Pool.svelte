@@ -1,9 +1,11 @@
 <script lang="ts">
   import { flip } from "svelte/animate";
-  import { ApiError, fetchPool, fetchWorkspaces, type Pool } from "../api";
+  import { ApiError, fetchPool, fetchWorkspaces, park, type Card as CardData, type Pool } from "../api";
   import Card from "../components/Card.svelte";
   import GitCounts from "../components/GitCounts.svelte";
   import Notifications from "../components/Notifications.svelte";
+  import PortButton from "../components/PortButton.svelte";
+  import SwipeRow from "../components/SwipeRow.svelte";
   import { chooseWorkspace, link, nav } from "../nav.svelte";
   import { remember, recall } from "../store";
 
@@ -18,6 +20,7 @@
   let failure = $state<string | null>(null);
   let isLoading = $state(false);
   let isParkedOpen = $state(false);
+  let parkFailure = $state<string | null>(null);
   let pulled = $state(0);
   let scroller: HTMLElement | undefined = $state();
 
@@ -49,6 +52,17 @@
       if (nav.workspace && !list.workspaces.includes(nav.workspace)) nav.workspace = null;
     } catch {
       // The pool's own failure says why; the switcher just stays as it was.
+    }
+  }
+
+  /** Parks a card or brings it back; the row stays gone once the pool says so. */
+  async function swipeAside(card: CardData) {
+    parkFailure = null;
+    try {
+      await park(nav.workspace, card.tree, !card.parked);
+      await load();
+    } catch (err) {
+      parkFailure = err instanceof ApiError ? err.message : "It did not go through";
     }
   }
 
@@ -134,6 +148,7 @@
   {:else if pool?.is_stale}
     <p class="banner quiet" role="status">Listing the pool…</p>
   {/if}
+  {#if parkFailure}<p class="banner failed" role="alert">{parkFailure}</p>{/if}
 
   <main
     bind:this={scroller}
@@ -170,7 +185,9 @@
           <h2 class="loud">Needs you</h2>
           <div class="stack">
             {#each pool.needs_you as card (card.tree)}
-              <div animate:flip={{ duration: 250 }}><Card {card} loud /></div>
+              <div animate:flip={{ duration: 250 }}>
+                <SwipeRow label="Park" isRounded onswipe={() => swipeAside(card)}><Card {card} loud /></SwipeRow>
+              </div>
             {/each}
           </div>
         </section>
@@ -185,14 +202,16 @@
                 <span class="checkout">
                   main checkout
                   <GitCounts git={group.checkout.git} />
-                  {#each group.checkout.ports as port (port)}<span class="mono port">:{port}</span>{/each}
+                  {#each group.checkout.ports as port (port)}<PortButton {port} />{/each}
                 </span>
               {/if}
             </h2>
             {#if group.cards.length}
               <div class="list">
                 {#each group.cards as card (card.tree)}
-                  <div animate:flip={{ duration: 250 }}><Card {card} /></div>
+                  <div animate:flip={{ duration: 250 }}>
+                    <SwipeRow label="Park" onswipe={() => swipeAside(card)}><Card {card} /></SwipeRow>
+                  </div>
                 {/each}
               </div>
             {/if}
@@ -217,7 +236,9 @@
           </button>
           {#if isParkedOpen}
             <div class="list">
-              {#each pool.parked as card (card.tree)}<Card {card} />{/each}
+              {#each pool.parked as card (card.tree)}
+                <SwipeRow label="Unpark" onswipe={() => swipeAside(card)}><Card {card} /></SwipeRow>
+              {/each}
             </div>
           {/if}
         {/if}
@@ -301,7 +322,7 @@
     font-size: 16px;
   }
   footer {
-    padding: 12px 16px calc(var(--safe-bottom) + 12px);
+    padding: 8px 16px var(--bottom);
     border-top: 1px solid var(--bg-high);
     background: var(--bg);
   }
@@ -310,7 +331,7 @@
     align-items: center;
     justify-content: center;
     gap: 8px;
-    min-height: 50px;
+    min-height: 46px;
     border-radius: 12px;
     background: var(--green);
     color: var(--on-accent);
@@ -323,6 +344,10 @@
     font-size: 13px;
     background: var(--yellow-bg);
     color: var(--yellow);
+  }
+  .banner.failed {
+    background: var(--red-bg);
+    color: var(--red);
   }
   .banner.quiet {
     background: var(--bg-raised);
@@ -390,13 +415,10 @@
   .checkout {
     display: flex;
     gap: 8px;
-    align-items: baseline;
+    align-items: center;
     font-weight: 400;
     letter-spacing: 0;
     text-transform: none;
-  }
-  .port {
-    color: var(--blue);
   }
   .stack {
     display: flex;

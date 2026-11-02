@@ -50,6 +50,8 @@ export interface Card {
   more: number;
   says: string | null;
   needs_you: boolean;
+  /** Set aside under Parked. */
+  parked: boolean;
   /** "unknown" where git could not read a held tree; null for a free one. */
   git: Git | "unknown" | null;
   ports: number[];
@@ -265,6 +267,16 @@ export function resume(workspace: string | null, tree: string): Promise<void> {
 /** Gives the tree back to the pool, stopping its agents. */
 export function giveBack(workspace: string | null, tree: string): Promise<void> {
   return post<void>(`/api/trees/${encodeURIComponent(tree)}/return${workspaceQuery(workspace)}`, {});
+}
+
+/** Sets the tree aside under Parked, or brings it back. */
+export function park(workspace: string | null, tree: string, parked: boolean): Promise<void> {
+  return post<void>(`/api/trees/${encodeURIComponent(tree)}/park${workspaceQuery(workspace)}`, { parked });
+}
+
+/** Shares a port a tree serves with the phone, and says where to reach it. */
+export function sharePort(workspace: string | null, port: number): Promise<{ url: string }> {
+  return post<{ url: string }>(`/api/ports/${port}/share${workspaceQuery(workspace)}`, {});
 }
 
 /** The server's key a browser subscribes to pushes with; null when it sends none. */

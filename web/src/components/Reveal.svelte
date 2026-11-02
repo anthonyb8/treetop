@@ -1,46 +1,69 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import { markdown } from "../markdown";
+  import { eased, FADE_MS, pace } from "../pace";
 
   /**
-   * A reply from Claude, written out word by word when it is new, as a
-   * chat with Claude reads. Claude Code writes a reply to its transcript
-   * once it is finished, so this paces the finished reply rather than
-   * following it as it is made: at a reading pace, and never more than a
-   * few seconds however long the reply; none at all for a reader who asked
-   * for less motion.
+   * A reply from Claude, written out when it is new, as a chat with Claude
+   * reads. Claude Code writes a reply to its transcript once it is finished,
+   * so this paces the finished reply: the whole of it is laid out from the
+   * start, each word fades up in turn, and the box opens as the words reach
+   * each line. Nothing reflows, half-written Markdown never shows, and the
+   * browser runs the fades itself, so a busy page does not stutter them.
+   * None of it for a reader who asked for less motion.
    */
-  let { text, isNew, ongrow }: { text: string; isNew: boolean; ongrow?: () => void } = $props();
+  let {
+    text,
+    isNew,
+    longest,
+    ondone,
+  }: { text: string; isNew: boolean; longest: number; ondone?: () => void } = $props();
 
-  const LONGEST_MS = 4000;
-  const WORDS_PER_SECOND = 25;
+  /** How long the box takes to close most of the way to the next line. */
+  const OPEN_MS = 90;
 
-  let shown = $state("");
+  const paced = untrack(() => (isNew ? pace(markdown(text), longest) : null));
+  let isWriting = $state(paced !== null);
+  let box: HTMLElement | undefined = $state();
 
   $effect(() => {
-    const full = text;
-    const isStill = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    if (!isNew || isStill) {
-      shown = full;
-      return;
-    }
-    // Words with the spaces after them, so the text builds as it will end.
-    const words = full.match(/\S+\s*/g) ?? [full];
-    const perSecond = Math.max(WORDS_PER_SECOND, (words.length * 1000) / LONGEST_MS);
+    if (!paced || !box) return;
+    const prose = box;
+    const top = prose.getBoundingClientRect().top;
+    // Where the text ends as each word comes up.
+    const marks = [...prose.querySelectorAll<HTMLElement>(".word")].map((word) => ({
+      at: parseFloat(word.style.getPropertyValue("--at")),
+      bottom: word.getBoundingClientRect().bottom - top,
+    }));
+    const full = prose.scrollHeight;
     const started = performance.now();
+    let last = started;
+    let height = 0;
+    let target = 0;
+    let next = 0;
     let frame = 0;
     const step = (now: number) => {
-      const count = Math.min(words.length, Math.ceil(((now - started) / 1000) * perSecond));
-      shown = words.slice(0, count).join("");
-      ongrow?.();
-      if (count < words.length) frame = requestAnimationFrame(step);
-      else shown = full;
+      const elapsed = now - started;
+      while (next < marks.length && (marks[next]?.at ?? 0) <= elapsed) target = marks[next++]?.bottom ?? target;
+      if (next === marks.length) target = full;
+      height += (target - height) * eased(now - last, OPEN_MS);
+      last = now;
+      prose.style.height = `${height}px`;
+      if (elapsed >= paced.ms + FADE_MS && target - height < 0.5) {
+        isWriting = false;
+        ondone?.();
+      } else {
+        frame = requestAnimationFrame(step);
+      }
     };
     frame = requestAnimationFrame(step);
     return () => cancelAnimationFrame(frame);
   });
 </script>
 
-<div class="prose" class:writing={shown.length < text.length}>{@html markdown(shown)}</div>
+<div class="prose" class:writing={isWriting} style:height={isWriting ? "0" : null} style:--fade="{FADE_MS}ms" bind:this={box}>
+  {@html isWriting && paced ? paced.html : markdown(text)}
+</div>
 
 <style>
   .prose {
@@ -95,16 +118,16 @@
   .prose :global(strong) {
     color: var(--fg-strong);
   }
-  /* A caret at the end while the reply is still being written out. */
-  .writing :global(> :last-child)::after {
-    content: "";
-    display: inline-block;
-    width: 0.5em;
-    height: 1em;
-    margin-left: 2px;
-    vertical-align: -0.15em;
-    border-radius: 2px;
-    background: var(--orange);
-    opacity: 0.8;
+  .writing {
+    overflow: hidden;
+  }
+  .writing :global(.word) {
+    opacity: 0;
+    animation: word var(--fade) ease-out var(--at) forwards;
+  }
+  @keyframes -global-word {
+    to {
+      opacity: 1;
+    }
   }
 </style>

@@ -2,13 +2,15 @@
   import { tick } from "svelte";
   import { cubicOut } from "svelte/easing";
   import { SvelteSet } from "svelte/reactivity";
-  import { fly } from "svelte/transition";
+  import { fly, slide } from "svelte/transition";
   import { answer, ApiError, chatUrl, fetchTree, sendLine, type Answer, type ChatMessage, type Tree } from "../api";
   import Mark from "../components/Mark.svelte";
+  import PortButton from "../components/PortButton.svelte";
   import PromptCard from "../components/PromptCard.svelte";
   import Reveal from "../components/Reveal.svelte";
   import Working from "../components/Working.svelte";
   import { back, nav } from "../nav.svelte";
+  import { eased } from "../pace";
   import { recall, remember } from "../store";
 
   let { name }: { name: string } = $props();
@@ -27,6 +29,11 @@
   /** Messages that came in while the chat was open, which ease in; those
    * shown on opening are just there. */
   const fresh = new SvelteSet<string>();
+  /** Replies being written out. What came after one waits for it, so a
+   * burst from the transcript reads in the order it happened. */
+  const writing = new SvelteSet<string>();
+  /** The time a reply may take, shared when several are waiting. */
+  const LONGEST_MS = 4000;
   const isStill = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   function arrive(id: string) {
     return { y: 10, duration: fresh.has(id) && !isStill ? 240 : 0, easing: cubicOut };
@@ -39,9 +46,15 @@
   let opened = $state<Set<string>>(new Set());
   let unseen = $state(0);
   let scroller: HTMLElement | undefined = $state();
+  let thread: HTMLElement | undefined = $state();
   let footerHeight = $state(76);
   let isAtEnd = true;
   let nextId = 0;
+
+  let shown = $derived.by(() => {
+    const at = messages.findIndex((m) => writing.has(m.id));
+    return at < 0 ? messages : messages.slice(0, at + 1);
+  });
 
   // Following the conversation: the transcript's last messages first, then
   // each new one as it is written. A dropped connection comes back by
@@ -63,14 +76,15 @@
         isLive = true;
         isGone = false;
         refusals = 0;
-        settle();
         void stickToEnd(true);
       });
       source.addEventListener("message", (event) => {
         const message = JSON.parse((event as MessageEvent<string>).data) as ChatMessage;
+        const isYours = isPending(message);
         const isNew = take(message);
-        if (isNew) fresh.add(message.id);
-        settle();
+        // Your line is on screen already; it settles in place.
+        if (isNew && !isYours) fresh.add(message.id);
+        if (isNew && message.kind === "claude" && !isStill) writing.add(message.id);
         void stickToEnd(false, isNew);
       });
       source.onopen = () => {
@@ -132,22 +146,67 @@
     return true;
   }
 
-  /** Lines the transcript now shows are no longer pending. */
-  function settle() {
-    const said = messages.filter((m) => m.kind === "you").map((m) => m.text?.trim());
-    pending = pending.filter((p) => p.state === "failed" || !said.includes(p.text.trim()));
+  function isPending(message: ChatMessage): boolean {
+    return message.kind === "you" && pending.some((p) => p.text.trim() === message.text?.trim());
   }
+
+  // Lines the conversation now shows are no longer pending.
+  $effect(() => {
+    const said = shown.filter((m) => m.kind === "you").map((m) => m.text?.trim());
+    const left = pending.filter((p) => p.state === "failed" || !said.includes(p.text.trim()));
+    if (left.length !== pending.length) pending = left;
+  });
 
   async function stickToEnd(always: boolean, isNew = true) {
     const wasAtEnd = isAtEnd;
     await tick();
     if (!scroller) return;
-    if (always || wasAtEnd) {
+    if (always) {
       scroller.scrollTop = scroller.scrollHeight;
+      unseen = 0;
+    } else if (wasAtEnd) {
       unseen = 0;
     } else if (isNew) {
       unseen += 1;
     }
+  }
+
+  /** How long the chat takes to close most of the way to its end. */
+  const FOLLOW_MS = 110;
+  let following = 0;
+  let isTouching = false;
+
+  // A chat at its end glides after what grows under it, rather than jumping
+  // a line at a time. A finger on the screen has the scroll to itself.
+  function follow() {
+    if (following || !scroller) return;
+    let last = performance.now();
+    const step = (now: number) => {
+      following = 0;
+      if (!scroller || !isAtEnd || isTouching) return;
+      const gap = scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop;
+      if (gap < 1) return;
+      scroller.scrollTop += Math.max(1, gap * eased(now - last, FOLLOW_MS));
+      last = now;
+      following = requestAnimationFrame(step);
+    };
+    following = requestAnimationFrame(step);
+  }
+
+  $effect(() => {
+    if (!thread) return;
+    const observer = new ResizeObserver(() => follow());
+    observer.observe(thread);
+    return () => {
+      observer.disconnect();
+      cancelAnimationFrame(following);
+      following = 0;
+    };
+  });
+
+  function onTouchEnd() {
+    isTouching = false;
+    follow();
   }
 
   // The conversation's box shrinks when a question comes in under it: a
@@ -175,11 +234,6 @@
     if (isNearEnd) isAtEnd = true;
     else if (wentUp) isAtEnd = false;
     if (isAtEnd) unseen = 0;
-  }
-
-  /** A reply being written out grows the conversation; one at its end stays there. */
-  function followGrowth() {
-    if (isAtEnd && scroller) scroller.scrollTop = scroller.scrollHeight;
   }
 
   function toEnd() {
@@ -261,7 +315,7 @@
   let promptMessage = $derived.by(() => {
     if (!isWaiting) return null;
     let last: ChatMessage | undefined;
-    for (let i = messages.length - 1; i >= 0 && !last; i--) if (messages[i]?.kind === "tool") last = messages[i];
+    for (let i = shown.length - 1; i >= 0 && !last; i--) if (shown[i]?.kind === "tool") last = shown[i];
     return last?.tool?.status === "running" && last.id !== answeredId ? last : null;
   });
   let promptTool = $derived(promptMessage?.tool ? { ...promptMessage.tool, id: promptMessage.id } : null);
@@ -289,7 +343,7 @@
   let working = $derived.by(() => {
     if (!card || isWaiting || promptTool) return null;
     if (!isBusy && tree?.report?.state !== "working") return null;
-    const last = messages.at(-1);
+    const last = shown.at(-1);
     if (last?.kind === "tool" && last.tool?.status === "running") {
       return { step: doing(last.tool.verb, last.tool.what) };
     }
@@ -332,23 +386,42 @@
         <span>{tree?.agents[0]?.name ?? "agent"}{isLive ? "" : " · connecting…"}</span>
       </div>
     </div>
+    {#if tree?.ports.length}
+      <div class="ports">
+        {#each tree.ports as port (port.port)}<PortButton port={port.port} />{/each}
+      </div>
+    {/if}
   </header>
 
-  <main bind:this={scroller} onscroll={onScroll} aria-label="Conversation" aria-live="polite">
+  <main
+    bind:this={scroller}
+    onscroll={onScroll}
+    ontouchstart={() => (isTouching = true)}
+    ontouchend={onTouchEnd}
+    ontouchcancel={onTouchEnd}
+    aria-label="Conversation"
+    aria-live="polite"
+  >
     {#if isGone}
       <p class="empty">This agent has no conversation treetop can read.</p>
     {:else if !isLive && messages.length === 0}
       <div class="empty" aria-busy="true">Opening the conversation…</div>
     {/if}
-    {#each messages as message (message.id)}
+    <div class="thread" bind:this={thread}>
+    {#each shown as message (message.id)}
       {#if message.kind === "you"}
         <div class="you" in:fly={arrive(message.id)}>
           <div class="bubble">{message.text}</div>
           <span class="at">{time(message.at)}</span>
         </div>
       {:else if message.kind === "claude"}
-        <div class="claude" in:fly={arrive(message.id)}>
-          <Reveal text={message.text ?? ""} isNew={fresh.has(message.id)} ongrow={followGrowth} />
+        <div class="claude">
+          <Reveal
+            text={message.text ?? ""}
+            isNew={writing.has(message.id)}
+            longest={LONGEST_MS / Math.max(1, writing.size)}
+            ondone={() => writing.delete(message.id)}
+          />
         </div>
       {:else if message.kind === "tool" && message.tool}
         {@const tool = message.tool}
@@ -383,7 +456,10 @@
         {/if}
       </div>
     {/each}
-    {#if working}<Working step={working.step} />{/if}
+    {#if working}
+      <div transition:slide={{ duration: isStill ? 0 : 180 }}><Working step={working.step} /></div>
+    {/if}
+    </div>
   </main>
 
   {#if unseen > 0}
@@ -485,11 +561,22 @@
     overscroll-behavior: contain;
     display: flex;
     flex-direction: column;
-    gap: 12px;
     padding: 14px 14px 12px;
   }
   main > :global(*) {
     flex-shrink: 0;
+  }
+  .thread {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .ports {
+    flex: none;
+    display: flex;
+    gap: 6px;
+    max-width: 45%;
+    overflow-x: auto;
   }
   .empty {
     margin: auto;
@@ -641,7 +728,7 @@
     display: flex;
     flex-direction: column;
     gap: 8px;
-    padding: 8px 12px calc(var(--safe-bottom) + 10px);
+    padding: 8px 12px var(--bottom);
     border-top: 1px solid var(--bg-high);
     background: var(--bg);
   }

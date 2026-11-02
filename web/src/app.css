@@ -25,6 +25,14 @@
   --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
   --safe-top: env(safe-area-inset-top, 0px);
   --safe-bottom: env(safe-area-inset-bottom, 0px);
+  /* What a screen leaves under its footer: enough to clear the home
+     indicator, not the whole inset, which reads as a gap. */
+  --bottom: max(8px, calc(var(--safe-bottom) - 12px));
+}
+
+/* The keyboard covers the indicator, so a footer sits right on it. */
+:root:has(textarea:focus, input:focus) {
+  --bottom: 8px;
 }
 
 * {

@@ -4,6 +4,7 @@
   import { ago } from "../time";
   import GitCounts from "./GitCounts.svelte";
   import Mark from "./Mark.svelte";
+  import PortButton from "./PortButton.svelte";
   import PrBadge from "./PrBadge.svelte";
 
   let { card, loud = false }: { card: Card; loud?: boolean } = $props();
@@ -20,7 +21,8 @@
   );
 </script>
 
-<a class="card" class:loud href="/trees/{encodeURIComponent(card.tree)}" onclick={link} aria-label="tree {card.tree}">
+<div class="card" class:loud>
+  <a class="open" href="/trees/{encodeURIComponent(card.tree)}" onclick={link} aria-label="tree {card.tree}">
   <div class="top">
     <Mark mark={card.mark} />
     <span class="tree mono">{card.tree}</span>
@@ -35,26 +37,40 @@
       {#if card.active_ago !== null}<span class="when">{ago(card.active_ago)}</span>{/if}
     </div>
   {/if}
+  </a>
   {#if hasMeta}
     <div class="meta">
       <GitCounts git={card.git} />
-      {#each card.ports as port (port)}<span class="mono port">:{port}</span>{/each}
+      {#each card.ports as port (port)}<PortButton {port} />{/each}
       {#if loud && card.active_ago !== null}<span class="when">{ago(card.active_ago)}</span>{/if}
     </div>
   {/if}
-</a>
+</div>
 
 <style>
   .card {
-    color: inherit;
+    position: relative;
     display: flex;
     flex-direction: column;
     gap: 6px;
     padding: 14px;
     min-width: 0;
   }
-  .card:active {
+  .card:has(.open:active) {
     background: var(--bg-high);
+  }
+  .open {
+    color: inherit;
+    display: flex;
+    flex-direction: column;
+    gap: inherit;
+    min-width: 0;
+  }
+  /* The whole card opens its tree, but for the ports on it. */
+  .open::after {
+    content: "";
+    position: absolute;
+    inset: 0;
   }
   .loud {
     gap: 8px;
@@ -121,12 +137,12 @@
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 4px 12px;
+    gap: 4px 8px;
     font-size: 12px;
     color: var(--muted);
   }
-  .port {
-    color: var(--blue);
+  .meta :global(.port) {
+    z-index: 1;
   }
   .when {
     flex: none;

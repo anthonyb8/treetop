@@ -1,7 +1,8 @@
 <script lang="ts">
-  import { ApiError, fetchTree, giveBack, resume, type ReportState, type Tree } from "../api";
+  import { ApiError, fetchTree, giveBack, park, resume, type ReportState, type Tree } from "../api";
   import GitCounts from "../components/GitCounts.svelte";
   import Mark from "../components/Mark.svelte";
+  import PortButton from "../components/PortButton.svelte";
   import PrBadge from "../components/PrBadge.svelte";
   import { back, go, link, nav } from "../nav.svelte";
   import { ago } from "../time";
@@ -56,7 +57,7 @@
   }
 
   /** The action under way, and why the last one failed. */
-  let doing = $state<"resume" | "return" | null>(null);
+  let doing = $state<"resume" | "return" | "park" | null>(null);
   let actionFailure = $state<string | null>(null);
   let isConfirming = $state(false);
 
@@ -80,6 +81,20 @@
     }
   }
 
+  async function togglePark() {
+    if (!tree) return;
+    doing = "park";
+    actionFailure = null;
+    try {
+      await park(nav.workspace, name, !tree.card.parked);
+      await load();
+    } catch (err) {
+      actionFailure = err instanceof ApiError ? err.message : "It did not go through";
+    } finally {
+      doing = null;
+    }
+  }
+
   let card = $derived(tree?.card);
   // An agent that is not running can be started again with its
   // conversation; one that is has nothing to resume.
@@ -95,11 +110,18 @@
 
 <div class="screen">
   <header>
-    <button type="button" class="back" onclick={back}>
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-        stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 18l-6-6 6-6" /></svg>
-      Pool
-    </button>
+    <div class="bar">
+      <button type="button" class="back" onclick={back}>
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+          stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 18l-6-6 6-6" /></svg>
+        Pool
+      </button>
+      {#if card}
+        <button type="button" class="back" disabled={doing !== null} onclick={togglePark}>
+          {card.parked ? "Unpark" : "Park"}
+        </button>
+      {/if}
+    </div>
     <div class="name">
       <span class="number mono">{name}</span>
       <h1>{card?.title ?? card?.branch ?? `tree ${name}`}</h1>
@@ -185,7 +207,7 @@
           <span class="key">Ports</span>
           <span class="value list">
             {#each tree.ports as port (port.port)}
-              <span class="mono"><span class="port">:{port.port}</span> {port.process}</span>
+              <PortButton port={port.port} process={port.process} />
             {:else}
               <span class="muted">none</span>
             {/each}
@@ -301,8 +323,15 @@
     padding: calc(var(--safe-top) + 4px) 16px 14px;
     background: var(--bg-raised);
   }
+  .bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .back:disabled {
+    opacity: 0.6;
+  }
   .back {
-    align-self: flex-start;
     display: flex;
     align-items: center;
     gap: 2px;
@@ -348,7 +377,7 @@
     display: flex;
     flex-direction: column;
     gap: 14px;
-    padding: 16px 16px calc(var(--safe-bottom) + 24px);
+    padding: 16px;
   }
   section {
     border-radius: 14px;
@@ -457,8 +486,8 @@
     align-items: center;
     gap: 12px;
   }
-  .port {
-    color: var(--blue);
+  .value.list :global(.port) {
+    align-self: flex-start;
   }
   .muted {
     color: var(--muted);
@@ -505,7 +534,7 @@
     display: flex;
     flex-direction: column;
     gap: 8px;
-    padding: 12px 16px calc(var(--safe-bottom) + 12px);
+    padding: 8px 16px var(--bottom);
     border-top: 1px solid var(--bg-high);
   }
   .actions {
@@ -558,7 +587,7 @@
     display: flex;
     flex-direction: column;
     gap: 10px;
-    padding: 20px 16px calc(var(--safe-bottom) + 16px);
+    padding: 20px 16px calc(var(--bottom) + 8px);
     border-radius: 18px 18px 0 0;
     background: var(--bg-raised);
     box-shadow: 0 -8px 24px rgb(0 0 0 / 0.4);
