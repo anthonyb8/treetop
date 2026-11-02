@@ -38,10 +38,10 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 
 | Key | Does |
 |---|---|
-| Enter | open the agent of the tree under the cursor: its chat in a popup, starting a cold one again, else the tree itself (see [Agent chats](#agent-chats) and [Entering a tree](#entering-a-tree)); on a group's heading, fold the group or open it again |
+| Enter | open the agent of the tree under the cursor: its chat in a popup, starting a cold one again, else the tree itself (see [Agent chats](#agent-chats) and [Entering a tree](#entering-a-tree)); on a group's heading, fold the group or open it again, and on the main checkout's, open the chat of its agent when it has one |
 | `t` | go to the tree itself, even when its agent has a chat: its tmux pane or a window in it, else a shell there (see [Entering a tree](#entering-a-tree)) |
-| `n` | start a new agent in a fresh tree, on a branch named for the task (see [New agents](#new-agents)) |
-| `N` | start a new agent in the tree under the cursor: a free one is leased for it, on a branch named for the task, and a held one keeps its branch |
+| `n` | start a new agent in the tree under the cursor: a free one is leased for it, on a branch named for the task, and a held one keeps its branch; on the main checkout's heading, start one in the main checkout, for work that needs no tree |
+| `N` | start a new agent in a fresh tree, on a branch named for the task (see [New agents](#new-agents)) |
 | `m` | write a message to the agents in the marked trees, or the tree under the cursor |
 | `:` | ask the assistant about the tree under the cursor, or write `@17 ...` for that tree's agent (see [The assistant](#the-assistant)) |
 | `a` | open the assistant's chat, where it answers, starting it if there is none |
@@ -78,7 +78,9 @@ Where a tree has several, it names the most pressing live one, waiting on you, t
 The assistant is never a tree's agent.
 Its mark is `●` in bold when the tree's agent needs you, `✓` when it is done and `✗` when its process died, as on a restart (see [What agents say](#what-agents-say)), else the agent's own status: `●` busy, `○` idle, `◌` cold.
 The list is in groups, each under a heading with a blank line above it: a group per base the held trees were cut from (see [New agents](#new-agents)), the pool's base first and the rest by name, then the free trees, then Parked.
-The repository's main checkout is no row of its own: it heads its branch's group, `main · main checkout`, with its ports and git state, and no agent is ever started or shown there, so work happens in trees and the main checkout stays clean.
+The repository's main checkout is no row of its own: it heads its branch's group, `main · main checkout`, with its ports, agent and git state.
+Work happens in trees, but `n` on that heading starts an agent in the main checkout itself, on whatever it has checked out and with no branch named for it, for work that needs no tree; Enter on the heading then opens its chat rather than folding the group.
+The assistant is never shown there, and neither is a stopped session, since sessions run there in place are not its agent.
 Within a group, trees waiting on you come first, then those with the most recently active agent, so trees nobody has worked in for a while sink to the bottom.
 An agent's last activity is its latest report, or when its Claude Code transcript last grew.
 The cursor stops on headings too, and Enter on one folds its group to the heading, which then says how many of its trees wait on you, or opens it again; a filter opens every group and leaves out those it finds nothing in.
@@ -355,8 +357,8 @@ An agent running in a tmux pane, such as an interactive `claude`, belongs to tha
 
 treetop is where agents are sent out, and the assistant is who keeps track of them for you.
 
-`n` opens the compose box in the middle of the screen for a new agent in a fresh tree from the pool, leased with `treehouse get --lease` when the job runs, so two quick dispatches never share one.
-`N` opens it for a new agent in the tree under the cursor instead: a free tree is leased for it with `treehouse lease`, and one already held is started in as it is.
+`n` opens the compose box in the middle of the screen for a new agent in the tree under the cursor: a free tree is leased for it with `treehouse lease`, and one already held is started in as it is.
+`N` opens it for a new agent in a fresh tree from the pool instead, leased with `treehouse get --lease` when the job runs, so two quick dispatches never share one.
 `:` opens it to the assistant, about the tree under the cursor (see below).
 
 Enter sends it, Alt+Enter breaks the line, Esc cancels, Ctrl+U clears the text and Ctrl+W a word; a paste keeps its line breaks.
@@ -431,12 +433,12 @@ Claude Code runs a background session only in a folder you have trusted, so befo
 
 Every tree is leased with `treetop` as the holder, and a tree treetop leases always gets a branch: `<git user.name>/<the task as a slug>`, shown on the compose box's branch line.
 Down moves to that line to change the name before sending, and Up comes back; a tree someone already holds keeps its branch.
-A fresh tree from `n` also has a base line under it: the branch the tree is cut from, the pool's base unless you pick another.
+A fresh tree from `N` also has a base line under it: the branch the tree is cut from, the pool's base unless you pick another.
 On it, `←` and `→` step through the repository's branches, local and on origin, the pool's base first and the rest most recently committed first.
 Typing there narrows them to those that start with what you type, then those that contain it, ignoring case, and `←` and `→` step through the matches; Backspace and Ctrl+U widen them again.
 It only ever names a real branch: when what you type matches none, the line says so, and Enter keeps the box open until it does.
 treetop leases the tree with `treehouse get --lease --base <branch>` and records the base in the tree's `treetop.json`, so its diff goes against it and the detail pane says `from <branch>`.
-`N` on a free tree cannot take a base, since `treehouse lease` takes the tree as it is.
+`n` on a free tree cannot take a base, since `treehouse lease` takes the tree as it is.
 `b` renames the branch of the tree under the cursor, or names one on a detached HEAD.
 
 The agent is `claude --bg --name <the task's first words> -- <task>`, which Claude Code's own agent view lists too; `TREETOP_NEW_AGENT` names another command, which gets the task as its last argument.
@@ -681,7 +683,7 @@ Typing in the box answers in your own words instead.
 Allow and Deny press Enter and Esc in the agent's session, and only once its screen shows the prompt has the keys; an option, or your own words, put the prompt away with Esc and go in as a message, so an answer holds however Claude Code lays its options out.
 Each answer attaches to the session only for that moment, so the chat popup on your desktop keeps its size.
 
-New agent, at the foot of the pool, starts an agent on a task in a fresh tree cut from the base you pick, as `n` does, and opens its tree once it is going; New agent here, on a tree, starts one in that tree on its branch, as `N` does.
+New agent, at the foot of the pool, starts an agent on a task in a fresh tree cut from the base you pick, as `N` does, and opens its tree once it is going; New agent here, on a tree, starts one in that tree on its branch, as `n` does.
 On a tree whose agent has stopped or died, Resume starts it again with its conversation, as `R` does.
 Return… gives the tree back to the pool, as `r` does, after a sheet that names its branch and what it holds that is not pushed or committed; its agents are stopped first.
 Anything else running in the tree, such as a dev server, keeps it from the phone, and the refusal says what, since stopping it is a call to make at treetop with the return dialog's list of what would stop.

@@ -38,8 +38,8 @@ use crate::theme::theme;
 const KEYS: [(&str, &str); 13] = [
     ("Enter", "open"),
     ("?", "help"),
-    ("n", "new"),
-    ("N", "new here"),
+    ("n", "new here"),
+    ("N", "new tree"),
     ("m", "message"),
     (":", "ask"),
     ("a", "assistant"),
@@ -55,7 +55,7 @@ const KEYS: [(&str, &str); 13] = [
 const HELP: [(&str, &str); 30] = [
     (
         "Enter",
-        "open the agent: its chat, a cold one started again, else its tree; on a heading, fold or open its group",
+        "open the agent: its chat, a cold one started again, else its tree; a heading folds, or opens main's agent",
     ),
     (
         "t",
@@ -63,11 +63,11 @@ const HELP: [(&str, &str); 30] = [
     ),
     (
         "n",
-        "new agent in a fresh tree, on a branch named for the task",
+        "new agent in this tree, or the main checkout on its heading; a free tree is leased on a task branch",
     ),
     (
         "N",
-        "new agent in this tree; a free one is leased for it, on a branch named for the task",
+        "new agent in a fresh tree, on a branch named for the task",
     ),
     ("m", "message the agents in the marked trees, or this one"),
     (
@@ -585,8 +585,8 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
 /// A group's heading: folded or open, which group, and how many trees it
 /// holds. A base's names its branch in the BRANCH column, wide enough for
 /// any name, and the main checkout's branch carries the checkout itself,
-/// with its ports and git state in their columns. A folded heading says how
-/// many of its trees wait on you.
+/// with its ports, agents and git state in their columns. A folded heading
+/// says how many of its trees wait on you instead of naming an agent.
 fn heading_row(
     app: &App,
     group: &Group,
@@ -631,6 +631,8 @@ fn heading_row(
     let waits = if is_folded && waiting > 0 {
         Cell::from(format!("● {waiting} waiting on you"))
             .style(fg(t.warning).add_modifier(Modifier::BOLD))
+    } else if let Some(main) = main {
+        agent_cell(app, main)
     } else {
         Cell::from("")
     };
@@ -751,10 +753,17 @@ fn pr_line(app: &App, tree: &Tree) -> Line<'static> {
 }
 
 /// Each agent with its status, where it was seen and its pid.
+/// Every agent in the tree; in the main checkout only those its heading
+/// goes by, since the assistant and old sessions run there in place too.
 fn agents_line(app: &App, tree: &Tree) -> Line<'static> {
     let t = theme();
     let mut spans = vec![Span::styled("agents    ", fg(t.muted))];
-    if tree.agents.is_empty() {
+    let agents: Vec<&Agent> = if tree.is_main {
+        App::agents_of(tree)
+    } else {
+        tree.agents.iter().collect()
+    };
+    if agents.is_empty() {
         let text = if app.is_agents_read {
             "none"
         } else {
@@ -763,7 +772,7 @@ fn agents_line(app: &App, tree: &Tree) -> Line<'static> {
         spans.push(Span::raw(text));
         return Line::from(spans);
     }
-    for (i, agent) in tree.agents.iter().enumerate() {
+    for (i, agent) in agents.into_iter().enumerate() {
         if i > 0 {
             spans.push(Span::raw("   "));
         }
@@ -900,12 +909,12 @@ fn state_style(state: State) -> (&'static str, Style) {
 /// Rows the detail pane takes, borders included.
 const DETAIL_HEIGHT: u16 = 12;
 
-/// The tree under the cursor in full: where it is, its agents, what it
-/// serves and runs, what its agent last said with its latest steps, and its
-/// last action's outcome.
+/// The tree under the cursor in full, or the main checkout on its heading:
+/// where it is, its agents, what it serves and runs, what its agent last
+/// said with its latest steps, and its last action's outcome.
 fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     let t = theme();
-    let Some(tree) = app.current() else {
+    let Some(tree) = app.current().or(app.main_under_cursor()) else {
         let text = if app.is_loaded { "no trees match" } else { "" };
         frame.render_widget(Paragraph::new(text).block(pane_block()), area);
         return;
@@ -1377,7 +1386,11 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
         ),
         (None, Purpose::Dispatch { .. }) => (" New agent ".to_string(), ""),
         (None, Purpose::Start { tree }) => (
-            format!(" New agent in tree {} ", tree.name),
+            if tree.is_main {
+                " New agent in the main checkout ".to_string()
+            } else {
+                format!(" New agent in tree {} ", tree.name)
+            },
             "the task, or nothing to start it idle and open its chat",
         ),
         (None, Purpose::Rename { tree }) => (

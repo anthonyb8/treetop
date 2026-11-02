@@ -1,6 +1,6 @@
 //! The compose box where you write to agents: a word with the assistant
-//! (`:`), a task for a new agent in a fresh tree (`n`) or in the tree
-//! under the cursor (`N`), a line for agents already working (`m`), a
+//! (`:`), a task for a new agent in the tree under the cursor (`n`) or in
+//! a fresh tree (`N`), a line for agents already working (`m`), a
 //! branch's new name (`b`), or the handoff an agent wrote for the one that
 //! takes over from it (`h`). Kept free of terminal I/O, like `app`.
 

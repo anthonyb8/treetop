@@ -569,7 +569,7 @@ impl App {
     /// The group `tree` is listed under: Parked for one set aside, even when
     /// it waits on you, the free trees, else the base it was cut from. None
     /// for the main checkout, which heads its branch's group rather than
-    /// being a row, so no agent is ever started or shown there.
+    /// being a row; its agents are started and shown on that heading.
     pub fn group_of(&self, tree: &Tree) -> Option<Group> {
         if tree.is_main {
             return None;
@@ -709,6 +709,17 @@ impl App {
             Some(ListRow::Heading { group, .. }) => Some(group.clone()),
             _ => None,
         }
+    }
+
+    /// The main checkout, when the cursor is on the heading it leads: where
+    /// `n` starts an agent that needs no tree, and Enter opens its chat.
+    pub fn main_under_cursor(&self) -> Option<&Tree> {
+        let Some(Group::Base(base)) = self.current_heading() else {
+            return None;
+        };
+        self.trees
+            .iter()
+            .find(|t| t.is_main && t.branch.as_ref() == Some(&base))
     }
 
     /// `z`: sets the tree under the cursor aside under Parked, or brings it
@@ -1251,17 +1262,18 @@ impl App {
         let Some(tree) = self.current() else {
             return Outcome::Continue;
         };
-        if let Some((agent, command)) = Self::agents_of(tree)
-            .into_iter()
-            .find_map(|a| Some((a, a.attach.clone()?)))
-        {
-            return Outcome::Chat {
-                command,
+        Self::chat_of(tree).unwrap_or_else(|| Outcome::Enter(tree.clone()))
+    }
+
+    /// The chat of the tree's leading agent that has one, as Enter opens it.
+    fn chat_of(tree: &Tree) -> Option<Outcome> {
+        Self::agents_of(tree).into_iter().find_map(|agent| {
+            Some(Outcome::Chat {
+                command: agent.attach.clone()?,
                 agent: agent.name.clone(),
                 tree: tree.name.clone(),
-            };
-        }
-        Outcome::Enter(tree.clone())
+            })
+        })
     }
 
     /// The chat of an agent `n` started: at once when its start printed the
@@ -2053,9 +2065,10 @@ impl App {
     }
 
     /// Opens the compose box for a new agent in the tree under the cursor:
-    /// a free one is leased for it, a held one keeps its branch.
+    /// a free one is leased for it, a held one keeps its branch. On the main
+    /// checkout's heading it starts there, on whatever it has checked out.
     fn open_start(&mut self) {
-        let Some(tree) = self.current().cloned() else {
+        let Some(tree) = self.current().or(self.main_under_cursor()).cloned() else {
             return;
         };
         if self.jobs.get(&tree.path).is_some_and(|s| s.is_active()) {
@@ -2327,7 +2340,11 @@ impl App {
                     branch,
                     ..Launch::agent(text, false)
                 };
-                self.message = Some(format!("starting an agent in tree {}...", tree.name));
+                self.message = Some(if tree.is_main {
+                    "starting an agent in the main checkout...".to_string()
+                } else {
+                    format!("starting an agent in tree {}...", tree.name)
+                });
                 self.start(*tree, launch)
             }
             Purpose::Handoff { tree, from } => self.take_over(*tree, from, text),
@@ -2835,10 +2852,14 @@ impl App {
         if key.code == KeyCode::Char('C') {
             return Outcome::Scratches;
         }
-        // On a heading, Enter folds its group or opens it again.
+        // On a heading, Enter folds its group or opens it again; on the main
+        // checkout's, it opens the chat of an agent working there instead.
         if key.code == KeyCode::Enter
             && let Some(group) = self.current_heading()
         {
+            if let Some(chat) = self.main_under_cursor().and_then(Self::chat_of) {
+                return chat;
+            }
             self.toggle_fold(&group);
             return Outcome::Continue;
         }
@@ -2893,8 +2914,8 @@ impl App {
             }
             // The assistant's chat, where it answers.
             KeyCode::Char('a') => return self.converse(String::new()),
-            KeyCode::Char('n') => self.open_dispatch(),
-            KeyCode::Char('N') => self.open_start(),
+            KeyCode::Char('n') => self.open_start(),
+            KeyCode::Char('N') => self.open_dispatch(),
             KeyCode::Char('d') => self.open_diff(),
             KeyCode::Char('b') => self.open_rename(),
             KeyCode::Char('r') => {
@@ -3536,6 +3557,73 @@ mod tests {
         assert_eq!(shape(&app)[2], "▾main 1", "Enter opens it again");
     }
 
+    /// The fixture's pool under the main checkout, on `development`, with
+    /// the cursor on the heading it leads.
+    fn app_on_main_heading() -> App {
+        let mut app = app_with_main();
+        let main = app.trees.iter().position(|t| t.is_main).unwrap();
+        app.trees[main].branch = Some("development".into());
+        app.base = Some("development".into());
+        app.selected = 0;
+        assert_eq!(
+            app.current_heading(),
+            Some(Group::Base("development".into()))
+        );
+        app
+    }
+
+    #[test]
+    fn n_on_the_main_checkouts_heading_starts_an_agent_there_on_its_own_branch() {
+        let mut app = app_on_main_heading();
+        press(&mut app, KeyCode::Char('n'));
+        assert!(
+            !app.prompt.as_ref().unwrap().names_branch(),
+            "the main checkout keeps what it has checked out"
+        );
+        type_in(&mut app, "why is the build slow");
+        let job = queued(press(&mut app, KeyCode::Enter)).remove(0);
+        assert_eq!(job.kind, Kind::Start);
+        assert!(job.tree.is_main, "no tree is leased for it");
+        let launch = job.launch.unwrap();
+        assert!(!launch.is_new_tree);
+        assert_eq!(launch.branch, None);
+        assert_eq!(
+            app.message.as_deref(),
+            Some("starting an agent in the main checkout...")
+        );
+        app.selected = 3;
+        assert!(
+            app.current_heading().is_some(),
+            "on the free trees' heading"
+        );
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.prompt.is_none(), "no other heading starts one");
+    }
+
+    #[test]
+    fn enter_on_the_main_checkouts_heading_opens_its_agents_chat_else_folds() {
+        let mut app = app_on_main_heading();
+        let main = app.trees.iter().find(|t| t.is_main).unwrap().path.clone();
+        let mut assistant = attachable(assistant::NAME);
+        assistant.status = Some(Status::Idle);
+        app.apply_agents(&HashMap::from([(main.clone(), vec![assistant.clone()])]));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            shape(&app)[0],
+            "▸development 2",
+            "the assistant is not its agent, so Enter folds"
+        );
+        press(&mut app, KeyCode::Enter);
+        let mut own = attachable("why is the build slow");
+        own.status = Some(Status::Busy);
+        app.apply_agents(&HashMap::from([(main, vec![assistant, own])]));
+        assert!(matches!(
+            press(&mut app, KeyCode::Enter),
+            Outcome::Chat { agent, tree, .. } if agent == "why is the build slow" && tree == "main"
+        ));
+        assert_eq!(shape(&app)[0], "▾development 2", "left open");
+    }
+
     #[test]
     fn the_main_checkout_heads_its_branchs_group_and_is_no_row() {
         let mut app = app_with_main();
@@ -3729,7 +3817,7 @@ mod tests {
     fn a_base_typed_that_names_no_branch_keeps_the_box_open() {
         let mut app = app();
         app.base = Some("development".into());
-        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('N'));
         app.prompt.as_mut().unwrap().bases = vec!["development".into(), "main".into()];
         type_in(&mut app, "fix the login");
         press(&mut app, KeyCode::Down);
@@ -3747,7 +3835,7 @@ mod tests {
     fn a_fresh_tree_is_leased_from_the_base_picked() {
         let mut app = app();
         app.base = Some("development".into());
-        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('N'));
         let prompt = app.prompt.as_mut().unwrap();
         assert_eq!(prompt.default_base.as_deref(), Some("development"));
         prompt.bases = vec!["development".into(), "main".into()];
@@ -4059,13 +4147,13 @@ mod tests {
     }
 
     #[test]
-    fn n_with_no_task_starts_an_idle_agent_and_opens_its_chat_once_it_shows() {
+    fn capital_n_with_no_task_starts_an_idle_agent_and_opens_its_chat_once_it_shows() {
         let mut app = app();
         app.apply_agents(&HashMap::from([(
             PathBuf::from("/p/4/app"),
             vec![agent("old")],
         )]));
-        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('N'));
         assert_eq!(app.prompt.as_ref().unwrap().target(), Some(Target::NewTree));
         let mut job = queued(press(&mut app, KeyCode::Enter)).remove(0);
         assert_eq!(job.kind, Kind::Start);
@@ -4158,7 +4246,7 @@ mod tests {
     #[test]
     fn a_new_tree_dispatch_runs_under_a_stand_in_until_its_tree_is_leased() {
         let mut app = app();
-        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('N'));
         type_in(&mut app, "fix login");
         let mut job = queued(press(&mut app, KeyCode::Enter)).remove(0);
         assert!(job.launch.as_ref().unwrap().is_new_tree);
@@ -4174,7 +4262,7 @@ mod tests {
     #[test]
     fn esc_closes_the_bar_and_queues_nothing() {
         let mut app = app();
-        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('N'));
         type_in(&mut app, "q");
         assert_eq!(press(&mut app, KeyCode::Esc), Outcome::Continue);
         assert!(app.prompt.is_none() && app.active_jobs() == 0);
@@ -4498,10 +4586,10 @@ mod tests {
     }
 
     #[test]
-    fn capital_n_starts_an_agent_in_the_tree_under_the_cursor() {
+    fn n_starts_an_agent_in_the_tree_under_the_cursor() {
         let mut app = app();
         select(&mut app, "7");
-        press(&mut app, KeyCode::Char('N'));
+        press(&mut app, KeyCode::Char('n'));
         assert!(
             app.prompt.as_ref().unwrap().names_branch(),
             "a free tree is leased on a branch named for the task"
@@ -4514,7 +4602,7 @@ mod tests {
         assert!(!launch.is_new_tree, "this tree, not a fresh one");
         assert!(launch.branch.is_some());
         select(&mut app, "4");
-        press(&mut app, KeyCode::Char('N'));
+        press(&mut app, KeyCode::Char('n'));
         type_in(&mut app, "add tests");
         let job = queued(press(&mut app, KeyCode::Enter)).remove(0);
         assert_eq!(job.tree.name, "4");
@@ -4524,7 +4612,7 @@ mod tests {
             "a held tree keeps its branch"
         );
         select(&mut app, "4");
-        press(&mut app, KeyCode::Char('N'));
+        press(&mut app, KeyCode::Char('n'));
         assert!(app.prompt.is_none(), "not while its start is queued");
         assert_eq!(
             app.message.as_deref(),
