@@ -19,7 +19,7 @@ It is for one developer, on their own server, reached over their own tailnet.
 - An agent blocked on a permission prompt or a question can be answered from the phone.
 - The phone buzzes when an agent needs you, finishes or dies, and when a PR's checks fail or it merges.
 - Starting an agent in a fresh tree, resuming a dead one and returning a finished tree each take no more than three taps.
-- Nothing on the server is reachable from outside the tailnet, and nothing leaves it except push notifications.
+- Nothing on the server is reachable from outside the tailnet, and nothing leaves it except push notifications and the calls to the issue sources in the config, which the Issues screen makes from the server.
 
 ## Scope
 
@@ -27,7 +27,7 @@ It is for one developer, on their own server, reached over their own tailnet.
 
 - `treetop serve`, a `tiny_http` server inside the `treetop` binary, serving a JSON API, live streams, and the built web app embedded in the binary.
 - The web app, in Svelte and TypeScript under `web/`.
-- An installable web app (a PWA) with four screens: the pool, a tree, its agent's chat, and a new agent.
+- An installable web app (a PWA) with the pool, a tree, its agent's chat and a new agent, and from ANB-27 the Issues screen beside the pool.
 - A chat view of each agent's conversation, read from its session transcript, with a reply box.
 - Answering what the agent waits on in the chat: a question's options as buttons, a permission with Allow and Deny, or your own words (ANB-21, which replaced ANB-18's terminal view).
 - The actions `send`, `dispatch`, `resume` and `return`, parking a tree as `z` does, sharing and opening a port as `p` does, and switching workspaces, as `w` does.
@@ -37,7 +37,7 @@ It is for one developer, on their own server, reached over their own tailnet.
 
 - Claude Code's Remote Control and the Claude app. treetop starts agents as it does today, without `--remote-control`.
 - Destroying a tree, renaming a branch, ship runs, handoffs and the diff. They stay in the terminal, where their dialogs show what is at stake; any of them can be a later issue.
-- The Issues screen and the assistant's pane.
+- The assistant's pane.
 - A native iOS app or an App Store listing. The open decisions say why.
 - Reaching the server from outside the tailnet, or anyone but its owner.
 
@@ -112,6 +112,11 @@ When the agent waits on you, a card above the reply box shows what on, and answe
 The first build had a fourth screen, the agent's own terminal, for answering prompts. It attached a second client to the session at phone width, and Claude Code draws a session at one size for every client, so the chat popup on the desktop shrank while it was open; it was dropped for answers in the chat (ANB-21).
 
 **New agent**, from the pool's button: a text box for the task, a choice of a fresh tree or a tree you pick, the base and an optional ticket, as `n` and `N` offer.
+
+**Issues**, a tab beside the pool, as Tab switches them in the terminal: the terminal's views, a source switcher, search over ids and titles, and filters, with each row saying who is working on it (ANB-27).
+An issue opens to its description, links and comments, and its agent's question when it has one.
+Status, assignee, labels, a comment and new issues change from there (ANB-28), and Pick up puts an agent on it in a fresh tree, after asking, since a stray tap would start a real agent (ANB-29).
+A source on a plugin other than Linear lists, reads and picks up, and offers no edits.
 
 ### The server
 

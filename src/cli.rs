@@ -27,7 +27,7 @@ use crate::pool::{self, Tree};
 use crate::reports::{self, Report};
 use crate::ship;
 use crate::sidecar;
-use crate::tickets::{Filters, Source};
+use crate::tickets::Filters;
 use crate::watch::Check;
 
 const USAGE: &str = "usage:
@@ -187,32 +187,37 @@ fn read_ship(checkout: &Path, trees: &mut [Tree]) {
     }
 }
 
-/// The tickets the merged trees' tickets leave with nothing blocking them,
-/// and nobody working on them yet.
-fn ready_after_merges(checkout: &Path, trees: &[Tree]) -> Vec<String> {
-    let merged: Vec<&str> = trees
+/// The tickets of the trees whose PRs have merged, each with its issue source.
+pub fn merged_tickets(trees: &[Tree]) -> Vec<(&str, Option<&str>)> {
+    trees
         .iter()
         .filter(|t| {
             t.ship
                 .as_ref()
                 .is_some_and(|s| s.stage == ship::Stage::Merged)
         })
-        .filter_map(|t| t.sidecar.as_ref()?.ticket.as_deref())
-        .collect();
-    let Some(source) = (!merged.is_empty())
-        .then(|| Source::of(checkout).ok())
-        .flatten()
-    else {
-        return Vec::new();
-    };
+        .filter_map(|t| {
+            let record = t.sidecar.as_ref()?;
+            Some((record.ticket.as_deref()?, record.source.as_deref()))
+        })
+        .collect()
+}
+
+/// The tickets the merged trees' tickets leave with nothing blocking them,
+/// and nobody working on them yet.
+pub fn ready_after_merges(checkout: &Path, trees: &[Tree]) -> Vec<String> {
     let worked_on = |id: &String| {
         trees
             .iter()
             .any(|t| t.sidecar.as_ref().and_then(|s| s.ticket.as_ref()) == Some(id))
     };
-    let mut ready: Vec<String> = merged
+    let mut ready: Vec<String> = merged_tickets(trees)
         .into_iter()
-        .filter_map(|id| source.ready_after(id).ok())
+        .filter_map(|(id, source)| {
+            crate::tickets::named(source, checkout)
+                .and_then(|backend| backend.ready_after(id))
+                .ok()
+        })
         .flatten()
         .filter(|id| !worked_on(id))
         .collect();
@@ -446,7 +451,7 @@ fn send(checkout: &Path, target: &str, message: &str) -> Result<()> {
 /// One line per open ticket of the repository's source: its id, state and
 /// title. `--mine` keeps those assigned to you; other words search titles.
 fn tickets(checkout: &Path, args: &[String]) -> Result<()> {
-    let source = Source::of(checkout).map_err(anyhow::Error::msg)?;
+    let source = crate::tickets::own(checkout).map_err(anyhow::Error::msg)?;
     let words: Vec<&str> = args
         .iter()
         .map(String::as_str)
@@ -459,7 +464,7 @@ fn tickets(checkout: &Path, args: &[String]) -> Result<()> {
     };
     let tickets = source.list(&filters).map_err(anyhow::Error::msg)?;
     if tickets.is_empty() {
-        println!("no open tickets in {}", source.name);
+        println!("no open tickets in {}", source.name());
     }
     for ticket in tickets {
         println!("{:<10} {:<14} {}", ticket.id, ticket.state, ticket.title);
@@ -485,7 +490,7 @@ fn pick(checkout: &Path, id: &str) -> Result<()> {
         bail!("{id} is already in tree {}", tree.name);
     }
     let mut job = Job {
-        launch: Some(Launch::pick(id.to_string(), checkout.to_path_buf())),
+        launch: Some(Launch::pick(id.to_string(), checkout.to_path_buf(), None)),
         ..Job::new(Kind::Start, pool::stand_in(PathBuf::from("(new tree)")))
     };
     let (is_ok, output) = jobs::run(&mut job);
@@ -597,7 +602,39 @@ fn give_back(checkout: &Path, name: &str, start: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::agents::{Agent, Source, Status};
+    use crate::jobs::tests::{in_process_of_its_own, tracker_fixture};
     use crate::reports::State;
+    use crate::sidecar::Sidecar;
+
+    /// `treetop status` and the phone both ask this; each merged ticket is
+    /// read in the source it came from.
+    #[test]
+    fn a_merge_readies_tickets_in_the_source_of_the_ticket_that_merged() {
+        let root = tracker_fixture("status-ready");
+        if !in_process_of_its_own(
+            "cli::tests::a_merge_readies_tickets_in_the_source_of_the_ticket_that_merged",
+            &root,
+        ) {
+            return;
+        }
+        let merged = |ticket: &str, source: Option<&str>| Tree {
+            ship: Some(Box::new(
+                serde_json::from_value(json!({ "branch": "b", "stage": "merged" })).unwrap(),
+            )),
+            sidecar: Some(Box::new(Sidecar {
+                ticket: Some(ticket.into()),
+                source: source.map(str::to_string),
+                ..Sidecar::leased_now()
+            })),
+            ..tree("4", "leased", Vec::new())
+        };
+        let trees = [merged("END-1", None), merged("PER-1", Some("personal"))];
+        assert_eq!(
+            ready_after_merges(&root.join("main"), &trees),
+            ["END-2", "PER-2"]
+        );
+        assert_eq!(merged_tickets(&trees)[1], ("PER-1", Some("personal")));
+    }
 
     fn tree(name: &str, status: &str, agents: Vec<Agent>) -> Tree {
         Tree {

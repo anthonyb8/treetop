@@ -102,20 +102,6 @@ impl Client {
         }
     }
 
-    /// The key in the environment variable `name`, or an auth error naming it.
-    pub fn from_env(name: &str) -> Result<Self, Error> {
-        std::env::var(name)
-            .ok()
-            .filter(|key| !key.trim().is_empty())
-            .map(Client::new)
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::Auth,
-                    format!("{name} is not set; it should hold a Linear API key"),
-                )
-            })
-    }
-
     /// Runs one GraphQL request and returns its `data`.
     pub fn query(&self, query: &str, variables: Value) -> Result<Value, Error> {
         let body = json!({ "query": query, "variables": variables }).to_string();
@@ -191,11 +177,6 @@ impl Client {
             .limit(IMAGE_LIMIT)
             .read_to_vec()
             .map_err(unavailable)
-    }
-
-    /// One issue, by its id, with its description.
-    pub fn issue(&self, id: &str) -> Result<Issue, Error> {
-        self.detail(id).map(|detail| detail.issue)
     }
 
     /// The team with key `key`, read once and then kept; `refresh` reads it
@@ -712,7 +693,8 @@ mod tests {
     #[test]
     #[ignore = "calls Linear with a real key"]
     fn reads_a_real_workspace() {
-        let client = Client::from_env("LINEAR_API_KEY_WORK").expect("LINEAR_API_KEY_WORK is set");
+        let key = std::env::var("LINEAR_API_KEY_WORK").expect("LINEAR_API_KEY_WORK is set");
+        let client = Client::new(key);
         let team = std::env::var("LINEAR_TEST_TEAM").unwrap_or_else(|_| "END".into());
         let read = client
             .team(&team)
@@ -726,17 +708,5 @@ mod tests {
                 .detail(&first.id)
                 .unwrap_or_else(|err| panic!("detail of {}: {err}", first.id));
         }
-    }
-
-    #[test]
-    fn a_missing_key_is_an_auth_error_that_names_the_variable() {
-        let Err(err) = Client::from_env("TREETOP_TEST_NO_SUCH_KEY") else {
-            panic!("no key, no client");
-        };
-        assert_eq!(err.kind, ErrorKind::Auth);
-        assert!(
-            err.message
-                .starts_with("TREETOP_TEST_NO_SUCH_KEY is not set")
-        );
     }
 }

@@ -66,58 +66,6 @@
 </div>
 
 <style>
-  .prose {
-    font-size: 15px;
-    line-height: 1.5;
-    color: var(--fg);
-    overflow-wrap: anywhere;
-  }
-  .prose :global(p) {
-    margin: 0 0 8px;
-  }
-  .prose :global(p:last-child) {
-    margin-bottom: 0;
-  }
-  .prose :global(.h) {
-    font-weight: 700;
-    color: var(--fg-strong);
-  }
-  .prose :global(ul),
-  .prose :global(ol) {
-    margin: 0 0 8px;
-    padding-left: 20px;
-  }
-  .prose :global(li + li) {
-    margin-top: 2px;
-  }
-  .prose :global(code) {
-    font-family: var(--mono);
-    font-size: 13px;
-    padding: 1px 4px;
-    border-radius: 4px;
-    background: var(--bg-high);
-    color: var(--fg-strong);
-  }
-  .prose :global(pre) {
-    margin: 0 0 8px;
-    padding: 10px;
-    border-radius: 8px;
-    background: #1d2021;
-    overflow-x: auto;
-  }
-  .prose :global(pre code) {
-    padding: 0;
-    background: none;
-  }
-  .prose :global(blockquote) {
-    margin: 0 0 8px;
-    padding-left: 10px;
-    border-left: 2px solid var(--line-strong);
-    color: var(--muted);
-  }
-  .prose :global(strong) {
-    color: var(--fg-strong);
-  }
   .writing {
     overflow: hidden;
   }

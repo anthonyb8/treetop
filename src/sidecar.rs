@@ -33,6 +33,10 @@ pub struct Sidecar {
     /// The agent's id, as its plugin knows it.
     pub job: Option<String>,
     pub ticket: Option<String>,
+    /// The issue source the ticket is in, by its name in the config; None
+    /// for the repository's own, as a tree recorded before there was a field.
+    #[serde(default)]
+    pub source: Option<String>,
     /// The task the agent was dispatched with, which a ship run gives as
     /// its intent where there is no ticket.
     #[serde(default)]
@@ -60,6 +64,7 @@ impl Sidecar {
             agent: None,
             job: None,
             ticket: None,
+            source: None,
             task: None,
             parked: false,
             branch: None,
@@ -136,6 +141,14 @@ mod tests {
         )
         .unwrap();
         tree
+    }
+
+    #[test]
+    fn a_record_from_before_sources_reads_as_the_repository_s_own() {
+        let text = r#"{"version": 1, "agent": "claude", "job": "0908e7f3", "ticket": "END-123",
+            "branch": "anthony/fix-login", "lease_id": null, "leased_at": 1792227120}"#;
+        let record: Sidecar = serde_json::from_str(text).unwrap();
+        assert_eq!(record.source, None);
     }
 
     #[test]

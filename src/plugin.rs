@@ -402,7 +402,7 @@ impl Plugin {
     /// `call`, with `config`, such as a ticket source's table.
     pub fn call_with(&self, op: &str, args: Value, config: Value) -> Result<Value, Error> {
         match self {
-            Plugin::Builtin(name) => builtin::handle(name, op, &args, &config),
+            Plugin::Builtin(name) => builtin::handle(name, op, &args),
             Plugin::External { path, .. } => call_with(path, op, args, config, timeout(op)),
         }
     }
@@ -411,7 +411,7 @@ impl Plugin {
     pub fn description(&self) -> Result<Description, Error> {
         match self {
             Plugin::Builtin(name) => {
-                let result = builtin::handle(name, "describe", &json!({}), &json!({}))?;
+                let result = builtin::handle(name, "describe", &json!({}))?;
                 serde_json::from_value(result)
                     .map_err(|err| Error::new(Code::Failed, format!("invalid description: {err}")))
             }

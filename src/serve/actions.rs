@@ -62,6 +62,48 @@ pub fn dispatch(pool: &Pool, body: &[u8]) -> Reply {
     }
 }
 
+/// Starts an agent on ticket `id` of issue source `source` in a fresh tree, as
+/// `p` does on the Issues screen, its task, name and branch from the ticket.
+/// A ticket already in a tree is not picked up twice: the answer names that
+/// tree.
+pub fn pick(pool: &Pool, id: &str, source: Option<String>, body: &[u8]) -> Reply {
+    #[derive(Deserialize)]
+    struct Picked {
+        /// The branch the tree is cut from; None for the pool's base.
+        #[serde(default)]
+        base: Option<String>,
+    }
+    let Ok(asked) = serde_json::from_slice::<Picked>(body) else {
+        return Reply::error(400, "pick takes {\"base\": null}");
+    };
+    let held = {
+        let app = pool.app.lock().unwrap_or_else(PoisonError::into_inner);
+        app.tree_of_ticket(id).map(|tree| tree.name.clone())
+    };
+    if let Some(tree) = held {
+        return Reply::json(200, &json!({ "tree": tree }));
+    }
+    let mut job = Job {
+        launch: Some(pick_launch(pool, id, source, asked.base)),
+        ..Job::new(Kind::Start, stand_in("(new tree)".into()))
+    };
+    let (is_ok, output) = jobs::run(&mut job);
+    pool.refresh();
+    if is_ok {
+        Reply::json(200, &json!({ "tree": job.tree.name }))
+    } else {
+        Reply::error(502, &last_line(&output, "the agent did not start"))
+    }
+}
+
+/// What picking up ticket `id` starts: a fresh tree cut from `base`, or from
+/// the pool's own where none was chosen.
+fn pick_launch(pool: &Pool, id: &str, source: Option<String>, base: Option<String>) -> Launch {
+    let mut launch = Launch::pick(id.to_string(), pool.checkout.clone(), source);
+    launch.base = base.filter(|b| !b.is_empty());
+    launch
+}
+
 /// Starts the tree's stopped or failed agent again, with its conversation
 /// and the flags it was started with, as `R` does.
 pub fn resume(pool: &Pool, name: &str) -> Reply {
@@ -198,9 +240,15 @@ fn last_line(output: &str, otherwise: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use serde_json::Value;
+
     use crate::agents::{Agent, Source, Status};
     use crate::pool::Process;
-    use crate::serve::pool::tests::tree;
+    use crate::serve::pool::tests::{pool as app_of_trees, tree};
+    use crate::sidecar::Sidecar;
     use std::fs;
     use std::path::PathBuf;
 
@@ -210,6 +258,45 @@ mod tests {
             name: name.into(),
             ports: Vec::new(),
         }
+    }
+
+    /// ANB-29. The source is one no config has, so that a pick that gets as
+    /// far as the job stops there, having started nothing.
+    #[test]
+    fn an_issue_already_in_a_tree_answers_with_it_and_any_other_goes_to_the_job() {
+        let mut app = app_of_trees();
+        let mut record = Sidecar::leased_now();
+        record.ticket = Some("END-1".into());
+        app.apply_sidecars(HashMap::from([(PathBuf::from("/pool/17"), record)]));
+        let pool = Pool {
+            name: "app".into(),
+            checkout: PathBuf::from("/nowhere"),
+            kick: Mutex::new(std::sync::mpsc::channel().0),
+            push: None,
+            seen: Mutex::default(),
+            ready: Mutex::default(),
+            app: Mutex::new(app),
+        };
+        let ask = |id: &str, body: &[u8]| {
+            let reply = pick(&pool, id, Some("no-such-source".into()), body);
+            let json: Value = serde_json::from_slice(&reply.body).unwrap();
+            (reply.status, json)
+        };
+        let (status, held) = ask("END-1", br#"{"base": null}"#);
+        assert_eq!((status, held["tree"].as_str()), (200, Some("17")));
+        let (status, free) = ask("END-2", br#"{"base": null}"#);
+        assert_eq!(
+            (status, free["error"].as_str()),
+            (
+                502,
+                Some("ticket: no issue source no-such-source in the config")
+            )
+        );
+        assert_eq!(ask("END-2", b"not json").0, 400);
+        let base =
+            |asked: Option<&str>| pick_launch(&pool, "END-2", None, asked.map(str::to_string)).base;
+        assert_eq!(base(Some("release")).as_deref(), Some("release"));
+        assert_eq!(base(Some("")), None, "no choice is the pool's own");
     }
 
     #[test]

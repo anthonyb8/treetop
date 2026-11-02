@@ -25,7 +25,6 @@ mod handoff;
 mod hook;
 mod jobs;
 mod keeper;
-mod linear_plugin;
 mod live;
 mod nomistakes_plugin;
 mod phone;
@@ -597,13 +596,14 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                     Outcome::Continue
                 }
                 issues::Action::Quit => app.quit(),
-                issues::Action::Pick(issue) => app.pick(issue.id),
+                issues::Action::Pick(issue) => app.pick(issue.id, screen.source_name().to_string()),
                 issues::Action::Ask(context) => {
                     app.open_ask(Some(context));
                     Outcome::Continue
                 }
                 issues::Action::Attach(issue) => {
-                    if let Some((tree, record)) = app.attach(issue.id)
+                    if let Some((tree, record)) =
+                        app.attach(issue.id, screen.source_name().to_string())
                         && let Err(err) = sidecar::write(&tree, &record)
                     {
                         app.message = Some(format!("could not record the issue: {err}"));

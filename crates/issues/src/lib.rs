@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 pub use backend::{Backend, Linear, READ_ONLY};
 pub use host::{Host, NoTrees, Work};
 pub use screen::{Action, Screen};
-pub use views::{Group, View};
+pub use views::{Group, Section, View, builtin, is_closed, sections};
 
 /// The colours the screen draws in, given by the program it runs in so the
 /// two look like one.

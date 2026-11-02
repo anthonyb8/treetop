@@ -87,6 +87,39 @@ pub fn place(issue: &Issue, group: Group, team: Option<&Team>) -> (usize, String
     }
 }
 
+/// One group of a list, under its heading.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Section {
+    /// Empty for a list with no groups.
+    pub heading: String,
+    /// Its issues' work is over, so it comes folded until opened by hand.
+    pub is_closed: bool,
+    pub issues: Vec<Issue>,
+}
+
+/// `issues` cut into the groups of `group`, in the order the groups stack,
+/// each keeping Linear's order, for a program that draws the list itself.
+pub fn sections(mut issues: Vec<Issue>, group: Group, team: Option<&Team>) -> Vec<Section> {
+    issues.sort_by_cached_key(|issue| place(issue, group, team));
+    let is_closed_state = |name: &str| {
+        group == Group::Status
+            && team.is_some_and(|t| t.states.iter().any(|s| s.name == name && is_closed(s)))
+    };
+    let mut sections: Vec<Section> = Vec::new();
+    for issue in issues {
+        let (_, heading) = place(&issue, group, team);
+        match sections.last_mut() {
+            Some(last) if last.heading == heading => last.issues.push(issue),
+            _ => sections.push(Section {
+                is_closed: is_closed_state(&heading),
+                heading,
+                issues: vec![issue],
+            }),
+        }
+    }
+    sections
+}
+
 /// A state's work is over: done, cancelled, or a duplicate, which Linear
 /// gives a type of its own.
 pub fn is_closed(state: &linear::State) -> bool {
@@ -104,6 +137,69 @@ fn status_order(team: &Team) -> Vec<&linear::State> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sections_stack_as_the_status_groups_do_and_closed_ones_say_so() {
+        let state = |id: &str, kind: &str| linear::State {
+            id: id.into(),
+            name: id.into(),
+            kind: kind.into(),
+            position: 0.0,
+        };
+        let team = Team {
+            id: "t".into(),
+            key: "END".into(),
+            name: "End".into(),
+            states: vec![
+                state("Todo", "unstarted"),
+                state("Doing", "started"),
+                state("Done", "completed"),
+            ],
+            labels: Vec::new(),
+            members: Vec::new(),
+            projects: Vec::new(),
+            cycles: Vec::new(),
+            me: None,
+        };
+        let issue = |id: &str, state: &str, project: Option<&str>| Issue {
+            id: id.into(),
+            state: state.into(),
+            state_id: Some(state.into()),
+            project: project.map(str::to_string),
+            ..Issue::default()
+        };
+        let issues = vec![
+            issue("A", "Done", None),
+            issue("B", "Todo", Some("Web")),
+            issue("C", "Doing", Some("Web")),
+            issue("D", "Todo", None),
+        ];
+        let said = |group| -> Vec<(String, bool, Vec<String>)> {
+            sections(issues.clone(), group, Some(&team))
+                .into_iter()
+                .map(|s| {
+                    let ids = s.issues.into_iter().map(|i| i.id).collect();
+                    (s.heading, s.is_closed, ids)
+                })
+                .collect()
+        };
+        assert_eq!(
+            said(Group::Status),
+            [
+                ("Doing".to_string(), false, vec!["C".to_string()]),
+                (
+                    "Todo".to_string(),
+                    false,
+                    vec!["B".to_string(), "D".to_string()]
+                ),
+                ("Done".to_string(), true, vec!["A".to_string()]),
+            ]
+        );
+        let by_project = said(Group::Project);
+        assert_eq!(by_project[0].0, "Web");
+        assert_eq!(by_project[1].0, "No project", "none last");
+        assert_eq!(said(Group::None)[0].2.len(), 4, "one section, whole");
+    }
 
     #[test]
     fn a_views_line_may_say_how_to_group() {

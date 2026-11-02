@@ -1,23 +1,33 @@
-//! Tickets, from the ticket plugin of the repository's ticket source in
-//! `config.toml`: listing them with filters, reading one, the branch its
-//! system names for it, and marking it started. The plugin does the talking;
-//! this resolves which plugin and which settings, and reads its replies.
+//! Issue sources: each `[issues.<name>]` table in `config.toml` as a backend,
+//! which is how everything in treetop reads and changes issues. Linear is
+//! called directly; any other source goes through its ticket plugin, on the
+//! wire format below. A source's backend is built once a process, so its
+//! client and team are shared by whatever asks. Keys come from `config::key`.
+//!
+//! ```toml
+//! [issues.work]
+//! plugin = "linear"                 # the default
+//! key_env = "LINEAR_API_KEY_WORK"   # the variable holding a personal API key
+//! team = "END"                      # the team whose issues are listed
+//! ```
 
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use issues::Backend;
 pub use issues::Filters;
+use linear::Issue;
 
 use crate::config;
 use crate::plugin::{self, Kind, Plugin};
 
 /// A ticket as a ticket plugin reports it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Ticket {
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+struct Ticket {
     /// The id people use, such as `END-123`.
     pub id: String,
     pub title: String,
@@ -46,8 +56,8 @@ pub struct Ticket {
 }
 
 /// Another ticket a ticket is linked to.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Link {
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+struct Link {
     pub id: String,
     /// `blocks`, `blocked by` or `related`, from the ticket's side.
     pub kind: String,
@@ -56,87 +66,27 @@ pub struct Link {
     pub done: bool,
 }
 
-/// The repository's ticket source: its name, its plugin and the settings the
-/// plugin is given.
+/// A source on a ticket plugin other than Linear: it reads and marks through
+/// the plugin contract, and its edits say they cannot.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Source {
-    pub name: String,
+struct Plugged {
+    name: String,
     plugin: Plugin,
     config: Value,
 }
 
-impl Source {
-    /// The source of the repository checked out at `checkout`, or what to
-    /// set to have one.
-    pub fn of(checkout: &Path) -> Result<Self, String> {
-        let config = config::load()?;
-        let (name, source) = config.source_for(checkout)?;
-        let plugin = plugin::named(Kind::Tickets, &source.plugin)
-            .ok_or_else(|| format!("no ticket plugin {}", source.plugin))?;
-        Ok(Source {
-            name: name.to_string(),
-            plugin,
-            config: source.config(),
-        })
-    }
-
+impl Plugged {
     fn call(&self, op: &str, args: Value) -> Result<Value, String> {
         self.plugin
             .call_with(op, args, self.config.clone())
             .map_err(|err| format!("{}: {err}", self.name))
-    }
-
-    pub fn get(&self, id: &str) -> Result<Ticket, String> {
-        serde_json::from_value(self.call("get", json!({ "id": id }))?)
-            .map_err(|err| format!("{}: unreadable ticket: {err}", self.name))
-    }
-
-    /// Marks the ticket started and assigned to the key's user.
-    pub fn start(&self, id: &str) -> Result<(), String> {
-        self.call("start", json!({ "id": id })).map(|_| ())
-    }
-
-    /// Marks the ticket done.
-    pub fn finish(&self, id: &str) -> Result<(), String> {
-        self.call("finish", json!({ "id": id })).map(|_| ())
-    }
-
-    /// The source says `finish = true`: a ticket is marked done once its
-    /// tree's PR merges.
-    pub fn finishes(&self) -> bool {
-        self.config.get("finish").and_then(Value::as_bool) == Some(true)
-    }
-
-    /// The tickets `id` blocks that are ready now that it is done: not done
-    /// themselves, and with every other ticket blocking them done.
-    pub fn ready_after(&self, id: &str) -> Result<Vec<String>, String> {
-        let done = self.get(id)?;
-        let mut ready = Vec::new();
-        for blocked in done.links.iter().filter(|l| l.kind == "blocks" && !l.done) {
-            let ticket = self.get(&blocked.id)?;
-            let is_free = ticket
-                .links
-                .iter()
-                .filter(|l| l.kind == "blocked by" && l.id != id)
-                .all(|l| l.done);
-            if is_free {
-                ready.push(ticket.id);
-            }
-        }
-        Ok(ready)
-    }
-
-    pub fn list(&self, filters: &Filters) -> Result<Vec<Ticket>, String> {
-        let reply = self.call("list", json!({ "filters": filters }))?;
-        serde_json::from_value(reply.get("tickets").cloned().unwrap_or(json!([])))
-            .map_err(|err| format!("{}: unreadable tickets: {err}", self.name))
     }
 }
 
 /// The prompt an agent picking up `ticket` starts with: `template` from the
 /// config with `{id}`, `{title}`, `{description}`, `{url}` and `{branch}`
 /// filled in, else the ticket's id and title, its text and its link.
-pub fn prompt(template: Option<&str>, ticket: &Ticket) -> String {
+pub fn prompt(template: Option<&str>, ticket: &Issue) -> String {
     const DEFAULT: &str = "{id}: {title}\n\n{description}\n\n{url}";
     let text = |value: &Option<String>| value.clone().unwrap_or_default();
     let filled = template
@@ -157,13 +107,9 @@ pub fn prompt(template: Option<&str>, ticket: &Ticket) -> String {
     out
 }
 
-/// A ticket plugin other than Linear's on the Issues screen: it lists and
-/// reads through the plugin contract, and its edits say they cannot.
-struct ReadOnly(Source);
-
-/// A ticket as the Issues screen shows an issue.
-fn issue(ticket: Ticket) -> linear::Issue {
-    linear::Issue {
+/// A ticket as an issue.
+fn issue(ticket: Ticket) -> Issue {
+    Issue {
         uuid: ticket.id.clone(),
         id: ticket.id,
         title: ticket.title,
@@ -179,21 +125,50 @@ fn issue(ticket: Ticket) -> linear::Issue {
     }
 }
 
-impl Backend for ReadOnly {
+impl Backend for Plugged {
     fn name(&self) -> &str {
-        &self.0.name
+        &self.name
     }
 
-    fn list(&self, filters: &Filters) -> Result<Vec<linear::Issue>, String> {
-        Ok(self.0.list(filters)?.into_iter().map(issue).collect())
+    fn list(&self, filters: &Filters) -> Result<Vec<Issue>, String> {
+        let reply = self.call("list", json!({ "filters": filters }))?;
+        let tickets: Vec<Ticket> =
+            serde_json::from_value(reply.get("tickets").cloned().unwrap_or(json!([])))
+                .map_err(|err| format!("{}: unreadable tickets: {err}", self.name))?;
+        Ok(tickets.into_iter().map(issue).collect())
     }
 
     fn detail(&self, id: &str) -> Result<linear::Detail, String> {
+        let ticket: Ticket = serde_json::from_value(self.call("get", json!({ "id": id }))?)
+            .map_err(|err| format!("{}: unreadable ticket: {err}", self.name))?;
+        let links = ticket
+            .links
+            .iter()
+            .map(|link| linear::Link {
+                kind: link.kind.clone(),
+                id: link.id.clone(),
+                title: String::new(),
+                state: String::new(),
+                is_done: link.done,
+            })
+            .collect();
         Ok(linear::Detail {
-            issue: issue(self.0.get(id)?),
+            issue: issue(ticket),
             comments: Vec::new(),
-            links: Vec::new(),
+            links,
         })
+    }
+
+    fn start(&self, id: &str) -> Result<(), String> {
+        self.call("start", json!({ "id": id })).map(|_| ())
+    }
+
+    fn finish(&self, id: &str) -> Result<(), String> {
+        self.call("finish", json!({ "id": id })).map(|_| ())
+    }
+
+    fn finishes(&self) -> bool {
+        self.config.get("finish").and_then(Value::as_bool) == Some(true)
     }
 }
 
@@ -215,9 +190,91 @@ pub fn views() -> Vec<issues::View> {
 /// why it has none.
 pub type Own = Result<usize, String>;
 
+/// Each source's backend, by everything that makes it what it is, its key
+/// too, so a change to the config or a key added to the `env` file takes
+/// effect without one source being built twice.
+static BUILT: LazyLock<Mutex<HashMap<String, Arc<dyn Backend>>>> = LazyLock::new(Mutex::default);
+
+/// The backend of source `name`: its plugin where it has one, which is how a
+/// plugin of your own named `linear` replaces the built-in client.
+fn build(
+    name: &str,
+    source: &config::Source,
+    key: Result<String, String>,
+) -> Result<Arc<dyn Backend>, String> {
+    if let Some(plugin) = plugin::named(Kind::Tickets, &source.plugin) {
+        return Ok(Arc::new(Plugged {
+            name: name.to_string(),
+            plugin,
+            config: source.config(),
+        }));
+    }
+    if source.plugin != config::LINEAR {
+        return Err(format!(
+            "[issues.{name}]: no ticket plugin {}",
+            source.plugin
+        ));
+    }
+    let team = source.settings.get("team").and_then(|t| t.as_str());
+    let finishes = source.settings.get("finish").and_then(toml::Value::as_bool);
+    Ok(Arc::new(issues::Linear::new(
+        name,
+        key,
+        team.map(str::to_string),
+        finishes == Some(true),
+    )))
+}
+
+/// The API key source `name` names in `key_env`, or why it has none.
+fn key_of(name: &str, source: &config::Source) -> Result<String, String> {
+    let key_env = source.settings.get("key_env").and_then(|k| k.as_str());
+    let key_env = key_env.ok_or_else(|| {
+        format!("[issues.{name}] needs key_env, the variable holding a Linear API key")
+    })?;
+    config::key(key_env)
+}
+
+fn backend(name: &str, source: &config::Source) -> Result<Arc<dyn Backend>, String> {
+    let api_key = key_of(name, source);
+    let made_of = format!(
+        "{name}\0{}\0{}\0{api_key:?}",
+        source.plugin,
+        source.config()
+    );
+    let mut built = BUILT.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(backend) = built.get(&made_of) {
+        return Ok(Arc::clone(backend));
+    }
+    let backend = build(name, source, api_key)?;
+    built.insert(made_of, Arc::clone(&backend));
+    Ok(backend)
+}
+
+/// The issue source of the repository checked out at `checkout`, or what to
+/// set to have one. Only that source is built, so a broken table for another
+/// one does not stand in the way.
+pub fn own(checkout: &Path) -> Result<Arc<dyn Backend>, String> {
+    let config = config::load()?;
+    let (name, source) = config.source_for(checkout)?;
+    backend(name, source)
+}
+
+/// The issue source called `name`, or the repository's own for None, which is
+/// what a tree picked up before sources were recorded works from.
+pub fn named(name: Option<&str>, checkout: &Path) -> Result<Arc<dyn Backend>, String> {
+    let Some(name) = name else {
+        return own(checkout);
+    };
+    let config = config::load()?;
+    let source = config
+        .issues
+        .get(name)
+        .ok_or_else(|| format!("no issue source {name} in the config"))?;
+    backend(name, source)
+}
+
 /// Every issue source in the config as a backend for the Issues screen, and
-/// the index of the repository's own, or why it has none. Linear's built-in
-/// plugin gets the full screen; any other plugin is read-only.
+/// the index of the repository's own, or why it has none.
 pub fn backends(checkout: &Path) -> Result<(Vec<Arc<dyn Backend>>, Own), String> {
     let config = config::load()?;
     // The backends follow the config's order, so the repository's source
@@ -225,31 +282,11 @@ pub fn backends(checkout: &Path) -> Result<(Vec<Arc<dyn Backend>>, Own), String>
     let own = config
         .source_for(checkout)
         .map(|(name, _)| config.issues.keys().position(|n| n == name).unwrap_or(0));
-    let mut backends: Vec<Arc<dyn Backend>> = Vec::new();
-    for (name, source) in &config.issues {
-        let plugin = plugin::named(Kind::Tickets, &source.plugin)
-            .ok_or_else(|| format!("[issues.{name}]: no ticket plugin {}", source.plugin))?;
-        let setting = |key: &str| {
-            source
-                .settings
-                .get(key)
-                .and_then(|value| value.as_str())
-                .map(str::to_string)
-        };
-        if plugin == Plugin::Builtin("linear") {
-            backends.push(Arc::new(issues::Linear::new(
-                name,
-                setting("key_env").as_deref(),
-                setting("team"),
-            )));
-        } else {
-            backends.push(Arc::new(ReadOnly(Source {
-                name: name.clone(),
-                plugin,
-                config: source.config(),
-            })));
-        }
-    }
+    let backends = config
+        .issues
+        .iter()
+        .map(|(name, source)| backend(name, source))
+        .collect::<Result<_, _>>()?;
     Ok((backends, own))
 }
 
@@ -259,12 +296,12 @@ mod tests {
 
     #[test]
     fn a_prompt_fills_the_template_and_drops_what_the_ticket_lacks() {
-        let ticket = Ticket {
+        let ticket = Issue {
             id: "END-812".into(),
             title: "Fix the login redirect".into(),
             description: Some("Keep return_to through SSO.".into()),
             url: None,
-            ..Ticket::default()
+            ..Issue::default()
         };
         assert_eq!(
             prompt(None, &ticket),
@@ -279,7 +316,7 @@ mod tests {
     /// A source on a ticket plugin that knows END-1, which blocks END-2
     /// (blocked by nothing else), END-3 (blocked by END-9, still open) and
     /// END-4 (done already).
-    fn linked_source(test: &str) -> Source {
+    fn linked_source(test: &str) -> Plugged {
         use std::os::unix::fs::PermissionsExt;
         let dir =
             std::env::temp_dir().join(format!("treetop-tickets-{}-{test}", std::process::id()));
@@ -293,7 +330,8 @@ mod tests {
         };
         let script = format!(
             "#!/bin/sh\nid=$(sed 's/.*\"id\": *\"\\([^\"]*\\)\".*/\\1/')\ncase $id in\n\
-             END-1) echo \"{}\" ;;\nEND-2) echo \"{}\" ;;\nEND-3) echo \"{}\" ;;\nesac\n",
+             END-1) echo \"{}\" ;;\nEND-2) echo \"{}\" ;;\nEND-3) echo \"{}\" ;;\n\
+             *) echo \"{}\" ;;\nesac\n",
             reply(
                 r#"{\"id\":\"END-2\",\"kind\":\"blocks\"},{\"id\":\"END-3\",\"kind\":\"blocks\"},{\"id\":\"END-4\",\"kind\":\"blocks\",\"done\":true},{\"id\":\"END-7\",\"kind\":\"related\"}"#
             ),
@@ -301,10 +339,11 @@ mod tests {
             reply(
                 r#"{\"id\":\"END-1\",\"kind\":\"blocked by\"},{\"id\":\"END-9\",\"kind\":\"blocked by\"}"#
             ),
+            r#"{\"ok\":true,\"result\":{\"tickets\":[{\"id\":\"END-1\",\"title\":\"t\",\"state\":\"Todo\"}]}}"#,
         );
         std::fs::write(&path, script).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        Source {
+        Plugged {
             name: "test".into(),
             plugin: Plugin::External {
                 name: "tracker".into(),
@@ -312,6 +351,81 @@ mod tests {
             },
             config: json!({ "finish": true }),
         }
+    }
+
+    fn source(table: &str) -> config::Source {
+        toml::from_str(table).unwrap()
+    }
+
+    /// ANB-26: where a key comes from, in a process of its own for the sake
+    /// of the environment, and with a config directory of its own.
+    #[test]
+    fn a_key_comes_from_the_shell_else_the_env_file_and_its_lack_says_where_it_looked() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = crate::jobs::tests::config_root("key");
+        if !crate::jobs::tests::in_process_of_its_own(
+            "tickets::tests::a_key_comes_from_the_shell_else_the_env_file_and_its_lack_says_where_it_looked",
+            &root,
+        ) {
+            return;
+        }
+        let env = root.join("config/treetop/env");
+        let linear = source("key_env = \"TREETOP_TEST_KEY\"");
+        let without = backend("work", &linear).unwrap();
+        assert_eq!(
+            without.list(&Filters::default()).unwrap_err(),
+            format!(
+                "TREETOP_TEST_KEY is not set, in the environment or in {}; \
+                 it should hold a Linear API key",
+                env.display()
+            )
+        );
+        std::fs::write(&env, "TREETOP_TEST_KEY=from-the-file\n").unwrap();
+        std::fs::set_permissions(&env, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            key_of("work", &linear).as_deref(),
+            Ok("from-the-file"),
+            "a service has only the file"
+        );
+        let with = backend("work", &linear).unwrap();
+        assert!(!Arc::ptr_eq(&without, &with), "a key added takes effect");
+        assert!(
+            Arc::ptr_eq(&with, &backend("work", &linear).unwrap()),
+            "whatever asks shares one client"
+        );
+        // SAFETY: this process runs only this test, on this thread.
+        unsafe { std::env::set_var("TREETOP_TEST_KEY", "from-the-shell") };
+        assert_eq!(key_of("work", &linear).as_deref(), Ok("from-the-shell"));
+        assert!(key_of("work", &source("")).unwrap_err().contains("key_env"));
+    }
+
+    #[test]
+    fn a_source_on_a_plugin_nobody_has_says_which_table() {
+        let nobody = source("plugin = \"nobody\"");
+        let why = build("work", &nobody, Err(String::new())).err().unwrap();
+        assert_eq!(why, "[issues.work]: no ticket plugin nobody");
+    }
+
+    #[test]
+    fn a_source_on_a_plugin_lists_and_reads_but_its_edits_say_they_cannot() {
+        let source = linked_source("plugged");
+        let listed = source.list(&Filters::default()).unwrap();
+        assert_eq!(listed[0].id, "END-1");
+        assert_eq!(listed[0].state, "Todo");
+        assert_eq!(source.detail("END-2").unwrap().links[0].kind, "blocked by");
+        let change = linear::Change::default();
+        assert_eq!(
+            source.update(&Issue::default(), &change),
+            Err(issues::READ_ONLY.to_string())
+        );
+        assert_eq!(
+            source.comment(&Issue::default(), "hello"),
+            Err(issues::READ_ONLY.to_string())
+        );
+        assert_eq!(
+            source.create(&linear::NewIssue::default()),
+            Err(issues::READ_ONLY.to_string())
+        );
     }
 
     #[test]

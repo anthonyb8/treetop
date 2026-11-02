@@ -98,7 +98,8 @@ pub struct Guard {
     pub in_tree: Vec<String>,
 }
 
-/// A place issues come from: a ticket plugin and the settings it is given.
+/// A place issues come from: Linear or a ticket plugin, and the settings it
+/// is given.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Source {
     #[serde(default = "linear")]
@@ -108,8 +109,60 @@ pub struct Source {
     pub settings: BTreeMap<String, toml::Value>,
 }
 
+/// The value of `name`, a variable holding an API key: from the environment,
+/// else from the `env` file beside the config, which is how a service, with
+/// none of a shell's variables, gets its keys without one in a unit file.
+pub fn key(name: &str) -> Result<String, String> {
+    if let Ok(value) = std::env::var(name)
+        && !value.trim().is_empty()
+    {
+        return Ok(value);
+    }
+    let file = path().and_then(|p| p.parent().map(|dir| dir.join("env")));
+    let found = file.as_deref().map(|f| key_in(f, name)).transpose()?;
+    found.flatten().ok_or_else(|| {
+        let place = file.map_or("the config directory".into(), |f| f.display().to_string());
+        format!(
+            "{name} is not set, in the environment or in {place}; it should hold a Linear API key"
+        )
+    })
+}
+
+/// The value of `name` in `file`, of `NAME=value` lines, where `file` exists.
+/// Lines may say `export`, quote the value and be commented out with `#`. A
+/// file others can read is refused rather than used, since it holds keys.
+fn key_in(file: &Path, name: &str) -> Result<Option<String>, String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let shown = file.display();
+    let metadata = match fs::metadata(file) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("{shown}: {err}")),
+    };
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(format!(
+            "{shown} holds keys and others can read it: run chmod 600 {shown}"
+        ));
+    }
+    let text = fs::read_to_string(file).map_err(|err| format!("{shown}: {err}"))?;
+    Ok(text.lines().find_map(|line| {
+        let line = line.trim();
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let (key, value) = line.split_once('=')?;
+        let value = value.trim();
+        let unquoted = ['"', '\'']
+            .iter()
+            .find_map(|q| value.strip_prefix(*q)?.strip_suffix(*q))
+            .unwrap_or(value);
+        (key.trim() == name && !unquoted.is_empty()).then(|| unquoted.to_string())
+    }))
+}
+
+/// The source treetop reads itself, without a plugin.
+pub const LINEAR: &str = "linear";
+
 fn linear() -> String {
-    "linear".into()
+    LINEAR.into()
 }
 
 impl Source {
@@ -304,6 +357,34 @@ mod tests {
         );
         assert_eq!(config.ship_for(Path::new("/home/me/quiet")), Some(vec![]));
         assert_eq!(config.ship_for(Path::new("/home/me/other")), None);
+    }
+
+    #[test]
+    fn a_key_file_reads_as_a_shell_would_and_only_when_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("treetop-keys-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("env");
+        assert_eq!(key_in(&file, "A"), Ok(None), "no file is no key");
+        fs::write(
+            &file,
+            "# A=commented\nA=plain\nexport B=\"quoted\"\nC='single'\nD=\nAA=other\n",
+        )
+        .unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        let read = |name| key_in(&file, name).unwrap();
+        assert_eq!(read("A").as_deref(), Some("plain"));
+        assert_eq!(read("B").as_deref(), Some("quoted"));
+        assert_eq!(read("C").as_deref(), Some("single"));
+        assert_eq!(read("D"), None, "empty is unset");
+        assert_eq!(read("E"), None);
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
+        let why = key_in(&file, "A").unwrap_err();
+        assert!(
+            why.ends_with(&format!("run chmod 600 {}", file.display())),
+            "{why}"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

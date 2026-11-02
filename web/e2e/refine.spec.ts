@@ -67,7 +67,7 @@ test.describe("the foot of each screen", () => {
     await serve(page, () => pool);
     await page.goto("/");
     await page.getByRole("link", { name: "New agent" }).waitFor();
-    expect(await gapBelow(page, "a.new")).toBeLessThanOrEqual(22);
+    expect(await gapBelow(page, "a.add")).toBeLessThanOrEqual(22);
   });
 
   test("a tree clears the indicator once, not again above its footer", async ({ page }) => {
