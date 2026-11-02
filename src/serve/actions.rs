@@ -27,8 +27,8 @@ struct Dispatch {
     base: Option<String>,
 }
 
-/// Starts an agent on a task, in a fresh tree or the one named, as `n` and
-/// `N` do.
+/// Starts an agent on a task, in a fresh tree or the one named, as `N` and
+/// `n` do.
 pub fn dispatch(pool: &Pool, body: &[u8]) -> Reply {
     let Ok(asked) = serde_json::from_slice::<Dispatch>(body) else {
         return Reply::error(
