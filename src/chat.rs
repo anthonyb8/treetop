@@ -132,6 +132,48 @@ pub fn input(text: &str, hints: &Screen) -> Input {
     }
 }
 
+/// `screen`'s rows with dim text blanked, leaving the rules and prompt that
+/// frame the input box. A chat draws its own hints in the box dim, such as
+/// Claude Code's for a queued message, and what is typed there at full
+/// strength, so this tells a hint from a draft whatever the hint says.
+fn without_dim_text(screen: &vt100::Screen, hints: &Screen) -> String {
+    let (rows, cols) = screen.size();
+    let cells = |row| (0..cols).filter_map(move |col| screen.cell(row, col));
+    let mut text = String::new();
+    for row in 0..rows {
+        let line: String = cells(row).map(vt100::Cell::contents).collect();
+        let line = line.trim_start();
+        if line.starts_with(&hints.rule) {
+            text.push_str(line);
+        } else {
+            // The prompt's own cells are kept, however it is drawn.
+            let mut prompt = if line.starts_with(&hints.input) {
+                hints.input.chars().count()
+            } else {
+                0
+            };
+            for cell in cells(row) {
+                let shown = cell.contents();
+                let is_prompt = prompt > 0 && !shown.trim().is_empty();
+                if is_prompt {
+                    prompt -= 1;
+                }
+                text.push_str(if cell.dim() && !is_prompt { " " } else { shown });
+            }
+        }
+        text.push('\n');
+    }
+    text
+}
+
+/// The chat's input box as `hints` describe it, read from `screen`.
+fn read_input(screen: &vt100::Screen, hints: &Screen) -> Input {
+    match input(&screen.contents(), hints) {
+        Input::Holding(_) => input(&without_dim_text(screen, hints), hints),
+        state => state,
+    }
+}
+
 pub struct Chat {
     pub agent: String,
     pub tree: String,
@@ -420,7 +462,7 @@ impl Chat {
             return (self.flush_blind(), failed);
         };
         while let Some(next) = self.outbox.front() {
-            let state = input(&self.screen().contents(), &hints);
+            let state = read_input(self.screen(), &hints);
             let (stage, text) = (next.stage, next.text.clone());
             let fail = match (stage, state) {
                 (Stage::Waiting(_), Input::Empty) if self.is_ready => {
@@ -1034,6 +1076,62 @@ mod tests {
             input(screen, &claude()),
             Input::Holding("first line second line".into())
         );
+    }
+
+    /// Pumps `chats` until a message is delivered or fails, or time is up.
+    fn outcome(chats: &mut Chats) -> Pumped {
+        let started = Instant::now();
+        loop {
+            let pumped = chats.pump();
+            if !pumped.delivered.is_empty() || !pumped.failed.is_empty() {
+                return pumped;
+            }
+            assert!(started.elapsed() < Duration::from_secs(15), "no outcome");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_message_queued_behind_a_busy_agent_counts_as_sent_and_so_does_the_next() {
+        // Claude Code at work: a message sent now queues, and the box shows a
+        // dim hint until the agent takes it. This stands in for it in a real
+        // terminal, taking two two-letter messages.
+        let script = r#"
+            box() { printf '\033[2J\033[H──────\n❯ %b\n──────\n' "$1"; }
+            stty -icanon -echo min 1
+            box ''
+            for _ in 1 2; do
+                text=$(dd bs=1 count=2 2>/dev/null); box "$text"
+                dd bs=1 count=1 2>/dev/null >/dev/null
+                box '\033[2mThe wording of this hint is the chat'"'"'s own\033[0m'
+            done
+            sleep 30
+        "#;
+        let command = ["sh".to_string(), "-c".to_string(), script.to_string()];
+        let mut chats = Chats::default();
+        for text in ["hi", "yo"] {
+            let who = ("agent".to_string(), "tree".to_string());
+            chats
+                .deliver(&command, text, (24, 80), who, Some(claude()))
+                .unwrap();
+            let pumped = outcome(&mut chats);
+            assert_eq!(pumped.failed, Vec::new(), "sending {text}");
+            assert_eq!(pumped.delivered.len(), 1, "sending {text}");
+        }
+    }
+
+    #[test]
+    fn a_draft_at_full_strength_is_never_taken_for_a_hint() {
+        let mut parser = vt100::Parser::new(10, 60, 0);
+        // The prompt is dim on Claude Code's screen, the draft not.
+        parser.process("──────\r\n\x1b[2m❯ \x1b[0mkeep me\r\n──────\r\n".as_bytes());
+        assert_eq!(
+            read_input(parser.screen(), &claude()),
+            Input::Holding("keep me".into())
+        );
+        let mut parser = vt100::Parser::new(10, 60, 0);
+        parser.process("──────\r\n\x1b[2m❯ Press up to edit\x1b[0m\r\n──────\r\n".as_bytes());
+        assert_eq!(read_input(parser.screen(), &claude()), Input::Empty);
     }
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
