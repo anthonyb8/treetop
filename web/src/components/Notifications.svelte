@@ -86,14 +86,15 @@
     justify-content: center;
     width: 44px;
     height: 44px;
-    border-radius: 10px;
-    border: 1px solid var(--yellow);
-    background: var(--yellow-bg);
+    border-radius: 22px;
+    border: 0;
+    background: transparent;
     color: var(--yellow);
   }
-  .bell.blocked {
-    border-color: var(--line-strong);
+  .bell:active {
     background: var(--bg-high);
+  }
+  .bell.blocked {
     color: var(--muted);
   }
 </style>

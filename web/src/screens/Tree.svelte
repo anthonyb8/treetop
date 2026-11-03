@@ -60,6 +60,19 @@
   let doing = $state<"resume" | "return" | "park" | null>(null);
   let actionFailure = $state<string | null>(null);
   let isConfirming = $state(false);
+  let isMenuOpen = $state(false);
+  let isCopied = $state(false);
+
+  async function copyPath() {
+    if (!tree) return;
+    try {
+      await navigator.clipboard.writeText(tree.path);
+      isCopied = true;
+      setTimeout(() => (isCopied = false), 1500);
+    } catch {
+      // Without clipboard access the path stays on screen to select by hand.
+    }
+  }
 
   async function act(what: "resume" | "return") {
     doing = what;
@@ -83,6 +96,7 @@
 
   async function togglePark() {
     if (!tree) return;
+    isMenuOpen = false;
     doing = "park";
     actionFailure = null;
     try {
@@ -102,6 +116,8 @@
     !!tree && tree.agents.length > 0 && !tree.agents.some((a) => a.status && a.status !== "cold"),
   );
   let agent = $derived(tree?.agents[0] ?? null);
+  // The path as a shell shows it, so it breaks at its slashes, not mid-name.
+  let shortPath = $derived(tree?.path.replace(/^\/(home|Users)\/[^/]+/, "~") ?? "");
   let isDirty = $derived(
     card?.git === "unknown" ||
       (card?.git != null && card.git.unpushed + card.git.staged + card.git.unstaged + card.git.untracked > 0),
@@ -112,24 +128,44 @@
   <header>
     <div class="bar">
       <button type="button" class="back" onclick={back}>
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 18l-6-6 6-6" /></svg>
-        Pool
+        Trees
       </button>
       {#if card}
-        <button type="button" class="back" disabled={doing !== null} onclick={togglePark}>
-          {card.parked ? "Unpark" : "Park"}
+        <button type="button" class="more" aria-label="More" aria-expanded={isMenuOpen} onclick={() => (isMenuOpen = !isMenuOpen)}>
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"
+            ><circle cx="5" cy="12" r="1.8" /><circle cx="12" cy="12" r="1.8" /><circle cx="19" cy="12" r="1.8" /></svg>
         </button>
       {/if}
     </div>
     <div class="name">
-      <span class="number mono">{name}</span>
+      <span class="number mono" class:loud={card?.needs_you}>{name}</span>
       <h1>{card?.title ?? card?.branch ?? `tree ${name}`}</h1>
     </div>
     {#if card?.branch}
-      <p class="branch mono">{card.branch}{tree?.base ? ` · from ${tree.base}` : ""}</p>
+      <p class="branch mono">
+        {card.branch}{#if tree?.base}<span class="from" aria-label="from">←</span>{tree.base}{/if}
+        {#if card.parked}<span class="parked">parked</span>{/if}
+      </p>
     {/if}
   </header>
+
+  {#if isMenuOpen && card}
+    <button type="button" class="menu-back" aria-label="Close menu" onclick={() => (isMenuOpen = false)}></button>
+    <div class="menu">
+      <button type="button" disabled={doing !== null} onclick={togglePark}>{card.parked ? "Unpark" : "Park"}</button>
+      <button
+        type="button"
+        class="danger"
+        disabled={doing !== null}
+        onclick={() => {
+          isMenuOpen = false;
+          isConfirming = true;
+        }}>Return…</button
+      >
+    </div>
+  {/if}
 
   <main>
     {#if !tree}
@@ -167,19 +203,17 @@
           {/if}
         </div>
         {#if tree.report?.says}
-          <p class="says" class:question={tree.report.state === "blocked"}>
-            {tree.report.state === "blocked" ? `“${tree.report.says}”` : tree.report.says}
-          </p>
+          <p class="says" class:question={tree.report.state === "blocked"}>{tree.report.says}</p>
         {:else if tree.task}
           <p class="says">{tree.task}</p>
         {/if}
-        {#if agent?.has_chat}
+        {#if agent?.has_chat && card.needs_you}
           <div class="ways">
-            <a class="open-chat" class:loud={card.needs_you} href="/trees/{encodeURIComponent(name)}/chat" onclick={link}>
+            <a class="open-chat" href="/trees/{encodeURIComponent(name)}/chat" onclick={link}>
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"
                 ><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z" /></svg>
-              {card.needs_you ? "Answer in chat" : "Open chat"}
+              Answer in chat
             </a>
           </div>
         {/if}
@@ -193,18 +227,16 @@
       <section class="facts" aria-label="Tree">
         <div class="fact">
           <span class="key">Git</span>
-          <span class="value">
-            {#if card.git === "unknown"}
-              <span class="muted">git could not read it</span>
-            {:else if isDirty}
-              <GitCounts git={card.git} />
-            {:else}
-              <span class="muted">clean, nothing unpushed</span>
-            {/if}
-          </span>
+          {#if card.git === "unknown"}
+            <span class="muted">git could not read it</span>
+          {:else if isDirty}
+            <span class="value"><GitCounts git={card.git} /></span>
+          {:else}
+            <span class="muted">clean</span>
+          {/if}
         </div>
         <div class="fact">
-          <span class="key">Ports</span>
+          <span class="key">{tree.ports.length > 1 ? "Ports" : "Port"}</span>
           <span class="value list">
             {#each tree.ports as port (port.port)}
               <PortButton port={port.port} process={port.process} />
@@ -215,24 +247,25 @@
         </div>
         <div class="fact">
           <span class="key">PR</span>
-          <span class="value list">
-            {#if tree.pr}
-              <span class="pr">
-                <PrBadge pr={tree.pr} />
-                {#if tree.pr.url}<a href={tree.pr.url} target="_blank" rel="noreferrer">Open</a>{/if}
-              </span>
-              {#each tree.pr.detail as line, i (i)}<span class="muted small">{line}</span>{/each}
-            {:else if tree.pr_unknown}
-              <span class="muted">unknown: {tree.pr_unknown}</span>
-            {:else}
-              <span class="muted">none</span>
-            {/if}
-          </span>
+          {#if tree.pr}
+            <span class="pr">
+              <PrBadge pr={tree.pr} />
+              {#if tree.pr.url}<a href={tree.pr.url} target="_blank" rel="noreferrer">Open</a>{/if}
+            </span>
+            {#each tree.pr.detail as line, i (i)}<span class="small">{line}</span>{/each}
+          {:else if tree.pr_unknown}
+            <span class="muted">unknown: {tree.pr_unknown}</span>
+          {:else}
+            <span class="muted">none</span>
+          {/if}
         </div>
-        <div class="fact">
+        <button type="button" class="fact copy" aria-label="Copy path {tree.path}" onclick={copyPath}>
           <span class="key">Path</span>
-          <span class="value mono small path">{tree.path}</span>
-        </div>
+          <span class="mono small path"
+            >{#each shortPath.split("/") as part, i (i)}{i ? "/" : ""}<wbr />{part}{/each}</span
+          >
+          <span class="muted small">{isCopied ? "copied" : "tap to copy"}</span>
+        </button>
       </section>
 
       {#if tree.report?.steps.length}
@@ -240,12 +273,13 @@
           <h2>Timeline</h2>
           <ol>
             {#each [...tree.report.steps].reverse() as step, i (i)}
-              <li>
-                <span class="mono at">{clock(step.at)}</span>
-                <span class="step-state" style:color={step.state ? said[step.state].tone : "var(--muted)"}>
-                  {step.state ? stepWord[step.state] : ""}
+              <li style:--tone={step.state ? said[step.state].tone : "var(--muted)"}>
+                <span class="dot" aria-hidden="true"></span>
+                <span class="detail" class:first={i === 0}>
+                  <span class="visually-hidden">{step.state ? stepWord[step.state] : ""}:</span>
+                  {step.detail}
                 </span>
-                <span class="detail">{step.detail}</span>
+                <span class="mono at">{clock(step.at)}</span>
               </li>
             {/each}
           </ol>
@@ -265,9 +299,9 @@
         {:else}
           <a class="action" href="/trees/{encodeURIComponent(name)}/new" onclick={link}>New agent here</a>
         {/if}
-        <button type="button" class="action danger" disabled={doing !== null} onclick={() => (isConfirming = true)}>
-          Return…
-        </button>
+        {#if agent?.has_chat}
+          <a class="action primary" href="/trees/{encodeURIComponent(name)}/chat" onclick={link}>Open chat</a>
+        {/if}
       </div>
     </footer>
   {/if}
@@ -319,9 +353,9 @@
   header {
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    gap: 6px;
     padding: calc(var(--safe-top) + 4px) 16px 14px;
-    background: var(--bg-raised);
+    border-bottom: 1px solid var(--bg-high);
   }
   .bar {
     display: flex;
@@ -345,14 +379,73 @@
   }
   .name {
     display: flex;
-    align-items: baseline;
+    align-items: center;
     gap: 10px;
     min-width: 0;
   }
   .number {
-    font-size: 26px;
+    flex: none;
+    padding: 1px 7px;
+    border-radius: 7px;
+    background: var(--bg-high);
+    font-size: 15px;
     font-weight: 700;
     color: var(--fg-strong);
+  }
+  .number.loud {
+    background: var(--yellow);
+    color: var(--on-accent);
+  }
+  .more {
+    display: grid;
+    place-items: center;
+    width: 44px;
+    height: 44px;
+    margin-right: -10px;
+    border: 0;
+    border-radius: 22px;
+    background: none;
+    color: var(--muted);
+  }
+  .more:active {
+    background: var(--bg-high);
+  }
+  .menu-back {
+    position: absolute;
+    inset: 0;
+    z-index: 2;
+    border: 0;
+    background: transparent;
+  }
+  .menu {
+    position: absolute;
+    z-index: 3;
+    top: calc(var(--safe-top) + 48px);
+    right: 12px;
+    min-width: 180px;
+    display: flex;
+    flex-direction: column;
+    padding: 6px;
+    border-radius: 14px;
+    border: 1px solid var(--line);
+    background: var(--bg-high);
+    box-shadow: 0 12px 32px rgb(0 0 0 / 0.45);
+  }
+  .menu button {
+    min-height: 44px;
+    padding: 0 12px;
+    border: 0;
+    border-radius: 10px;
+    background: none;
+    color: var(--fg-strong);
+    font-size: 15px;
+    text-align: left;
+  }
+  .menu button:active {
+    background: var(--line);
+  }
+  .menu .danger {
+    color: var(--red);
   }
   h1 {
     margin: 0;
@@ -360,15 +453,27 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-size: 20px;
+    font-size: 21px;
     font-weight: 600;
     color: var(--fg-strong);
   }
   .branch {
     margin: 0;
-    font-size: 12px;
+    font-size: 13px;
     color: var(--muted);
     overflow-wrap: anywhere;
+  }
+  .from {
+    margin: 0 6px;
+    color: var(--line-strong);
+  }
+  .parked {
+    margin-left: 8px;
+    padding: 1px 6px;
+    border-radius: 6px;
+    background: var(--bg-high);
+    font-family: var(--sans);
+    font-size: 12px;
   }
   main {
     flex: 1;
@@ -432,11 +537,10 @@
     align-items: center;
     justify-content: center;
     gap: 8px;
-    min-height: 46px;
-    border-radius: 10px;
-    border: 1px solid var(--line-strong);
-    background: var(--bg-high);
-    color: var(--fg-strong);
+    min-height: 44px;
+    border-radius: 12px;
+    background: var(--yellow);
+    color: var(--on-accent);
     font-size: 15px;
     font-weight: 600;
   }
@@ -444,50 +548,56 @@
     display: grid;
     gap: 8px;
   }
-  .open-chat.loud {
-    border: 0;
-    background: var(--yellow);
-    color: var(--on-accent);
-  }
   .others {
     margin: 0;
     font-size: 13px;
     color: var(--muted);
   }
+  /* The tree's facts as four tiles, so the timeline below stays on screen. */
   .facts {
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+    background: none;
   }
   .fact {
-    display: grid;
-    grid-template-columns: 56px minmax(0, 1fr);
-    gap: 8px;
-    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+    min-width: 0;
+    padding: 12px;
+    border: 0;
+    border-radius: 14px;
+    background: var(--bg-raised);
     font-size: 14px;
+    text-align: left;
+    color: inherit;
   }
-  .fact + .fact {
-    border-top: 1px solid var(--line);
+  .fact.copy:active {
+    background: var(--bg-high);
   }
   .key {
+    font-size: 12px;
     color: var(--muted);
   }
   .value {
     display: flex;
     flex-wrap: wrap;
-    gap: 4px 12px;
+    gap: 4px 10px;
     min-width: 0;
+  }
+  .value :global(span) {
+    font-size: 15px;
   }
   .value.list {
     flex-direction: column;
+    align-items: flex-start;
   }
   .pr {
     display: flex;
     align-items: center;
-    gap: 12px;
-  }
-  .value.list :global(.port) {
-    align-self: flex-start;
+    gap: 10px;
   }
   .muted {
     color: var(--muted);
@@ -496,7 +606,7 @@
     font-size: 12px;
   }
   .path {
-    overflow-wrap: anywhere;
+    color: var(--fg);
   }
   .timeline {
     padding: 14px;
@@ -515,20 +625,46 @@
     list-style: none;
     display: flex;
     flex-direction: column;
-    gap: 8px;
   }
+  /* Each step a dot on a rail, newest first and in its state's colour. */
   .timeline li {
+    position: relative;
     display: grid;
-    grid-template-columns: 44px 60px minmax(0, 1fr);
-    gap: 8px;
-    font-size: 13px;
-    line-height: 1.35;
+    grid-template-columns: 10px minmax(0, 1fr) auto;
+    gap: 12px;
+    padding-bottom: 12px;
+    font-size: 14px;
+    line-height: 1.4;
   }
-  .at {
-    color: var(--muted);
+  .timeline li:last-child {
+    padding-bottom: 0;
+  }
+  .timeline li:not(:last-child)::before {
+    content: "";
+    position: absolute;
+    left: 4px;
+    top: 16px;
+    bottom: 0;
+    width: 2px;
+    background: var(--line);
+  }
+  .dot {
+    width: 10px;
+    height: 10px;
+    margin-top: 5px;
+    border-radius: 5px;
+    background: var(--tone);
   }
   .detail {
     overflow-wrap: anywhere;
+  }
+  .detail.first {
+    color: var(--tone);
+  }
+  .at {
+    font-size: 12px;
+    line-height: 20px;
+    color: var(--muted);
   }
   footer {
     display: flex;
@@ -553,6 +689,14 @@
     color: var(--fg-strong);
     font-size: 15px;
     font-weight: 600;
+  }
+  .action.primary {
+    border: 0;
+    background: var(--green);
+    color: var(--on-accent);
+  }
+  .action:only-child {
+    grid-column: 1 / -1;
   }
   .action.danger {
     border-color: var(--red);

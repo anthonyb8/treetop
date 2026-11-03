@@ -69,31 +69,33 @@
 
     <fieldset>
       <legend>Where</legend>
-      <label class="choice" class:on={where === "fresh"}>
-        <input type="radio" name="where" value="fresh" bind:group={where} />
-        <span>
+      <div class="segments">
+        <label class="choice" class:on={where === "fresh"}>
+          <input type="radio" name="where" value="fresh" bind:group={where} />
           <span class="name">A fresh tree</span>
-          <span class="hint">{pool ? `${pool.free} free in the pool` : "leased from the pool"}</span>
-        </span>
-      </label>
-      {#if tree}
-        <label class="choice" class:on={where === "here"}>
-          <input type="radio" name="where" value="here" bind:group={where} />
-          <span>
+          <span class="hint">{pool ? `${pool.free} free` : "from the pool"}</span>
+        </label>
+        {#if tree}
+          <label class="choice" class:on={where === "here"}>
+            <input type="radio" name="where" value="here" bind:group={where} />
             <span class="name">Tree {tree}</span>
             <span class="hint">keeps its branch</span>
-          </span>
-        </label>
-      {/if}
+          </label>
+        {/if}
+      </div>
     </fieldset>
 
     {#if where === "fresh" && bases.length}
-      <div class="field">
+      <div class="base">
         <label for="base">Base</label>
+        <span class="picked mono">{base}</span>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+          stroke-linecap="round" aria-hidden="true"><path d="M6 9l6 6 6-6" /></svg>
         <select id="base" bind:value={base}>
           {#each bases as name (name)}<option value={name}>{name}</option>{/each}
         </select>
       </div>
+      <p class="note">It gets a branch named for the task, off {base}.</p>
     {/if}
 
     {#if failure}<p class="failure" role="alert">{failure}</p>{/if}
@@ -119,7 +121,7 @@
     justify-content: space-between;
     gap: 12px;
     padding: calc(var(--safe-top) + 6px) 16px 10px;
-    background: var(--bg-raised);
+    border-bottom: 1px solid var(--bg-high);
   }
   .cancel {
     min-height: 44px;
@@ -157,28 +159,25 @@
     font-weight: 600;
     color: var(--muted);
   }
-  textarea,
-  select {
+  textarea {
     width: 100%;
-    padding: 12px;
-    border-radius: 12px;
+    padding: 14px;
+    border-radius: 14px;
     border: 1px solid var(--line-strong);
     background: var(--bg-raised);
     color: var(--fg-strong);
     font-size: 16px;
     line-height: 1.45;
-  }
-  textarea {
     resize: none;
   }
-  select {
-    min-height: 48px;
-    font-family: var(--mono);
+  /* One ring when it has the keys: its own border, not a second outline. */
+  textarea:focus,
+  textarea:focus-visible {
+    outline: none;
+    border-color: var(--blue);
+    box-shadow: 0 0 0 1px var(--blue);
   }
   fieldset {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
     margin: 0;
     padding: 0;
     border: 0;
@@ -186,38 +185,85 @@
   legend {
     margin-bottom: 8px;
   }
-  .choice {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    min-height: 56px;
-    padding: 0 14px;
-    border-radius: 12px;
-    border: 1px solid var(--line);
+  /* Where it runs, as a two-way switch. */
+  .segments {
+    display: grid;
+    grid-auto-columns: minmax(0, 1fr);
+    grid-auto-flow: column;
+    gap: 4px;
+    padding: 4px;
+    border-radius: 14px;
     background: var(--bg-raised);
+  }
+  .choice {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    min-height: 52px;
+    border-radius: 10px;
     font-weight: 400;
   }
   .choice.on {
-    border-color: var(--green);
+    background: var(--bg-high);
+  }
+  .choice:has(input:focus-visible) {
+    outline: 2px solid var(--blue);
   }
   .choice input {
-    width: 20px;
-    height: 20px;
-    margin: 0;
-    accent-color: var(--green);
-  }
-  .choice > span {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
+    position: absolute;
+    opacity: 0;
+    pointer-events: none;
   }
   .name {
     font-size: 15px;
     font-weight: 500;
+    color: var(--muted);
+  }
+  .on .name {
+    font-weight: 600;
     color: var(--fg-strong);
   }
   .hint {
     font-size: 12px;
+    color: var(--muted);
+  }
+  .on .hint {
+    color: var(--green);
+  }
+  .base {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 52px;
+    padding: 0 14px;
+    border-radius: 14px;
+    background: var(--bg-raised);
+    color: var(--muted);
+  }
+  .base label {
+    flex: 1;
+    font-size: 15px;
+    font-weight: 400;
+  }
+  .picked {
+    font-size: 14px;
+    color: var(--fg-strong);
+  }
+  .base select {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    opacity: 0;
+    font-size: 16px;
+  }
+  .note {
+    margin: -14px 4px 0;
+    font-size: 13px;
+    line-height: 1.45;
     color: var(--muted);
   }
   .failure {
@@ -234,8 +280,8 @@
   }
   .go {
     width: 100%;
-    min-height: 50px;
-    border-radius: 12px;
+    min-height: 52px;
+    border-radius: 16px;
     border: 0;
     background: var(--green);
     color: var(--on-accent);

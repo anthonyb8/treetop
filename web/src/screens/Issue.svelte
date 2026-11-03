@@ -222,7 +222,7 @@
     </div>
     <div class="name">
       <span class="id mono">{id}</span>
-      {#if issue}<Priority priority={issue.priority} />{/if}
+      {#if issue}<Priority priority={issue.priority} isWorded />{/if}
     </div>
     {#if issue}<h1>{issue.title}</h1>{/if}
   </header>

@@ -14,7 +14,7 @@ test("a tree's screen shows its agent, git, ports, PR and timeline", async ({ pa
   const agent = page.getByRole("region", { name: "Agent" });
   await expect(agent).toContainText("login");
   await expect(agent).toContainText("waiting on you");
-  await expect(agent).toContainText("“Which auth provider should the login use, Clerk or Supabase?”");
+  await expect(agent).toContainText("Which auth provider should the login use, Clerk or Supabase?");
 
   const facts = page.getByRole("region", { name: "Tree" });
   await expect(facts).toContainText("⇡2");
@@ -28,7 +28,7 @@ test("a tree's screen shows its agent, git, ports, PR and timeline", async ({ pa
   await expect(steps.first()).toContainText("asked about the auth provider");
   await page.screenshot({ path: "test-results/tree.png", fullPage: true });
 
-  await page.getByRole("button", { name: "Pool" }).click();
+  await page.getByRole("button", { name: "Trees" }).click();
   await expect(page).toHaveURL(/\/$/);
   await expect(page.getByRole("region", { name: "Agent" })).toHaveCount(0);
 });
@@ -47,7 +47,7 @@ test("a tree opened from its address goes back to the pool, not out of the app",
   await serve(page, () => pool);
   await page.goto("/trees/17");
   await expect(page.getByRole("region", { name: "Agent" })).toBeVisible();
-  await page.getByRole("button", { name: "Pool" }).click();
+  await page.getByRole("button", { name: "Trees" }).click();
   await expect(page).toHaveURL(/\/$/);
   await expect(page.getByRole("region", { name: "Agent" })).toHaveCount(0);
   await expect(page.getByRole("region", { name: "Needs you" })).toBeVisible();

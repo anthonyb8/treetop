@@ -3,6 +3,7 @@
   import { ApiError, fetchPool, fetchWorkspaces, park, type Card as CardData, type Pool } from "../api";
   import Card from "../components/Card.svelte";
   import GitCounts from "../components/GitCounts.svelte";
+  import Logo from "../components/Logo.svelte";
   import Notifications from "../components/Notifications.svelte";
   import PortButton from "../components/PortButton.svelte";
   import SwipeRow from "../components/SwipeRow.svelte";
@@ -98,34 +99,45 @@
       pool.parked.length === 0,
   );
   let shownName = $derived(pool?.workspace ?? nav.workspace ?? "treetop");
+  // The pool at a glance, as the icon's bars draw it: what waits on you, what
+  // else is held, and what is free.
+  let held = $derived(pool ? pool.groups.reduce((sum, g) => sum + g.cards.length, 0) : 0);
 </script>
 
 <div class="screen">
   <header>
-    <div class="heading">
+    <div class="brand">
+      <Logo />
       <h1 class="mono">treetop</h1>
-      <p class="sub">
-        {#if pool}
-          {pool.needs_you.length} need{pool.needs_you.length === 1 ? "s" : ""} you · {pool.free} free
-        {:else}
-          &nbsp;
-        {/if}
-      </p>
+      <div class="tools">
+        <Notifications />
+        <label class="switcher">
+          <span class="visually-hidden">Workspace</span>
+          <span class="current">{shownName}</span>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+            stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6" /></svg>
+          <select value={shownName} onchange={(e) => choose(e.currentTarget.value)} disabled={workspaces.length < 2}>
+            {#each workspaces.length ? workspaces : [shownName] as name (name)}
+              <option value={name}>{name}</option>
+            {/each}
+          </select>
+        </label>
+      </div>
     </div>
-    <div class="tools">
-    <Notifications />
-    <label class="switcher">
-      <span class="visually-hidden">Workspace</span>
-      <span class="current">{shownName}</span>
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-        stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6" /></svg>
-      <select value={shownName} onchange={(e) => choose(e.currentTarget.value)} disabled={workspaces.length < 2}>
-        {#each workspaces.length ? workspaces : [shownName] as name (name)}
-          <option value={name}>{name}</option>
-        {/each}
-      </select>
-    </label>
-    </div>
+    {#if pool}
+      <div class="glance">
+        <div class="bar" aria-hidden="true">
+          {#if pool.needs_you.length}<span class="needs" style:flex-grow={pool.needs_you.length}></span>{/if}
+          {#if held}<span class="held" style:flex-grow={held}></span>{/if}
+          {#if pool.free}<span class="free-bar" style:flex-grow={pool.free}></span>{/if}
+        </div>
+        <p class="sub">
+          <span><b class="needs-n">{pool.needs_you.length}</b> need{pool.needs_you.length === 1 ? "s" : ""} you</span>
+          <span><b class="held-n">{held}</b> held</span>
+          <span><b>{pool.free}</b> free</span>
+        </p>
+      </div>
+    {/if}
   </header>
 
   {#if failure && pool}
@@ -181,8 +193,8 @@
       {#each pool.groups as group (group.base)}
         {#if group.cards.length || group.checkout}
           <section aria-label={group.base || "trees"}>
-            <h2>
-              <span>{group.base || "trees"}</span>
+            <h2 class="base">
+              <span class="mono">{group.base || "trees"}</span>
               {#if group.checkout}
                 <span class="checkout">
                   main checkout
@@ -211,21 +223,23 @@
         </div>
       {/if}
 
-      <section class="tail">
-        <p class="free">{pool.free} free {pool.free === 1 ? "tree" : "trees"}</p>
-        {#if pool.parked.length}
-          <button type="button" class="fold" aria-expanded={isParkedOpen} onclick={() => (isParkedOpen = !isParkedOpen)}>
-            <span>Parked · {pool.parked.length}</span>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-              stroke-linecap="round" aria-hidden="true"><path d={isParkedOpen ? "M6 15l6-6 6 6" : "M6 9l6 6 6-6"} /></svg>
-          </button>
-          {#if isParkedOpen}
-            <div class="list">
-              {#each pool.parked as card (card.tree)}
-                <SwipeRow label="Unpark" onswipe={() => swipeAside(card)}><Card {card} /></SwipeRow>
-              {/each}
-            </div>
+      <section class="tail" aria-label="Free and parked">
+        <div class="tail-row">
+          <p class="free">{pool.free} free {pool.free === 1 ? "tree" : "trees"}</p>
+          {#if pool.parked.length}
+            <button type="button" class="fold" aria-expanded={isParkedOpen} onclick={() => (isParkedOpen = !isParkedOpen)}>
+              <span>Parked · {pool.parked.length}</span>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+                stroke-linecap="round" aria-hidden="true"><path d={isParkedOpen ? "M6 15l6-6 6 6" : "M6 9l6 6 6-6"} /></svg>
+            </button>
           {/if}
+        </div>
+        {#if isParkedOpen && pool.parked.length}
+          <div class="list">
+            {#each pool.parked as card (card.tree)}
+              <SwipeRow label="Unpark" onswipe={() => swipeAside(card)}><Card {card} /></SwipeRow>
+            {/each}
+          </div>
         {/if}
       </section>
     {/if}
@@ -245,30 +259,68 @@
   }
   header {
     display: flex;
-    align-items: center;
-    justify-content: space-between;
+    flex-direction: column;
     gap: 12px;
-    padding: calc(var(--safe-top) + 12px) 16px 12px;
-    background: var(--bg-raised);
+    padding: calc(var(--safe-top) + 10px) 16px 14px;
+    border-bottom: 1px solid var(--bg-high);
   }
-  .heading {
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
     min-width: 0;
   }
   h1 {
+    flex: 1;
     margin: 0;
     font-size: 20px;
     font-weight: 700;
     color: var(--fg-strong);
   }
+  .glance {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .bar {
+    display: flex;
+    gap: 4px;
+    height: 6px;
+  }
+  .bar span {
+    flex-basis: 0;
+    border-radius: 3px;
+  }
+  .needs {
+    background: var(--yellow);
+  }
+  .held {
+    background: var(--green);
+  }
+  .free-bar {
+    background: var(--line);
+  }
   .sub {
-    margin: 2px 0 0;
+    display: flex;
+    gap: 14px;
+    margin: 0;
     font-size: 13px;
     color: var(--muted);
+  }
+  .sub b {
+    font-weight: 600;
+    color: var(--fg-strong);
+  }
+  .sub .needs-n {
+    color: var(--yellow);
+  }
+  .sub .held-n {
+    color: var(--green);
   }
   .tools {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 4px;
     min-width: 0;
   }
   .switcher {
@@ -276,14 +328,14 @@
     display: flex;
     align-items: center;
     gap: 6px;
-    min-height: 44px;
+    min-height: 36px;
     max-width: 160px;
-    padding: 0 12px;
-    border-radius: 10px;
-    border: 1px solid var(--line-strong);
-    background: var(--bg-high);
+    padding: 0 12px 0 14px;
+    border-radius: 18px;
+    border: 1px solid var(--line);
+    background: var(--bg-raised);
     color: var(--fg-strong);
-    font-size: 14px;
+    font-size: 15px;
     font-weight: 500;
   }
   .current {
@@ -372,6 +424,13 @@
   h2.loud {
     color: var(--yellow);
   }
+  /* A base is a branch, so it reads as one. */
+  h2.base {
+    font-size: 13px;
+    font-weight: 500;
+    letter-spacing: 0;
+    text-transform: none;
+  }
   .checkout {
     display: flex;
     gap: 8px;
@@ -396,24 +455,38 @@
     border-top: 1px solid var(--line);
   }
   .tail {
-    gap: 10px;
+    gap: 8px;
+  }
+  .tail-row {
+    display: flex;
+    align-items: center;
+    min-height: 48px;
+    border-radius: 14px;
+    background: var(--bg-raised);
   }
   .free {
+    flex: 1;
     margin: 0;
-    font-size: 13px;
+    padding: 0 14px;
+    font-size: 14px;
     color: var(--muted);
   }
   .fold {
+    flex: 1;
     display: flex;
     align-items: center;
     justify-content: space-between;
-    min-height: 44px;
+    align-self: stretch;
     padding: 0 14px;
-    border-radius: 12px;
-    border: 1px solid var(--line);
+    border: 0;
+    border-left: 1px solid var(--line);
+    border-radius: 0 14px 14px 0;
     background: transparent;
-    color: var(--fg);
+    color: var(--fg-strong);
     font-size: 14px;
+  }
+  .fold :global(svg) {
+    color: var(--muted);
   }
   .state {
     display: flex;

@@ -308,6 +308,13 @@
   let answeredId = $state<string | null>(null);
   let answeredNeeds = $state<string | null>(null);
   let shownNeeds = $derived(needs !== answeredNeeds ? needs : null);
+  // The agent's last words, when they are what it waits on you for: the
+  // question is marked where it was asked rather than said again below.
+  let askedId = $derived.by(() => {
+    const last = shown.at(-1);
+    if (!shownNeeds || last?.kind !== "claude" || !last.text) return null;
+    return last.text.includes(shownNeeds.trim()) ? last.id : null;
+  });
 
   // What the agent waits on: its newest tool call, when it has no result
   // yet and the agent waits on you. A question carries its choices; any
@@ -384,6 +391,7 @@
       <div class="status">
         {#if card}<Mark mark={card.mark} />{/if}
         <span>{tree?.agents[0]?.name ?? "agent"}{isLive ? "" : " · connecting…"}</span>
+        {#if isLive && isWaiting}<span class="waiting">· waiting on you</span>{/if}
       </div>
     </div>
     {#if tree?.ports.length}
@@ -415,7 +423,8 @@
           <span class="at">{time(message.at)}</span>
         </div>
       {:else if message.kind === "claude"}
-        <div class="claude">
+        <div class="claude" class:asks={message.id === askedId}>
+          {#if message.id === askedId}<span class="asks-label">Needs you</span>{/if}
           <Reveal
             text={message.text ?? ""}
             isNew={writing.has(message.id)}
@@ -471,13 +480,13 @@
   {/if}
 
   <footer bind:clientHeight={footerHeight}>
-    {#if promptTool || shownNeeds}
+    {#if promptTool || (shownNeeds && !askedId)}
       <PromptCard tool={promptTool} needs={shownNeeds} onanswer={answerPrompt} />
     {/if}
     {#if answerFailure}<p class="failure" role="alert">{answerFailure}</p>{/if}
     <form onsubmit={send}>
       <label class="visually-hidden" for="line-{name}">Message {name}</label>
-      <textarea id="line-{name}" rows="1" placeholder={promptTool ? "Answer in your own words…" : `Message ${name}…`}
+      <textarea id="line-{name}" rows="1" placeholder={promptTool ? "Answer in your own words…" : isWaiting ? `Answer ${name}…` : `Message ${name}…`}
         bind:value={draft} onkeydown={onKey}
         enterkeyhint="send"></textarea>
       <button type="submit" class="send" aria-label="Send" disabled={!draft.trim()}>
@@ -625,6 +634,24 @@
   }
   .claude {
     max-width: 96%;
+  }
+  .claude.asks {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 12px 14px;
+    border-radius: 16px;
+    background: var(--yellow-bg);
+  }
+  .asks-label {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--yellow);
+  }
+  .waiting {
+    color: var(--yellow);
   }
   .tool {
     display: flex;
