@@ -753,6 +753,19 @@ fn tree_route(pool: &Pool, method: &Method, rest: &str, asked: &Asked) -> Reply 
                 ),
             }
         }
+        (Method::Get, "prompt") => {
+            let Some(command) = App::agents_of(found).iter().find_map(|a| a.attach.clone()) else {
+                return Reply::error(404, "this tree's agent has no chat to read a question from");
+            };
+            drop(app);
+            let Some(hints) = crate::plugin::screen_of("claude") else {
+                return Reply::error(500, "the Claude Code plugin says nothing of its screen");
+            };
+            match answer::read(&command, &hints) {
+                Ok(ask) => Reply::json(200, &json!({ "ask": ask })),
+                Err(why) => Reply::error(409, &why),
+            }
+        }
         (Method::Post, "answer") => {
             #[derive(serde::Deserialize)]
             struct Answer {
@@ -813,7 +826,7 @@ fn answer_of(action: &str) -> Option<(answer::Press, bool)> {
     match action {
         "allow" => Some((answer::Press::Allow, false)),
         "deny" => Some((answer::Press::Deny, false)),
-        "say" => Some((answer::Press::Deny, true)),
+        "say" => Some((answer::Press::Clear, true)),
         _ => None,
     }
 }
@@ -1228,10 +1241,10 @@ mod tests {
 
     #[test]
     fn only_allow_lets_a_prompt_s_choice_stand() {
-        use answer::Press::{Allow, Deny};
+        use answer::Press::{Allow, Clear, Deny};
         assert_eq!(answer_of("allow"), Some((Allow, false)));
         assert_eq!(answer_of("deny"), Some((Deny, false)));
-        assert_eq!(answer_of("say"), Some((Deny, true)));
+        assert_eq!(answer_of("say"), Some((Clear, true)));
         assert_eq!(answer_of("yes"), None);
     }
 

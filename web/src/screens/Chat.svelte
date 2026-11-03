@@ -3,7 +3,19 @@
   import { cubicOut } from "svelte/easing";
   import { SvelteSet } from "svelte/reactivity";
   import { fly, slide } from "svelte/transition";
-  import { answer, ApiError, chatUrl, fetchTree, sendLine, type Answer, type ChatMessage, type Tree } from "../api";
+  import {
+    answer,
+    ApiError,
+    chatUrl,
+    fetchPrompt,
+    fetchTree,
+    sendLine,
+    type Answer,
+    type ChatMessage,
+    type Question,
+    type ToolCall,
+    type Tree,
+  } from "../api";
   import Mark from "../components/Mark.svelte";
   import PortButton from "../components/PortButton.svelte";
   import PromptCard from "../components/PromptCard.svelte";
@@ -265,7 +277,10 @@
     event.preventDefault();
     const text = draft.trim();
     if (!text) return;
-    const line: Pending = { id: nextId++, text, state: "sending", answers: promptTool?.id };
+    // While the agent waits on you, words answer whatever it waits on, found
+    // or not: a prompt it shows would swallow a plain message.
+    const answers = promptTool?.id ?? (isWaiting ? (spell ?? undefined) : undefined);
+    const line: Pending = { id: nextId++, text, state: "sending", answers };
     pending.push(line);
     draft = "";
     isAtEnd = true;
@@ -325,7 +340,37 @@
     for (let i = shown.length - 1; i >= 0 && !last; i--) if (shown[i]?.kind === "tool") last = shown[i];
     return last?.tool?.status === "running" && last.id !== answeredId ? last : null;
   });
-  let promptTool = $derived(promptMessage?.tool ? { ...promptMessage.tool, id: promptMessage.id } : null);
+
+  // Claude Code writes a question to the transcript only once it has been
+  // answered, so while the agent waits with nothing running in its chat,
+  // the question is read off its screen, once for each time it waits.
+  let screenAsk = $state<{ spell: string; ask: Question[] } | null>(null);
+  let spell = $derived(isWaiting ? `screen:${tree?.report?.says ?? ""}` : null);
+  $effect(() => {
+    if (!spell || promptMessage || screenAsk?.spell === spell) return;
+    const asking = spell;
+    screenAsk = { spell: asking, ask: [] };
+    fetchPrompt(nav.workspace, name)
+      .then(({ ask }) => {
+        if (screenAsk?.spell === asking) screenAsk = { spell: asking, ask };
+      })
+      .catch(() => {});
+  });
+  let promptTool = $derived.by((): (ToolCall & { id: string }) | null => {
+    if (promptMessage?.tool) return { ...promptMessage.tool, id: promptMessage.id };
+    const ask = screenAsk?.spell === spell ? screenAsk?.ask : undefined;
+    if (!spell || !ask?.length || answeredId === spell) return null;
+    return {
+      id: spell,
+      verb: "Asked you",
+      what: ask[0]?.question ?? null,
+      added: null,
+      removed: null,
+      status: "running",
+      output: null,
+      ask,
+    };
+  });
   let answerFailure = $state<string | null>(null);
 
   // What a running tool call is doing, as the dots say it: a command's own
