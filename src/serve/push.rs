@@ -343,6 +343,20 @@ impl Notice {
     }
 }
 
+/// `value` as it can sit in a query string: everything but letters,
+/// digits and `-._~` percent-encoded.
+fn query_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+            escaped.push(char::from(byte));
+        } else {
+            escaped.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    escaped
+}
+
 /// What each tree looked like the last time: its agent's state and its
 /// PR's stage.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -389,8 +403,11 @@ impl Seen {
     /// What changed from `self` to `now` that is worth a push: an agent
     /// coming to need you, finishing or dying, and a PR's checks failing or
     /// it merging. A tree seen for the first time says nothing, so a
-    /// server starting up does not push the whole pool.
-    pub fn notices(&self, now: &Seen, app: &App) -> Vec<Notice> {
+    /// server starting up does not push the whole pool. Each opens its tree
+    /// in `workspace`, its own, whichever one the phone last showed: tree 17
+    /// of one repository is not tree 17 of another.
+    pub fn notices(&self, now: &Seen, app: &App, workspace: &str) -> Vec<Notice> {
+        let query = format!("?workspace={}", query_escape(workspace));
         let mut notices = Vec::new();
         for (name, (said, stage)) in &now.trees {
             let Some((was_said, was_stage)) = self.trees.get(name) else {
@@ -403,8 +420,8 @@ impl Seen {
                     title(t.branch.as_deref(), ticket.as_deref())
                 })
                 .map_or_else(|| name.clone(), |title| format!("{name} · {title}"));
-            let chat = format!("/trees/{name}/chat");
-            let page = format!("/trees/{name}");
+            let chat = format!("/trees/{name}/chat{query}");
+            let page = format!("/trees/{name}{query}");
             if said != was_said {
                 let what = match said {
                     Some(Said::NeedsYou) => Some(("Needs you", &chat)),
@@ -634,35 +651,35 @@ mod tests {
         app.apply_reports(vec![report("j17", "/pool/17", State::Blocked)]);
         app.trees[0].ship = ship(Stage::CiFailed);
         let now = Seen::of(&app);
-        let notices = before.notices(&now, &app);
+        let notices = before.notices(&now, &app, "my app");
         assert_eq!(
             notices,
             [
                 Notice {
                     title: "17 · END-123 fix-login".into(),
-                    body: "Its PR's checks failed".into(),
-                    url: "/trees/17".into(),
+                    body: "Needs you".into(),
+                    url: "/trees/17/chat?workspace=my%20app".into(),
                 },
                 Notice {
                     title: "17 · END-123 fix-login".into(),
-                    body: "Needs you".into(),
-                    url: "/trees/17/chat".into(),
+                    body: "Its PR's checks failed".into(),
+                    url: "/trees/17?workspace=my%20app".into(),
                 },
             ]
         );
         // Read again with nothing changed, nothing pushes.
-        assert!(now.notices(&Seen::of(&app), &app).is_empty());
+        assert!(now.notices(&Seen::of(&app), &app, "app").is_empty());
         // A tree seen for the first time says nothing.
-        assert!(Seen::default().notices(&now, &app).is_empty());
+        assert!(Seen::default().notices(&now, &app, "app").is_empty());
         // Done, then merged.
         app.apply_reports(vec![report("j17", "/pool/17", State::Done)]);
         app.trees[0].ship = ship(Stage::Merged);
         let bodies: Vec<String> = now
-            .notices(&Seen::of(&app), &app)
+            .notices(&Seen::of(&app), &app, "app")
             .into_iter()
             .map(|n| n.body)
             .collect();
-        assert_eq!(bodies, ["Its PR merged", "Done"]);
+        assert_eq!(bodies, ["Done", "Its PR merged"]);
     }
 
     #[test]

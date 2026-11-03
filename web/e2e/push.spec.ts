@@ -2,7 +2,7 @@
 // the server's key and tells the server where to push; refused in Settings,
 // the bell says so instead of asking again.
 import { expect, test, type Page } from "@playwright/test";
-import { pool, serve } from "./fixtures";
+import { pool, serve, tree17 } from "./fixtures";
 
 const subscription = {
   endpoint: "https://web.push.apple.com/QGuQ",
@@ -81,4 +81,53 @@ test("a phone that allowed them before is told to the server again on open", asy
   await page.goto("/");
   await expect.poll(() => told).toBe(1);
   await expect(page.getByRole("button", { name: /notifications/i })).toHaveCount(0);
+});
+
+test("a notification from another workspace opens its tree's chat there", async ({ page }) => {
+  // The phone was last on "app"; the push is for tree 17 of "treetop".
+  await page.addInitScript(() => {
+    if (!sessionStorage.getItem("seeded")) {
+      localStorage.setItem("treetop:workspace", JSON.stringify("app"));
+      sessionStorage.setItem("seeded", "1");
+    }
+  });
+  const asked: string[] = [];
+  await page.route("**/api/workspaces", (route) =>
+    route.fulfill({ json: { default: "app", workspaces: ["app", "treetop"] } }),
+  );
+  await page.route("**/api/pool**", (route) => {
+    const workspace = new URL(route.request().url()).searchParams.get("workspace");
+    asked.push(`pool ${workspace}`);
+    return route.fulfill({ json: { ...pool, workspace: workspace ?? "app" } });
+  });
+  await page.route("**/api/trees/17?**", (route) => {
+    const workspace = new URL(route.request().url()).searchParams.get("workspace");
+    asked.push(`tree ${workspace}`);
+    return workspace === "treetop"
+      ? route.fulfill({ json: tree17 })
+      : route.fulfill({ status: 404, json: { error: `no tree 17 in ${workspace}` } });
+  });
+  await page.route("**/api/trees/17/chat**", (route) => {
+    const workspace = new URL(route.request().url()).searchParams.get("workspace");
+    asked.push(`chat ${workspace}`);
+    const backlog = [{ id: "a1:0", kind: "claude", text: "Which auth provider should the login use?" }];
+    return route.fulfill({
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" },
+      body: `retry: 200\n\nevent: backlog\ndata: ${JSON.stringify(backlog)}\n\n`,
+    });
+  });
+
+  await page.goto("/trees/17/chat?workspace=treetop");
+  const chat = page.getByRole("main", { name: "Conversation" });
+  await expect(chat.getByText("Which auth provider should the login use?")).toBeVisible();
+  expect(asked).toContain("chat treetop");
+  expect(asked.filter((a) => a.endsWith(" app"))).toEqual([]);
+  await expect(page).toHaveURL(/\/trees\/17\/chat$/);
+
+  // Back on the pool, the app stays on the notification's workspace.
+  await page.getByRole("button", { name: "Back to tree 17" }).click();
+  await page.getByRole("button", { name: "Trees" }).click();
+  await expect(page.getByRole("combobox")).toHaveValue("treetop");
+  expect(asked.filter((a) => a.startsWith("pool")).at(-1)).toBe("pool treetop");
 });

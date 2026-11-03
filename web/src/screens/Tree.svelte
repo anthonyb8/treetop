@@ -560,12 +560,15 @@
     gap: 10px;
     background: none;
   }
+  /* A tile is half the screen, so a long path or PR line breaks anywhere
+     rather than pushing the tile wider. */
   .fact {
     display: flex;
     flex-direction: column;
     align-items: flex-start;
     gap: 6px;
     min-width: 0;
+    overflow-wrap: anywhere;
     padding: 12px;
     border: 0;
     border-radius: 14px;
@@ -586,6 +589,7 @@
     flex-wrap: wrap;
     gap: 4px 10px;
     min-width: 0;
+    max-width: 100%;
   }
   .value :global(span) {
     font-size: 15px;

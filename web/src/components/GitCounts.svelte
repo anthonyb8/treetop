@@ -16,6 +16,7 @@
 <style>
   span {
     font-size: 12px;
+    white-space: nowrap;
   }
   .unknown {
     color: var(--yellow);

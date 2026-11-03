@@ -431,6 +431,10 @@
     letter-spacing: 0;
     text-transform: none;
   }
+  h2.base > .mono {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
   .checkout {
     display: flex;
     gap: 8px;

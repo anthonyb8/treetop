@@ -16,7 +16,9 @@
   .port {
     position: relative;
     flex: none;
+    max-width: 100%;
     display: inline-flex;
+    white-space: nowrap;
     align-items: center;
     gap: 4px;
     min-height: 26px;
@@ -39,7 +41,15 @@
   .port:active {
     background: var(--line-strong);
   }
+  .number,
+  svg {
+    flex: none;
+  }
   .process {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     color: var(--muted);
   }
 </style>

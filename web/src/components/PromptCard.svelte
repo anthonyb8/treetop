@@ -145,6 +145,7 @@
     display: flex;
     align-items: flex-start;
     flex-wrap: wrap;
+    overflow-wrap: anywhere;
     gap: 6px 8px;
     margin: 0;
     font-size: 15px;

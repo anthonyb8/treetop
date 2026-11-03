@@ -89,7 +89,7 @@
      when and what it serves on the right. */
   .quiet {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr) fit-content(55%);
     column-gap: 10px;
   }
   .quiet .open {
@@ -107,6 +107,7 @@
   .meta.side {
     grid-row: 2;
     align-self: end;
+    justify-content: flex-end;
   }
   .loud {
     display: flex;
@@ -168,8 +169,10 @@
   .more {
     color: var(--fg);
   }
+  /* A tree serving many ports wraps them rather than running off the card. */
   .meta {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 8px;
     font-size: 12px;
