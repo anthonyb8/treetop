@@ -68,6 +68,9 @@ pub struct Screen {
     /// The issues on screen: the listed ones the search keeps, grouped.
     pub(crate) issues: Vec<Issue>,
     pub(crate) selected: usize,
+    /// The issues marked with `x`, by id, which status, assignee and
+    /// project change together.
+    pub(crate) marked: BTreeSet<String>,
     pub(crate) filters: Filters,
     /// The views on keys 1 to 9: the five built in, then the config's.
     pub(crate) views: Vec<View>,
@@ -192,6 +195,7 @@ impl Screen {
             all: Vec::new(),
             issues: Vec::new(),
             selected: 0,
+            marked: BTreeSet::new(),
             filters: views[0].filters.clone(),
             group: views[0].group,
             view: Some(0),
@@ -503,6 +507,36 @@ impl Screen {
                 self.message = Some(said);
                 self.replace(issue);
             }
+            Reply::UpdatedMany {
+                source,
+                before,
+                result,
+            } => {
+                if source != self.source {
+                    return;
+                }
+                let (done, why) = match result {
+                    Ok(done) => (done, None),
+                    Err((done, why)) => (done, Some(why)),
+                };
+                let count = done.len();
+                // Those Linear did not change go back as they were.
+                let kept: Vec<Issue> = before
+                    .into_iter()
+                    .filter(|b| !done.iter().any(|d| d.id == b.id))
+                    .collect();
+                self.message = Some(match why {
+                    None => format!("{} updated", issues_said(count)),
+                    Some(why) => format!(
+                        "{} of {} updated: {why}; the rest kept as they were",
+                        count,
+                        count + kept.len()
+                    ),
+                });
+                for issue in done.into_iter().chain(kept) {
+                    self.replace(issue);
+                }
+            }
             Reply::Created {
                 source,
                 form,
@@ -737,6 +771,9 @@ impl Screen {
     /// Opens a picker of `kind` on the issue under the cursor, once its team
     /// is known.
     fn open_picker(&mut self, kind: picker::Kind) {
+        if self.acts_on_marked() {
+            return self.open_picker_for_marked(kind);
+        }
         let Some(issue) = self.current() else {
             return;
         };
@@ -755,6 +792,90 @@ impl Screen {
             return;
         };
         self.picker = Some(Picker::new(kind, issue, team));
+    }
+
+    /// An edit goes to the marked issues: some are, and the list is on
+    /// screen rather than one issue or the form.
+    pub(crate) fn acts_on_marked(&self) -> bool {
+        !self.marked.is_empty() && self.focus == Focus::List && self.form.is_none()
+    }
+
+    /// The marked issues, in the order the list shows them.
+    pub(crate) fn marked_issues(&self) -> Vec<Issue> {
+        self.issues
+            .iter()
+            .filter(|i| self.marked.contains(&i.id))
+            .cloned()
+            .collect()
+    }
+
+    /// Opens a picker of `kind` for every marked issue, once the team is
+    /// known.
+    fn open_picker_for_marked(&mut self, kind: picker::Kind) {
+        if kind == picker::Kind::Labels {
+            self.message = Some("labels change one issue at a time; Esc clears the marks".into());
+            return;
+        }
+        let Some(team) = self.team_to_change() else {
+            return;
+        };
+        self.picker = Picker::for_many(kind, &self.marked_issues(), &team);
+    }
+
+    /// Makes the change `picker` asks for to every marked issue, on screen at
+    /// once, and sends it as one; the marks go once it is sent.
+    fn change_marked(&mut self, picker: &Picker) {
+        let before = self.marked_issues();
+        let Some((change, _)) = before.first().and_then(|i| picker.apply(i)) else {
+            return;
+        };
+        let after: Vec<Issue> = before
+            .iter()
+            .filter_map(|i| picker.apply(i).map(|(_, after)| after))
+            .collect();
+        self.message = Some(format!("updating {}...", issues_said(before.len())));
+        for issue in after {
+            self.replace(issue);
+        }
+        self.marked.clear();
+        self.worker.send(Request::UpdateMany {
+            source: self.source,
+            before,
+            change: Box::new(change),
+        });
+    }
+
+    /// Marks the issue under the cursor, or unmarks it, and moves down.
+    fn toggle_mark(&mut self) {
+        let Some(id) = self.current().map(|i| i.id.clone()) else {
+            return;
+        };
+        if self.read_only.contains(&self.source) {
+            self.message = Some(READ_ONLY.into());
+            return;
+        }
+        if !self.marked.remove(&id) {
+            self.marked.insert(id);
+        }
+        self.move_by(1);
+    }
+
+    /// Marks every issue the list shows, folded groups aside, or unmarks
+    /// them all when they all are.
+    fn toggle_mark_all(&mut self) {
+        if self.read_only.contains(&self.source) {
+            self.message = Some(READ_ONLY.into());
+            return;
+        }
+        let shown: BTreeSet<String> = (0..self.issues.len())
+            .filter(|at| !self.is_folded(*at))
+            .map(|at| self.issues[at].id.clone())
+            .collect();
+        if shown.is_subset(&self.marked) {
+            self.marked.clear();
+        } else {
+            self.marked.extend(shown);
+        }
     }
 
     /// Posts the comment the box holds, now that Enter sent it.
@@ -833,6 +954,8 @@ impl Screen {
             })
             .cloned()
             .collect();
+        let all = &self.all;
+        self.marked.retain(|id| all.iter().any(|i| i.id == *id));
         self.arrange();
         self.selected = cursor
             .and_then(|id| self.issues.iter().position(|i| i.id == id))
@@ -1111,6 +1234,7 @@ impl Screen {
             return;
         }
         self.source = (self.source + 1) % self.backends.len();
+        self.marked.clear();
         self.all.clear();
         self.issues.clear();
         self.details.clear();
@@ -1168,6 +1292,11 @@ impl Screen {
                     self.picker = None;
                     let row = ROWS[self.panel.unwrap_or(0)];
                     self.set_filter(row, id);
+                }
+                Picked::Apply(..) if self.acts_on_marked() => {
+                    if let Some(picker) = self.picker.take() {
+                        self.change_marked(&picker);
+                    }
                 }
                 Picked::Apply(change, after) => {
                     self.picker = None;
@@ -1276,7 +1405,13 @@ impl Screen {
             }
         }
         match key.code {
+            KeyCode::Esc if !self.marked.is_empty() => {
+                self.message = Some(format!("{} unmarked", issues_said(self.marked.len())));
+                self.marked.clear();
+            }
             KeyCode::Tab | KeyCode::Esc => return Action::Back,
+            KeyCode::Char('x') => self.toggle_mark(),
+            KeyCode::Char('X') => self.toggle_mark_all(),
             KeyCode::Down | KeyCode::Char('j') => self.move_by(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_by(-1),
             KeyCode::Home | KeyCode::Char('g') => self.move_by(isize::MIN),
@@ -1514,6 +1649,7 @@ impl Screen {
             KeyCode::Char('s') => self.open_picker(picker::Kind::Status),
             KeyCode::Char('l') => self.open_picker(picker::Kind::Labels),
             KeyCode::Char('a') => self.open_picker(picker::Kind::Assignee),
+            KeyCode::Char('P') => self.open_picker(picker::Kind::Project),
             KeyCode::Char('c') => self.open_compose(),
             KeyCode::Char('e') => self.open_edit(),
             KeyCode::Char('o') => {
@@ -1532,6 +1668,14 @@ impl Screen {
             _ => {}
         }
         Action::None
+    }
+}
+
+/// `count` issues, in words.
+pub(crate) fn issues_said(count: usize) -> String {
+    match count {
+        1 => "1 issue".to_string(),
+        n => format!("{n} issues"),
     }
 }
 
@@ -1811,7 +1955,10 @@ mod tests {
         );
         assert!(screen.issues.is_empty());
         let drawn = drawn(&screen).join("\n");
-        assert!(drawn.contains(" no issue source for this repository"), "{drawn}");
+        assert!(
+            drawn.contains(" no issue source for this repository"),
+            "{drawn}"
+        );
         assert!(
             drawn.contains("/home/me/blog has no issue source; w shows work anyway"),
             "{drawn}"
@@ -2369,6 +2516,99 @@ mod tests {
             screen.message.as_deref(),
             Some("END-1: Linear: forbidden; kept as it was")
         );
+    }
+
+    /// END-1 to END-3, all todo, with END-1 and END-3 marked and set to
+    /// doing in one go.
+    fn marked_and_set(refuse: Option<&str>) -> Screen {
+        let todo = |id: &str| Issue {
+            state: "todo".into(),
+            state_id: Some("todo".into()),
+            ..issue(id)
+        };
+        let fake = Arc::new(Fake {
+            name: "work".into(),
+            issues: vec![todo("END-1"), todo("END-2"), todo("END-3")],
+            team: Some(team_of(&["todo", "doing"])),
+            refuse: refuse.map(str::to_string),
+            ..Fake::default()
+        });
+        let mut screen = Screen::new(vec![fake], 0, Vec::new());
+        settle(&mut screen);
+        screen.handle_key(key(KeyCode::Char('x')));
+        screen.handle_key(key(KeyCode::Char('j')));
+        screen.handle_key(key(KeyCode::Char('x')));
+        let rows = drawn_with(&screen, &crate::NoTrees, 140);
+        let text = rows.join("\n");
+        assert!(rows.iter().any(|r| r.starts_with("✓ END-1")), "{text}");
+        assert!(rows.iter().any(|r| r.starts_with("  END-2")), "{text}");
+        assert!(text.contains("2 marked"), "{text}");
+        screen.handle_key(key(KeyCode::Char('s')));
+        let text = drawn(&screen).join("\n");
+        assert!(text.contains(" Status of 2 issues "), "{text}");
+        screen.handle_key(key(KeyCode::Down));
+        screen.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            states_of(&screen),
+            ["doing", "todo", "doing"],
+            "shown at once"
+        );
+        assert!(screen.marked.is_empty(), "the marks go once it is sent");
+        screen
+    }
+
+    /// The status of END-1 to END-3, in that order, wherever their groups
+    /// put them.
+    fn states_of(screen: &Screen) -> Vec<String> {
+        let mut issues: Vec<&Issue> = screen.issues.iter().collect();
+        issues.sort_by(|a, b| a.id.cmp(&b.id));
+        issues.into_iter().map(|i| i.state.clone()).collect()
+    }
+
+    #[test]
+    fn marked_issues_take_one_status_together() {
+        let mut screen = marked_and_set(None);
+        settle_update(&mut screen);
+        assert_eq!(screen.message.as_deref(), Some("2 issues updated"));
+        assert_eq!(states_of(&screen), ["doing", "todo", "doing"]);
+    }
+
+    #[test]
+    fn marked_issues_the_source_refuses_go_back_and_say_why() {
+        let mut screen = marked_and_set(Some("Linear: forbidden"));
+        settle_update(&mut screen);
+        assert_eq!(states_of(&screen), ["todo", "todo", "todo"]);
+        assert_eq!(
+            screen.message.as_deref(),
+            Some("0 of 2 updated: Linear: forbidden; the rest kept as they were")
+        );
+    }
+
+    #[test]
+    fn marks_leave_the_issue_being_read_alone_and_esc_clears_them() {
+        let fake = Arc::new(Fake {
+            name: "work".into(),
+            issues: vec![issue("END-1"), issue("END-2")],
+            team: Some(team_of(&["todo", "doing"])),
+            ..Fake::default()
+        });
+        let mut screen = Screen::new(vec![fake], 0, Vec::new());
+        settle(&mut screen);
+        screen.handle_key(key(KeyCode::Char('x')));
+        assert_eq!(screen.current().unwrap().id, "END-2", "x moves down");
+        screen.handle_key(key(KeyCode::Enter));
+        screen.handle_key(key(KeyCode::Char('s')));
+        assert_eq!(
+            screen.picker.as_ref().unwrap().issue,
+            "END-2",
+            "the issue open, not the marked ones"
+        );
+        screen.handle_key(key(KeyCode::Esc));
+        screen.handle_key(key(KeyCode::Esc));
+        assert_eq!(screen.focus, Focus::List);
+        assert_eq!(screen.handle_key(key(KeyCode::Esc)), Action::None);
+        assert!(screen.marked.is_empty());
+        assert_eq!(screen.handle_key(key(KeyCode::Esc)), Action::Back);
     }
 
     fn commented(refuse: Option<&str>) -> Screen {

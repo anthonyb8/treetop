@@ -55,6 +55,9 @@ pub struct Picker {
     pub marked: BTreeSet<String>,
     /// The choice the issue has now, by id, marked in the list.
     pub current: Option<String>,
+    /// Picking for issues that do not all have the same choice now, so
+    /// none is marked as theirs.
+    pub is_mixed: bool,
 }
 
 /// What a key did to the picker.
@@ -148,7 +151,29 @@ impl Picker {
             cursor,
             marked,
             current,
+            is_mixed: false,
         }
+    }
+
+    /// A picker of `kind` for every one of `issues`, titled by how many: on
+    /// the choice they share, if they all have one.
+    pub fn for_many(kind: Kind, issues: &[Issue], team: &Team) -> Option<Self> {
+        let first = issues.first()?;
+        let mut picker = Picker::new(kind, first, team);
+        let of = |issue: &Issue| match kind {
+            Kind::Status => issue.state_id.clone(),
+            Kind::Assignee => issue.assignee_id.clone(),
+            Kind::Project => issue.project_id.clone(),
+            Kind::Priority => Some(issue.priority.to_string()),
+            Kind::Labels | Kind::Choice => None,
+        };
+        if issues.iter().any(|i| of(i) != of(first)) {
+            picker.is_mixed = true;
+            picker.current = None;
+            picker.cursor = 0;
+        }
+        picker.issue = format!("{} issues", issues.len());
+        Some(picker)
     }
 
     /// A picker of `choices` titled `title`, on the one whose id is
@@ -163,6 +188,7 @@ impl Picker {
             cursor,
             marked: BTreeSet::new(),
             current,
+            is_mixed: false,
         }
     }
 
@@ -187,7 +213,7 @@ impl Picker {
 
     /// The change the picker asks for, made to `issue`, and the issue as it
     /// will look.
-    fn apply(&self, issue: &Issue) -> Option<Picked> {
+    pub(crate) fn apply(&self, issue: &Issue) -> Option<(Change, Issue)> {
         let mut after = issue.clone();
         let change = match self.kind {
             Kind::Choice => {
@@ -247,7 +273,7 @@ impl Picker {
                 }
             }
         };
-        Some(Picked::Apply(Box::new(change), Box::new(after)))
+        Some((change, after))
     }
 
     pub fn handle_key(&mut self, key: KeyEvent, issue: &Issue) -> Picked {
@@ -255,7 +281,13 @@ impl Picker {
         match key.code {
             KeyCode::Esc => return Picked::Cancel,
             KeyCode::Char('c') if ctrl => return Picked::Cancel,
-            KeyCode::Enter => return self.apply(issue).unwrap_or(Picked::Continue),
+            KeyCode::Enter => {
+                return self
+                    .apply(issue)
+                    .map_or(Picked::Continue, |(change, after)| {
+                        Picked::Apply(Box::new(change), Box::new(after))
+                    });
+            }
             KeyCode::Down => self.move_by(1),
             KeyCode::Up => self.move_by(-1),
             KeyCode::Char('n') if ctrl => self.move_by(1),

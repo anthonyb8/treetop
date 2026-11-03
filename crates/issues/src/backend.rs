@@ -34,6 +34,23 @@ pub trait Backend: Send + Sync {
         Err(READ_ONLY.into())
     }
 
+    /// Makes `change` to every one of `issues`, and returns them as they
+    /// now are; when it stops short, the error carries those it changed.
+    fn update_many(
+        &self,
+        issues: &[Issue],
+        change: &Change,
+    ) -> Result<Vec<Issue>, (Vec<Issue>, String)> {
+        let mut done = Vec::new();
+        for issue in issues {
+            match self.update(issue, change) {
+                Ok(issue) => done.push(issue),
+                Err(err) => return Err((done, err)),
+            }
+        }
+        Ok(done)
+    }
+
     fn create(&self, _new: &NewIssue) -> Result<Issue, String> {
         Err(READ_ONLY.into())
     }
@@ -127,16 +144,26 @@ impl Linear {
     }
 }
 
-fn filter(filters: &Filters) -> linear::Filter {
-    linear::Filter {
+/// The Linear filter `filters` ask for, or why a priority is not one.
+fn filter(filters: &Filters) -> Result<linear::Filter, String> {
+    let priority = match filters.priority.as_deref() {
+        Some(word) => Some(
+            linear::priority(word)
+                .ok_or_else(|| format!("no priority {word}: urgent, high, medium, low or none"))?,
+        ),
+        None => None,
+    };
+    Ok(linear::Filter {
         mine: filters.mine,
         assignee: filters.assignee.clone(),
+        creator: filters.creator.clone(),
+        priority,
         label: filters.label.clone(),
         state: filters.state.clone(),
         project: filters.project.clone(),
         cycle: filters.cycle.clone(),
         query: filters.query.clone(),
-    }
+    })
 }
 
 impl Backend for Linear {
@@ -146,7 +173,7 @@ impl Backend for Linear {
 
     fn list(&self, filters: &Filters) -> Result<Vec<Issue>, String> {
         self.client()?
-            .issues(self.team.as_deref(), &filter(filters))
+            .issues(self.team.as_deref(), &filter(filters)?)
             .map_err(|err| err.message)
     }
 
@@ -174,6 +201,18 @@ impl Backend for Linear {
             .map_err(|err| err.message)
     }
 
+    fn update_many(
+        &self,
+        issues: &[Issue],
+        change: &Change,
+    ) -> Result<Vec<Issue>, (Vec<Issue>, String)> {
+        let client = self.client().map_err(|err| (Vec::new(), err))?;
+        let uuids: Vec<String> = issues.iter().map(|i| i.uuid.clone()).collect();
+        client
+            .update_many(&uuids, change)
+            .map_err(|(done, err)| (done, err.message))
+    }
+
     fn create(&self, new: &NewIssue) -> Result<Issue, String> {
         self.client()?.create(new).map_err(|err| err.message)
     }
@@ -198,5 +237,21 @@ impl Backend for Linear {
 
     fn fetch(&self, url: &str) -> Result<Vec<u8>, String> {
         self.client()?.fetch(url).map_err(|err| err.message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_priority_linear_has_no_name_for_is_refused_not_dropped() {
+        let source = Linear::new("work", Ok("lin_api_x".into()), Some("END".into()), false);
+        let filters = Filters {
+            priority: Some("hgih".into()),
+            ..Filters::default()
+        };
+        let err = source.list(&filters).unwrap_err();
+        assert_eq!(err, "no priority hgih: urgent, high, medium, low or none");
     }
 }

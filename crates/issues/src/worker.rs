@@ -36,6 +36,13 @@ pub(crate) enum Request {
         change: Box<Change>,
         form: Option<Box<Form>>,
     },
+    /// Make one change to many issues, which looked like `before` until
+    /// they were changed on screen.
+    UpdateMany {
+        source: usize,
+        before: Vec<Issue>,
+        change: Box<Change>,
+    },
     Comment {
         source: usize,
         issue: Box<Issue>,
@@ -63,6 +70,7 @@ impl Request {
             Request::Team { .. }
             | Request::Image { .. }
             | Request::Update { .. }
+            | Request::UpdateMany { .. }
             | Request::Comment { .. }
             | Request::Create { .. } => None,
         }
@@ -89,6 +97,13 @@ pub(crate) enum Reply {
         before: Box<Issue>,
         form: Option<Box<Form>>,
         result: Result<Box<Issue>, String>,
+    },
+    /// The issues as they now are, or those changed before it stopped short
+    /// and why.
+    UpdatedMany {
+        source: usize,
+        before: Vec<Issue>,
+        result: Result<Vec<Issue>, (Vec<Issue>, String)>,
     },
     Created {
         source: usize,
@@ -162,6 +177,15 @@ fn run(backends: &[Arc<dyn Backend>], request: Request) -> Option<Reply> {
             result: backends.get(source)?.update(&before, &change).map(Box::new),
             before,
             form,
+        },
+        Request::UpdateMany {
+            source,
+            before,
+            change,
+        } => Reply::UpdatedMany {
+            source,
+            result: backends.get(source)?.update_many(&before, &change),
+            before,
         },
         Request::Create { source, new, form } => Reply::Created {
             source,

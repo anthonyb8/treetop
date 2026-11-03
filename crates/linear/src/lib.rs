@@ -20,7 +20,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 pub use edit::{Change, NewIssue};
-pub use filter::{ANY_STATE, Filter, UNASSIGNED};
+pub use filter::{ANY_STATE, Filter, ME, UNASSIGNED, priority};
 pub use model::{Comment, Cycle, Detail, Issue, Link, Named, State, Team};
 
 use model::{ISSUE_FIELDS, RawIssue, RawTeam};
@@ -32,6 +32,9 @@ const LIMIT: Duration = Duration::from_secs(10);
 
 /// Issues one list returns, the most recently updated first.
 const PAGE: usize = 100;
+
+/// The most issues Linear changes in one batch.
+const BATCH: usize = 50;
 
 /// The most an image fetched may weigh.
 const IMAGE_LIMIT: u64 = 25 * 1024 * 1024;
@@ -241,6 +244,40 @@ impl Client {
         let data = self.query(&query, json!({ "id": uuid, "input": change.input() }))?;
         succeeded(&data, "/issueUpdate/success", uuid)?;
         raw_issue(data.pointer("/issueUpdate/issue"), uuid).map(Issue::from)
+    }
+
+    /// Applies `change` to every issue in `uuids`, fifty to a request as
+    /// Linear takes them, and returns the issues as they now are. A batch
+    /// Linear refuses stops the rest: the error carries those already
+    /// changed.
+    pub fn update_many(
+        &self,
+        uuids: &[String],
+        change: &Change,
+    ) -> Result<Vec<Issue>, (Vec<Issue>, Error)> {
+        let query = format!(
+            "mutation($ids: [UUID!]!, $input: IssueUpdateInput!) {{ \
+             issueBatchUpdate(ids: $ids, input: $input) {{ success issues {{ {ISSUE_FIELDS} }} }} }}"
+        );
+        let mut done = Vec::new();
+        for batch in uuids.chunks(BATCH) {
+            let changed = self
+                .query(&query, json!({ "ids": batch, "input": change.input() }))
+                .and_then(|data| {
+                    succeeded(&data, "/issueBatchUpdate/success", "the issues")?;
+                    let nodes = data
+                        .pointer("/issueBatchUpdate/issues")
+                        .cloned()
+                        .unwrap_or(Value::Array(Vec::new()));
+                    serde_json::from_value::<Vec<RawIssue>>(nodes)
+                        .map_err(|err| Error::failed(format!("unreadable issues: {err}")))
+                });
+            match changed {
+                Ok(raw) => done.extend(raw.into_iter().map(Issue::from)),
+                Err(err) => return Err((done, err)),
+            }
+        }
+        Ok(done)
     }
 
     /// Creates `new` and returns it.
@@ -584,6 +621,8 @@ mod tests {
         let all = Filter {
             mine: true,
             assignee: None,
+            creator: Some(ME.into()),
+            priority: Some(2),
             label: Some("Bug".into()),
             state: Some("Todo".into()),
             project: Some("x".into()),
@@ -593,6 +632,7 @@ mod tests {
         let others = [
             Filter {
                 assignee: Some("Zoe".into()),
+                creator: Some("Zoe".into()),
                 ..Filter::default()
             },
             Filter {
@@ -623,6 +663,13 @@ mod tests {
             ("detail", client.detail("END-1").err()),
             ("team", client.team("END").err()),
             ("update", client.update("u", &change).err()),
+            (
+                "update many",
+                client
+                    .update_many(&["u".into()], &change)
+                    .err()
+                    .map(|(_, err)| err),
+            ),
             ("create", client.create(&new).err()),
             ("comment", client.comment("u", "hi").err()),
             ("start", client.start("END-1").err()),
@@ -649,6 +696,14 @@ mod tests {
                 "change",
                 format!(
                     "mutation {{ issueUpdate(id: \"u\", input: {}) {{ success }} }}",
+                    literal(&change.input())
+                ),
+            ),
+            (
+                "change many",
+                format!(
+                    "mutation {{ issueBatchUpdate(ids: [\"8b3d5f2e-1c4a-4b7e-9a6d-2f1e3c4b5a6d\"], \
+                     input: {}) {{ success }} }}",
                     literal(&change.input())
                 ),
             ),

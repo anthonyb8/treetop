@@ -8,6 +8,29 @@ pub const UNASSIGNED: &str = "unassigned";
 /// The state that asks for issues in any state, done and canceled too.
 pub const ANY_STATE: &str = "any";
 
+/// The creator that asks for issues the key's user created.
+pub const ME: &str = "me";
+
+/// Linear's priorities by the number it gives each, and the words that
+/// name them.
+const PRIORITIES: [(u8, &[&str]); 5] = [
+    (0, &["none", "no"]),
+    (1, &["urgent"]),
+    (2, &["high"]),
+    (3, &["medium"]),
+    (4, &["low"]),
+];
+
+/// The number Linear gives the priority `word` names: `urgent`, `high`,
+/// `medium`, `low` or `none`, any case, or the number itself.
+pub fn priority(word: &str) -> Option<u8> {
+    let word = word.trim().to_ascii_lowercase();
+    PRIORITIES
+        .iter()
+        .find(|(n, names)| names.contains(&word.as_str()) || n.to_string() == word)
+        .map(|(n, _)| *n)
+}
+
 /// Each field is optional; none lists the team's open issues.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Filter {
@@ -15,6 +38,10 @@ pub struct Filter {
     pub mine: bool,
     /// A person's name, or UNASSIGNED.
     pub assignee: Option<String>,
+    /// Who created it: a person's name, or ME.
+    pub creator: Option<String>,
+    /// 0 none, 1 urgent, 2 high, 3 medium, 4 low.
+    pub priority: Option<u8>,
     pub label: Option<String>,
     /// A state's name, or ANY_STATE; without one, only open issues are
     /// listed.
@@ -50,6 +77,17 @@ impl Filter {
                 json!({ "name": { "eqIgnoreCase": assignee } })
             };
             out.insert("assignee".into(), filter);
+        }
+        if let Some(creator) = &self.creator {
+            let filter = if creator.eq_ignore_ascii_case(ME) {
+                json!({ "isMe": { "eq": true } })
+            } else {
+                json!({ "name": { "eqIgnoreCase": creator } })
+            };
+            out.insert("creator".into(), filter);
+        }
+        if let Some(priority) = self.priority {
+            out.insert("priority".into(), json!({ "eq": priority }));
         }
         if let Some(label) = &self.label {
             out.insert(
@@ -120,6 +158,8 @@ mod tests {
         let all = Filter {
             mine: true,
             assignee: None,
+            creator: Some("me".into()),
+            priority: Some(0),
             label: Some("Bug".into()),
             state: Some("In Review".into()),
             project: Some("checkout".into()),
@@ -128,6 +168,8 @@ mod tests {
         }
         .to_value(None);
         assert_eq!(all["assignee"], json!({ "isMe": { "eq": true } }));
+        assert_eq!(all["creator"], json!({ "isMe": { "eq": true } }));
+        assert_eq!(all["priority"], json!({ "eq": 0 }), "no priority is 0");
         assert_eq!(all["labels"]["some"]["name"]["eqIgnoreCase"], "Bug");
         assert_eq!(
             all["state"],
@@ -159,11 +201,44 @@ mod tests {
             anyone("Zoe", "Todo")["assignee"],
             json!({ "name": { "eqIgnoreCase": "Zoe" } })
         );
+        let by_zoe = Filter {
+            creator: Some("Zoe".into()),
+            ..Filter::default()
+        }
+        .to_value(None);
+        assert_eq!(
+            by_zoe["creator"],
+            json!({ "name": { "eqIgnoreCase": "Zoe" } })
+        );
         let numbered = Filter {
             cycle: Some("12".into()),
             ..Filter::default()
         }
         .to_value(None);
         assert_eq!(numbered["cycle"], json!({ "number": { "eq": 12 } }));
+    }
+
+    #[test]
+    fn a_priority_is_named_as_linear_names_it_or_by_its_number() {
+        let read: Vec<Option<u8>> = [
+            "urgent", "High", "medium", "low", "none", "no", "3", "hgih", "5",
+        ]
+        .iter()
+        .map(|w| priority(w))
+        .collect();
+        assert_eq!(
+            read,
+            [
+                Some(1),
+                Some(2),
+                Some(3),
+                Some(4),
+                Some(0),
+                Some(0),
+                Some(3),
+                None,
+                None
+            ]
+        );
     }
 }
