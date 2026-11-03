@@ -3,7 +3,7 @@
 // settled once the agent has it, or kept with a retry when it could not go.
 import { expect, test, type Page } from "@playwright/test";
 import type { ChatMessage } from "../src/api";
-import { pool, serve } from "./fixtures";
+import { pool, serve, tree17 } from "./fixtures";
 
 const backlog: ChatMessage[] = [
   { id: "u1", kind: "you", at: "2026-11-01T13:40:00Z", text: "Fix the login redirect loop on expired sessions." },
@@ -43,6 +43,14 @@ async function stream(page: Page, first: string, later: () => string = () => ": 
   });
 }
 
+/** Tree 17's agent at work, so a line is a message rather than an answer to what it waits on. */
+async function atWork(page: Page) {
+  await page.route(
+    (url) => url.pathname === "/api/trees/17",
+    (route) => route.fulfill({ json: { ...tree17, agents: [{ ...tree17.agents[0]!, status: "busy" }] } }),
+  );
+}
+
 test("the chat shows the conversation, each tool call a line that opens", async ({ page }) => {
   await serve(page, () => pool);
   await stream(page, events(["backlog", backlog]));
@@ -74,6 +82,7 @@ test("the chat shows the conversation, each tool call a line that opens", async 
 
 test("a line you send shows at once, then settles once the agent has it", async ({ page }) => {
   await serve(page, () => pool);
+  await atWork(page);
   let isSent = false;
   await stream(page, events(["backlog", backlog]), () =>
     isSent ? events(["message", { id: "u9", kind: "you", text: "Use Clerk." }]) : ": quiet\n\n",
@@ -102,6 +111,7 @@ test("a line you send shows at once, then settles once the agent has it", async 
 
 test("a line that could not go says why and goes on a retry", async ({ page }) => {
   await serve(page, () => pool);
+  await atWork(page);
   await stream(page, events(["backlog", backlog]));
   let tries = 0;
   await page.route("**/api/trees/17/send**", (route) => {

@@ -120,6 +120,43 @@ test("a command is answered in your own words", async ({ page }) => {
   await expect(page.getByText("Run only the login tests.")).toBeVisible();
 });
 
+// ANB-30. Claude Code writes a question to the transcript only once it is
+// answered, so while the agent waits the chat has nothing but the agent's
+// "needs you" words to go on.
+const ran: ChatMessage = {
+  id: "r1",
+  kind: "tool",
+  tool: { verb: "Ran", what: "Run the tests", added: null, removed: null, status: "ok", output: "ok", ask: null },
+};
+
+test("a question not yet in the transcript is read off the agent's screen and answered with a tap", async ({ page }) => {
+  const given = await chat(page, ran);
+  await page.route("**/api/trees/17/prompt**", (route) =>
+    route.fulfill({ json: { ask: [asked.tool!.ask![0]] } }),
+  );
+  const prompt = page.getByRole("region", { name: "Waiting on you" });
+  await expect(prompt).toContainText("Which auth provider should the login use?");
+  await prompt.getByRole("button", { name: /Supabase/ }).click();
+  await page.screenshot({ path: "test-results/prompt-from-screen.png" });
+  await prompt.getByRole("button", { name: "Answer", exact: true }).click();
+  await expect.poll(() => given).toEqual([{ action: "say", text: "Supabase" }]);
+  await expect(page.getByRole("region", { name: "Waiting on you" })).toHaveCount(0);
+});
+
+test("a reply while the agent waits on you answers it, though no question was found", async ({ page }) => {
+  const given = await chat(page, ran);
+  const sent: string[] = [];
+  await page.route("**/api/trees/17/send**", (route) => {
+    sent.push(route.request().postData() ?? "");
+    return route.fulfill({ json: {} });
+  });
+  await expect(page.getByRole("region", { name: "Waiting on you" })).toContainText("Clerk or Supabase?");
+  await page.getByRole("textbox", { name: "Message 17" }).fill("Supabase, and keep Clerk's tables.");
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect.poll(() => given).toEqual([{ action: "say", text: "Supabase, and keep Clerk's tables." }]);
+  expect(sent).toEqual([]);
+});
+
 test("an answer the agent's screen would not take says why and keeps the prompt", async ({ page }) => {
   await chat(page, command, "nothing is waiting on an answer: the agent's input box is open");
   await page.getByRole("region", { name: "Waiting on you" }).getByRole("button", { name: "Deny" }).click();

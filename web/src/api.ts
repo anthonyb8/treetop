@@ -328,6 +328,12 @@ export function fetchTree(workspace: string | null, tree: string): Promise<Tree>
   return get<Tree>(`/api/trees/${encodeURIComponent(tree)}${workspaceQuery(workspace)}`);
 }
 
+/** The question on the agent's screen, read there because Claude Code
+ * writes it to the transcript only once it is answered. */
+export function fetchPrompt(workspace: string | null, tree: string): Promise<{ ask: Question[] }> {
+  return get<{ ask: Question[] }>(`/api/trees/${encodeURIComponent(tree)}/prompt${workspaceQuery(workspace)}`);
+}
+
 export function fetchWorkspaces(): Promise<Workspaces> {
   return get<Workspaces>("/api/workspaces");
 }
