@@ -63,8 +63,10 @@ test("long names and many ports stay inside the screen", async ({ page }) => {
   await page.route("**/api/trees/17/chat**", (route) =>
     route.fulfill({ status: 200, headers: { "Content-Type": "text/event-stream" }, body: ": quiet\n\n" }),
   );
-  details["END-123"] = issue;
   await serveIssues(page);
+  // Answered here rather than by changing the shared fixture, which later
+  // tests in the same worker read.
+  await page.route("**/api/issues/END-123?**", (route) => route.fulfill({ json: issue }));
 
   for (const [path, landmark] of [
     ["/", page.getByRole("region", { name: "Needs you" })],
