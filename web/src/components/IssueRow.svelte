@@ -18,8 +18,8 @@
 
 <a class="row" href="/issues/{encodeURIComponent(issue.id)}" onclick={link} aria-label="{issue.id} {issue.title}">
   <div class="top">
-    <span class="id mono">{issue.id}</span>
     <Priority priority={issue.priority} />
+    <span class="id mono">{issue.id}</span>
     {#if work}
       <span class="work {work.tone}">
         {#if work.mark}<Mark mark={work.mark} />{/if}
@@ -57,33 +57,39 @@
   .id {
     flex: none;
     font-size: 13px;
-    font-weight: 600;
-    color: var(--fg-strong);
+    font-weight: 500;
+    color: var(--muted);
   }
+  /* Who works on it, as a pill tinted by how much it wants you. */
   .work {
     margin-left: auto;
     flex: none;
     display: flex;
     align-items: center;
     gap: 5px;
-    font-size: 13px;
+    padding: 2px 9px 2px 7px;
+    border-radius: 11px;
+    background: var(--bg-high);
+    font-size: 12px;
     font-weight: 500;
     color: var(--muted);
   }
   .work.loud {
-    font-weight: 700;
+    background: var(--yellow-bg);
     color: var(--yellow);
   }
   .work.busy {
     color: var(--blue);
   }
   .work.ready {
-    font-weight: 700;
+    padding-left: 9px;
+    background: var(--green-bg);
     color: var(--green);
   }
   .title {
     font-size: 15px;
     font-weight: 500;
+    color: var(--fg-strong);
     line-height: 1.3;
     display: -webkit-box;
     -webkit-line-clamp: 2;

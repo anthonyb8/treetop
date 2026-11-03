@@ -144,7 +144,7 @@ test("an issue reads in full, with its agent's question", async ({ page }) => {
 
   await page.getByRole("link", { name: "Open tree 17" }).click();
   await expect(page).toHaveURL(/\/trees\/17$/);
-  await page.getByRole("button", { name: "Pool" }).click();
+  await page.getByRole("button", { name: "Trees" }).click();
   await expect(page).toHaveURL(/\/issues\/END-123$/);
 });
 

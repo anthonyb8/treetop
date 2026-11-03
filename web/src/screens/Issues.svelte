@@ -240,7 +240,7 @@
     <header>
       <div class="bar">
         <div class="heading">
-          <h1 class="mono">issues</h1>
+          <h1>Issues</h1>
           <p class="sub">{list ? `${count} ${count === 1 ? "issue" : "issues"} · ${working} with an agent` : " "}</p>
         </div>
         <div class="tools">
@@ -401,7 +401,7 @@
   }
   header {
     flex: none;
-    background: var(--bg-raised);
+    border-bottom: 1px solid var(--bg-high);
   }
   .searching {
     display: flex;
@@ -455,8 +455,8 @@
   }
   h1 {
     margin: 0;
-    font-size: 20px;
-    font-weight: 700;
+    font-size: 22px;
+    font-weight: 600;
     color: var(--fg-strong);
   }
   .sub {
@@ -477,25 +477,27 @@
     justify-content: center;
     width: 44px;
     height: 44px;
-    border-radius: 10px;
-    border: 1px solid var(--line-strong);
+    border-radius: 22px;
+    border: 0;
+    background: transparent;
+    color: var(--muted);
+  }
+  .tool:active {
     background: var(--bg-high);
-    color: var(--fg-strong);
   }
   .switcher {
     position: relative;
     display: flex;
     align-items: center;
     gap: 6px;
-    min-height: 44px;
+    min-height: 36px;
     max-width: 160px;
-    padding: 0 12px;
-    border-radius: 10px;
-    border: 1px solid var(--line-strong);
-    background: var(--bg-high);
+    padding: 0 12px 0 14px;
+    border-radius: 18px;
+    border: 1px solid var(--line);
+    background: var(--bg-raised);
     color: var(--fg-strong);
-    font-size: 14px;
-    font-weight: 500;
+    font-size: 15px;
   }
   .current {
     overflow: hidden;
@@ -523,6 +525,8 @@
     overflow-x: auto;
     padding-left: 12px;
     scrollbar-width: none;
+    /* Views past the edge fade out rather than being cut through. */
+    mask-image: linear-gradient(to right, #000 calc(100% - 32px), transparent);
   }
   nav::-webkit-scrollbar {
     display: none;
@@ -536,8 +540,9 @@
   }
   nav span {
     display: block;
-    padding: 7px 12px;
-    border-radius: 9px;
+    padding: 7px 14px;
+    border-radius: 18px;
+    border: 1px solid transparent;
     color: var(--muted);
     font-size: 14px;
     font-weight: 500;
@@ -547,6 +552,7 @@
     text-transform: uppercase;
   }
   nav span.on {
+    border-color: var(--line-strong);
     background: var(--bg-high);
     color: var(--fg-strong);
     font-weight: 600;
