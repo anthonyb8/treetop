@@ -10,8 +10,8 @@
 
 <nav aria-label="Screens">
   <a class="tab" class:on={tab === "trees"} href="/" onclick={link} aria-current={tab === "trees" ? "page" : undefined}>
-    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-      stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22v-6" /><path d="M12 2L6 10h3l-4 6h14l-4-6h3z" /></svg>
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+      stroke-linecap="round" aria-hidden="true"><path d="M10 4h4M8 8h8M6 12h12M4 16h16M12 19.5v1.5" /></svg>
     <span>Trees</span>
     {#if nav.needs > 0}<span class="badge" aria-label="{nav.needs} waiting on you">{nav.needs}</span>{/if}
   </a>
@@ -73,13 +73,13 @@
   }
   .add {
     flex: none;
-    width: 170px;
     display: flex;
     align-items: center;
     justify-content: center;
     gap: 8px;
-    min-height: 46px;
-    border-radius: 12px;
+    min-height: 48px;
+    padding: 0 22px;
+    border-radius: 24px;
     background: var(--green);
     color: var(--on-accent);
     font-size: 16px;

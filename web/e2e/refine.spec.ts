@@ -74,10 +74,10 @@ test.describe("the foot of each screen", () => {
     await withHomeIndicator(page);
     await serve(page, () => pool);
     await page.goto("/trees/17");
-    await page.getByRole("button", { name: "Return…" }).waitFor();
+    await page.getByRole("button", { name: "More" }).waitFor();
     const under = await page.locator("main").last().evaluate((el) => parseFloat(getComputedStyle(el).paddingBottom));
     expect(under).toBeLessThanOrEqual(16);
-    expect(await gapBelow(page, ".action.danger")).toBeLessThanOrEqual(22);
+    expect(await gapBelow(page, "footer .action.primary")).toBeLessThanOrEqual(22);
   });
 });
 
@@ -235,11 +235,13 @@ test.describe("parking", () => {
       return route.fulfill({ json: {} });
     });
     await page.goto("/trees/17");
+    await page.getByRole("button", { name: "More" }).click();
     await page.getByRole("button", { name: "Park", exact: true }).click();
-    await expect(page.getByRole("button", { name: "Unpark" })).toBeVisible();
+    await expect(page.getByText("parked", { exact: true })).toBeVisible();
     await page.screenshot({ path: "test-results/tree-parked.png" });
+    await page.getByRole("button", { name: "More" }).click();
     await page.getByRole("button", { name: "Unpark" }).click();
-    await expect(page.getByRole("button", { name: "Park", exact: true })).toBeVisible();
+    await expect(page.getByText("parked", { exact: true })).toHaveCount(0);
     expect(asked).toEqual([true, false]);
   });
 });

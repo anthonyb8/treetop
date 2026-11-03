@@ -54,6 +54,7 @@ test("a tree is returned after its sheet says what it holds", async ({ page }) =
     return route.fulfill({ json: {} });
   });
   await page.goto("/trees/17");
+  await page.getByRole("button", { name: "More" }).click();
   await page.getByRole("button", { name: "Return…" }).click();
   const sheet = page.getByRole("dialog", { name: "Return tree 17?" });
   await expect(sheet).toContainText("2 commits on no remote");
@@ -64,6 +65,7 @@ test("a tree is returned after its sheet says what it holds", async ({ page }) =
   await expect(sheet).toHaveCount(0);
   expect(returned).toBe(false);
 
+  await page.getByRole("button", { name: "More" }).click();
   await page.getByRole("button", { name: "Return…" }).click();
   await page.getByRole("dialog").getByRole("button", { name: "Return", exact: true }).click();
   await expect(page).toHaveURL(/\/$/);
@@ -79,6 +81,7 @@ test("a return the server refuses says why and leaves the tree", async ({ page }
     }),
   );
   await page.goto("/trees/17");
+  await page.getByRole("button", { name: "More" }).click();
   await page.getByRole("button", { name: "Return…" }).click();
   await page.getByRole("dialog").getByRole("button", { name: "Return", exact: true }).click();
   await expect(page.getByRole("alert")).toHaveText(

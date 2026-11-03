@@ -61,9 +61,10 @@ test("the chat shows the conversation, each tool call a line that opens", async 
   await expect(chat.getByText("1 failed: expects a Clerk session")).toHaveCount(0);
   await run.click();
   await expect(chat.getByText("1 failed: expects a Clerk session")).toBeVisible();
-  await expect(page.getByRole("region", { name: "Waiting on you" })).toContainText(
-    "Needs you: Which auth provider should the login use, Clerk or Supabase?",
-  );
+  // The question is marked where the agent asked it, not said again below.
+  await expect(chat.locator(".asks")).toContainText("Needs you");
+  await expect(chat.locator(".asks")).toContainText("Which auth provider should the login use, Clerk or Supabase?");
+  await expect(page.getByRole("region", { name: "Waiting on you" })).toHaveCount(0);
   await page.screenshot({ path: "test-results/chat.png" });
 
   await page.getByRole("button", { name: "Back to tree 17" }).click();
