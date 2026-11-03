@@ -2364,7 +2364,9 @@ impl App {
 
     fn submit(&mut self, prompt: Prompt) -> Outcome {
         let text = prompt.text.trim().to_string();
-        let branch = prompt.branch_name();
+        // Only a branch you named goes; one that only follows the task is
+        // named when the agent starts, from what the task says.
+        let branch = prompt.branch.clone().filter(|_| prompt.names_branch());
         let base = prompt.base_name();
         match prompt.purpose {
             Purpose::Rename { tree } => {
@@ -4684,7 +4686,7 @@ mod tests {
         let launch = job.launch.unwrap();
         assert_eq!(launch.task, "fix login");
         assert!(!launch.is_new_tree, "this tree, not a fresh one");
-        assert!(launch.branch.is_some());
+        assert_eq!(launch.branch, None, "named as it starts, from the task");
         select(&mut app, "4");
         press(&mut app, KeyCode::Char('n'));
         type_in(&mut app, "add tests");

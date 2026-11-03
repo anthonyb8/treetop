@@ -439,8 +439,13 @@ Claude Code runs a background session only in a folder you have trusted, so befo
 
 ### New agents
 
-Every tree is leased with `treetop` as the holder, and a tree treetop leases always gets a branch: `<git user.name>/<the task as a slug>`, shown on the compose box's branch line.
-Down moves to that line to change the name before sending, and Up comes back; a tree someone already holds keeps its branch.
+Every tree is leased with `treetop` as the holder, and a tree treetop leases always gets a branch: `<git user.name>/<slug>`.
+The compose box's branch line says it is named from the task when it starts; Down moves to that line to name it yourself, starting from the task's words, and Up comes back; a tree someone already holds keeps its branch.
+
+A branch you did not name, and the agent's session, are named when the agent starts, by a small model that reads the task: `can you scan he project and cmpiel a list` starts as "Scan project for useful tools" on `<user>/scan-project-tools`, not under its first words.
+It is `claude -p` on Haiku with no tools, no saved session and no user settings, given the task on its standard input, and it runs while the tree is leased, so the start waits on it little if at all.
+When it cannot answer within ten seconds, or its answer names a branch that exists or git would refuse, the task's own words name it, as before.
+A ticket's name and branch, and a branch you edited, are always kept.
 A fresh tree from `N` also has a base line under it: the branch the tree is cut from, the pool's base unless you pick another.
 On it, `←` and `→` step through the repository's branches, local and on origin, the pool's base first and the rest most recently committed first.
 Typing there narrows them to those that start with what you type, then those that contain it, ignoring case, and `←` and `→` step through the matches; Backspace and Ctrl+U widen them again.
@@ -449,10 +454,10 @@ treetop leases the tree with `treehouse get --lease --base <branch>` and records
 `n` on a free tree cannot take a base, since `treehouse lease` takes the tree as it is.
 `b` renames the branch of the tree under the cursor, or names one on a detached HEAD.
 
-The agent is `claude --bg --name <the task's first words> -- <task>`, which Claude Code's own agent view lists too; `TREETOP_NEW_AGENT` names another command, which gets the task as its last argument.
+The agent is `claude --bg --name <its name> -- <task>`, which Claude Code's own agent view lists too; `TREETOP_NEW_AGENT` names another command, which gets the task as its last argument.
 An empty task starts the agent idle and opens its chat as soon as it shows up, so its first message is typed there.
 
-A start runs as steps, each with its own timeout: lease the tree (`treehouse get --lease --branch`), check it is a clean worktree, name the branch, write `treetop.json`, start the agent, and wait for `claude agents` to list it, since `claude --bg` exits as soon as the session is queued.
+A start runs as steps, each with its own timeout: lease the tree (`treehouse get --lease`, with `--branch` where the name is already known), check it is a clean worktree, name the branch, write `treetop.json`, start the agent, and wait for `claude agents` to list it, since `claude --bg` exits as soon as the session is queued.
 When a step fails, the ones before it are undone in reverse: the agent stopped, the record removed, the branch deleted and the tree returned. The row shows "failed" and the status line which step failed and why.
 Up to four actions run at once, each on its own tree, so a slow one never holds up the rest.
 

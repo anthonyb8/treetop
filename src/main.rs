@@ -27,6 +27,7 @@ mod hook;
 mod jobs;
 mod keeper;
 mod live;
+mod naming;
 mod nomistakes_plugin;
 mod phone;
 mod plugin;

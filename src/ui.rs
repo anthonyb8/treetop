@@ -1593,8 +1593,8 @@ fn base_line(prompt: &Prompt) -> Line<'static> {
     Line::from(spans)
 }
 
-/// The compose box's branch line: the branch a new agent will start on,
-/// edited or following the task.
+/// The compose box's branch line: the branch a new agent will start on, as
+/// edited, else named from the task when it starts.
 fn branch_line(prompt: &Prompt) -> Line<'static> {
     let t = theme();
     let name = if prompt.is_editing_branch {
@@ -1603,10 +1603,10 @@ fn branch_line(prompt: &Prompt) -> Line<'static> {
             fg(t.accent).add_modifier(Modifier::BOLD),
         )
     } else {
-        match prompt.branch_name() {
-            Some(name) => Span::raw(name),
+        match &prompt.branch {
+            Some(name) => Span::raw(name.clone()),
             None => Span::styled(
-                "named from the task",
+                "named from the task when it starts",
                 fg(t.muted).add_modifier(Modifier::ITALIC),
             ),
         }
