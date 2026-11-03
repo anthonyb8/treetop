@@ -227,7 +227,7 @@ impl Pool {
         let notices = watch
             .last
             .as_ref()
-            .map(|last| last.notices(&now, &app))
+            .map(|last| last.notices(&now, &app, &self.name))
             .unwrap_or_default();
         watch.last = Some(now);
         if !notices.is_empty() {

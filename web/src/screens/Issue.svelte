@@ -675,10 +675,13 @@
     font-size: 13px;
   }
   .author {
+    min-width: 0;
+    overflow-wrap: anywhere;
     font-weight: 600;
     color: var(--fg-strong);
   }
   .age {
+    flex: none;
     font-size: 12px;
     color: var(--muted);
   }

@@ -29,9 +29,18 @@ export function parse(path: string): Route {
   return { screen: "tree", tree };
 }
 
+// A link that names its workspace, as a notification's does, opens there
+// and makes it the one chosen, so its tree is the right repository's tree.
+// The address keeps only the screen, as every other one does.
+const linked = new URLSearchParams(location.search).get("workspace");
+if (linked) {
+  remember("workspace", linked);
+  history.replaceState(history.state, "", location.pathname);
+}
+
 export const nav = $state({
   path: location.pathname,
-  workspace: recall<string>("workspace"),
+  workspace: linked ?? recall<string>("workspace"),
   /** The issue source chosen; null for the repository's own. */
   source: recall<string>("source"),
   /** How many trees wait on you, for the tab bar. */
