@@ -16,6 +16,10 @@
 //! A fourth asks the agent plugins how much of the plan is used, every
 //! USAGE, on a thread of its own, since the answer can come over the
 //! network and must never hold up the processes.
+//!
+//! A fifth keeps the main checkout on its upstream: it fetches every BASE
+//! and fast-forwards where that is safe, then again whenever the shared refs
+//! change, as an agent's fetch or push moves them.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -27,7 +31,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use crate::agents::{self, Agent};
+use crate::agents::{self, Agent, Status};
+use crate::base::{self, Standing};
 use crate::cache;
 use crate::live;
 use crate::plugin::{Code, Usage};
@@ -44,6 +49,7 @@ const SHIP: Duration = Duration::from_secs(60);
 const SHIP_GAP: Duration = Duration::from_secs(15);
 const SHIP_BACKOFF: Duration = Duration::from_secs(300);
 const USAGE: Duration = Duration::from_secs(60);
+const BASE: Duration = Duration::from_secs(300);
 
 pub enum Update {
     ListingStarted,
@@ -61,6 +67,9 @@ pub enum Update {
     /// Where each held tree's PR stands, by path, or why no ship plugin
     /// could say.
     Ship(Result<Answer, String>),
+    /// Where the main checkout stands against its upstream after a
+    /// catch-up.
+    Base(Standing),
 }
 
 pub struct Refresher {
@@ -78,6 +87,8 @@ impl Refresher {
         let (updates_tx, updates) = mpsc::channel();
         let (kick, kick_rx) = mpsc::channel();
         let (ship_kick, ship_kick_rx) = mpsc::channel();
+        let (base_kick, base_kick_rx) = mpsc::channel();
+        let main_busy = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(false));
         let trees = Arc::new(Mutex::new(known));
 
@@ -104,11 +115,22 @@ impl Refresher {
             move || usage_clock(&updates_tx, &paused)
         });
         thread::spawn({
+            let (updates_tx, paused, main_busy, checkout) = (
+                updates_tx.clone(),
+                Arc::clone(&paused),
+                Arc::clone(&main_busy),
+                checkout.clone(),
+            );
+            move || base_clock(&checkout, &updates_tx, &base_kick_rx, &paused, &main_busy)
+        });
+        thread::spawn({
             let (kick, ship_kick, paused) = (kick.clone(), ship_kick.clone(), Arc::clone(&paused));
             move || {
                 let kicks = Kicks {
                     listing: &kick,
                     ship: &ship_kick,
+                    base: &base_kick,
+                    main_busy: &main_busy,
                 };
                 fast(&checkout, &updates_tx, &kicks, &paused, &trees);
             }
@@ -175,10 +197,13 @@ fn slow(
 }
 
 /// What the fast clock kicks: the listing, when the worktrees change, and
-/// the ship clock, when the shared refs do.
+/// the ship and base clocks, when the shared refs do. It also tells the base
+/// clock whether an agent is busy in the main checkout.
 struct Kicks<'a> {
     listing: &'a Sender<()>,
     ship: &'a Sender<()>,
+    base: &'a Sender<()>,
+    main_busy: &'a AtomicBool,
 }
 
 fn fast(
@@ -206,8 +231,13 @@ fn fast(
                 if tick.is_multiple_of(GIT_EVERY) {
                     let sidecars = sidecar::read_all(&known);
                     let agents = agents::find(&known, &processes, &sidecars);
+                    let is_main_busy = agents.get(checkout).is_some_and(|agents| {
+                        agents.iter().any(|a| a.status == Some(Status::Busy))
+                    });
+                    kicks.main_busy.store(is_main_busy, Ordering::Relaxed);
                     if watcher.is_refs_changed() {
                         let _ = kicks.ship.send(());
+                        let _ = kicks.base.send(());
                     }
                     work.extend(live::work(watcher.take(&known, &work)));
                     work.retain(|path, _| known.iter().any(|t| t.is_held() && t.path == *path));
@@ -230,6 +260,36 @@ fn fast(
             seen = worktrees;
         }
         thread::sleep(FAST);
+    }
+}
+
+/// Keeps the main checkout on its upstream until treetop moves on: a fetch
+/// and a catch-up every BASE, and a catch-up alone when kicked, since the
+/// refs moved and fetching again would only repeat what moved them.
+fn base_clock(
+    checkout: &std::path::Path,
+    updates: &Sender<Update>,
+    kicks: &Receiver<()>,
+    paused: &AtomicBool,
+    main_busy: &AtomicBool,
+) {
+    let mut is_fetch_due = true;
+    loop {
+        if !paused.load(Ordering::Relaxed) {
+            if std::mem::take(&mut is_fetch_due) {
+                base::fetch(checkout);
+            }
+            let standing = base::catch_up(checkout, main_busy.load(Ordering::Relaxed));
+            if updates.send(Update::Base(standing)).is_err() {
+                return;
+            }
+        }
+        match kicks.recv_timeout(BASE) {
+            Err(RecvTimeoutError::Disconnected) => return,
+            Err(RecvTimeoutError::Timeout) => is_fetch_due = true,
+            // Kicks that queued up while catching up are answered by this one.
+            Ok(()) => while kicks.try_recv().is_ok() {},
+        }
     }
 }
 

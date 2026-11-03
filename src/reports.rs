@@ -14,7 +14,7 @@
 //! every field is read by name and anything unexpected leaves a job out
 //! rather than failing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -25,7 +25,8 @@ use serde_json::Value;
 use crate::pool::Tree;
 
 /// How long a finished or stopped job stays in the inbox. One still working
-/// or waiting on you stays however old it is.
+/// stays however old it is, and so does one waiting on you while its session
+/// still runs.
 const RECENT: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Timeline steps kept per job, the newest.
@@ -184,6 +185,23 @@ pub fn tree_of<'a>(report: &Report, trees: &'a [Tree]) -> Option<&'a Tree> {
     })
 }
 
+fn is_recent(report: &Report, now: SystemTime) -> bool {
+    now.duration_since(report.updated)
+        .is_ok_and(|age| age <= RECENT)
+}
+
+fn is_old_ask(report: &Report, now: SystemTime) -> bool {
+    report.state == State::Blocked && !is_recent(report, now)
+}
+
+/// Whether the inbox shows `report`, given the jobs whose session runs.
+fn worth_showing(report: &Report, now: SystemTime, running: &HashSet<String>) -> bool {
+    if report.state.is_settled() {
+        return is_recent(report, now);
+    }
+    !is_old_ask(report, now) || running.contains(&report.job)
+}
+
 /// Reads the jobs again only where their files have changed since the last
 /// read, since most sit still.
 #[derive(Default)]
@@ -192,16 +210,21 @@ pub struct Reader {
 }
 
 impl Reader {
-    /// Every job worth showing in the inbox: working or waiting on you, or
-    /// settled within RECENT.
+    /// Every job worth showing in the inbox: working, waiting on you, or
+    /// settled within RECENT. A question older than RECENT whose session no
+    /// longer runs is left out too: its process ended without saying so, and
+    /// nothing is left to answer it.
     pub fn read(&mut self) -> Vec<Report> {
         let now = SystemTime::now();
-        self.read_all()
+        let reports = self.read_all();
+        let running = if reports.iter().any(|r| is_old_ask(r, now)) {
+            crate::agents::claude::running_jobs()
+        } else {
+            HashSet::new()
+        };
+        reports
             .into_iter()
-            .filter(|r| {
-                !r.state.is_settled()
-                    || now.duration_since(r.updated).is_ok_and(|age| age <= RECENT)
-            })
+            .filter(|r| worth_showing(r, now, &running))
             .collect()
     }
 
@@ -308,6 +331,39 @@ mod tests {
 
     fn read(state: &str) -> Report {
         report("48af0855", state, TIMELINE, SystemTime::UNIX_EPOCH).unwrap()
+    }
+
+    #[test]
+    fn an_old_question_shows_only_while_its_session_runs() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10 * 86_400);
+        let at = |days: u64, state: &str| Report {
+            updated: now - Duration::from_secs(days * 86_400),
+            ..report("48af0855", state, "", SystemTime::UNIX_EPOCH).unwrap()
+        };
+        let none = HashSet::new();
+        let running = HashSet::from(["48af0855".to_string()]);
+        assert!(
+            worth_showing(&at(0, BLOCKED), now, &none),
+            "a fresh question"
+        );
+        assert!(
+            !worth_showing(&at(18, BLOCKED), now, &none),
+            "nothing left to answer it"
+        );
+        assert!(
+            worth_showing(&at(18, BLOCKED), now, &running),
+            "still waiting"
+        );
+        let working = BLOCKED.replace(r#""state":"blocked""#, r#""state":"working""#);
+        assert!(
+            worth_showing(&at(18, &working), now, &none),
+            "working stays"
+        );
+        let done = BLOCKED.replace(r#""state":"blocked""#, r#""state":"done""#);
+        assert!(
+            !worth_showing(&at(2, &done), now, &running),
+            "settled ages out"
+        );
     }
 
     #[test]

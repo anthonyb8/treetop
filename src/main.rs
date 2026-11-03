@@ -10,6 +10,7 @@ mod actions;
 mod agents;
 mod app;
 mod assistant;
+mod base;
 mod branch;
 mod builtin;
 mod cache;
@@ -26,6 +27,7 @@ mod hook;
 mod jobs;
 mod keeper;
 mod live;
+mod naming;
 mod nomistakes_plugin;
 mod phone;
 mod plugin;
@@ -37,10 +39,12 @@ mod scratch;
 mod serve;
 mod ship;
 mod sidecar;
+mod state;
 mod theme;
 mod tickets;
 mod tmux;
 mod ui;
+mod update;
 mod watch;
 mod workspaces;
 
@@ -49,7 +53,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
@@ -223,6 +227,8 @@ enum Exit {
     Quit,
     /// Show the pool of the repository checked out here instead.
     Switch(PathBuf),
+    /// Start the treetop installed over this one, on this workspace.
+    Restart,
 }
 
 /// Every workspace, with how many trees each held at its last listing.
@@ -272,7 +278,10 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                     app.is_listing = false;
                     app.error = Some(format!("{err:#}"));
                 }
-                Update::Processes(processes) => app.apply_processes(&processes),
+                Update::Processes(processes) => {
+                    app.apply_processes(&processes);
+                    app.replaced = update::is_replaced();
+                }
                 Update::Work(work) => app.apply_work(&work),
                 Update::Reports(reports) => {
                     let news = app.apply_reports(reports);
@@ -291,6 +300,7 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                     }
                 }
                 Update::Usage(usage) => app.usage = usage,
+                Update::Base(standing) => app.apply_base(standing),
                 Update::Agents(agents) => {
                     app.apply_agents(&agents);
                     let live: Vec<&Vec<String>> = agents
@@ -645,6 +655,7 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                 removing_scratch.push(result);
             }
             Outcome::Switch(path) => return Ok(Exit::Switch(path)),
+            Outcome::Restart => return Ok(Exit::Restart),
             Outcome::Chat {
                 command,
                 agent,
@@ -725,8 +736,14 @@ fn checkout_for(start: &Path, is_screen: bool) -> Result<PathBuf> {
 /// Shows the pool of `checkout`, and of each workspace `w` switches to,
 /// until treetop quits, opening on the Issues screen when `is_issues`. Each
 /// switch starts the pool's clocks, worker and chats afresh; ending the old
-/// pool's chat clients leaves its agents running.
-fn show(term: &mut Term, start: PathBuf, mut checkout: PathBuf, is_issues: bool) -> Result<()> {
+/// pool's chat clients leaves its agents running. Returns the workspace to
+/// restart on, when `U` asked for the newer treetop.
+fn show(
+    term: &mut Term,
+    start: PathBuf,
+    mut checkout: PathBuf,
+    is_issues: bool,
+) -> Result<Option<PathBuf>> {
     let mut here = Some(start);
     let mut is_issues = is_issues;
     loop {
@@ -737,6 +754,9 @@ fn show(term: &mut Term, start: PathBuf, mut checkout: PathBuf, is_issues: bool)
         app.checkout = checkout.clone();
         app.user = branch::user();
         app.scratch_root = scratch::root();
+        if let Some(file) = state::asked_file(&checkout) {
+            app.keep_asked_in(file);
+        }
         app.ship_plugins = ship::plugins(&checkout).0;
         app.is_issues = std::mem::take(&mut is_issues);
         if let Some(mut cached) = cache::read(&checkout) {
@@ -744,8 +764,9 @@ fn show(term: &mut Term, start: PathBuf, mut checkout: PathBuf, is_issues: bool)
             app.set_cached(cached);
         }
         match run(term, &mut app, &checkout)? {
-            Exit::Quit => return Ok(()),
+            Exit::Quit => return Ok(None),
             Exit::Switch(next) => checkout = next,
+            Exit::Restart => return Ok(Some(checkout)),
         }
     }
 }
@@ -768,6 +789,13 @@ fn main() -> Result<()> {
         && command == "hook"
     {
         return hook::run(event);
+    }
+    // `treetop update` needs no repository, since it replaces the binary.
+    if let [command, rest @ ..] = args.as_slice()
+        && command == "update"
+        && rest.len() <= 1
+    {
+        return update::run(rest.first().map(String::as_str));
     }
     // `treetop serve` serves the pool treetop would open here, as the
     // screen does from outside any repository.
@@ -798,5 +826,19 @@ fn main() -> Result<()> {
     let mut term = enter_screen()?;
     let result = show(&mut term, start, checkout, is_issues);
     leave_screen()?;
-    result
+    match result? {
+        Some(workspace) => restart(&workspace),
+        None => Ok(()),
+    }
+}
+
+/// Becomes the treetop installed over this one, opened on `workspace`. Only
+/// returns when it could not start.
+fn restart(workspace: &Path) -> Result<()> {
+    use std::os::unix::process::CommandExt as _;
+    let exe = update::is_replaced().context("the newer treetop is gone")?;
+    let err = std::process::Command::new(&exe)
+        .current_dir(workspace)
+        .exec();
+    Err(err).with_context(|| format!("starting {}", exe.display()))
 }

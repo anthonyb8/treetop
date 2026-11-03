@@ -176,6 +176,16 @@ pub fn install(unit: &Unit, port: u16) -> Result<()> {
     Ok(())
 }
 
+/// Restarts the service when treetop installed it, so it runs the binary now
+/// on disk. False when there is none to restart.
+pub fn restart_if_installed() -> Result<bool> {
+    if !is_installed(&unit_path()?)? {
+        return Ok(false);
+    }
+    systemctl(&["restart", SERVICE])?;
+    Ok(true)
+}
+
 /// Whether something answers on the port within `limit`.
 fn listens(port: u16, limit: Duration) -> bool {
     let deadline = Instant::now() + limit;

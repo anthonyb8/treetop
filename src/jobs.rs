@@ -530,7 +530,20 @@ fn start_steps(
         job.launch = Some(launch.clone());
     }
     let is_leasing = launch.is_new_tree || !job.tree.is_held();
-    let branch = (is_leasing && !launch.is_assistant).then(|| {
+    // What nobody named, the session or a leased tree's branch, a model names
+    // from the task, asked now so its answer comes while the tree is leased.
+    let is_name_from_task = launch.name == crate::dispatch::session_name(&launch.task);
+    let is_branch_from_task = is_leasing && launch.branch.is_none();
+    let naming = (!launch.is_assistant
+        && launch.ticket.is_none()
+        && !launch.task.trim().is_empty()
+        && (is_name_from_task || is_branch_from_task))
+        .then(|| {
+            let task = launch.task.clone();
+            thread::spawn(move || crate::naming::suggest(&task))
+        });
+    let is_branch_named_late = is_branch_from_task && naming.is_some();
+    let mut branch = (is_leasing && !launch.is_assistant).then(|| {
         launch
             .branch
             .clone()
@@ -554,7 +567,10 @@ fn start_steps(
     if launch.is_new_tree {
         let mut command = Command::new("treehouse");
         command.args(["get", "--lease", "--json", "--lease-holder", "treetop"]);
-        if let Some(name) = branch.as_ref().filter(|_| !resumes) {
+        if let Some(name) = branch
+            .as_ref()
+            .filter(|_| !resumes && !is_branch_named_late)
+        {
             command.args(["--branch", name]);
         }
         if let Some(base) = &launch.base {
@@ -572,7 +588,10 @@ fn start_steps(
         job.tree.name = pool_name(&path);
         job.tree.path = path;
         job.tree.status = "leased".into();
-        if let Some(name) = branch.as_ref().filter(|_| !resumes) {
+        if let Some(name) = branch
+            .as_ref()
+            .filter(|_| !resumes && !is_branch_named_late)
+        {
             undone.push(Undo::Branch(name.clone()));
         }
         record.lease_id = lease.lease_id;
@@ -600,6 +619,26 @@ fn start_steps(
     if is_leasing {
         check(&job.tree.path, log).map_err(|why| format!("check: {why}"))?;
     }
+    if let Some(name) = naming.and_then(|naming| naming.join().ok().flatten()) {
+        let _ = writeln!(log, "named {:?}, {}", name.title, name.slug);
+        if is_name_from_task {
+            launch.name = Some(name.title.clone());
+            job.launch = Some(launch.clone());
+        }
+        let user = branch::user();
+        let named = if user.is_empty() {
+            name.slug
+        } else {
+            format!("{user}/{}", name.slug)
+        };
+        // A name already taken, or one git would refuse, leaves the task's.
+        if is_branch_named_late
+            && branch::problem(&named).is_none()
+            && !has_branch(&job.tree.path, &named)
+        {
+            branch = Some(named);
+        }
+    }
     if let Some(name) = &branch
         && resumes
     {
@@ -607,7 +646,7 @@ fn start_steps(
             .map_err(|why| format!("branch: {why}"))?;
         undone.push(Undo::Detach);
     } else if let Some(name) = &branch
-        && !launch.is_new_tree
+        && (!launch.is_new_tree || is_branch_named_late)
         && checked_out(&job.tree.path).is_none()
     {
         exec(
@@ -1898,6 +1937,108 @@ PER-2) ticket '{"id":"PER-1","kind":"blocked by"}' ;;
             std::env::set_var("TREETOP_NEW_AGENT", agent);
         }
         tree
+    }
+
+    /// A task typed in a hurry starts on a branch and under a name the model
+    /// gives it, the tree leased while it answers; a model that cannot
+    /// answer leaves the task's own words, as before.
+    #[test]
+    fn a_new_agent_is_named_by_the_model_else_by_its_task() {
+        let root = config_root("named");
+        if !in_own_process("a_new_agent_is_named_by_the_model_else_by_its_task", &root) {
+            return;
+        }
+        let tree = fake_pool_and_agent(&root);
+        // treehouse hands trees out on a detached HEAD.
+        for args in [
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "0",
+            ][..],
+            &["checkout", "-q", "--detach"][..],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&tree)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let claude = root.join("bin/claude");
+        let answer =
+            r#"{"title": "Scan project for useful tools", "branch": "scan-project-tools"}"#;
+        std::fs::write(
+            &claude,
+            format!(
+                "#!/bin/sh
+cat > /dev/null
+echo '{answer}'
+"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&claude, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let task = "can you scan he project and cmpiel a list of thngs";
+        let mut job = Job {
+            launch: Some(Launch::agent(task.into(), true)),
+            ..Job::new(Kind::Start, pool::stand_in(PathBuf::from("(new tree)")))
+        };
+        let (is_ok, log) = run(&mut job);
+        assert!(is_ok, "{log}");
+        let leased = std::fs::read_to_string(root.join("leased")).unwrap();
+        assert!(!leased.contains("--branch"), "named once leased: {leased}");
+        let user = branch::user();
+        let named = if user.is_empty() {
+            "scan-project-tools".to_string()
+        } else {
+            format!("{user}/scan-project-tools")
+        };
+        assert_eq!(checked_out(&tree).as_deref(), Some(named.as_str()));
+        assert_eq!(
+            job.launch.unwrap().name.as_deref(),
+            Some("Scan project for useful tools")
+        );
+
+        // A model that cannot answer leaves the task's words.
+        std::fs::write(
+            &claude,
+            "#!/bin/sh
+exit 1
+",
+        )
+        .unwrap();
+        assert!(
+            Command::new("git")
+                .args(["checkout", "-q", "--detach"])
+                .current_dir(&tree)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut job = Job {
+            launch: Some(Launch::agent("fix the login redirect".into(), true)),
+            ..Job::new(Kind::Start, pool::stand_in(PathBuf::from("(new tree)")))
+        };
+        let (is_ok, log) = run(&mut job);
+        assert!(is_ok, "{log}");
+        assert_eq!(
+            checked_out(&tree),
+            branch::for_task(&user, "fix the login redirect")
+        );
+        assert_eq!(
+            job.launch.unwrap().name.as_deref(),
+            Some("fix the login redirect")
+        );
     }
 
     /// ANB-25, and the base of ANB-29: `w` to another source, then `p`, as the

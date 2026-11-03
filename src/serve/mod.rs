@@ -176,6 +176,7 @@ impl Pool {
                 app.apply_ship(answer);
             }
             Update::Usage(usage) => app.usage = usage,
+            Update::Base(standing) => app.apply_base(standing),
             Update::Agents(agents) => app.apply_agents(&agents),
         }
         // Pushes are judged once the pool has been read in full: agents,
@@ -316,6 +317,12 @@ fn parse(args: &[String]) -> Result<Mode> {
 /// outlast every one.
 pub fn uninstall() -> Result<()> {
     install::uninstall()
+}
+
+/// Restarts the service on the binary now on disk, after an update. False
+/// when it is not installed.
+pub fn restart_service() -> Result<bool> {
+    install::restart_if_installed()
 }
 
 /// The login the config says to answer, without which there is nothing to

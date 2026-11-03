@@ -22,6 +22,10 @@ It installs the latest release to `~/.local/bin` when that is on PATH, else `/us
 Set `TREETOP_VERSION=v0.1.0` before `sh` to install a specific release.
 From source: `cargo install --git https://github.com/anthonyb8/treetop`.
 
+Once installed, `treetop update` installs the latest release over itself in one step, checked against its SHA-256 as the script checks it, and `treetop update v0.1.0` a given one.
+It restarts `treetop serve`'s service where `treetop serve --install` set one up, so the phone gets the new version too.
+A treetop already open notices the binary was replaced and says `treetop updated: U restarts` in its summary; `U` starts the new one in its place, on the same workspace, once no action is under way.
+
 ## Release
 
 Bump `version` in `Cargo.toml`, then push a matching tag:
@@ -63,6 +67,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | Tab | switch to the Issues screen, and back (see [Issues](#issues)) |
 | `j` `k` / arrows, `g` `G` | move |
 | Esc | clear the filter, then the marks |
+| `U` | restart on a newer treetop, once one is installed over the running one (see [Install](#install)) |
 | `?` | show every key |
 | `q` | quit |
 
@@ -79,6 +84,9 @@ The assistant is never a tree's agent.
 Its mark is `●` in bold when the tree's agent needs you, `✓` when it is done and `✗` when its process died, as on a restart (see [What agents say](#what-agents-say)), else the agent's own status: `●` busy, `○` idle, `◌` cold.
 The list is in groups, each under a heading with a blank line above it: a group per base the held trees were cut from (see [New agents](#new-agents)), the pool's base first and the rest by name, then the free trees, then Parked.
 The repository's main checkout is no row of its own: it heads its branch's group, `main · main checkout`, with its ports, agent and git state.
+treetop keeps it on its upstream: it fetches every five minutes, and whenever the shared refs move, as an agent's fetch or push moves them, it fast-forwards the checkout and says so on the status line.
+It only ever fast-forwards, and only a checkout on a branch with an upstream, with no tracked changes, no commits of its own and no agent busy in it; one it leaves shows how far behind it is as `⇣25` in its git state.
+`treetop serve` does the same, so the checkout keeps up while no terminal has treetop open.
 Work happens in trees, but `n` on that heading starts an agent in the main checkout itself, on whatever it has checked out and with no branch named for it, for work that needs no tree; Enter on the heading then opens its chat rather than folding the group.
 The assistant is never shown there, and neither is a stopped session, since sessions run there in place are not its agent.
 Within a group, trees waiting on you come first, then those with the most recently active agent, so trees nobody has worked in for a while sink to the bottom.
@@ -137,7 +145,7 @@ A pid two sources both see counts once, where the more specific source saw it; a
   This gives the session's name and whether it is busy, idle or waiting on you.
   It also reports every background job in `~/.claude/jobs` with no running session as a **cold** agent, drawn `◌`: Enter attaches to it, which starts it again with its conversation kept.
   An agent a plugin reports, running or cold, shows in the tree whose `treetop.json` names its job, else in the tree it last worked in when that was since the tree's lease began, so one started by hand stays on its tree while a tree that has been returned and handed out again never shows the last lease's agent, even one still running.
-  It stays there however long ago it finished; only the inbox forgets a finished job after a day.
+  It stays there however long ago it finished; only the inbox forgets a finished job after a day, and a question a day old whose session has stopped.
   These files are internal to Claude Code, so a release that changes them blanks this source until treetop catches up.
 - **A process** standing in the tree whose name, or the script its interpreter runs, is a known agent: `claude`, `codex`, `aider`, `opencode`, `gemini`, `goose`, `amp` or `cursor-agent`.
   `TREETOP_AGENTS=one,two` adds names. This sees any agent started inside a tree, by name only.
@@ -431,8 +439,13 @@ Claude Code runs a background session only in a folder you have trusted, so befo
 
 ### New agents
 
-Every tree is leased with `treetop` as the holder, and a tree treetop leases always gets a branch: `<git user.name>/<the task as a slug>`, shown on the compose box's branch line.
-Down moves to that line to change the name before sending, and Up comes back; a tree someone already holds keeps its branch.
+Every tree is leased with `treetop` as the holder, and a tree treetop leases always gets a branch: `<git user.name>/<slug>`.
+The compose box's branch line says it is named from the task when it starts; Down moves to that line to name it yourself, starting from the task's words, and Up comes back; a tree someone already holds keeps its branch.
+
+A branch you did not name, and the agent's session, are named when the agent starts, by a small model that reads the task: `can you scan he project and cmpiel a list` starts as "Scan project for useful tools" on `<user>/scan-project-tools`, not under its first words.
+It is `claude -p` on Haiku with no tools, no saved session and no user settings, given the task on its standard input, and it runs while the tree is leased, so the start waits on it little if at all.
+When it cannot answer within ten seconds, or its answer names a branch that exists or git would refuse, the task's own words name it, as before.
+A ticket's name and branch, and a branch you edited, are always kept.
 A fresh tree from `N` also has a base line under it: the branch the tree is cut from, the pool's base unless you pick another.
 On it, `←` and `→` step through the repository's branches, local and on origin, the pool's base first and the rest most recently committed first.
 Typing there narrows them to those that start with what you type, then those that contain it, ignoring case, and `←` and `→` step through the matches; Backspace and Ctrl+U widen them again.
@@ -441,10 +454,10 @@ treetop leases the tree with `treehouse get --lease --base <branch>` and records
 `n` on a free tree cannot take a base, since `treehouse lease` takes the tree as it is.
 `b` renames the branch of the tree under the cursor, or names one on a detached HEAD.
 
-The agent is `claude --bg --name <the task's first words> -- <task>`, which Claude Code's own agent view lists too; `TREETOP_NEW_AGENT` names another command, which gets the task as its last argument.
+The agent is `claude --bg --name <its name> -- <task>`, which Claude Code's own agent view lists too; `TREETOP_NEW_AGENT` names another command, which gets the task as its last argument.
 An empty task starts the agent idle and opens its chat as soon as it shows up, so its first message is typed there.
 
-A start runs as steps, each with its own timeout: lease the tree (`treehouse get --lease --branch`), check it is a clean worktree, name the branch, write `treetop.json`, start the agent, and wait for `claude agents` to list it, since `claude --bg` exits as soon as the session is queued.
+A start runs as steps, each with its own timeout: lease the tree (`treehouse get --lease`, with `--branch` where the name is already known), check it is a clean worktree, name the branch, write `treetop.json`, start the agent, and wait for `claude agents` to list it, since `claude --bg` exits as soon as the session is queued.
 When a step fails, the ones before it are undone in reverse: the agent stopped, the record removed, the branch deleted and the tree returned. The row shows "failed" and the status line which step failed and why.
 Up to four actions run at once, each on its own tree, so a slow one never holds up the rest.
 
@@ -490,7 +503,8 @@ Leaving a chat with Ctrl+Q opens the next ask, so once you are done with other w
 Each ask opens once: one you have seen, opened for you or asked while its chat was open, stays shut until that agent asks something new, and its row keeps its `●` for Enter.
 A finished agent never opens, nor does a busy one whose last report still asks, nor one with no chat here, such as `claude` in a tmux pane.
 A filter that hides the asking tree is cleared, so the cursor lands on it.
-Opening treetop, or coming back to a workspace, opens what is waiting there.
+Opening treetop, or coming back to a workspace, opens only what is waiting there that you have not seen yet.
+What you have seen is kept per workspace under `$XDG_STATE_HOME/treetop` (else `~/.local/state/treetop`), so neither a switch nor a restart opens it again.
 
 When an agent comes to need you, or finishes, treetop rings the terminal bell, and inside tmux shows it in the status line for five seconds, so it is heard from any window; the assistant finishing an answer rings it too.
 
@@ -499,6 +513,7 @@ When an agent comes to need you, or finishes, treetop rings the terminal bell, a
 Under the list, the pane shows the tree under the cursor in full: where it is, who holds it, its agents, ports and processes, everything its agent last said with its latest steps, its PR, and the outcome of its last action.
 Only this workspace's agents open their chat; agents elsewhere are counted in the summary.
 The summary counts the trees that need you, and, as "elsewhere", agents outside the pool waiting on you, which have no row.
+A question more than a day old whose session no longer runs counts nowhere, since its process ended without saying so and nothing is left to answer it.
 These job files are internal to Claude Code, like its session files, so a release that changes them blanks those marks until treetop catches up.
 
 ## After the agent

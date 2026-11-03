@@ -52,7 +52,7 @@ const KEYS: [(&str, &str); 13] = [
 ];
 
 /// Every key on the list, for the `?` overlay.
-const HELP: [(&str, &str); 30] = [
+const HELP: [(&str, &str); 31] = [
     (
         "Enter",
         "open the agent: its chat, a cold one started again, else its tree; a heading folds, or opens main's agent",
@@ -129,6 +129,7 @@ const HELP: [(&str, &str); 30] = [
     ("j k ↑ ↓", "move"),
     ("g G", "top, bottom"),
     ("Esc", "clear the filter, then the marks"),
+    ("U", "restart on a newer treetop, once one is installed"),
     ("?", "this help"),
     ("q", "quit"),
 ];
@@ -293,6 +294,12 @@ fn summary(app: &App, is_compact: bool) -> Vec<Span<'static>> {
         if !app.marked.is_empty() {
             spans.push(Span::raw(format!("  {} marked", app.marked.len())));
         }
+        if app.replaced.is_some() {
+            spans.push(Span::styled(
+                "  treetop updated: U restarts",
+                fg(t.special).add_modifier(Modifier::BOLD),
+            ));
+        }
         if let n @ 1.. = app.active_jobs() {
             spans.push(Span::styled(
                 format!("  {n} action(s) running"),
@@ -348,8 +355,15 @@ fn freshness(app: &App) -> Span<'static> {
 /// no remote, `+` staged, `!` unstaged and `?` untracked files, each only
 /// when there are some. Nothing for a clean tree.
 fn git_spans(work: Work) -> Vec<Span<'static>> {
+    behind_spans(work, 0)
+}
+
+/// `git_spans` with the commits the tree sits behind its upstream first, as
+/// `⇣`, which only the main checkout tracks.
+fn behind_spans(work: Work, behind: usize) -> Vec<Span<'static>> {
     let t = theme();
     [
+        ("⇣", behind, t.info),
         ("⇡", work.unpushed, t.success),
         ("+", work.staged, t.warning),
         ("!", work.unstaged, t.warning),
@@ -371,11 +385,11 @@ fn git_spans(work: Work) -> Vec<Span<'static>> {
 /// The tree's git state, blank when clean or available, and `─`, as
 /// Powerlevel10k writes an unknown count, where git could not read a held
 /// tree.
-fn git_cell(tree: &Tree) -> Cell<'static> {
+fn git_cell(tree: &Tree, behind: usize) -> Cell<'static> {
     match tree.work {
         None if tree.is_held() => Cell::from("─").style(fg(theme().warning)),
         None => Cell::from(""),
-        Some(work) => Cell::from(Line::from(git_spans(work))),
+        Some(work) => Cell::from(Line::from(behind_spans(work, behind))),
     }
 }
 
@@ -519,7 +533,7 @@ fn row(app: &App, tree: &Tree) -> Row<'static> {
         branch,
         agent_cell(app, tree),
         ports_cell(tree),
-        git_cell(tree),
+        git_cell(tree, 0),
     ];
     if app.is_shipping() {
         cells.push(pr_cell(tree));
@@ -646,7 +660,7 @@ fn heading_row(
     ];
     if let Some(main) = main {
         cells.push(ports_cell(main));
-        cells.push(git_cell(main));
+        cells.push(git_cell(main, app.behind));
     }
     Row::new(cells)
 }
@@ -1579,8 +1593,8 @@ fn base_line(prompt: &Prompt) -> Line<'static> {
     Line::from(spans)
 }
 
-/// The compose box's branch line: the branch a new agent will start on,
-/// edited or following the task.
+/// The compose box's branch line: the branch a new agent will start on, as
+/// edited, else named from the task when it starts.
 fn branch_line(prompt: &Prompt) -> Line<'static> {
     let t = theme();
     let name = if prompt.is_editing_branch {
@@ -1589,10 +1603,10 @@ fn branch_line(prompt: &Prompt) -> Line<'static> {
             fg(t.accent).add_modifier(Modifier::BOLD),
         )
     } else {
-        match prompt.branch_name() {
-            Some(name) => Span::raw(name),
+        match &prompt.branch {
+            Some(name) => Span::raw(name.clone()),
             None => Span::styled(
-                "named from the task",
+                "named from the task when it starts",
                 fg(t.muted).add_modifier(Modifier::ITALIC),
             ),
         }

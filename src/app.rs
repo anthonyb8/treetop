@@ -254,6 +254,8 @@ pub enum Outcome {
     RemoveScratch(Scratch),
     /// Show the pool of the repository checked out here instead.
     Switch(PathBuf),
+    /// Start the newer treetop installed over this one, on this workspace.
+    Restart,
     /// Open `http://localhost:<port>`, served from tree `tree`, in the browser.
     Browse {
         port: u16,
@@ -388,6 +390,12 @@ pub struct App {
     /// How much of the plan the agents run on is used, as the last agent
     /// plugin that could say reported it.
     pub usage: Option<Usage>,
+    /// How many commits the main checkout sits behind its upstream, left
+    /// there because it has work of its own or a busy agent.
+    pub behind: usize,
+    /// The newer treetop installed over the running one since it started,
+    /// which `U` restarts on.
+    pub replaced: Option<PathBuf>,
     /// Each tree's stage at the last ask, so a change can be announced; None
     /// until the first ask, which announces nothing.
     last_stages: Option<HashMap<PathBuf, Stage>>,
@@ -397,6 +405,9 @@ pub struct App {
     /// opened for it or open while it asked, by their chat's command. One
     /// leaves once it stops asking, so its next ask opens again.
     asked: BTreeSet<String>,
+    /// Where `asked` is kept for this workspace, so a switch back or a new
+    /// run does not open an ask already seen. None keeps it in memory only.
+    asked_file: Option<PathBuf>,
     /// Issues a merge has left with nothing blocking them, by id, until
     /// a tree takes one up.
     pub ready: BTreeSet<String>,
@@ -1381,8 +1392,17 @@ impl App {
                 )
             })
             .collect();
+        // Until agents and reports have both been read, an ask still under
+        // way looks finished, and forgetting it would open it again.
+        if !self.is_agents_read || self.last_states.is_none() {
+            return None;
+        }
+        let before = self.asked.len();
         self.asked
             .retain(|key| asks.iter().any(|(.., command)| command.join(" ") == *key));
+        if self.asked.len() != before {
+            self.save_asked();
+        }
         if !self.is_free() {
             return None;
         }
@@ -1390,6 +1410,7 @@ impl App {
             .into_iter()
             .find(|(.., command)| !self.asked.contains(&command.join(" ")))?;
         self.asked.insert(command.join(" "));
+        self.save_asked();
         if !self.visible().iter().any(|t| t.path == path) {
             self.filter.clear();
             let group = self
@@ -1412,8 +1433,38 @@ impl App {
     /// The chat running `command` is on screen, so whatever its agent asks
     /// now has been seen and does not open again when it closes.
     pub fn saw_chat(&mut self, command: &[String]) {
-        if self.asks().iter().any(|(.., c)| c.as_slice() == command) {
-            self.asked.insert(command.join(" "));
+        if self.asks().iter().any(|(.., c)| c.as_slice() == command)
+            && self.asked.insert(command.join(" "))
+        {
+            self.save_asked();
+        }
+    }
+
+    /// Takes where the main checkout stands after a catch-up, and says so on
+    /// the status line when it moved.
+    pub fn apply_base(&mut self, standing: crate::base::Standing) {
+        self.behind = standing.behind();
+        if let crate::base::Standing::Forwarded(n) = standing {
+            let branch = self
+                .trees
+                .iter()
+                .find(|t| t.is_main)
+                .and_then(|t| t.branch.clone())
+                .unwrap_or_else(|| "main checkout".into());
+            let commits = if n == 1 { "commit" } else { "commits" };
+            self.message = Some(format!("{branch} fast-forwarded {n} {commits}"));
+        }
+    }
+
+    /// Keeps the asks seen in `file`, starting from those it already holds.
+    pub fn keep_asked_in(&mut self, file: PathBuf) {
+        self.asked = crate::state::read_asked(&file);
+        self.asked_file = Some(file);
+    }
+
+    fn save_asked(&self) {
+        if let Some(file) = &self.asked_file {
+            crate::state::write_asked(file, &self.asked);
         }
     }
 
@@ -2313,7 +2364,9 @@ impl App {
 
     fn submit(&mut self, prompt: Prompt) -> Outcome {
         let text = prompt.text.trim().to_string();
-        let branch = prompt.branch_name();
+        // Only a branch you named goes; one that only follows the task is
+        // named when the agent starts, from what the task says.
+        let branch = prompt.branch.clone().filter(|_| prompt.names_branch());
         let base = prompt.base_name();
         match prompt.purpose {
             Purpose::Rename { tree } => {
@@ -2709,6 +2762,22 @@ impl App {
     }
 
     /// Quits, or waits for running actions to finish first.
+    /// Restarts on the treetop installed over this one, once no action is
+    /// under way, since a restart would cut one off.
+    fn restart(&mut self) -> Outcome {
+        if self.replaced.is_none() {
+            self.message = Some("treetop is current; `treetop update` installs a newer one".into());
+            return Outcome::Continue;
+        }
+        match self.active_jobs() {
+            0 => Outcome::Restart,
+            n => {
+                self.message = Some(format!("{n} action(s) still running; U again once done"));
+                Outcome::Continue
+            }
+        }
+    }
+
     pub fn quit(&mut self) -> Outcome {
         match self.active_jobs() {
             0 => Outcome::Quit,
@@ -2880,6 +2949,7 @@ impl App {
             KeyCode::Char('I') => self.choose_issue(),
             KeyCode::Char('m') => self.open_message(),
             KeyCode::Char('q') => return self.quit(),
+            KeyCode::Char('U') => return self.restart(),
             KeyCode::Char('?') => self.is_help = true,
             KeyCode::Esc if !self.filter.is_empty() => {
                 self.filter.clear();
@@ -4411,6 +4481,22 @@ mod tests {
     }
 
     #[test]
+    fn u_restarts_only_on_a_newer_treetop_and_never_mid_action() {
+        let mut app = app();
+        assert_eq!(press(&mut app, KeyCode::Char('U')), Outcome::Continue);
+        assert!(app.message.as_deref().unwrap().contains("treetop update"));
+
+        app.replaced = Some(PathBuf::from("/home/me/.local/bin/treetop"));
+        app.jobs
+            .insert(PathBuf::from("/p/4/app"), JobState::Queued(Kind::Return));
+        assert_eq!(press(&mut app, KeyCode::Char('U')), Outcome::Continue);
+        assert!(app.message.as_deref().unwrap().contains("still running"));
+
+        app.jobs.clear();
+        assert_eq!(press(&mut app, KeyCode::Char('U')), Outcome::Restart);
+    }
+
+    #[test]
     fn w_opens_the_picker_on_the_last_other_workspace_and_enter_switches() {
         let mut app = app_with_main();
         app.checkout = PathBuf::from("/repo");
@@ -4600,7 +4686,7 @@ mod tests {
         let launch = job.launch.unwrap();
         assert_eq!(launch.task, "fix login");
         assert!(!launch.is_new_tree, "this tree, not a fresh one");
-        assert!(launch.branch.is_some());
+        assert_eq!(launch.branch, None, "named as it starts, from the task");
         select(&mut app, "4");
         press(&mut app, KeyCode::Char('n'));
         type_in(&mut app, "add tests");
@@ -4791,10 +4877,48 @@ mod tests {
             ..attachable("asks")
         };
         app.apply_agents(&HashMap::from([(PathBuf::from("/p/8/app"), vec![asking])]));
+        app.apply_reports(Vec::new());
         app.filter = "end-1".into();
         assert_eq!(chat_of(app.next_ask()).as_deref(), Some("asks"));
         assert!(app.filter.is_empty());
         assert_eq!(app.current().unwrap().name, "8");
+    }
+
+    #[test]
+    fn an_ask_seen_before_a_workspace_switch_stays_shut_on_coming_back() {
+        let file = std::env::temp_dir()
+            .join(format!("treetop-asked-{}", std::process::id()))
+            .join("asked-app.json");
+        let _ = std::fs::remove_file(&file);
+        let waiting = || {
+            HashMap::from([(
+                PathBuf::from("/p/8/app"),
+                vec![Agent {
+                    status: Some(Status::Waiting),
+                    ..attachable("asks")
+                }],
+            )])
+        };
+        let mut app = app();
+        app.keep_asked_in(file.clone());
+        app.apply_agents(&waiting());
+        app.apply_reports(Vec::new());
+        assert_eq!(chat_of(app.next_ask()).as_deref(), Some("asks"));
+
+        // Coming back builds the workspace afresh.
+        let mut back = tests::app();
+        back.keep_asked_in(file.clone());
+        assert_eq!(back.next_ask(), None, "nothing is read yet");
+        back.apply_agents(&waiting());
+        back.apply_reports(Vec::new());
+        assert_eq!(back.next_ask(), None, "already seen, it stays shut");
+
+        // Once it stops asking, its next ask opens again.
+        back.apply_agents(&HashMap::new());
+        assert_eq!(back.next_ask(), None);
+        back.apply_agents(&waiting());
+        assert_eq!(chat_of(back.next_ask()).as_deref(), Some("asks"));
+        let _ = std::fs::remove_file(&file);
     }
 
     #[test]

@@ -40,11 +40,7 @@ impl Scratch {
 /// `$XDG_STATE_HOME/treetop/scratch`, else `~/.local/state/treetop/scratch`:
 /// where every scratch chat runs and keeps its record.
 pub fn root() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".local/state")))?;
-    Some(base.join("treetop").join("scratch"))
+    Some(crate::state::dir()?.join("scratch"))
 }
 
 /// Every scratch chat whose record can be read, the newest first.

@@ -38,6 +38,8 @@ const USAGE: &str = "usage:
   treetop serve --install [--port N]
                                    keep it running as a systemd user service
   treetop serve --uninstall        stop and remove the service
+  treetop update [vX.Y.Z]          install the latest release, or the one named,
+                                   over this binary, and restart the service
   treetop status                   every tree, agent, report and PR, as JSON
   treetop send <tree|agent> <msg>  type a message into an agent's chat and send it
   treetop dispatch <new|main|N> <task>

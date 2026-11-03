@@ -453,6 +453,22 @@ fn dirs(dir: &Path) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
+/// The jobs whose session is running now, by job id.
+pub fn running_jobs() -> HashSet<String> {
+    let Some(config) = config_dir() else {
+        return HashSet::new();
+    };
+    dirs(&config.join("sessions"))
+        .iter()
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .filter_map(|path| serde_json::from_str::<Session>(&fs::read_to_string(path).ok()?).ok())
+        .filter_map(|session| {
+            let start = live::stat(session.pid).map(|s| s.start);
+            live_session(&session, start, PathBuf::new())?.id
+        })
+        .collect()
+}
+
 /// Every running session and where it works.
 fn live_sessions(config: &Path) -> Vec<Seen> {
     let sessions = dirs(&config.join("sessions"));
