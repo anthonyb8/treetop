@@ -39,6 +39,7 @@ mod scratch;
 mod serve;
 mod ship;
 mod sidecar;
+mod snapshot;
 mod state;
 mod theme;
 mod tickets;
@@ -51,7 +52,7 @@ mod workspaces;
 use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context as _, Result};
 use ratatui::Terminal;
@@ -268,6 +269,10 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
     let mut opening_urls: Vec<(actions::Pending, bool)> = Vec::new();
     // The port `p` is sharing with the phone, off this thread.
     let mut sharing: Option<phone::Sharing> = None;
+    // When `treetop status` was last written for this workspace.
+    let mut snapshots = snapshot::Clock::default();
+    // `U` installing a newer release, off this thread.
+    let mut updating: Option<mpsc::Receiver<Result<String, String>>> = None;
     loop {
         while let Ok(update) = refresher.updates.try_recv() {
             is_stale = true;
@@ -301,6 +306,8 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                 }
                 Update::Usage(usage) => app.usage = usage,
                 Update::Base(standing) => app.apply_base(standing),
+                Update::Release(tag) => app.apply_release(tag),
+                Update::CatchUpHookFailed(why) => app.message = Some(why),
                 Update::Agents(agents) => {
                     app.apply_agents(&agents);
                     let live: Vec<&Vec<String>> = agents
@@ -328,6 +335,23 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                     }
                 }
             }
+        }
+        if let Some(result) = updating.as_ref().and_then(|r| r.try_recv().ok()) {
+            updating = None;
+            app.is_updating = false;
+            match result {
+                Ok(_) if update::is_replaced().is_some() && app.active_jobs() == 0 => {
+                    return Ok(Exit::Restart);
+                }
+                Ok(done) => app.message = done.lines().next().map(str::to_string),
+                Err(why) => app.message = Some(format!("update failed: {why}")),
+            }
+            is_stale = true;
+        }
+        if app.is_read() && snapshots.is_due() {
+            let ready: Vec<String> = app.ready.iter().cloned().collect();
+            let status = cli::status_json(&app.trees, &app.reports, &ready, SystemTime::now());
+            snapshot::write(checkout, &status);
         }
         if let Some(Outcome::Send { to, text }) = app.ready_failure() {
             send(term, app, &mut chats, &worker, to, &text)?;
@@ -656,6 +680,15 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             }
             Outcome::Switch(path) => return Ok(Exit::Switch(path)),
             Outcome::Restart => return Ok(Exit::Restart),
+            Outcome::Update => {
+                app.is_updating = true;
+                let (done, result) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ =
+                        done.send(update::install(None, &mut |_| {}).map_err(|e| format!("{e:#}")));
+                });
+                updating = Some(result);
+            }
             Outcome::Chat {
                 command,
                 agent,

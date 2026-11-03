@@ -24,17 +24,16 @@ From source: `cargo install --git https://github.com/anthonyb8/treetop`.
 
 Once installed, `treetop update` installs the latest release over itself in one step, checked against its SHA-256 as the script checks it, and `treetop update v0.1.0` a given one.
 It restarts `treetop serve`'s service where `treetop serve --install` set one up, so the phone gets the new version too.
-A treetop already open notices the binary was replaced and says `treetop updated: U restarts` in its summary; `U` starts the new one in its place, on the same workspace, once no action is under way.
+An open treetop checks for a newer release every hour and says `treetop v0.1.60 out: U updates` in its summary; `U` installs it as `treetop update` does and starts it in its place, on the same workspace, once no action is under way.
+One whose binary was replaced from outside, by `treetop update` or install.sh, says `treetop updated: U restarts` instead.
 
 ## Release
 
-Bump `version` in `Cargo.toml`, then push a matching tag:
+Bump `version` in `Cargo.toml` in a PR and merge it: the push to main releases that version.
 
-```sh
-git tag v0.1.0 && git push origin v0.1.0
-```
-
-`.github/workflows/release.yml` refuses a tag that does not match `Cargo.toml`, builds and tests the web app in `web/`, runs the tests, builds static musl binaries for x86_64 and arm64 with the web app embedded, and publishes them with checksums as a GitHub release.
+`.github/workflows/release.yml` runs on every push to main and releases only when `Cargo.toml`'s version has no tag yet, so a merge that does not bump it publishes nothing.
+It builds and tests the web app in `web/`, runs the tests, builds static musl binaries for x86_64 and arm64 with the web app embedded, and publishes them with checksums as a GitHub release, which creates the tag at the merge.
+Pushing a `v*` tag by hand still releases that tag, refused when it does not match `Cargo.toml`.
 
 ## Use
 
@@ -67,7 +66,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | Tab | switch to the Issues screen, and back (see [Issues](#issues)) |
 | `j` `k` / arrows, `g` `G` | move |
 | Esc | clear the filter, then the marks |
-| `U` | restart on a newer treetop, once one is installed over the running one (see [Install](#install)) |
+| `U` | install a newer treetop release and restart on it, or restart on one installed from outside (see [Install](#install)) |
 | `?` | show every key |
 | `q` | quit |
 
@@ -174,6 +173,18 @@ on_return = ["harness", "stack", "down"]
 ```
 
 A hook is a command and its arguments, run in the tree with `TREETOP_TREE`, `TREETOP_BRANCH` and `TREETOP_TICKET` set, and given two minutes.
+
+A repository can add hooks of its own under `[repos]`.
+Its `on_return` runs in each of its trees after the global one, for what only it needs, such as clearing a Rust tree's build leftovers so a returned tree does not keep tens of gigabytes of old test binaries.
+Its `on_catch_up` runs in its main checkout each time treetop fast-forwards it (see [Use](#use)), given ten minutes, so what new trees are seeded from, such as installed packages, keeps up with the base; a failure shows on the status line.
+
+```toml
+[repos."~/treetop"]
+on_return = ["cargo", "clean", "-p", "treetop", "-p", "issues", "-p", "linear"]
+
+[repos."~/endo/app"]
+on_catch_up = ["harness", "provision"]
+```
 One that fails is written to the log and never stops the start or return it belongs to.
 A config file treetop cannot parse is reported in the log, and no hooks run.
 
@@ -399,6 +410,9 @@ Anything they do not cover, such as returning a tree with work left in it, stays
 | `treetop send <tree\|agent> <message>` | types a message into an agent's chat, as `m` does |
 | `treetop return <tree>` | gives a tree back to the pool, as `r` does, when the guard below lets it |
 
+`treetop status` answers in milliseconds while treetop is open on the workspace or `treetop serve` serves it: each writes the workspace's status every two seconds once it has read the pool, under `$XDG_CACHE_HOME/treetop`, and `status` prints that when it is under ten seconds old.
+With neither running it reads the pool itself, which takes seconds, `treehouse status` most of them.
+
 `treetop return` never stops a process for whoever runs it.
 It refuses a tree that any live process works in, other than the caller's own: a process standing in it, or an agent treetop places in it.
 Beyond that, the caller may return the tree its own agent works in, or, when it is no agent, the tree it stands in; any other tree only once its PR has merged or it is on no branch, with nothing uncommitted and nothing unpushed.
@@ -442,9 +456,10 @@ Claude Code runs a background session only in a folder you have trusted, so befo
 Every tree is leased with `treetop` as the holder, and a tree treetop leases always gets a branch: `<git user.name>/<slug>`.
 The compose box's branch line says it is named from the task when it starts; Down moves to that line to name it yourself, starting from the task's words, and Up comes back; a tree someone already holds keeps its branch.
 
-A branch you did not name, and the agent's session, are named when the agent starts, by a small model that reads the task: `can you scan he project and cmpiel a list` starts as "Scan project for useful tools" on `<user>/scan-project-tools`, not under its first words.
-It is `claude -p` on Haiku with no tools, no saved session and no user settings, given the task on its standard input, and it runs while the tree is leased, so the start waits on it little if at all.
-When it cannot answer within ten seconds, or its answer names a branch that exists or git would refuse, the task's own words name it, as before.
+A branch you did not name, and the agent, are named by a small model that reads the task: `can you scan he project and cmpiel a list` shows as "Scan project for useful tools" on `<user>/scan-project-tools`, not under its first words.
+It is `claude -p` on Haiku with no tools, no saved session and no user settings, given the task on its standard input, and the start never waits for it: the agent starts under the task's first words, and the answer, a few seconds later, renames the branch while nothing has been pushed from it and gives the agent its title.
+treetop keeps the titles in `titles.json` under its state directory and shows them wherever it names the agent; Claude Code's own `claude agents` keeps the first words, since a running session's name cannot change.
+When the model cannot answer within ten seconds, or its answer names a branch that exists or git would refuse, the task's own words stay.
 A ticket's name and branch, and a branch you edited, are always kept.
 A fresh tree from `N` also has a base line under it: the branch the tree is cut from, the pool's base unless you pick another.
 On it, `←` and `→` step through the repository's branches, local and on origin, the pool's base first and the rest most recently committed first.
@@ -454,11 +469,12 @@ treetop leases the tree with `treehouse get --lease --base <branch>` and records
 `n` on a free tree cannot take a base, since `treehouse lease` takes the tree as it is.
 `b` renames the branch of the tree under the cursor, or names one on a detached HEAD.
 
-The agent is `claude --bg --name <its name> -- <task>`, which Claude Code's own agent view lists too; `TREETOP_NEW_AGENT` names another command, which gets the task as its last argument.
+The agent is `claude --bg --name <the task's first words> -- <task>`, which Claude Code's own agent view lists too; `TREETOP_NEW_AGENT` names another command, which gets the task as its last argument.
 An empty task starts the agent idle and opens its chat as soon as it shows up, so its first message is typed there.
 
-A start runs as steps, each with its own timeout: lease the tree (`treehouse get --lease`, with `--branch` where the name is already known), check it is a clean worktree, name the branch, write `treetop.json`, start the agent, and wait for `claude agents` to list it, since `claude --bg` exits as soon as the session is queued.
+A start runs as steps, each with its own timeout: lease the tree (`treehouse get --lease --branch`), check it is a clean worktree, name the branch, write `treetop.json`, start the agent, and wait for `claude agents` to list it, since `claude --bg` exits as soon as the session is queued.
 When a step fails, the ones before it are undone in reverse: the agent stopped, the record removed, the branch deleted and the tree returned. The row shows "failed" and the status line which step failed and why.
+The start's log ends with how long each step took, such as `took 1.4s: lease 0.0s branch 0.0s record 0.0s agent 1.4s attach 0.0s`, so a slow start says which step was slow.
 Up to four actions run at once, each on its own tree, so a slow one never holds up the rest.
 
 ### Messages

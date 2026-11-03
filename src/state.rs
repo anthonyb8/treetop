@@ -4,7 +4,7 @@
 //! be read counts as empty, and one that cannot be written is skipped: losing
 //! it only means an ask may open once more.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -40,6 +40,40 @@ pub fn write_asked(file: &Path, asked: &BTreeSet<String>) {
         let partial = file.with_extension("json.partial");
         fs::write(&partial, serde_json::to_string(asked)?)?;
         fs::rename(partial, file)
+    };
+    let _ = write();
+}
+
+/// The titles agents were given after they started, by job, since Claude
+/// Code's own name for a session cannot change once it runs.
+pub fn titles() -> HashMap<String, String> {
+    dir()
+        .and_then(|dir| fs::read_to_string(dir.join("titles.json")).ok())
+        .and_then(|raw| serde_json::from_str::<Vec<(String, String)>>(&raw).ok())
+        .map(|titles| titles.into_iter().collect())
+        .unwrap_or_default()
+}
+
+/// Records `title` for agent `job`, keeping the newest titles only, so the
+/// file stays small.
+pub fn add_title(job: &str, title: &str) {
+    const KEPT: usize = 500;
+    let Some(file) = dir().map(|dir| dir.join("titles.json")) else {
+        return;
+    };
+    let mut titles: Vec<(String, String)> = fs::read_to_string(&file)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Vec<(String, String)>>(&raw).ok())
+        .unwrap_or_default();
+    titles.retain(|(j, _)| j != job);
+    titles.push((job.to_string(), title.to_string()));
+    let skip = titles.len().saturating_sub(KEPT);
+    let titles = &titles[skip..];
+    let write = || -> std::io::Result<()> {
+        fs::create_dir_all(file.parent().unwrap_or(Path::new(".")))?;
+        let partial = file.with_extension("json.partial");
+        fs::write(&partial, serde_json::to_string(titles)?)?;
+        fs::rename(partial, &file)
     };
     let _ = write();
 }

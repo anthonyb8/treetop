@@ -50,6 +50,10 @@ const SHIP_GAP: Duration = Duration::from_secs(15);
 const SHIP_BACKOFF: Duration = Duration::from_secs(300);
 const USAGE: Duration = Duration::from_secs(60);
 const BASE: Duration = Duration::from_secs(300);
+const RELEASE: Duration = Duration::from_secs(60 * 60);
+/// How long a repository's `on_catch_up` may take: an install of its
+/// packages can run for minutes.
+const CATCH_UP_HOOK: Duration = Duration::from_secs(600);
 
 pub enum Update {
     ListingStarted,
@@ -70,6 +74,10 @@ pub enum Update {
     /// Where the main checkout stands against its upstream after a
     /// catch-up.
     Base(Standing),
+    /// Why the repository's `on_catch_up` failed after a fast-forward.
+    CatchUpHookFailed(String),
+    /// The latest treetop release's tag.
+    Release(String),
 }
 
 pub struct Refresher {
@@ -113,6 +121,10 @@ impl Refresher {
         thread::spawn({
             let (updates_tx, paused) = (updates_tx.clone(), Arc::clone(&paused));
             move || usage_clock(&updates_tx, &paused)
+        });
+        thread::spawn({
+            let (updates_tx, paused) = (updates_tx.clone(), Arc::clone(&paused));
+            move || release_clock(&updates_tx, &paused)
         });
         thread::spawn({
             let (updates_tx, paused, main_busy, checkout) = (
@@ -283,6 +295,12 @@ fn base_clock(
             if updates.send(Update::Base(standing)).is_err() {
                 return;
             }
+            if let Standing::Forwarded(_) = standing
+                && let Some(why) = run_catch_up_hook(checkout)
+                && updates.send(Update::CatchUpHookFailed(why)).is_err()
+            {
+                return;
+            }
         }
         match kicks.recv_timeout(BASE) {
             Err(RecvTimeoutError::Disconnected) => return,
@@ -290,6 +308,40 @@ fn base_clock(
             // Kicks that queued up while catching up are answered by this one.
             Ok(()) => while kicks.try_recv().is_ok() {},
         }
+    }
+}
+
+/// Runs the repository's `on_catch_up` in its main checkout. Says why when
+/// it failed, from the last line of its log.
+fn run_catch_up_hook(checkout: &std::path::Path) -> Option<String> {
+    let command = crate::config::load()
+        .ok()?
+        .repo(checkout)
+        .map(|repo| repo.on_catch_up.clone())
+        .filter(|command| !command.is_empty())?;
+    let mut log = String::new();
+    let is_ok =
+        crate::jobs::run_hook_for("on_catch_up", &command, checkout, CATCH_UP_HOOK, &mut log);
+    (!is_ok).then(|| {
+        log.lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("on_catch_up hook failed")
+            .to_string()
+    })
+}
+
+/// Asks which treetop release is the latest, every RELEASE, until treetop
+/// moves on. One it cannot reach is asked again at the next.
+fn release_clock(updates: &Sender<Update>, paused: &AtomicBool) {
+    loop {
+        if !paused.load(Ordering::Relaxed)
+            && let Ok(tag) = crate::update::latest_release()
+            && updates.send(Update::Release(tag)).is_err()
+        {
+            return;
+        }
+        thread::sleep(RELEASE);
     }
 }
 
