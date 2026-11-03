@@ -175,7 +175,10 @@ Like every other field read from Claude Code's files, the records are undocument
 What the agent waits on comes from the transcript: its newest tool call with no result yet, while the agent waits on you. An `AskUserQuestion` call carries its questions and options, which the chat shows as buttons; any other is a permission.
 `POST /api/trees/<n>/answer` takes `allow`, `deny` or `say` with words. It attaches to the session with `claude attach` in a terminal of its own, as `treetop send` does, waits until `chat::input` reads the screen as a dialog, presses Enter or Esc, waits for the dialog to go, and detaches.
 `say` presses Esc, then sends its words as `treetop send` does: a question's picks, or your own words, go in as a message, so the answer does not depend on how Claude Code numbers and lays out its options.
-With no dialog on the screen nothing is pressed, and the answer fails with why.
+With no dialog on the screen nothing is pressed, and the answer fails with why, except `say`, whose words then go in as a message.
+Claude Code writes an `AskUserQuestion` call to the transcript only once it has been answered (ANB-30), so while the agent waits on you with no such call in its chat, `GET /api/trees/<n>/prompt` reads the question and its options off the agent's screen, attached as for an answer, and the chat shows that as the buttons.
+A prompt of several questions shows only its open tab's options on the screen, so it is not read, and is answered in words.
+While the agent waits on you, a line typed in the reply box always goes through `say`, found prompt or not, since a dialog on the screen would swallow a plain message.
 
 ### Push
 
