@@ -31,5 +31,10 @@ toml = { version = "1.1.6", default-features = false, features = ["parse", "serd
 ureq = "3"
 vt100 = "0.16.2"
 
+# Line tables are enough for a panic's backtrace and cut each test binary to
+# well under half, which matters with a target directory in every pool tree.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 strip = true

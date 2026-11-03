@@ -22,44 +22,79 @@ const LIMIT: Duration = Duration::from_secs(120);
 const LARGEST: u64 = 64 * 1024 * 1024;
 
 /// Installs `version`, such as `v0.1.52`, else the latest release, over the
-/// binary that is running.
+/// binary that is running, saying what it does as it goes.
 pub fn run(version: Option<&str>) -> Result<()> {
-    let current = format!("v{}", env!("CARGO_PKG_VERSION"));
-    let agent: ureq::Agent = ureq::Agent::config_builder()
+    println!("{}", install(version, &mut |line| println!("{line}"))?);
+    Ok(())
+}
+
+fn agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
         .timeout_global(Some(LIMIT))
         .build()
-        .into();
+        .into()
+}
+
+/// The running version, as its tag is written.
+pub fn current() -> String {
+    format!("v{}", env!("CARGO_PKG_VERSION"))
+}
+
+/// The latest release's tag, or why it could not be read.
+pub fn latest_release() -> Result<String> {
+    latest(&agent())
+}
+
+/// Whether release `tag` is newer than the one running, comparing their
+/// numbers, so an older or unreadable tag never reads as an update.
+pub fn is_newer(tag: &str) -> bool {
+    let numbers = |tag: &str| -> Option<Vec<u64>> {
+        tag.strip_prefix('v')?
+            .split('.')
+            .map(|part| part.parse().ok())
+            .collect()
+    };
+    numbers(tag)
+        .zip(numbers(&current()))
+        .is_some_and(|(theirs, ours)| theirs > ours)
+}
+
+/// `run` without printing: `say` hears each step, and the result says what
+/// was installed and whether the service was restarted on it.
+pub fn install(version: Option<&str>, say: &mut dyn FnMut(&str)) -> Result<String> {
+    let current = current();
+    let agent = agent();
     let version = match version {
         Some(v) if v.starts_with('v') => v.to_string(),
         Some(v) => format!("v{v}"),
         None => latest(&agent)?,
     };
     let target = installed()?;
-    if version == current {
-        println!(
+    let mut done = if version == current {
+        format!(
             "treetop {current} is already installed at {}",
             target.display()
-        );
+        )
     } else {
         let name = format!("treetop-{version}-linux-{}.tar.gz", arch()?);
         let url = format!("https://github.com/{REPO}/releases/download/{version}/{name}");
-        println!("Downloading treetop {version}...");
+        say(&format!("Downloading treetop {version}..."));
         let archive = download(&agent, &url)?;
         let sum = String::from_utf8(download(&agent, &format!("{url}.sha256"))?)
             .context("the checksum file is not text")?;
         verify(&archive, &sum).with_context(|| format!("{name}: nothing was installed"))?;
         replace(&target, &unpack(&archive)?)?;
-        println!(
+        format!(
             "treetop {current} -> {version} installed at {}",
             target.display()
-        );
-    }
+        )
+    };
     // Restarted even when the binary was already current, since a service
     // started before an earlier install still runs the old one.
     if crate::serve::restart_service()? {
-        println!("treetop-serve restarted on it");
+        done.push_str("\ntreetop-serve restarted on it");
     }
-    Ok(())
+    Ok(done)
 }
 
 /// The latest release's tag, read from the redirect GitHub serves for it
@@ -197,6 +232,22 @@ mod tests {
             None,
             "no release yet"
         );
+    }
+
+    #[test]
+    fn only_a_higher_release_reads_as_newer() {
+        let current = current();
+        let mut parts: Vec<u64> = current[1..]
+            .split('.')
+            .map(|p| p.parse().unwrap())
+            .collect();
+        assert!(!is_newer(&current), "the running one");
+        parts[2] += 1;
+        let next = format!("v{}.{}.{}", parts[0], parts[1], parts[2]);
+        assert!(is_newer(&next));
+        assert!(is_newer(&format!("v{}.{}.0", parts[0], parts[1] + 1)));
+        assert!(!is_newer("v0.0.1"), "an older one");
+        assert!(!is_newer("nightly"), "not a version");
     }
 
     #[test]

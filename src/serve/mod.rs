@@ -99,12 +99,42 @@ impl Pool {
         thread::spawn({
             let pool = Arc::clone(&pool);
             move || {
+                let mut clock = crate::snapshot::Clock::default();
                 while let Ok(update) = refresher.updates.recv() {
                     pool.apply(update);
+                    pool.snapshot(&mut clock);
                 }
             }
         });
         pool
+    }
+
+    /// Writes what `treetop status` prints for this workspace, once the pool
+    /// has been read in full and at most as often as `clock` allows.
+    fn snapshot(&self, clock: &mut crate::snapshot::Clock) {
+        let app = self.app.lock().unwrap_or_else(PoisonError::into_inner);
+        let has_reports = self
+            .seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .has_reports;
+        if !app.is_agents_read || !has_reports || !clock.is_due() {
+            return;
+        }
+        let ready = self
+            .ready
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .1
+            .clone();
+        let status = crate::cli::status_json(
+            &app.trees,
+            &app.reports,
+            &ready,
+            std::time::SystemTime::now(),
+        );
+        drop(app);
+        crate::snapshot::write(&self.checkout, &status);
     }
 
     /// Lists the pool again now rather than at the next trigger.
@@ -177,6 +207,8 @@ impl Pool {
             }
             Update::Usage(usage) => app.usage = usage,
             Update::Base(standing) => app.apply_base(standing),
+            Update::Release(tag) => app.apply_release(tag),
+            Update::CatchUpHookFailed(why) => app.message = Some(why),
             Update::Agents(agents) => app.apply_agents(&agents),
         }
         // Pushes are judged once the pool has been read in full: agents,

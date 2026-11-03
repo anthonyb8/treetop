@@ -129,7 +129,7 @@ const HELP: [(&str, &str); 31] = [
     ("j k ↑ ↓", "move"),
     ("g G", "top, bottom"),
     ("Esc", "clear the filter, then the marks"),
-    ("U", "restart on a newer treetop, once one is installed"),
+    ("U", "install a newer treetop release and restart on it"),
     ("?", "this help"),
     ("q", "quit"),
 ];
@@ -294,9 +294,18 @@ fn summary(app: &App, is_compact: bool) -> Vec<Span<'static>> {
         if !app.marked.is_empty() {
             spans.push(Span::raw(format!("  {} marked", app.marked.len())));
         }
-        if app.replaced.is_some() {
+        let update = if app.replaced.is_some() {
+            Some("treetop updated: U restarts".to_string())
+        } else if app.is_updating {
+            Some("treetop updating...".to_string())
+        } else {
+            app.newer
+                .as_ref()
+                .map(|tag| format!("treetop {tag} out: U updates"))
+        };
+        if let Some(update) = update {
             spans.push(Span::styled(
-                "  treetop updated: U restarts",
+                format!("  {update}"),
                 fg(t.special).add_modifier(Modifier::BOLD),
             ));
         }

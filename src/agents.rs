@@ -179,7 +179,14 @@ pub fn find(
     let (seen, active) = from_plugins(&dirs);
     sightings.extend(seen);
     sightings.extend(procs::find(processes));
-    place(trees, sightings, sidecars, &active)
+    let mut placed = place(trees, sightings, sidecars, &active);
+    let titles = crate::state::titles();
+    for agent in placed.values_mut().flatten() {
+        if let Some(title) = agent.job.as_ref().and_then(|job| titles.get(job)) {
+            agent.name.clone_from(title);
+        }
+    }
+    placed
 }
 
 /// How much of the plan the agents run on is used, from the first agent

@@ -246,7 +246,7 @@ fn report_json(report: &Report, trees: &[Tree], now: SystemTime) -> Value {
 /// and reports, then the reports from outside the pool. Available trees
 /// with nothing in them are only counted. The assistant is left out of
 /// what it reads about.
-fn status_json(trees: &[Tree], reports: &[Report], ready: &[String], now: SystemTime) -> Value {
+pub fn status_json(trees: &[Tree], reports: &[Report], ready: &[String], now: SystemTime) -> Value {
     let reports: Vec<&Report> = reports
         .iter()
         .filter(|r| !assistant::is_assistant(&r.name))
@@ -336,7 +336,14 @@ pub fn full_listing(checkout: &Path) -> Result<Vec<Tree>> {
     Ok(trees)
 }
 
+/// Prints the snapshot an open treetop or `treetop serve` keeps of this
+/// workspace when it is fresh, else reads the pool in full, which takes
+/// seconds.
 fn status(checkout: &Path) -> Result<()> {
+    if let Some(status) = crate::snapshot::fresh(checkout) {
+        println!("{}", status.trim_end());
+        return Ok(());
+    }
     let trees = full_listing(checkout)?;
     let ready = ready_after_merges(checkout, &trees);
     let reports = reports::Reader::default().read();
@@ -523,6 +530,9 @@ fn dispatch(checkout: &Path, place: &str, task: &str) -> Result<()> {
         bail!("the agent did not start in tree {}", job.tree.name);
     }
     println!("started an agent in tree {}", job.tree.name);
+    // Its name comes from a model after it starts, and this process is
+    // what puts it in place.
+    jobs::wait_for_names();
     Ok(())
 }
 

@@ -521,6 +521,52 @@ fn start_steps(
     log: &mut String,
     undone: &mut Vec<Undo>,
 ) -> Result<Option<String>, String> {
+    let mut timed = Timed::new();
+    let started = timed_steps(job, log, undone, &mut timed);
+    let _ = writeln!(log, "{timed}");
+    started
+}
+
+/// How long each step of a start took, for its log, so a slow start says
+/// which step was slow.
+struct Timed {
+    at: std::time::Instant,
+    steps: Vec<(&'static str, Duration)>,
+}
+
+impl Timed {
+    fn new() -> Self {
+        Timed {
+            at: std::time::Instant::now(),
+            steps: Vec::new(),
+        }
+    }
+
+    /// Ends `step`, which ran since the last one ended.
+    fn mark(&mut self, step: &'static str) {
+        let now = std::time::Instant::now();
+        self.steps.push((step, now - self.at));
+        self.at = now;
+    }
+}
+
+impl std::fmt::Display for Timed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let total: Duration = self.steps.iter().map(|(_, took)| *took).sum();
+        write!(f, "took {:.1}s:", total.as_secs_f64())?;
+        for (step, took) in &self.steps {
+            write!(f, " {step} {:.1}s", took.as_secs_f64())?;
+        }
+        Ok(())
+    }
+}
+
+fn timed_steps(
+    job: &mut Job,
+    log: &mut String,
+    undone: &mut Vec<Undo>,
+    timed: &mut Timed,
+) -> Result<Option<String>, String> {
     let mut launch = job
         .launch
         .clone()
@@ -528,10 +574,12 @@ fn start_steps(
     if let Some(pick) = launch.ticket.clone() {
         take_up(&pick, &mut launch).map_err(|why| format!("ticket: {why}"))?;
         job.launch = Some(launch.clone());
+        timed.mark("ticket");
     }
     let is_leasing = launch.is_new_tree || !job.tree.is_held();
-    // What nobody named, the session or a leased tree's branch, a model names
-    // from the task, asked now so its answer comes while the tree is leased.
+    // What nobody named, the agent or a leased tree's branch, a model names
+    // from the task. The start never waits for it: the task's words name both
+    // until the answer comes, and `name_later` puts it in place then.
     let is_name_from_task = launch.name == crate::dispatch::session_name(&launch.task);
     let is_branch_from_task = is_leasing && launch.branch.is_none();
     let naming = (!launch.is_assistant
@@ -542,8 +590,7 @@ fn start_steps(
             let task = launch.task.clone();
             thread::spawn(move || crate::naming::suggest(&task))
         });
-    let is_branch_named_late = is_branch_from_task && naming.is_some();
-    let mut branch = (is_leasing && !launch.is_assistant).then(|| {
+    let branch = (is_leasing && !launch.is_assistant).then(|| {
         launch
             .branch
             .clone()
@@ -567,10 +614,7 @@ fn start_steps(
     if launch.is_new_tree {
         let mut command = Command::new("treehouse");
         command.args(["get", "--lease", "--json", "--lease-holder", "treetop"]);
-        if let Some(name) = branch
-            .as_ref()
-            .filter(|_| !resumes && !is_branch_named_late)
-        {
+        if let Some(name) = branch.as_ref().filter(|_| !resumes) {
             command.args(["--branch", name]);
         }
         if let Some(base) = &launch.base {
@@ -588,10 +632,7 @@ fn start_steps(
         job.tree.name = pool_name(&path);
         job.tree.path = path;
         job.tree.status = "leased".into();
-        if let Some(name) = branch
-            .as_ref()
-            .filter(|_| !resumes && !is_branch_named_late)
-        {
+        if let Some(name) = branch.as_ref().filter(|_| !resumes) {
             undone.push(Undo::Branch(name.clone()));
         }
         record.lease_id = lease.lease_id;
@@ -616,28 +657,10 @@ fn start_steps(
         });
         record.lease_id = lease_id;
     }
+    timed.mark("lease");
     if is_leasing {
         check(&job.tree.path, log).map_err(|why| format!("check: {why}"))?;
-    }
-    if let Some(name) = naming.and_then(|naming| naming.join().ok().flatten()) {
-        let _ = writeln!(log, "named {:?}, {}", name.title, name.slug);
-        if is_name_from_task {
-            launch.name = Some(name.title.clone());
-            job.launch = Some(launch.clone());
-        }
-        let user = branch::user();
-        let named = if user.is_empty() {
-            name.slug
-        } else {
-            format!("{user}/{}", name.slug)
-        };
-        // A name already taken, or one git would refuse, leaves the task's.
-        if is_branch_named_late
-            && branch::problem(&named).is_none()
-            && !has_branch(&job.tree.path, &named)
-        {
-            branch = Some(named);
-        }
+        timed.mark("check");
     }
     if let Some(name) = &branch
         && resumes
@@ -646,7 +669,7 @@ fn start_steps(
             .map_err(|why| format!("branch: {why}"))?;
         undone.push(Undo::Detach);
     } else if let Some(name) = &branch
-        && (!launch.is_new_tree || is_branch_named_late)
+        && !launch.is_new_tree
         && checked_out(&job.tree.path).is_none()
     {
         exec(
@@ -657,7 +680,14 @@ fn start_steps(
         .map_err(|why| format!("branch: {why}"))?;
         undone.push(Undo::Branch(name.clone()));
     }
+    timed.mark("branch");
     let starter = starter(&launch, &job.tree.path)?;
+    let later = Later {
+        naming,
+        tree: job.tree.path.clone(),
+        branch: branch.clone().filter(|_| is_branch_from_task),
+        is_titled: is_name_from_task,
+    };
     if is_leasing {
         record.agent = Some(match &starter {
             Starter::Command(command) => agent_name(&command[0]),
@@ -668,6 +698,7 @@ fn start_steps(
             .map_err(|err| format!("sidecar: could not write {}: {err}", sidecar::FILE))?;
         undone.push(Undo::Sidecar);
     }
+    timed.mark("record");
     let (plugin, id) = match starter {
         Starter::Command(command) => {
             let (program, args) = command.split_first().ok_or("start: no agent command")?;
@@ -677,6 +708,7 @@ fn start_steps(
                 log,
             )
             .map_err(|why| format!("start: {why}"))?;
+            later.spawn(None);
             return Ok(None);
         }
         Starter::Assistant(command, plugin) => {
@@ -717,18 +749,100 @@ fn start_steps(
             (plugin, id)
         }
     };
+    timed.mark("agent");
     let _ = writeln!(log, "{} started {id}", plugin.name());
     job.attach = plugin
         .call("attach", json!({ "id": id }))
         .ok()
         .and_then(|reply| serde_json::from_value(reply["argv"].clone()).ok());
+    timed.mark("attach");
     if is_leasing {
         record.job = Some(id.clone());
         if let Err(err) = sidecar::write(&job.tree.path, &record) {
             let _ = writeln!(log, "could not record the job in {}: {err}", sidecar::FILE);
         }
     }
+    later.spawn(Some(id.clone()));
     Ok(Some(id))
+}
+
+/// A started agent's name, once the model gives it: what `name_later` needs.
+struct Later {
+    naming: Option<thread::JoinHandle<Option<crate::naming::Name>>>,
+    tree: PathBuf,
+    /// The branch named from the task's words, which the model's name
+    /// replaces; None when the branch was named another way.
+    branch: Option<String>,
+    /// The agent was named from the task's words, so its title replaces them.
+    is_titled: bool,
+}
+
+/// The threads putting names in place, which a command that exits once its
+/// agent starts waits for.
+static NAMING: Mutex<Vec<thread::JoinHandle<()>>> = Mutex::new(Vec::new());
+
+impl Later {
+    /// Waits for the name off the start's thread, then puts it in place for
+    /// agent `id`.
+    fn spawn(self, id: Option<String>) {
+        let Some(naming) = self.naming else {
+            return;
+        };
+        let handle = thread::spawn(move || {
+            if let Some(name) = naming.join().ok().flatten() {
+                name_later(
+                    &self.tree,
+                    self.branch.as_deref(),
+                    id.filter(|_| self.is_titled),
+                    &name,
+                );
+            }
+        });
+        NAMING
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(handle);
+    }
+}
+
+/// Waits until every started agent's name is in place.
+pub fn wait_for_names() {
+    let handles = std::mem::take(&mut *NAMING.lock().unwrap_or_else(PoisonError::into_inner));
+    for handle in handles {
+        let _ = handle.join();
+    }
+}
+
+/// Gives agent `job` the model's title, as treetop shows it, and renames
+/// the tree's branch from `words`, the task's, to the model's, while that is
+/// still safe: the tree is on it and nothing has been pushed from it.
+fn name_later(tree: &Path, words: Option<&str>, job: Option<String>, name: &crate::naming::Name) {
+    if let Some(job) = job {
+        crate::state::add_title(&job, &name.title);
+    }
+    let Some(words) = words else {
+        return;
+    };
+    let user = branch::user();
+    let named = if user.is_empty() {
+        name.slug.clone()
+    } else {
+        format!("{user}/{}", name.slug)
+    };
+    let is_pushed = pool::git(tree, &["rev-parse", "--verify", "--quiet", "@{upstream}"]).is_some();
+    if named == words
+        || checked_out(tree).as_deref() != Some(words)
+        || is_pushed
+        || branch::problem(&named).is_some()
+        || has_branch(tree, &named)
+        || pool::git(tree, &["branch", "-m", words, &named]).is_none()
+    {
+        return;
+    }
+    if let Some(mut record) = sidecar::read(tree).filter(|r| r.branch.as_deref() == Some(words)) {
+        record.branch = Some(named);
+        let _ = sidecar::write(tree, &record);
+    }
 }
 
 /// Fills `launch` from the ticket it picks up: the prompt from the config's
@@ -923,10 +1037,33 @@ fn hooks(log: &mut String) -> Hooks {
     )
 }
 
+/// The `on_return` of the repository `tree` belongs to, under `[repos]`.
+fn repo_on_return(tree: &Path) -> Vec<String> {
+    let checkout = pool::git_dir(tree)
+        .map(|dir| pool::common_dir(&dir))
+        .and_then(|common| std::fs::canonicalize(common).ok())
+        .and_then(|common| common.parent().map(Path::to_path_buf));
+    checkout
+        .zip(config::load().ok())
+        .and_then(|(checkout, config)| config.repo(&checkout).map(|r| r.on_return.clone()))
+        .unwrap_or_default()
+}
+
 /// Runs a hook in `tree`. A failure goes to the log and nothing else.
 fn run_hook(name: &str, command: &[String], tree: &Path, log: &mut String) {
+    run_hook_for(name, command, tree, HOOK_LIMIT, log);
+}
+
+/// `run_hook`, given `limit` to finish in.
+pub fn run_hook_for(
+    name: &str,
+    command: &[String],
+    tree: &Path,
+    limit: Duration,
+    log: &mut String,
+) -> bool {
     let Some((program, args)) = command.split_first() else {
-        return;
+        return true;
     };
     let record = sidecar::read(tree);
     let field = |pick: fn(&Sidecar) -> Option<&String>| {
@@ -939,8 +1076,12 @@ fn run_hook(name: &str, command: &[String], tree: &Path, log: &mut String) {
         .env("TREETOP_TREE", tree)
         .env("TREETOP_BRANCH", field(|r| r.branch.as_ref()))
         .env("TREETOP_TICKET", field(|r| r.ticket.as_ref()));
-    if let Err(why) = exec(&mut command, HOOK_LIMIT, log) {
-        let _ = writeln!(log, "{name} hook failed: {why}");
+    match exec(&mut command, limit, log) {
+        Ok(_) => true,
+        Err(why) => {
+            let _ = writeln!(log, "{name} hook failed: {why}");
+            false
+        }
     }
 }
 
@@ -1305,6 +1446,7 @@ fn give_back(tree: &Tree, log: &mut String) -> bool {
     let record = sidecar::read(path);
     end_agents(tree, log);
     run_hook("on_return", &hooks(log).on_return, path, log);
+    run_hook("on_return", &repo_on_return(path), path, log);
     let mut command = treehouse("return", path);
     command.arg("--force");
     if let Some(id) = record.as_ref().and_then(|r| r.lease_id.as_deref()) {
@@ -1988,15 +2130,34 @@ echo '{answer}'
         .unwrap();
         std::fs::set_permissions(&claude, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
+        // A treehouse that cuts the branch it is asked for, as the real one does.
+        let treehouse = root.join("bin/treehouse");
+        std::fs::write(
+            &treehouse,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> {root}/leased\n\
+                 while [ $# -gt 0 ]; do [ \"$1\" = --branch ] && git -C {tree} switch -q -c \"$2\"; shift; done\n\
+                 echo '{{\"path\":\"{tree}\",\"lease_id\":\"l5\"}}'\n",
+                root = root.display(),
+                tree = tree.display()
+            ),
+        )
+        .unwrap();
         let task = "can you scan he project and cmpiel a list of thngs";
+        let words = branch::for_task(&branch::user(), task).unwrap();
         let mut job = Job {
             launch: Some(Launch::agent(task.into(), true)),
             ..Job::new(Kind::Start, pool::stand_in(PathBuf::from("(new tree)")))
         };
         let (is_ok, log) = run(&mut job);
         assert!(is_ok, "{log}");
+        assert!(
+            !log.contains("naming"),
+            "the start never waits for the name: {log}"
+        );
         let leased = std::fs::read_to_string(root.join("leased")).unwrap();
-        assert!(!leased.contains("--branch"), "named once leased: {leased}");
+        assert!(leased.contains(&format!("--branch {words}")), "{leased}");
+        wait_for_names();
         let user = branch::user();
         let named = if user.is_empty() {
             "scan-project-tools".to_string()
@@ -2004,19 +2165,9 @@ echo '{answer}'
             format!("{user}/scan-project-tools")
         };
         assert_eq!(checked_out(&tree).as_deref(), Some(named.as_str()));
-        assert_eq!(
-            job.launch.unwrap().name.as_deref(),
-            Some("Scan project for useful tools")
-        );
 
         // A model that cannot answer leaves the task's words.
-        std::fs::write(
-            &claude,
-            "#!/bin/sh
-exit 1
-",
-        )
-        .unwrap();
+        std::fs::write(&claude, "#!/bin/sh\nexit 1\n").unwrap();
         assert!(
             Command::new("git")
                 .args(["checkout", "-q", "--detach"])
@@ -2025,19 +2176,38 @@ exit 1
                 .unwrap()
                 .success()
         );
+        let task = "fix the login redirect";
         let mut job = Job {
-            launch: Some(Launch::agent("fix the login redirect".into(), true)),
+            launch: Some(Launch::agent(task.into(), true)),
             ..Job::new(Kind::Start, pool::stand_in(PathBuf::from("(new tree)")))
         };
         let (is_ok, log) = run(&mut job);
         assert!(is_ok, "{log}");
+        wait_for_names();
+        assert_eq!(checked_out(&tree), branch::for_task(&user, task));
+    }
+
+    /// A title given after the start is what the agent is called from then
+    /// on, the newest kept when one job is titled twice.
+    #[test]
+    fn a_title_given_after_the_start_names_its_agent() {
+        let root = config_root("titled");
+        if !in_own_process("a_title_given_after_the_start_names_its_agent", &root) {
+            return;
+        }
+        // SAFETY: this process runs only this test, on this thread.
+        unsafe { std::env::set_var("XDG_STATE_HOME", root.join("state")) };
+        crate::state::add_title("j1", "Fix login");
+        crate::state::add_title("j2", "Scan the project");
+        crate::state::add_title("j1", "Fix the login redirect");
+        let titles = crate::state::titles();
         assert_eq!(
-            checked_out(&tree),
-            branch::for_task(&user, "fix the login redirect")
+            titles.get("j1").map(String::as_str),
+            Some("Fix the login redirect")
         );
         assert_eq!(
-            job.launch.unwrap().name.as_deref(),
-            Some("fix the login redirect")
+            titles.get("j2").map(String::as_str),
+            Some("Scan the project")
         );
     }
 

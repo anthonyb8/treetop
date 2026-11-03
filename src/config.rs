@@ -195,6 +195,15 @@ pub struct Repo {
     /// Its ship plugins, in order; None for the default.
     #[serde(default)]
     pub ship: Option<Vec<String>>,
+    /// Run in each of its trees before it is returned, after the global
+    /// `on_return`: what only this repository needs, such as clearing build
+    /// leftovers.
+    #[serde(default)]
+    pub on_return: Vec<String>,
+    /// Run in its main checkout once treetop has fast-forwarded it, so what
+    /// trees are seeded from, such as installed packages, keeps up.
+    #[serde(default)]
+    pub on_catch_up: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -267,6 +276,14 @@ impl Config {
             .get_key_value(name)
             .map(|(name, source)| (name.as_str(), source))
             .ok_or_else(|| format!("no issue source named {name}"))
+    }
+
+    /// The `[repos]` entry of the repository checked out at `checkout`.
+    pub fn repo(&self, checkout: &Path) -> Option<&Repo> {
+        self.repos
+            .iter()
+            .find(|(path, _)| expand(path) == checkout)
+            .map(|(_, repo)| repo)
     }
 
     /// The ship plugins the repository checked out at `checkout` names,

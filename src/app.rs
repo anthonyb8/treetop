@@ -256,6 +256,8 @@ pub enum Outcome {
     Switch(PathBuf),
     /// Start the newer treetop installed over this one, on this workspace.
     Restart,
+    /// Install the newer release, then restart on it.
+    Update,
     /// Open `http://localhost:<port>`, served from tree `tree`, in the browser.
     Browse {
         port: u16,
@@ -396,6 +398,10 @@ pub struct App {
     /// The newer treetop installed over the running one since it started,
     /// which `U` restarts on.
     pub replaced: Option<PathBuf>,
+    /// A newer release than the one running, which `U` installs.
+    pub newer: Option<String>,
+    /// `U` is installing the newer release.
+    pub is_updating: bool,
     /// Each tree's stage at the last ask, so a change can be announced; None
     /// until the first ask, which announces nothing.
     last_stages: Option<HashMap<PathBuf, Stage>>,
@@ -1394,7 +1400,7 @@ impl App {
             .collect();
         // Until agents and reports have both been read, an ask still under
         // way looks finished, and forgetting it would open it again.
-        if !self.is_agents_read || self.last_states.is_none() {
+        if !self.is_read() {
             return None;
         }
         let before = self.asked.len();
@@ -1438,6 +1444,16 @@ impl App {
         {
             self.save_asked();
         }
+    }
+
+    /// Takes the latest release's tag, kept only when it is newer.
+    pub fn apply_release(&mut self, tag: String) {
+        self.newer = crate::update::is_newer(&tag).then_some(tag);
+    }
+
+    /// Agents and reports have both been read, so the pool is known in full.
+    pub fn is_read(&self) -> bool {
+        self.is_agents_read && self.last_states.is_some()
     }
 
     /// Takes where the main checkout stands after a catch-up, and says so on
@@ -2765,13 +2781,24 @@ impl App {
     /// Restarts on the treetop installed over this one, once no action is
     /// under way, since a restart would cut one off.
     fn restart(&mut self) -> Outcome {
-        if self.replaced.is_none() {
-            self.message = Some("treetop is current; `treetop update` installs a newer one".into());
+        let to = if self.replaced.is_some() {
+            Outcome::Restart
+        } else if let Some(tag) = self.newer.clone().filter(|_| !self.is_updating) {
+            self.message = Some(format!("installing {tag}..."));
+            Outcome::Update
+        } else if self.is_updating {
             return Outcome::Continue;
-        }
+        } else {
+            self.message = Some(format!(
+                "treetop {} is the latest",
+                crate::update::current()
+            ));
+            return Outcome::Continue;
+        };
         match self.active_jobs() {
-            0 => Outcome::Restart,
+            0 => to,
             n => {
+                self.message = None;
                 self.message = Some(format!("{n} action(s) still running; U again once done"));
                 Outcome::Continue
             }
@@ -4481,10 +4508,22 @@ mod tests {
     }
 
     #[test]
-    fn u_restarts_only_on_a_newer_treetop_and_never_mid_action() {
+    fn u_installs_a_newer_release_and_restarts_never_mid_action() {
         let mut app = app();
         assert_eq!(press(&mut app, KeyCode::Char('U')), Outcome::Continue);
-        assert!(app.message.as_deref().unwrap().contains("treetop update"));
+        assert!(app.message.as_deref().unwrap().contains("is the latest"));
+
+        app.apply_release("v0.0.1".into());
+        assert_eq!(app.newer, None, "an older release is no update");
+        app.apply_release("v999.0.0".into());
+        assert_eq!(press(&mut app, KeyCode::Char('U')), Outcome::Update);
+        app.is_updating = true;
+        assert_eq!(
+            press(&mut app, KeyCode::Char('U')),
+            Outcome::Continue,
+            "once"
+        );
+        app.is_updating = false;
 
         app.replaced = Some(PathBuf::from("/home/me/.local/bin/treetop"));
         app.jobs
