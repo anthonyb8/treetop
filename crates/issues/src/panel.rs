@@ -2,7 +2,7 @@
 //! from a picker of what the team has, and the filters said in words for the
 //! bar above the list.
 
-use linear::{ANY_STATE, Team, UNASSIGNED};
+use linear::{ANY_STATE, ME as CREATOR_ME, Team, UNASSIGNED};
 
 use crate::Filters;
 use crate::picker::Choice;
@@ -15,15 +15,19 @@ const ME: &str = "@me";
 pub enum Row {
     Assignee,
     Status,
+    Priority,
+    Creator,
     Label,
     Project,
     Cycle,
     Group,
 }
 
-pub const ROWS: [Row; 6] = [
+pub const ROWS: [Row; 8] = [
     Row::Assignee,
     Row::Status,
+    Row::Priority,
+    Row::Creator,
     Row::Label,
     Row::Project,
     Row::Cycle,
@@ -34,7 +38,9 @@ impl Row {
     pub fn label(self) -> &'static str {
         match self {
             Row::Assignee => "Assignee",
+            Row::Creator => "Creator",
             Row::Status => "Status",
+            Row::Priority => "Priority",
             Row::Label => "Label",
             Row::Project => "Project",
             Row::Cycle => "Cycle",
@@ -62,6 +68,15 @@ pub fn choices(row: Row, team: Option<&Team>) -> Vec<Choice> {
             choice(Some(ME), "me"),
             choice(Some(UNASSIGNED), "unassigned"),
         ],
+        Row::Creator => vec![choice(None, "anyone"), choice(Some(CREATOR_ME), "me")],
+        Row::Priority => vec![
+            choice(None, "any priority"),
+            choice(Some("urgent"), "urgent"),
+            choice(Some("high"), "high"),
+            choice(Some("medium"), "medium"),
+            choice(Some("low"), "low"),
+            choice(Some("none"), "no priority"),
+        ],
         Row::Status => vec![
             choice(None, "open issues"),
             choice(Some(ANY_STATE), "all, done and canceled too"),
@@ -81,14 +96,17 @@ pub fn choices(row: Row, team: Option<&Team>) -> Vec<Choice> {
     let Some(team) = team else {
         return choices;
     };
-    match row {
-        Row::Assignee => choices.extend(named(
+    let others = || {
+        named(
             team.members
                 .iter()
                 .filter(|m| team.me.as_ref().is_none_or(|me| me.id != m.id))
                 .map(|m| m.name.as_str())
                 .collect(),
-        )),
+        )
+    };
+    match row {
+        Row::Assignee | Row::Creator => choices.extend(others()),
         Row::Status => choices.extend(named(team.states.iter().map(|s| s.name.as_str()).collect())),
         Row::Label => choices.extend(named(team.labels.iter().map(|l| l.name.as_str()).collect())),
         Row::Project => {
@@ -103,7 +121,7 @@ pub fn choices(row: Row, team: Option<&Team>) -> Vec<Choice> {
             };
             choice(Some(&c.number.to_string()), &name)
         })),
-        Row::Group => {}
+        Row::Priority | Row::Group => {}
     }
     choices
 }
@@ -113,7 +131,9 @@ pub fn current(row: Row, filters: &Filters, group: Group) -> Option<String> {
     match row {
         Row::Assignee if filters.mine => Some(ME.to_string()),
         Row::Assignee => filters.assignee.clone(),
+        Row::Creator => filters.creator.clone(),
         Row::Status => filters.state.clone(),
+        Row::Priority => filters.priority.clone(),
         Row::Label => filters.label.clone(),
         Row::Project => filters.project.clone(),
         Row::Cycle => filters.cycle.clone(),
@@ -132,7 +152,9 @@ pub fn set(row: Row, id: Option<String>, filters: &mut Filters, group: &mut Grou
             filters.mine = id.as_deref() == Some(ME);
             filters.assignee = id.filter(|id| id != ME);
         }
+        Row::Creator => filters.creator = id,
         Row::Status => filters.state = id,
+        Row::Priority => filters.priority = id,
         Row::Label => filters.label = id,
         Row::Project => filters.project = id,
         Row::Cycle => filters.cycle = id,
@@ -175,6 +197,17 @@ pub fn describe(filters: &Filters, group: Group) -> Vec<String> {
         Some(state) => state.to_string(),
     };
     let mut pieces = vec![whose, which];
+    pieces.extend(filters.creator.as_ref().map(|c| {
+        if c.eq_ignore_ascii_case(CREATOR_ME) {
+            "created by me".to_string()
+        } else {
+            format!("created by {c}")
+        }
+    }));
+    pieces.extend(filters.priority.as_ref().map(|p| match p.as_str() {
+        "none" => "no priority".to_string(),
+        p => format!("priority {p}"),
+    }));
     pieces.extend(filters.label.as_ref().map(|l| format!("label {l}")));
     pieces.extend(filters.project.as_ref().map(|p| format!("project {p}")));
     pieces.extend(filters.cycle.as_ref().map(|c| match c.as_str() {
@@ -210,6 +243,9 @@ mod tests {
             &mut filters,
             &mut group,
         );
+        set(Row::Creator, Some("me".into()), &mut filters, &mut group);
+        assert_eq!(value(Row::Creator, &filters, group), "me");
+        set(Row::Priority, Some("high".into()), &mut filters, &mut group);
         set(Row::Label, Some("Bug".into()), &mut filters, &mut group);
         set(Row::Cycle, Some("current".into()), &mut filters, &mut group);
         set(Row::Group, Some("status".into()), &mut filters, &mut group);
@@ -218,6 +254,8 @@ mod tests {
             [
                 "Zoe's issues",
                 "all states",
+                "created by me",
+                "priority high",
                 "label Bug",
                 "this cycle",
                 "by status"

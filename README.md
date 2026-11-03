@@ -576,22 +576,25 @@ On the Issues screen treetop takes the mouse, so selecting text there takes Shif
 `w` switches to the next issue source, so a work and a personal workspace are one key apart, and `o` opens the issue in the browser.
 
 Number keys switch between views: `1` your open issues and `2` everyone's, both grouped by status as Linear groups them, `3` grouped by project, `4` grouped by status in the team's workflow order, and `5` the current cycle.
-Views of your own go on `6` to `9`, in name order, from `[views]` in the config, each a line of filters: `mine`, and `assignee:`, `label:`, `state:` (a status, or `any`), `project:` and `cycle:` (`current` or a number), a value with spaces in double quotes, other words searched for, and `group:project` or `group:status`:
+Views of your own go on `6` to `9`, in name order, from `[views]` in the config, each a line of filters: `mine`, and `assignee:`, `creator:` (a name, or `me`), `priority:` (`urgent`, `high`, `medium`, `low` or `none`), `label:`, `state:` (a status, or `any`), `project:` and `cycle:` (`current` or a number), a value with spaces in double quotes, other words searched for, and `group:project` or `group:status`:
 
 ```toml
 [views]
 bugs = "label:Bug group:status"
 review = "mine state:\"In Review\""
+filed = "creator:me priority:urgent"
 ```
 
 The line above the list says what it shows: whose issues, which status, and whatever else narrows them, such as `my issues · open · label Bug · “login”`.
 `/` searches: the list narrows as you type, by id, title, label and assignee, and once typing rests Linear is searched too, by title or issue number, so older issues show; Enter keeps the search and Esc clears it.
-`f` opens the filters: assignee (anyone, you, nobody, or a teammate), status (open, all, or one), label, project, cycle, and grouping, each picked from the team's own with Enter, the list following at once; `x` clears one and `c` all of them.
+`f` opens the filters: assignee (anyone, you, nobody, or a teammate), status (open, all, or one), priority, creator (anyone, you, or a teammate), label, project, cycle, and grouping, each picked from the team's own with Enter, the list following at once; `x` clears one and `c` all of them.
 In a grouped list, `z` folds the group under the cursor to its heading and `z` or Enter on the heading opens it again, as Linear folds a status; `Z` folds every group, or opens them all.
 `m` switches between yours and everyone's, `r` reads the list and the team again, and `?` shows these keys.
 
-`s` changes the issue's status, `l` its labels and `a` its assignee, each from a picker of the team's own states, labels and members that narrows as you type; labels are marked and unmarked with Tab and applied together with Enter, and the assignee picker offers you first, then nobody, then everyone else.
+`s` changes the issue's status, `l` its labels, `a` its assignee and `P` its project, each from a picker of the team's own states, labels, members and projects that narrows as you type; labels are marked and unmarked with Tab and applied together with Enter, and the assignee picker offers you first, then nobody, then everyone else.
 The change shows on the row at once and is sent behind it; if Linear refuses it, the row goes back to what it was and the bar says why.
+`x` marks the issue under the cursor and moves down, and `X` marks every issue shown, or unmarks them all.
+While issues are marked, `s`, `a` and `P` set the status, assignee or project of every one of them at once, sent to Linear as one batch; any it refuses go back as they were, the marks clear once it is sent, and Esc clears them without changing anything.
 `c` writes a comment on the issue: Markdown, Alt+Enter for a new line, Enter to post it under the issue's other comments; one Linear refuses opens again with its text, so nothing written is lost.
 
 `n` opens a form for a new issue, and `e` the same form on the issue under the cursor.

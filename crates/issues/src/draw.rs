@@ -37,6 +37,16 @@ const KEYS: [(&str, &str); 6] = [
     ("?", "help"),
 ];
 
+/// The bar's keys on the list while issues are marked.
+const MARKED_KEYS: [(&str, &str); 6] = [
+    ("s", "status"),
+    ("a", "assignee"),
+    ("P", "project"),
+    ("Esc", "unmark"),
+    ("x", "mark"),
+    ("X", "all"),
+];
+
 /// The bar's keys inside an open issue.
 const ISSUE_KEYS: [(&str, &str); 5] = [
     ("Esc", "back"),
@@ -74,7 +84,7 @@ fn form_keys(field: Field) -> &'static [(&'static str, &'static str)] {
 }
 
 /// Every key, for the `?` overlay.
-const HELP: [(&str, &str); 26] = [
+const HELP: [(&str, &str); 28] = [
     (
         "Enter →",
         "read it: the whole issue, its description and comments",
@@ -85,9 +95,23 @@ const HELP: [(&str, &str); 26] = [
         "scroll the preview below the list, a line or a page",
     ),
     ("p", "pick it up: an agent on it in a new tree"),
-    ("s", "status: pick one, typing narrows the list"),
+    (
+        "s",
+        "status: pick one, typing narrows the list; marked, every one's",
+    ),
     ("l", "labels: Tab marks or unmarks each, Enter applies them"),
-    ("a", "assignee: you, nobody, or a teammate"),
+    (
+        "a",
+        "assignee: you, nobody, or a teammate; marked, every one's",
+    ),
+    (
+        "P",
+        "project: one of the team's, or none; marked, every one's",
+    ),
+    (
+        "x X",
+        "mark the issue and move down, or every one shown; Esc unmarks",
+    ),
     (
         "c",
         "comment: Markdown, Alt+Enter for a new line, Enter sends",
@@ -103,7 +127,7 @@ const HELP: [(&str, &str); 26] = [
     ),
     (
         "f",
-        "filters: assignee, status, label, project, cycle, grouping",
+        "filters: assignee, creator, status, priority, label, project, cycle, grouping",
     ),
     (
         "z Z",
@@ -334,8 +358,17 @@ impl Screen {
             if at == self.selected {
                 cursor_row = rows.len();
             }
+            // While any are marked, each row says whether it is.
+            let id = match (self.marked.is_empty(), self.marked.contains(&issue.id)) {
+                (true, _) => Cell::from(issue.id.clone()).style(fg(p.accent)),
+                (false, true) => Cell::from(Line::from(vec![
+                    Span::styled("✓ ", fg(p.success).add_modifier(Modifier::BOLD)),
+                    Span::styled(issue.id.clone(), fg(p.accent).add_modifier(Modifier::BOLD)),
+                ])),
+                (false, false) => Cell::from(format!("  {}", issue.id)).style(fg(p.accent)),
+            };
             rows.push(Row::new(columns(vec![
-                Cell::from(issue.id.clone()).style(fg(p.accent)),
+                id,
                 Cell::from(issue.state.clone()).style(fg(p.info)),
                 priority(issue, p),
                 Cell::from(issue.title.clone()),
@@ -344,8 +377,9 @@ impl Screen {
                 work_cell(host, &issue.id, p),
             ])));
         }
+        let id_width = if self.marked.is_empty() { 10 } else { 12 };
         let mut widths = vec![
-            Constraint::Length(10),
+            Constraint::Length(id_width),
             Constraint::Length(14),
             Constraint::Length(8),
             Constraint::Fill(1),
@@ -923,6 +957,12 @@ impl Screen {
             n => format!("{n} issues"),
         };
         let mut right = vec![Span::raw(format!("  {count}"))];
+        if !self.marked.is_empty() {
+            right.push(Span::styled(
+                format!("  {} marked", self.marked.len()),
+                fg(p.success).add_modifier(Modifier::BOLD),
+            ));
+        }
         let source = if self.source_count() > 1 {
             format!(
                 "  {} ({}/{})",
@@ -994,6 +1034,8 @@ impl Screen {
             Line::from(key_bar(&VIEWER_KEYS, left_area.width, p))
         } else if self.focus == Focus::Issue {
             Line::from(key_bar(&ISSUE_KEYS, left_area.width, p))
+        } else if !self.marked.is_empty() {
+            Line::from(key_bar(&MARKED_KEYS, left_area.width, p))
         } else {
             Line::from(key_bar(&KEYS, left_area.width, p))
         };
@@ -1315,7 +1357,7 @@ fn draw_picker(frame: &mut Frame, area: Rect, picker: &Picker, p: &Palette) {
                 .id
                 .as_ref()
                 .is_some_and(|id| picker.marked.contains(id)),
-            _ => choice.id == picker.current,
+            _ => !picker.is_mixed && choice.id == picker.current,
         };
         let mark = match (picker.kind, is_marked) {
             (Kind::Labels, true) => "[x] ",

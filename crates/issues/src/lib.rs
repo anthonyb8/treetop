@@ -77,6 +77,13 @@ pub struct Filters {
     /// `unassigned`.
     #[serde(default)]
     pub assignee: Option<String>,
+    /// Only issues this person created, by name, or you, as `me`.
+    #[serde(default)]
+    pub creator: Option<String>,
+    /// Only issues of this priority: `urgent`, `high`, `medium`, `low` or
+    /// `none`.
+    #[serde(default)]
+    pub priority: Option<String>,
     #[serde(default)]
     pub label: Option<String>,
     #[serde(default)]
@@ -112,8 +119,9 @@ fn words(text: &str) -> Vec<String> {
     words
 }
 
-/// The filters a filter line asks for: `mine`, `assignee:`, `label:`,
-/// `state:`, `project:` and `cycle:` (`current` or a number) take a value,
+/// The filters a filter line asks for: `mine`, `assignee:`, `creator:`
+/// (a name or `me`), `priority:`, `label:`, `state:`, `project:` and
+/// `cycle:` (`current` or a number) take a value,
 /// quoted when it has spaces; every other word is searched for.
 pub fn parse(text: &str) -> Filters {
     let mut filters = Filters::default();
@@ -123,6 +131,8 @@ pub fn parse(text: &str) -> Filters {
         let value = Some(value.to_string()).filter(|v| !v.is_empty());
         match key {
             "assignee" => filters.assignee = value,
+            "creator" => filters.creator = value,
+            "priority" => filters.priority = value,
             "label" => filters.label = value,
             "state" => filters.state = value,
             "project" => filters.project = value,
@@ -150,6 +160,8 @@ pub fn line(filters: &Filters) -> String {
     }
     for (key, value) in [
         ("assignee", &filters.assignee),
+        ("creator", &filters.creator),
+        ("priority", &filters.priority),
         ("label", &filters.label),
         ("state", &filters.state),
         ("project", &filters.project),
@@ -169,11 +181,15 @@ mod tests {
 
     #[test]
     fn a_filter_line_reads_keys_quoted_values_and_search_words() {
-        let filters = parse(r#"mine label:Bug state:"In Review" cycle:current fix login"#);
+        let filters = parse(
+            r#"mine creator:me priority:high label:Bug state:"In Review" cycle:current fix login"#,
+        );
         assert_eq!(
             filters,
             Filters {
                 mine: true,
+                creator: Some("me".into()),
+                priority: Some("high".into()),
                 label: Some("Bug".into()),
                 state: Some("In Review".into()),
                 cycle: Some("current".into()),
