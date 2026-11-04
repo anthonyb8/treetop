@@ -54,8 +54,9 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | `z` | park the tree under the cursor, setting it aside under Parked, or bring it back; `Z` opens or folds Parked |
 | `/` | filter by number, branch, holder or agent; Enter keeps it, Esc clears it |
 | `o` | open the port the tree serves, `http://localhost:<port>`, in the browser, or the `browser` the config names (see [Config](#config)), or copy it to the clipboard where there is no desktop; a tree serving several, such as a frontend and a backend, offers a menu of them |
-| `p` | share the port the tree serves with your phone and show its address as a QR code to scan with the phone's camera; it runs `tether share <port>`, or the `share` the config names (see [Config](#config)); a tree serving several offers the same menu as `o` |
-| `P` | put the port the tree serves on the internet, for anyone with the link, and copy that link to the clipboard; it runs `tether share --public <port>`, or the `publish` the config names, and `x` in its popup takes it down again with `tether unshare <port>`, or the `unpublish` the config names; a tree serving several offers the same menu as `o` |
+| `p` | share the port the tree serves with your phone and show its address as a QR code to scan with the phone's camera; it runs `tether share <port>`, or the `share` the config names (see [Config](#config)); pressed again on a port already shared, it takes the share down; a tree serving several offers the same menu as `o` |
+| `P` | put the port the tree serves on the internet, for anyone with the link, and copy that link to the clipboard; it runs `tether share --public <port>`, or the `publish` the config names; pressed again on a port already public, it takes it off the internet, as `x` in its popup does, with `tether unshare <port>`, or the `unpublish` the config names; a tree serving several offers the same menu as `o` |
+| `Q` | show a shared port's QR code and address again, without sharing anything: treetop reads them back from `tether shares`, so a port shared before it started shows too; on a port that is not shared it says which key shares it |
 | `O` | open the tree's PR the same way (see [After the agent](#after-the-agent)) |
 | `f` | send what failed on the tree's PR, a check's log or a review's requested changes, to its agent |
 | `R` | resume the tree's stopped or failed agent in the tree, with its conversation and the flags it was started with, rather than a fresh dispatch that loses them |
@@ -77,6 +78,8 @@ The columns are what a destroy would lose.
 GIT says what is not safe yet, in a Powerlevel10k prompt's symbols: `⇡2` commits on no remote, `+1` staged, `!3` unstaged and `?4` untracked files, each only when there are some, so a clean tree is blank.
 `─` means git could not read a held tree, which deserves a look before it goes.
 PORTS lists every TCP port the tree's processes listen on, lowest first, so a frontend and a backend both show; the processes themselves are in the detail pane and the return dialog.
+A port shared with your phone carries a `p` after it, and one on the internet a `P`: the key that put it there, so what anyone with the link can open is on the row rather than only in the popup that shared it.
+treetop reads which ports are shared back from `tether shares`, or the `shares` the config names, every 10 seconds and at once after `p`, `P` or `x`, so a share made outside treetop, or before it started, is marked too.
 `o` opens the port in the browser on a desktop, and where the tree serves several it opens a menu of them, each with the process listening on it, picked with its number or `j`/`k` and Enter; on a server reached over SSH it copies the URL to the clipboard of the computer you are typing at, through the terminal (OSC 52; inside tmux, `set-clipboard on`).
 AGENT names the coding agent working in the tree, from the sources under [Agents](#agents); `no agent` on a held tree marks one nobody is working in.
 Where a tree has several, it names the most pressing live one, waiting on you, then busy, then idle, the most recently active first, and counts the other live ones as `+N`; a stopped agent shows only where nothing is live, and Enter opens the same agent the row names.
@@ -258,11 +261,20 @@ share = ["tether", "share"]
 `{port}` works in both as in `share`, and the first line `publish` prints that starts with `http` is the link treetop copies to the clipboard and shows as a QR code.
 With tether, the link is the port on Tailscale Funnel, on the first free of HTTPS ports 443, 8443 and 10000, so three ports can be public at once, and whoever opens it needs nothing installed.
 Funnel must be allowed in the tailnet's policy; where it is not, the popup shows the link tether prints to allow it.
-`tether unshare` also stops the port's tailnet share, so `p` shares it again afresh.
+tailscaled must also let you write its serve config, which it does for root and for the operator user: where neither `p` nor `P` works and the popup says `Access denied: serve config denied`, `sudo tailscale set --operator=$USER` once is what it wants.
+`tether unshare` stops the port's tailnet share along with its public one, so `p` and `P` both take a port all the way down, and `p` shares it again afresh.
 
 ```toml
 publish = ["tether", "share", "--public"]
 unpublish = ["tether", "unshare"]
+```
+
+`shares` is the command the PORTS column reads the marks from, `tether shares` when the config names none.
+It takes no port, and prints a line an address, as `https://host:5173 -> http://localhost:5173`, with ` (public)` on the ones the internet can reach; treetop marks the local port each line forwards to, and anything else it prints is ignored.
+Where the command is missing or fails, no port is marked and nothing is said: sharing a port reports its own failures.
+
+```toml
+shares = ["tether", "shares"]
 ```
 
 `treetop tickets` lists the repository's open tickets from its source, `--mine` those assigned to you, and any other words search their titles; it is the quickest check that a key and team are right.

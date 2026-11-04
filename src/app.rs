@@ -15,7 +15,7 @@ use crate::dispatch::{Edit, Prompt, Purpose, Recipient, Target};
 use crate::handoff;
 use crate::jobs::{Job, Kind, Launch, Message, Pick, Replaced, ShipAction, ShipCall};
 use crate::keeper::Kept;
-use crate::phone::Code;
+use crate::phone::{Code, Shared};
 use crate::plugin::{Plugin, Usage};
 use crate::pool::{self, Process, Tree, Work};
 use crate::reports::{Report, State};
@@ -140,6 +140,8 @@ pub enum Reach {
     Phone,
     /// The internet, for anyone with the link, as `P` publishes it.
     Public,
+    /// Neither: the code of a share already up, as `Q` shows it.
+    Code,
 }
 
 /// A tree's port on its way to the phone, as `p` shares it: its address as
@@ -284,8 +286,9 @@ pub enum Outcome {
         port: u16,
         is_public: bool,
     },
-    /// Take `port` off the internet.
-    Unpublish(u16),
+    /// Take `port` off the phone and the internet both, as one unshare
+    /// command does.
+    Unshare(u16),
     /// Write `record` as the treetop.json of the tree at `path`.
     Record {
         path: PathBuf,
@@ -364,6 +367,11 @@ pub struct App {
     pub here: Option<PathBuf>,
     /// treetop runs inside tmux, so an agent in a pane can be switched to.
     pub is_in_tmux: bool,
+    /// Every port this machine shares, by port: how far it reaches and the
+    /// address it is reached at, as the PORTS column marks them and `Q`
+    /// draws them. A share outlives treetop, so these are read back, never
+    /// remembered.
+    pub shares: HashMap<u16, Shared>,
     /// An agent `n` started, whose chat opens once it shows up.
     awaiting_chat: Option<Awaiting>,
     /// The chat of an agent just started, ready to open: `claude --bg`
@@ -1463,6 +1471,20 @@ impl App {
         {
             self.save_asked();
         }
+    }
+
+    /// Takes the ports this machine shares, as the refresher read them.
+    pub fn apply_shares(&mut self, shares: Vec<Shared>) {
+        self.shares = shares
+            .into_iter()
+            .map(|share| (share.port, share))
+            .collect();
+    }
+
+    /// How far `port` is shared: None where it is not, Some(false) for the
+    /// tailnet, as `p` shares it, Some(true) for the internet, as `P` does.
+    pub fn reach_of(&self, port: u16) -> Option<bool> {
+        self.shares.get(&port).map(|share| share.is_public)
     }
 
     /// Takes the latest release's tag, kept only when it is newer.
@@ -2699,10 +2721,11 @@ impl App {
         self.start(tree, Launch::pick(id, self.checkout.clone(), Some(source)))
     }
 
-    /// Opens the port the tree under the cursor serves in the browser, or
-    /// shares it with the phone or the internet, as `reach` says, or, where
-    /// it serves several, such as a frontend and a backend, offers a menu of
-    /// them.
+    /// Opens the port the tree under the cursor serves in the browser,
+    /// shares it with the phone or the internet or takes that share down
+    /// again, or shows the code of one already up, as `reach` says; where
+    /// the tree serves several, such as a frontend and a backend, it offers
+    /// a menu of them first.
     fn choose_port(&mut self, reach: Reach) -> Outcome {
         let Some(tree) = self.current() else {
             return Outcome::Continue;
@@ -2730,8 +2753,34 @@ impl App {
     /// Opens `port` of tree `tree` in the browser, or shares it with the
     /// phone or the internet, showing its code once it has an address.
     fn use_port(&mut self, port: u16, tree: String, reach: Reach) -> Outcome {
+        let shared = self.shares.get(&port).cloned();
         let is_public = match reach {
             Reach::Browser => return Outcome::Browse { port, tree },
+            // A share already up costs no command: the shares listing
+            // carries the address its code is drawn from.
+            Reach::Code => {
+                let Some(share) = shared else {
+                    self.message = Some(format!(
+                        ":{port} is not shared; p shares it with your phone, P with the internet"
+                    ));
+                    return Outcome::Continue;
+                };
+                let code = Code::new(&share.address).map(|code| (share.address, code));
+                self.phone = Some(Phone {
+                    tree,
+                    port,
+                    shared: Some(code),
+                    is_public: share.is_public,
+                });
+                return Outcome::Continue;
+            }
+            // Both keys toggle what they turn on. The unshare command takes
+            // the tailnet share down with the public one, so either key off
+            // leaves the port local again.
+            Reach::Phone if shared.is_some() => return self.stop_sharing(port),
+            Reach::Public if shared.is_some_and(|share| share.is_public) => {
+                return self.stop_sharing(port);
+            }
             Reach::Phone => false,
             Reach::Public => true,
         };
@@ -2744,6 +2793,14 @@ impl App {
         Outcome::Share { port, is_public }
     }
 
+    /// Takes `port` off the phone and the internet both, as one unshare
+    /// command does, and says so while it runs.
+    fn stop_sharing(&mut self, port: u16) -> Outcome {
+        self.phone = None;
+        self.message = Some(format!("unsharing :{port}..."));
+        Outcome::Unshare(port)
+    }
+
     /// What sharing `port` with the phone came to: the code of its address,
     /// or why there is none. Ignored once its popup is closed or shows
     /// another port.
@@ -2754,17 +2811,16 @@ impl App {
     }
 
     /// Keys while the phone's code is shown: any of its ways out closes it,
-    /// and `x` takes a public port off the internet once it is there.
+    /// and `x` takes the port down again once its share is up, whether it
+    /// is on the phone or the internet.
     fn handle_phone_key(&mut self, key: KeyEvent) -> Outcome {
         match key.code {
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q' | 'p' | 'P') => self.phone = None,
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q' | 'p' | 'P' | 'Q') => {
+                self.phone = None;
+            }
             KeyCode::Char('x') => {
-                if let Some(phone) = self
-                    .phone
-                    .take_if(|p| p.is_public && matches!(p.shared, Some(Ok(_))))
-                {
-                    self.message = Some("unpublishing...".into());
-                    return Outcome::Unpublish(phone.port);
+                if let Some(phone) = self.phone.take_if(|p| matches!(p.shared, Some(Ok(_)))) {
+                    return self.stop_sharing(phone.port);
                 }
             }
             _ => {}
@@ -2796,7 +2852,7 @@ impl App {
                 }
                 at
             }
-            KeyCode::Esc | KeyCode::Char('q' | 'o' | 'p' | 'P') => {
+            KeyCode::Esc | KeyCode::Char('q' | 'o' | 'p' | 'P' | 'Q') => {
                 self.port_menu = None;
                 return Outcome::Continue;
             }
@@ -3030,6 +3086,7 @@ impl App {
             KeyCode::Char('o') => return self.choose_port(Reach::Browser),
             KeyCode::Char('p') => return self.choose_port(Reach::Phone),
             KeyCode::Char('P') => return self.choose_port(Reach::Public),
+            KeyCode::Char('Q') => return self.choose_port(Reach::Code),
             KeyCode::Char('O') => return self.open_pr(),
             KeyCode::Char('f') => return self.read_failure(),
             KeyCode::Char('R') => return self.resume(),
@@ -4308,19 +4365,83 @@ mod tests {
         assert!(app.phone.is_some());
         let url = "https://box.tail1.ts.net/";
         app.set_shared(5173, Ok(url.into()));
-        assert_eq!(
-            press(&mut app, KeyCode::Char('x')),
-            Outcome::Unpublish(5173)
-        );
+        assert_eq!(press(&mut app, KeyCode::Char('x')), Outcome::Unshare(5173));
         assert!(app.phone.is_none());
 
-        // `x` on the phone's tailnet-only code does nothing.
+        // `x` takes the phone's tailnet share down as well.
         press(&mut app, KeyCode::Char('p'));
         app.set_shared(5173, Ok("https://box.tail1.ts.net:5173".into()));
-        assert_eq!(press(&mut app, KeyCode::Char('x')), Outcome::Continue);
-        assert!(app.phone.is_some());
+        assert_eq!(press(&mut app, KeyCode::Char('x')), Outcome::Unshare(5173));
+        assert!(app.phone.is_none());
+        press(&mut app, KeyCode::Char('p'));
         press(&mut app, KeyCode::Char('P'));
         assert!(app.phone.is_none(), "P closes it too");
+    }
+
+    #[test]
+    fn p_and_shift_p_toggle_a_share_and_shift_q_shows_the_code_of_one_up() {
+        let mut app = app();
+        app.apply_processes(&HashMap::from([(
+            PathBuf::from("/p/4/app"),
+            vec![Process {
+                pid: 1,
+                name: "node".into(),
+                ports: vec![5173],
+            }],
+        )]));
+        assert_eq!(press(&mut app, KeyCode::Char('Q')), Outcome::Continue);
+        assert!(app.phone.is_none(), "nothing to show while it is local");
+        assert_eq!(
+            app.message.as_deref(),
+            Some(":5173 is not shared; p shares it with your phone, P with the internet")
+        );
+
+        let url = "https://box.tail1.ts.net:5173";
+        app.apply_shares(vec![Shared {
+            port: 5173,
+            is_public: false,
+            address: url.into(),
+        }]);
+        assert_eq!(press(&mut app, KeyCode::Char('Q')), Outcome::Continue);
+        let phone = app.phone.as_ref().unwrap();
+        assert_eq!(
+            phone.shared,
+            Some(Ok((url.into(), Code::new(url).unwrap()))),
+            "no command runs: the listing carries the address"
+        );
+        assert!(!phone.is_public);
+        press(&mut app, KeyCode::Esc);
+
+        assert_eq!(
+            press(&mut app, KeyCode::Char('p')),
+            Outcome::Unshare(5173),
+            "a second p takes the share down"
+        );
+        assert_eq!(
+            press(&mut app, KeyCode::Char('P')),
+            Outcome::Share {
+                port: 5173,
+                is_public: true
+            },
+            "P puts a port already on the phone on the internet"
+        );
+        press(&mut app, KeyCode::Esc);
+
+        app.apply_shares(vec![Shared {
+            port: 5173,
+            is_public: true,
+            address: "https://box.tail1.ts.net".into(),
+        }]);
+        assert_eq!(
+            press(&mut app, KeyCode::Char('P')),
+            Outcome::Unshare(5173),
+            "a second P takes it off the internet"
+        );
+        assert_eq!(
+            press(&mut app, KeyCode::Char('p')),
+            Outcome::Unshare(5173),
+            "p takes a public port down too, as one unshare does both"
+        );
     }
 
     fn type_in(app: &mut App, text: &str) {

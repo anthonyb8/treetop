@@ -20,6 +20,10 @@
 //! A fifth keeps the main checkout on its upstream: it fetches every BASE
 //! and fast-forwards where that is safe, then again whenever the shared refs
 //! change, as an agent's fetch or push moves them.
+//!
+//! A sixth reads which ports are shared with the phone or the internet,
+//! every SHARES and whenever `p` or `P` has just changed one, so the PORTS
+//! column marks them.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -34,7 +38,9 @@ use anyhow::Result;
 use crate::agents::{self, Agent, Status};
 use crate::base::{self, Standing};
 use crate::cache;
+use crate::config;
 use crate::live;
+use crate::phone::{self, Shared};
 use crate::plugin::{Code, Usage};
 use crate::pool::{self, Process, Tree, Work};
 use crate::reports::{self, Report};
@@ -50,6 +56,7 @@ const SHIP_GAP: Duration = Duration::from_secs(15);
 const SHIP_BACKOFF: Duration = Duration::from_secs(300);
 const USAGE: Duration = Duration::from_secs(60);
 const BASE: Duration = Duration::from_secs(300);
+const SHARES: Duration = Duration::from_secs(10);
 const RELEASE: Duration = Duration::from_secs(60 * 60);
 /// How long a repository's `on_catch_up` may take: an install of its
 /// packages can run for minutes.
@@ -78,12 +85,15 @@ pub enum Update {
     CatchUpHookFailed(String),
     /// The latest treetop release's tag.
     Release(String),
+    /// Every port this machine shares, and whether each is public.
+    Shares(Vec<Shared>),
 }
 
 pub struct Refresher {
     pub updates: Receiver<Update>,
     kick: Sender<()>,
     ship_kick: Sender<()>,
+    shares_kick: Sender<()>,
     paused: Arc<AtomicBool>,
 }
 
@@ -96,6 +106,7 @@ impl Refresher {
         let (kick, kick_rx) = mpsc::channel();
         let (ship_kick, ship_kick_rx) = mpsc::channel();
         let (base_kick, base_kick_rx) = mpsc::channel();
+        let (shares_kick, shares_kick_rx) = mpsc::channel();
         let main_busy = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(false));
         let trees = Arc::new(Mutex::new(known));
@@ -127,6 +138,10 @@ impl Refresher {
             move || release_clock(&updates_tx, &paused)
         });
         thread::spawn({
+            let (updates_tx, paused) = (updates_tx.clone(), Arc::clone(&paused));
+            move || shares_clock(&updates_tx, &shares_kick_rx, &paused)
+        });
+        thread::spawn({
             let (updates_tx, paused, main_busy, checkout) = (
                 updates_tx.clone(),
                 Arc::clone(&paused),
@@ -151,6 +166,7 @@ impl Refresher {
             updates,
             kick,
             ship_kick,
+            shares_kick,
             paused,
         }
     }
@@ -169,6 +185,12 @@ impl Refresher {
     /// Asks the ship plugins now rather than at the next minute.
     pub fn refresh_ship(&self) {
         let _ = self.ship_kick.send(());
+    }
+
+    /// Reads the shared ports now rather than at the next tick, for right
+    /// after `p` or `P` has changed one.
+    pub fn refresh_shares(&self) {
+        let _ = self.shares_kick.send(());
     }
 
     /// Stops the clocks, for while a shell has the terminal and treetop is
@@ -342,6 +364,28 @@ fn release_clock(updates: &Sender<Update>, paused: &AtomicBool) {
             return;
         }
         thread::sleep(RELEASE);
+    }
+}
+
+/// Reads which ports are shared, every SHARES while treetop is not paused
+/// and whenever `p` or `P` has just changed one, until treetop moves on. A
+/// machine with no shares command installed says nothing rather than an
+/// error a tick: sharing itself reports its own failures.
+fn shares_clock(updates: &Sender<Update>, kicks: &Receiver<()>, paused: &AtomicBool) {
+    loop {
+        if !paused.load(Ordering::Relaxed) {
+            let listing = config::load()
+                .map(|config| config.shares)
+                .unwrap_or_default();
+            if let Ok(shares) = phone::shares(&listing)
+                && updates.send(Update::Shares(shares)).is_err()
+            {
+                return;
+            }
+        }
+        if let Err(RecvTimeoutError::Disconnected) = kicks.recv_timeout(SHARES) {
+            return;
+        }
     }
 }
 

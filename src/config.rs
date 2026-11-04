@@ -78,6 +78,16 @@
 //! publish = ["tether", "share", "--public"]
 //! unpublish = ["tether", "unshare"]
 //! ```
+//!
+//! `shares` is the command the PORTS column reads back which ports are
+//! shared from, and which of them are public, `tether shares` when it names
+//! none. It takes no port, and prints a line an address, as
+//! `https://host:5173 -> http://localhost:5173`, with ` (public)` on the
+//! ones the internet can reach:
+//!
+//! ```toml
+//! shares = ["tether", "shares"]
+//! ```
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -251,6 +261,10 @@ pub struct Config {
     /// for `tether unshare`.
     #[serde(default)]
     pub unpublish: Vec<String>,
+    /// The command the shared ports are listed with, to mark them in the
+    /// PORTS column; empty for `tether shares`.
+    #[serde(default)]
+    pub shares: Vec<String>,
     /// `treetop serve`, the web app for a phone.
     #[serde(default)]
     pub mobile: Mobile,

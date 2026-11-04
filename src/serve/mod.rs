@@ -210,6 +210,7 @@ impl Pool {
             Update::Release(tag) => app.apply_release(tag),
             Update::CatchUpHookFailed(why) => app.message = Some(why),
             Update::Agents(agents) => app.apply_agents(&agents),
+            Update::Shares(shares) => app.apply_shares(shares),
         }
         // Pushes are judged once the pool has been read in full: agents,
         // reports and PRs. Until then a change is only the reading catching
