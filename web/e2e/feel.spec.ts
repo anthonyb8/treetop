@@ -4,7 +4,7 @@
 // for less.
 import { expect, test, type Page } from "@playwright/test";
 import type { ChatMessage, Tree } from "../src/api";
-import { pool, serve, tree17 } from "./fixtures";
+import { pool, serve, shot, tree17 } from "./fixtures";
 
 const reply =
   "The guard redirects before the token refresh finishes, so an expired session bounces between the login page and the app. Moving the check after the refresh fixes it.";
@@ -60,7 +60,7 @@ const running: ChatMessage = {
 test("while the agent works, the dots say what it is doing", async ({ page }) => {
   await chat(page, busy, events(["backlog", [{ id: "u1", kind: "you", text: "Fix it." }, running]]));
   await expect(page.getByRole("status", { name: "Claude is working: Run the tests" })).toBeVisible();
-  await page.screenshot({ path: "test-results/chat-working.png" });
+  await shot(page, "test-results/chat-working.png");
 });
 
 test("an agent waiting on you shows no dots, though its last report says it is working", async ({ page }) => {

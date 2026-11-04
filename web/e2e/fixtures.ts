@@ -1,6 +1,25 @@
 import type { Page } from "@playwright/test";
 import type { Card, IssueDetail, IssueRow, IssueSources, IssueTeam, IssueView, Pool, Tree } from "../src/api";
 
+/** What `shot` takes besides the file it writes. */
+type ShotOptions = Omit<NonNullable<Parameters<Page["screenshot"]>[0]>, "path">;
+
+/**
+ * A screenshot for a person to look at afterwards, not an assertion: the
+ * suite writes one at each state worth reviewing. Capturing one can fail on
+ * its own -- Chromium answers `Unable to capture screenshot` on a loaded CI
+ * runner -- and a picture nobody has looked at yet must never fail a run, or
+ * the release that run gates, so a capture that fails says so and is passed
+ * over.
+ */
+export async function shot(page: Page, path: string, options: ShotOptions = {}) {
+  try {
+    await page.screenshot({ path, ...options });
+  } catch (error) {
+    console.warn(`could not capture ${path}: ${error}`);
+  }
+}
+
 export function card(tree: string, fields: Partial<Card> = {}): Card {
   return {
     tree,

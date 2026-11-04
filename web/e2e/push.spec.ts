@@ -2,7 +2,7 @@
 // the server's key and tells the server where to push; refused in Settings,
 // the bell says so instead of asking again.
 import { expect, test, type Page } from "@playwright/test";
-import { pool, serve, tree17 } from "./fixtures";
+import { pool, serve, shot, tree17 } from "./fixtures";
 
 const subscription = {
   endpoint: "https://web.push.apple.com/QGuQ",
@@ -54,7 +54,7 @@ test("the bell turns notifications on and the server learns where to push", asyn
     return route.fulfill({ json: {} });
   });
   await page.goto("/");
-  await page.screenshot({ path: "test-results/push-bell.png" });
+  await shot(page, "test-results/push-bell.png");
   await page.getByRole("button", { name: "Turn on notifications" }).click();
   await expect(page.getByRole("button", { name: "Turn on notifications" })).toHaveCount(0);
   expect(told).toEqual(subscription);

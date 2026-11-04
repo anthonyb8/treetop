@@ -3,7 +3,7 @@
 // and Deny, or your own words; there is no terminal to read.
 import { expect, test, type Page } from "@playwright/test";
 import type { Answer, ChatMessage } from "../src/api";
-import { pool, serve } from "./fixtures";
+import { pool, serve, shot } from "./fixtures";
 
 const asked: ChatMessage = {
   id: "q1",
@@ -87,7 +87,7 @@ test("a question's options are answered with a tap", async ({ page }) => {
   await prompt.getByRole("button", { name: /GitHub/ }).click();
   await expect(prompt.getByRole("button", { name: /Supabase/ })).toHaveAttribute("aria-pressed", "true");
   await expect(answer).toBeInViewport();
-  await page.screenshot({ path: "test-results/prompt-question.png" });
+  await shot(page, "test-results/prompt-question.png");
   await answer.click();
   await expect.poll(() => given).toEqual([{ action: "say", text: "Auth: Supabase\nMethods: Email, GitHub" }]);
   await expect(page.getByRole("region", { name: "Waiting on you" })).toHaveCount(0);
@@ -101,7 +101,7 @@ for (const [button, action] of [
     const given = await chat(page, command);
     const prompt = page.getByRole("region", { name: "Waiting on you" });
     await expect(prompt).toContainText("Wants to: Run the tests");
-    await page.screenshot({ path: `test-results/prompt-permission-${action}.png` });
+    await shot(page, `test-results/prompt-permission-${action}.png`);
     await prompt.getByRole("button", { name: button }).click();
     await expect.poll(() => given).toEqual([{ action }]);
     await expect(page.getByRole("region", { name: "Waiting on you" })).toHaveCount(0);
@@ -137,7 +137,7 @@ test("a question not yet in the transcript is read off the agent's screen and an
   const prompt = page.getByRole("region", { name: "Waiting on you" });
   await expect(prompt).toContainText("Which auth provider should the login use?");
   await prompt.getByRole("button", { name: /Supabase/ }).click();
-  await page.screenshot({ path: "test-results/prompt-from-screen.png" });
+  await shot(page, "test-results/prompt-from-screen.png");
   await prompt.getByRole("button", { name: "Answer", exact: true }).click();
   await expect.poll(() => given).toEqual([{ action: "say", text: "Supabase" }]);
   await expect(page.getByRole("region", { name: "Waiting on you" })).toHaveCount(0);

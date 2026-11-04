@@ -3,7 +3,7 @@
 // many ports, but none of it may run off the side of the screen.
 import { expect, test, type Page } from "@playwright/test";
 import type { IssueDetail, Pool, Tree } from "../src/api";
-import { card, details, pool, serve, serveIssues, tree17, waiting } from "./fixtures";
+import { card, details, pool, serve, serveIssues, shot, tree17, waiting } from "./fixtures";
 
 const word = "test_billing_reconciliation_for_multi_currency_invoices";
 
@@ -76,7 +76,7 @@ test("long names and many ports stay inside the screen", async ({ page }) => {
   ] as const) {
     await page.goto(path);
     await expect(landmark).toBeVisible();
-    await page.screenshot({ path: `test-results/fit${path.replaceAll("/", "-")}.png` });
+    await shot(page, `test-results/fit${path.replaceAll("/", "-")}.png`);
     expect(await overflowing(page), path).toEqual([]);
   }
 });

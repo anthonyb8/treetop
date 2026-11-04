@@ -2,7 +2,7 @@
 // terminal's list does, with what waits on you lifted to the top, and keeps
 // showing the last pool, said to be old, while the server is out of reach.
 import { expect, test } from "@playwright/test";
-import { pool, serve } from "./fixtures";
+import { pool, serve, shot } from "./fixtures";
 
 test("the pool shows what needs you first, then each base's trees", async ({ page }) => {
   await serve(page, () => pool);
@@ -21,12 +21,12 @@ test("the pool shows what needs you first, then each base's trees", async ({ pag
   await expect(main).toContainText(":7777");
   await expect(page.getByText("3 free trees")).toBeVisible();
   await expect(page.getByRole("banner")).toContainText(/1\s*needs you\s*2\s*held\s*3\s*free/);
-  await page.screenshot({ path: "test-results/pool.png" });
+  await shot(page, "test-results/pool.png");
 
   await expect(page.getByRole("link", { name: "tree 6" })).toHaveCount(0);
   await page.getByRole("button", { name: "Parked · 1" }).click();
   await expect(page.getByRole("link", { name: "tree 6" })).toContainText("END-152 invoices");
-  await page.screenshot({ path: "test-results/pool-parked.png", fullPage: true });
+  await shot(page, "test-results/pool-parked.png", { fullPage: true });
 });
 
 test("with the server out of reach, the last pool still shows and says so", async ({ page }) => {
@@ -41,7 +41,7 @@ test("with the server out of reach, the last pool still shows and says so", asyn
     "Can't reach the server - showing the pool as it last was.",
   );
   await expect(page.getByRole("link", { name: "tree 17" })).toBeVisible();
-  await page.screenshot({ path: "test-results/pool-offline.png" });
+  await shot(page, "test-results/pool-offline.png");
 });
 
 test("a first open with the server out of reach says so and offers a retry", async ({ page }) => {
@@ -53,7 +53,7 @@ test("a first open with the server out of reach says so and offers a retry", asy
   await serve(page, () => (isDown ? "down" : pool));
   await page.goto("/");
   await expect(page.getByText("Can't reach the server.")).toBeVisible();
-  await page.screenshot({ path: "test-results/pool-unreachable.png" });
+  await shot(page, "test-results/pool-unreachable.png");
 
   isDown = false;
   await page.getByRole("button", { name: "Try again" }).click();

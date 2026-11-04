@@ -2,7 +2,7 @@
 // says about it: its agent and what it asks, git, ports, PR and timeline;
 // back lands on the pool where it was left.
 import { expect, test } from "@playwright/test";
-import { pool, serve, tree17 } from "./fixtures";
+import { pool, serve, shot, tree17 } from "./fixtures";
 
 test("a tree's screen shows its agent, git, ports, PR and timeline", async ({ page }) => {
   await serve(page, () => pool);
@@ -26,7 +26,7 @@ test("a tree's screen shows its agent, git, ports, PR and timeline", async ({ pa
   const steps = page.getByRole("region", { name: "Timeline" }).getByRole("listitem");
   await expect(steps).toHaveCount(3);
   await expect(steps.first()).toContainText("asked about the auth provider");
-  await page.screenshot({ path: "test-results/tree.png", fullPage: true });
+  await shot(page, "test-results/tree.png", { fullPage: true });
 
   await page.getByRole("button", { name: "Trees" }).click();
   await expect(page).toHaveURL(/\/$/);
@@ -57,7 +57,7 @@ test("a tree that has left the pool says so", async ({ page }) => {
   await serve(page, () => pool);
   await page.goto("/trees/99");
   await expect(page.getByText("Tree 99 is not in this pool any more.")).toBeVisible();
-  await page.screenshot({ path: "test-results/tree-gone.png" });
+  await shot(page, "test-results/tree-gone.png");
 });
 
 test("a long timeline scrolls below the tree's facts rather than squeezing them", async ({ page }) => {

@@ -3,7 +3,7 @@
 // seeing what it holds; a refusal says why.
 import { expect, test } from "@playwright/test";
 import type { Tree } from "../src/api";
-import { pool, serve, tree17 } from "./fixtures";
+import { pool, serve, shot, tree17 } from "./fixtures";
 
 test("an agent started from the pool lands on its tree", async ({ page }) => {
   await serve(page, () => pool);
@@ -19,7 +19,7 @@ test("an agent started from the pool lands on its tree", async ({ page }) => {
   await page.getByRole("textbox", { name: "Task" }).fill("Add rate limiting to the public API.");
   await expect(page.getByRole("radio", { name: /A fresh tree/ })).toBeChecked();
   await page.getByRole("combobox", { name: "Base" }).selectOption("feature/billing");
-  await page.screenshot({ path: "test-results/new-agent.png" });
+  await shot(page, "test-results/new-agent.png");
   await page.getByRole("button", { name: "Start agent" }).click();
   await expect(page.getByRole("button", { name: "Starting…" })).toBeDisabled();
   await expect(page).toHaveURL(/\/trees\/17$/);
@@ -60,7 +60,7 @@ test("a tree is returned after its sheet says what it holds", async ({ page }) =
   await expect(sheet).toContainText("2 commits on no remote");
   await expect(sheet).toContainText("3 uncommitted files");
   await expect(sheet).toContainText("Its agent is stopped first.");
-  await page.screenshot({ path: "test-results/return-sheet.png" });
+  await shot(page, "test-results/return-sheet.png");
   await sheet.getByRole("button", { name: "Cancel" }).click();
   await expect(sheet).toHaveCount(0);
   expect(returned).toBe(false);
@@ -88,7 +88,7 @@ test("a return the server refuses says why and leaves the tree", async ({ page }
     "tree 17 has vite (4242) running in it; stop it, or return the tree from treetop",
   );
   await expect(page).toHaveURL(/\/trees\/17$/);
-  await page.screenshot({ path: "test-results/return-refused.png" });
+  await shot(page, "test-results/return-refused.png");
 });
 
 test("a stopped agent is started again from its tree", async ({ page }) => {
