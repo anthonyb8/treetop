@@ -127,8 +127,19 @@ pub struct PortMenu {
     /// Each port and the process listening on it, lowest first.
     pub ports: Vec<(u16, String)>,
     pub selected: usize,
-    /// The port chosen goes to the phone, as `p` does, not the browser.
-    pub is_phone: bool,
+    /// Where the port chosen goes.
+    pub reach: Reach,
+}
+
+/// Where a tree's port goes once chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// The browser, as `o` opens it.
+    Browser,
+    /// The phone, over the tailnet, as `p` shares it.
+    Phone,
+    /// The internet, for anyone with the link, as `P` publishes it.
+    Public,
 }
 
 /// A tree's port on its way to the phone, as `p` shares it: its address as
@@ -140,6 +151,8 @@ pub struct Phone {
     /// None while the share command runs; then the address and its code,
     /// or why there is none.
     pub shared: Option<Result<(String, Code), String>>,
+    /// On the internet, as `P` publishes it, not only the tailnet.
+    pub is_public: bool,
 }
 
 /// A group of the list, under a heading of its own.
@@ -265,8 +278,14 @@ pub enum Outcome {
     },
     /// Open `url`, such as a tree's PR, in the browser.
     OpenUrl(String),
-    /// Share `port` with the phone, for the code `phone` shows.
-    Share(u16),
+    /// Share `port` with the phone, or with `is_public` the internet, for
+    /// the code `phone` shows.
+    Share {
+        port: u16,
+        is_public: bool,
+    },
+    /// Take `port` off the internet.
+    Unpublish(u16),
     /// Write `record` as the treetop.json of the tree at `path`.
     Record {
         path: PathBuf,
@@ -2681,9 +2700,10 @@ impl App {
     }
 
     /// Opens the port the tree under the cursor serves in the browser, or
-    /// with `is_phone` shares it with the phone, or, where it serves
-    /// several, such as a frontend and a backend, offers a menu of them.
-    fn choose_port(&mut self, is_phone: bool) -> Outcome {
+    /// shares it with the phone or the internet, as `reach` says, or, where
+    /// it serves several, such as a frontend and a backend, offers a menu of
+    /// them.
+    fn choose_port(&mut self, reach: Reach) -> Outcome {
         let Some(tree) = self.current() else {
             return Outcome::Continue;
         };
@@ -2694,13 +2714,13 @@ impl App {
                 self.message = Some(format!("tree {tree_name} serves no port"));
                 Outcome::Continue
             }
-            [(port, _)] => self.use_port(*port, tree_name, is_phone),
+            [(port, _)] => self.use_port(*port, tree_name, reach),
             _ => {
                 self.port_menu = Some(PortMenu {
                     tree: tree_name,
                     ports,
                     selected: 0,
-                    is_phone,
+                    reach,
                 });
                 Outcome::Continue
             }
@@ -2708,17 +2728,20 @@ impl App {
     }
 
     /// Opens `port` of tree `tree` in the browser, or shares it with the
-    /// phone, showing its code once it has an address.
-    fn use_port(&mut self, port: u16, tree: String, is_phone: bool) -> Outcome {
-        if !is_phone {
-            return Outcome::Browse { port, tree };
-        }
+    /// phone or the internet, showing its code once it has an address.
+    fn use_port(&mut self, port: u16, tree: String, reach: Reach) -> Outcome {
+        let is_public = match reach {
+            Reach::Browser => return Outcome::Browse { port, tree },
+            Reach::Phone => false,
+            Reach::Public => true,
+        };
         self.phone = Some(Phone {
             tree,
             port,
             shared: None,
+            is_public,
         });
-        Outcome::Share(port)
+        Outcome::Share { port, is_public }
     }
 
     /// What sharing `port` with the phone came to: the code of its address,
@@ -2730,13 +2753,21 @@ impl App {
         }
     }
 
-    /// Keys while the phone's code is shown: any of its ways out closes it.
+    /// Keys while the phone's code is shown: any of its ways out closes it,
+    /// and `x` takes a public port off the internet once it is there.
     fn handle_phone_key(&mut self, key: KeyEvent) -> Outcome {
-        if matches!(
-            key.code,
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q' | 'p')
-        ) {
-            self.phone = None;
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q' | 'p' | 'P') => self.phone = None,
+            KeyCode::Char('x') => {
+                if let Some(phone) = self
+                    .phone
+                    .take_if(|p| p.is_public && matches!(p.shared, Some(Ok(_))))
+                {
+                    self.message = Some("unpublishing...".into());
+                    return Outcome::Unpublish(phone.port);
+                }
+            }
+            _ => {}
         }
         Outcome::Continue
     }
@@ -2765,14 +2796,14 @@ impl App {
                 }
                 at
             }
-            KeyCode::Esc | KeyCode::Char('q' | 'o' | 'p') => {
+            KeyCode::Esc | KeyCode::Char('q' | 'o' | 'p' | 'P') => {
                 self.port_menu = None;
                 return Outcome::Continue;
             }
             _ => return Outcome::Continue,
         };
         match self.port_menu.take() {
-            Some(menu) => self.use_port(menu.ports[chosen].0, menu.tree, menu.is_phone),
+            Some(menu) => self.use_port(menu.ports[chosen].0, menu.tree, menu.reach),
             None => Outcome::Continue,
         }
     }
@@ -2996,8 +3027,9 @@ impl App {
                     self.move_by(1);
                 }
             }
-            KeyCode::Char('o') => return self.choose_port(false),
-            KeyCode::Char('p') => return self.choose_port(true),
+            KeyCode::Char('o') => return self.choose_port(Reach::Browser),
+            KeyCode::Char('p') => return self.choose_port(Reach::Phone),
+            KeyCode::Char('P') => return self.choose_port(Reach::Public),
             KeyCode::Char('O') => return self.open_pr(),
             KeyCode::Char('f') => return self.read_failure(),
             KeyCode::Char('R') => return self.resume(),
@@ -4198,7 +4230,13 @@ mod tests {
             PathBuf::from("/p/4/app"),
             vec![process(1, "node", vec![5173])],
         )]));
-        assert_eq!(press(&mut app, KeyCode::Char('p')), Outcome::Share(5173));
+        assert_eq!(
+            press(&mut app, KeyCode::Char('p')),
+            Outcome::Share {
+                port: 5173,
+                is_public: false
+            }
+        );
         let phone = app.phone.as_ref().unwrap();
         assert_eq!((phone.tree.as_str(), phone.shared.as_ref()), ("4", None));
         assert_eq!(app.next_ask(), None, "the code keeps chats shut");
@@ -4232,9 +4270,57 @@ mod tests {
             ],
         )]));
         assert_eq!(press(&mut app, KeyCode::Char('p')), Outcome::Continue);
-        assert!(app.port_menu.as_ref().unwrap().is_phone);
-        assert_eq!(press(&mut app, KeyCode::Char('2')), Outcome::Share(8000));
+        assert_eq!(app.port_menu.as_ref().unwrap().reach, Reach::Phone);
+        assert_eq!(
+            press(&mut app, KeyCode::Char('2')),
+            Outcome::Share {
+                port: 8000,
+                is_public: false
+            }
+        );
         assert_eq!(app.phone.as_ref().unwrap().port, 8000);
+    }
+
+    #[test]
+    fn shift_p_publishes_the_port_and_x_takes_it_down() {
+        let mut app = app();
+        app.apply_processes(&HashMap::from([(
+            PathBuf::from("/p/4/app"),
+            vec![Process {
+                pid: 1,
+                name: "node".into(),
+                ports: vec![5173],
+            }],
+        )]));
+        assert_eq!(
+            press(&mut app, KeyCode::Char('P')),
+            Outcome::Share {
+                port: 5173,
+                is_public: true
+            }
+        );
+        assert!(app.phone.as_ref().unwrap().is_public);
+        assert_eq!(
+            press(&mut app, KeyCode::Char('x')),
+            Outcome::Continue,
+            "nothing to take down before it is up"
+        );
+        assert!(app.phone.is_some());
+        let url = "https://box.tail1.ts.net/";
+        app.set_shared(5173, Ok(url.into()));
+        assert_eq!(
+            press(&mut app, KeyCode::Char('x')),
+            Outcome::Unpublish(5173)
+        );
+        assert!(app.phone.is_none());
+
+        // `x` on the phone's tailnet-only code does nothing.
+        press(&mut app, KeyCode::Char('p'));
+        app.set_shared(5173, Ok("https://box.tail1.ts.net:5173".into()));
+        assert_eq!(press(&mut app, KeyCode::Char('x')), Outcome::Continue);
+        assert!(app.phone.is_some());
+        press(&mut app, KeyCode::Char('P'));
+        assert!(app.phone.is_none(), "P closes it too");
     }
 
     fn type_in(app: &mut App, text: &str) {

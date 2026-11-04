@@ -52,7 +52,7 @@ const KEYS: [(&str, &str); 13] = [
 ];
 
 /// Every key on the list, for the `?` overlay.
-const HELP: [(&str, &str); 31] = [
+const HELP: [(&str, &str); 32] = [
     (
         "Enter",
         "open the agent: its chat, a cold one started again, else its tree; a heading folds, or opens main's agent",
@@ -99,6 +99,10 @@ const HELP: [(&str, &str); 31] = [
     (
         "p",
         "share the port with your phone, as a QR code to scan; tether share by default",
+    ),
+    (
+        "P",
+        "put the port on the internet and copy its public link; tether share --public by default",
     ),
     ("O", "open the tree's PR"),
     ("f", "send what failed on the tree's PR to its agent"),
@@ -1230,32 +1234,45 @@ fn draw_port_menu(frame: &mut Frame, menu: &PortMenu) {
     frame.render_stateful_widget(table, inner, &mut state);
 }
 
-/// The port `p` shares, as a QR code of its address for the phone's camera
-/// to scan, with the address under it; or that it is being shared, or why
-/// it could not be.
+/// The port `p` shares, or `P` publishes, as a QR code of its address for
+/// the phone's camera to scan, with the address under it; or that it is
+/// being shared, or why it could not be.
 fn draw_phone(frame: &mut Frame, phone: &Phone) {
     let t = theme();
     let screen = frame.area();
+    let (place, sharing, share) = if phone.is_public {
+        ("on the internet", "publishing", "publish")
+    } else {
+        ("on your phone", "sharing", "share")
+    };
     let title = Line::styled(
-        format!(" Tree {} on your phone ", phone.tree),
+        format!(" Tree {} {place} ", phone.tree),
         fg(t.title).add_modifier(Modifier::BOLD),
     );
-    let keys = [("Esc", "close")];
     let local = format!("localhost:{}", phone.port);
     let (url, code) = match &phone.shared {
         Some(Ok((url, code))) => (url, code),
         pending_or_failed => {
             let (said, colour) = match pending_or_failed {
-                Some(Err(err)) => (format!("could not share {local}: {err}"), t.danger),
-                _ => (format!("sharing {local}..."), t.muted),
+                Some(Err(err)) => (format!("could not {share} {local}: {err}"), t.danger),
+                _ => (format!("{sharing} {local}..."), t.muted),
             };
-            return draw_phone_note(frame, title, &keys, said, colour);
+            return draw_phone_note(frame, title, &[("Esc", "close")], said, colour);
         }
+    };
+    let keys: &[(&str, &str)] = if phone.is_public {
+        &[("x", "stop publishing"), ("Esc", "close")]
+    } else {
+        &[("Esc", "close")]
     };
     // Each cell is two modules, one over the other, drawn as an upper half
     // block: its foreground the top module, its background the bottom one.
     // Under the code, a blank line, the address, and how to use it.
-    let note = "scan it with the phone's camera";
+    let note = if phone.is_public {
+        "anyone with this link can open it"
+    } else {
+        "scan it with the phone's camera"
+    };
     let text_width = url.chars().count().max(note.len());
     let fits = |quiet: usize| {
         let side = code.width + 2 * quiet;
@@ -1264,7 +1281,7 @@ fn draw_phone(frame: &mut Frame, phone: &Phone) {
     };
     let Some(quiet) = (1..=QUIET_ZONE).rev().find(|&quiet| fits(quiet)) else {
         let said = format!("the screen is too small for the code; {url}");
-        return draw_phone_note(frame, title, &keys, said, t.text);
+        return draw_phone_note(frame, title, keys, said, t.text);
     };
     let side = code.width + 2 * quiet;
     let rows = side.div_ceil(2);
@@ -1276,7 +1293,7 @@ fn draw_phone(frame: &mut Frame, phone: &Phone) {
     let height = u16::try_from(rows + 5).unwrap_or(u16::MAX);
     let area = popup::centered(screen, width, height);
     let block =
-        popup_block(title).title_bottom(Line::from(fitting_keys(&keys, width.saturating_sub(2))));
+        popup_block(title).title_bottom(Line::from(fitting_keys(keys, width.saturating_sub(2))));
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);

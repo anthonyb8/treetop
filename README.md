@@ -55,6 +55,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | `/` | filter by number, branch, holder or agent; Enter keeps it, Esc clears it |
 | `o` | open the port the tree serves, `http://localhost:<port>`, in the browser, or the `browser` the config names (see [Config](#config)), or copy it to the clipboard where there is no desktop; a tree serving several, such as a frontend and a backend, offers a menu of them |
 | `p` | share the port the tree serves with your phone and show its address as a QR code to scan with the phone's camera; it runs `tether share <port>`, or the `share` the config names (see [Config](#config)); a tree serving several offers the same menu as `o` |
+| `P` | put the port the tree serves on the internet, for anyone with the link, and copy that link to the clipboard; it runs `tether share --public <port>`, or the `publish` the config names, and `x` in its popup takes it down again with `tether unshare <port>`, or the `unpublish` the config names; a tree serving several offers the same menu as `o` |
 | `O` | open the tree's PR the same way (see [After the agent](#after-the-agent)) |
 | `f` | send what failed on the tree's PR, a check's log or a review's requested changes, to its agent |
 | `R` | resume the tree's stopped or failed agent in the tree, with its conversation and the flags it was started with, rather than a fresh dispatch that loses them |
@@ -251,6 +252,17 @@ Like `browser`, it goes above the first `[table]`:
 
 ```toml
 share = ["tether", "share"]
+```
+
+`publish` is the command `P` puts a port on the internet with, `tether share --public` when the config names none, and `unpublish` the one `x` takes it down with, `tether unshare` when it names none.
+`{port}` works in both as in `share`, and the first line `publish` prints that starts with `http` is the link treetop copies to the clipboard and shows as a QR code.
+With tether, the link is the port on Tailscale Funnel, on the first free of HTTPS ports 443, 8443 and 10000, so three ports can be public at once, and whoever opens it needs nothing installed.
+Funnel must be allowed in the tailnet's policy; where it is not, the popup shows the link tether prints to allow it.
+`tether unshare` also stops the port's tailnet share, so `p` shares it again afresh.
+
+```toml
+publish = ["tether", "share", "--public"]
+unpublish = ["tether", "unshare"]
 ```
 
 `treetop tickets` lists the repository's open tickets from its source, `--mine` those assigned to you, and any other words search their titles; it is the quickest check that a key and team are right.

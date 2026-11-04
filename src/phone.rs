@@ -3,6 +3,11 @@
 //! phone, as tether does over the tailnet, and prints the address it is
 //! reached at, which treetop shows as a QR code to scan with the phone's
 //! camera.
+//!
+//! `P`: the same port on the internet, for anyone with the link. The publish
+//! command, `tether share --public` unless the config names another, puts
+//! it there with Tailscale Funnel, and the unpublish command, `tether
+//! unshare`, takes it down again.
 
 use std::process::Command;
 use std::sync::mpsc;
@@ -14,7 +19,13 @@ use qrcode::{Color, QrCode};
 use crate::child::{self, End};
 
 /// What a port is shared with when the config names nothing.
-const DEFAULT: [&str; 2] = ["tether", "share"];
+const DEFAULT: &[&str] = &["tether", "share"];
+
+/// What a port is published with when the config names nothing.
+const DEFAULT_PUBLISH: &[&str] = &["tether", "share", "--public"];
+
+/// What a published port is taken down with when the config names nothing.
+const DEFAULT_UNPUBLISH: &[&str] = &["tether", "unshare"];
 
 /// How long the share command has to print an address. `tether share`
 /// answers in a second or two, but on a tailnet without Serve it prints a
@@ -32,6 +43,8 @@ const RESET: &str = "\x1b[0m";
 /// while it works.
 pub struct Sharing {
     pub port: u16,
+    /// On the internet, for anyone with the link, not only the tailnet.
+    pub is_public: bool,
     result: mpsc::Receiver<Result<String, String>>,
 }
 
@@ -48,28 +61,84 @@ impl Sharing {
 
 /// Shares `port` with `share`, the configured command, off this thread.
 pub fn start(share: &[String], port: u16) -> Sharing {
-    let (program, args) = command(share, port);
+    spawn(command(share, DEFAULT, port), port, false)
+}
+
+/// Publishes `port` to the internet with `publish`, the configured
+/// command, off this thread.
+pub fn publish(publish: &[String], port: u16) -> Sharing {
+    spawn(command(publish, DEFAULT_PUBLISH, port), port, true)
+}
+
+fn spawn((program, args): (String, Vec<String>), port: u16, is_public: bool) -> Sharing {
     let (done, result) = mpsc::channel();
     thread::spawn(move || {
         let _ = done.send(run(&program, &args, GRACE));
     });
-    Sharing { port, result }
+    Sharing {
+        port,
+        is_public,
+        result,
+    }
+}
+
+/// Takes `port` off the internet with `unpublish`, the configured command,
+/// off this thread; the receiver gets what came of it, to show.
+pub fn unpublish(unpublish: &[String], port: u16) -> mpsc::Receiver<String> {
+    let (program, args) = command(unpublish, DEFAULT_UNPUBLISH, port);
+    let (done, result) = mpsc::channel();
+    thread::spawn(move || {
+        let said = match stop(&program, &args, GRACE) {
+            Ok(()) => format!("unpublished :{port}"),
+            Err(err) => format!("could not unpublish :{port}: {err}"),
+        };
+        let _ = done.send(said);
+    });
+    result
+}
+
+/// Runs the unpublish command to its end.
+fn stop(program: &str, args: &[String], grace: Duration) -> Result<(), String> {
+    let mut command = Command::new(program);
+    command.args(args);
+    let ran = child::run(&mut command, None, grace)
+        .map_err(|err| format!("could not run {program}: {err}"))?;
+    let status = match ran.end {
+        End::Exited(status) => status,
+        End::TimedOut => {
+            return Err(format!(
+                "{program} did not finish within {}s",
+                grace.as_secs()
+            ));
+        }
+        End::HeldOpen(_) => return Err(format!("{program} left its output open")),
+    };
+    if status.success() {
+        Ok(())
+    } else {
+        Err(crate::actions::failure(
+            program,
+            &String::from_utf8_lossy(&ran.stderr),
+            &status.to_string(),
+        ))
+    }
 }
 
 /// Shares `port` with `share`, the configured command, and returns its
 /// address, or why there is none, once the command has answered.
 pub fn share(share: &[String], port: u16) -> Result<String, String> {
-    let (program, args) = command(share, port);
+    let (program, args) = command(share, DEFAULT, port);
     run(&program, &args, GRACE)
 }
 
-/// The program and arguments that share `port`: each `{port}` in the
-/// configured words replaced, else the port added last.
-fn command(share: &[String], port: u16) -> (String, Vec<String>) {
-    let words: Vec<String> = if share.is_empty() {
-        DEFAULT.map(String::from).to_vec()
+/// The program and arguments that act on `port`: the configured words, or
+/// `default` where there are none, with each `{port}` replaced, else the
+/// port added last.
+fn command(configured: &[String], default: &[&str], port: u16) -> (String, Vec<String>) {
+    let words: Vec<String> = if configured.is_empty() {
+        default.iter().map(|word| word.to_string()).collect()
     } else {
-        share.to_vec()
+        configured.to_vec()
     };
     let port = port.to_string();
     let mut words: Vec<String> = if words.iter().any(|word| word.contains("{port}")) {
@@ -189,12 +258,20 @@ mod tests {
     #[test]
     fn shares_with_tether_unless_the_config_names_a_command() {
         assert_eq!(
-            command(&[], 5173),
+            command(&[], DEFAULT, 5173),
             ("tether".into(), words(&["share", "5173"]))
+        );
+        assert_eq!(
+            command(&[], DEFAULT_PUBLISH, 5173),
+            ("tether".into(), words(&["share", "--public", "5173"]))
+        );
+        assert_eq!(
+            command(&[], DEFAULT_UNPUBLISH, 5173),
+            ("tether".into(), words(&["unshare", "5173"]))
         );
         let custom = words(&["share-it", "--port={port}", "--https"]);
         assert_eq!(
-            command(&custom, 5173),
+            command(&custom, DEFAULT, 5173),
             ("share-it".into(), words(&["--port=5173", "--https"]))
         );
     }
@@ -218,6 +295,20 @@ mod tests {
         assert!(
             got.starts_with("could not run /nonexistent/tether"),
             "{got}"
+        );
+    }
+
+    #[test]
+    fn unpublishing_says_whether_the_port_came_down() {
+        let said = |script: &str| {
+            unpublish(&words(&["sh", "-c", script]), 5173)
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+        };
+        assert_eq!(said("exit 0"), "unpublished :5173");
+        assert_eq!(
+            said("echo 'tailscale is not running' >&2; exit 1"),
+            "could not unpublish :5173: sh failed: tailscale is not running"
         );
     }
 

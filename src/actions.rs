@@ -121,7 +121,7 @@ fn open_with(browser: &[String], url: &str, from: String) -> Opening {
 }
 
 /// Sets the terminal's clipboard to `url`.
-fn copy(url: &str) -> Result<()> {
+pub fn copy(url: &str) -> Result<()> {
     let mut stdout = std::io::stdout();
     stdout
         .write_all(osc52(url).as_bytes())
