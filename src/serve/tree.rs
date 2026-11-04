@@ -61,6 +61,7 @@ pub fn tree_json(app: &App, tree: &Tree, now: u64) -> Value {
             "port": port,
             "process": name,
             "pid": pid,
+            "public": app.shares.get(port).filter(|s| s.is_public).map(|s| &s.address),
         })).collect::<Vec<_>>(),
         "pr": tree.ship.as_ref().map(|s| json!({
             "label": s.label,

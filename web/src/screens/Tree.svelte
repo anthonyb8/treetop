@@ -3,6 +3,7 @@
   import GitCounts from "../components/GitCounts.svelte";
   import Mark from "../components/Mark.svelte";
   import PortButton from "../components/PortButton.svelte";
+  import PublicButton from "../components/PublicButton.svelte";
   import PrBadge from "../components/PrBadge.svelte";
   import { back, go, link, nav } from "../nav.svelte";
   import { ago } from "../time";
@@ -239,7 +240,10 @@
           <span class="key">{tree.ports.length > 1 ? "Ports" : "Port"}</span>
           <span class="value list">
             {#each tree.ports as port (port.port)}
-              <PortButton port={port.port} process={port.process} />
+              <span class="port-row">
+                <PortButton port={port.port} process={port.process} />
+                <PublicButton port={port.port} url={port.public} />
+              </span>
             {:else}
               <span class="muted">none</span>
             {/each}
@@ -597,6 +601,13 @@
   .value.list {
     flex-direction: column;
     align-items: flex-start;
+  }
+  .port-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    max-width: 100%;
   }
   .pr {
     display: flex;

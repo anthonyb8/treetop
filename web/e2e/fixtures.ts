@@ -80,7 +80,7 @@ export const tree17: Tree = {
   base: "main",
   task: "Fix the login redirect loop on expired sessions.",
   agents: [{ name: "login", status: "waiting", has_chat: true, active_ago: 720 }],
-  ports: [{ port: 5173, process: "vite", pid: 4242 }],
+  ports: [{ port: 5173, process: "vite", pid: 4242, public: null }],
   pr: {
     label: "#41 ✗ ci",
     stage: "ci_failed",

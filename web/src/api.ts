@@ -105,6 +105,8 @@ export interface Port {
   port: number;
   process: string;
   pid: number;
+  /** Its address on the internet, where it is public, as `P` puts it there. */
+  public: string | null;
 }
 
 export interface TreePr extends Pr {
@@ -402,6 +404,16 @@ export function park(workspace: string | null, tree: string, parked: boolean): P
 /** Shares a port a tree serves with the phone, and says where to reach it. */
 export function sharePort(workspace: string | null, port: number): Promise<{ url: string }> {
   return post<{ url: string }>(`/api/ports/${port}/share${workspaceQuery(workspace)}`, {});
+}
+
+/** Puts a port a tree serves on the internet and says its public address. */
+export function publishPort(workspace: string | null, port: number): Promise<{ url: string }> {
+  return post<{ url: string }>(`/api/ports/${port}/publish${workspaceQuery(workspace)}`, {});
+}
+
+/** Takes a port off the internet, and off the tailnet with it. */
+export function unsharePort(workspace: string | null, port: number): Promise<void> {
+  return post<void>(`/api/ports/${port}/unshare${workspaceQuery(workspace)}`, {});
 }
 
 /** The server's key a browser subscribes to pushes with; null when it sends none. */

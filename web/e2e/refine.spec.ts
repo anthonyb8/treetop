@@ -140,6 +140,109 @@ test.describe("a port a tap away", () => {
   });
 });
 
+test.describe("a public link to send", () => {
+  const LINK = "https://server.example.ts.net/";
+
+  /** What the phone's share sheet was handed, or null where it has none. */
+  async function withShareSheet(page: Page) {
+    await page.addInitScript(() => {
+      (window as unknown as { shared: ShareData[] }).shared = [];
+      navigator.share = async (data?: ShareData) => {
+        (window as unknown as { shared: ShareData[] }).shared.push(data ?? {});
+      };
+    });
+  }
+
+  function shared(page: Page): Promise<ShareData[]> {
+    return page.evaluate(() => (window as unknown as { shared: ShareData[] }).shared);
+  }
+
+  test("a port goes public, its link is copied, and Share hands it to the share sheet", async ({ page, context }) => {
+    await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+    await withShareSheet(page);
+    await serve(page, () => pool);
+    let published = 0;
+    await page.route("**/api/ports/5173/publish**", async (route) => {
+      published += 1;
+      // As slow as Funnel can be, which a copy made after the wait would lose.
+      await new Promise((done) => setTimeout(done, 1500));
+      return route.fulfill({ json: { url: LINK } });
+    });
+    await page.goto("/trees/17");
+    await page.getByRole("button", { name: "Get a public link to port 5173" }).click();
+    await expect(page.getByRole("status")).toContainText("Publishing :5173");
+    await expect(page.getByRole("status")).toContainText("Public link copied");
+    await expect(page.getByRole("status")).toContainText(LINK);
+    expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(LINK);
+    expect(published).toBe(1);
+    await shot(page, "test-results/public-link.png");
+    await page.getByRole("button", { name: "Share the public link" }).click();
+    expect(await shared(page)).toEqual([{ url: LINK }]);
+  });
+
+  test("a phone that will not copy leaves the link and a Copy button", async ({ page }) => {
+    await page.addInitScript(() => {
+      const refuse = () => Promise.reject(new DOMException("not allowed", "NotAllowedError"));
+      Object.defineProperty(navigator, "share", { value: undefined });
+      navigator.clipboard.write = refuse;
+      navigator.clipboard.writeText = refuse;
+    });
+    await serve(page, () => pool);
+    await page.route("**/api/ports/5173/publish**", (route) => route.fulfill({ json: { url: LINK } }));
+    await page.goto("/trees/17");
+    await page.getByRole("button", { name: "Get a public link to port 5173" }).click();
+    await expect(page.getByRole("status")).toContainText("Public link ready");
+    await expect(page.getByRole("status")).toContainText(LINK);
+    await expect(page.getByRole("button", { name: "Copy the public link" })).toBeVisible();
+    await shot(page, "test-results/public-link-uncopied.png");
+  });
+
+  test("Stop takes a public port down", async ({ page }) => {
+    await withShareSheet(page);
+    await serve(page, () => pool);
+    await page.route("**/api/ports/5173/publish**", (route) => route.fulfill({ json: { url: LINK } }));
+    let stopped = false;
+    await page.route("**/api/ports/5173/unshare**", (route) => {
+      stopped = true;
+      return route.fulfill({ json: {} });
+    });
+    await page.goto("/trees/17");
+    await page.getByRole("button", { name: "Get a public link to port 5173" }).click();
+    await page.getByRole("button", { name: "Stop publishing :5173" }).click();
+    await expect(page.getByRole("status")).toContainText(":5173 is no longer public");
+    expect(stopped).toBe(true);
+  });
+
+  test("a port already public sends its link at once, publishing nothing", async ({ page }) => {
+    await withShareSheet(page);
+    await serve(page, () => pool);
+    await page.route("**/api/trees/17", (route) =>
+      route.fulfill({ json: { ...tree17, ports: [{ ...tree17.ports[0]!, public: LINK }] } }),
+    );
+    let published = false;
+    await page.route("**/api/ports/5173/publish**", (route) => {
+      published = true;
+      return route.fulfill({ json: { url: LINK } });
+    });
+    await page.goto("/trees/17");
+    await page.getByRole("button", { name: "Send the public link to port 5173" }).click();
+    await expect.poll(() => shared(page)).toEqual([{ url: LINK }]);
+    await expect(page.getByRole("button", { name: "Stop publishing :5173" })).toBeVisible();
+    expect(published).toBe(false);
+    await shot(page, "test-results/public-already.png");
+  });
+
+  test("a port that could not go public says why", async ({ page }) => {
+    await serve(page, () => pool);
+    await page.route("**/api/ports/5173/publish**", (route) =>
+      route.fulfill({ status: 502, json: { error: "tether failed: Funnel is not enabled" } }),
+    );
+    await page.goto("/trees/17");
+    await page.getByRole("button", { name: "Get a public link to port 5173" }).click();
+    await expect(page.getByRole("alert")).toContainText("Could not publish :5173: tether failed: Funnel is not enabled");
+  });
+});
+
 /** Drags a finger across `selector` from its right edge, `by` pixels left. */
 async function swipe(page: Page, selector: string, by: number, lift = true) {
   await page.locator(selector).first().scrollIntoViewIfNeeded();

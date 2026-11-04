@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { dismiss, poking } from "../ports.svelte";
+  import { canShare, copyLink, dismiss, poking, sendLink, stopPublic } from "../ports.svelte";
 
   let poked = $derived(poking.current);
 </script>
@@ -7,7 +7,26 @@
 {#if poked}
   <div class="toast" class:failed={poked.why} role={poked.why ? "alert" : "status"}>
     {#if poked.why}
-      <span class="words">Could not share :{poked.port}: {poked.why}</span>
+      <span class="words">Could not {poked.isPublic ? (poked.url ? "stop" : "publish") : "share"} :{poked.port}: {poked.why}</span>
+    {:else if poked.stop === "stopping"}
+      <span class="spinner" aria-hidden="true"></span>
+      <span class="words">Stopping :{poked.port}…</span>
+    {:else if poked.stop === "stopped"}
+      <span class="words">:{poked.port} is no longer public</span>
+    {:else if poked.isPublic && poked.url}
+      <span class="words public">
+        <span class="headline">{poked.isCopied ? "Public link copied" : "Public link ready"}</span>
+        <span class="mono address">{poked.url}</span>
+      </span>
+      {#if canShare()}
+        <button type="button" class="act primary" aria-label="Share the public link" onclick={sendLink}>Share</button>
+      {:else if !poked.isCopied}
+        <button type="button" class="act primary" aria-label="Copy the public link" onclick={copyLink}>Copy</button>
+      {/if}
+      <button type="button" class="act" aria-label="Stop publishing :{poked.port}" onclick={stopPublic}>Stop</button>
+    {:else if poked.isPublic}
+      <span class="spinner" aria-hidden="true"></span>
+      <span class="words">Publishing :{poked.port}…</span>
     {:else if poked.url}
       <a class="open" href={poked.url} target="_blank" rel="noreferrer" onclick={dismiss}>Open :{poked.port}</a>
     {:else}
@@ -49,6 +68,37 @@
     min-width: 0;
     padding: 8px 0;
     overflow-wrap: anywhere;
+  }
+  .public {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+  .headline {
+    font-weight: 600;
+  }
+  .address {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .act {
+    flex: none;
+    min-height: 32px;
+    padding: 0 12px;
+    border-radius: 8px;
+    border: 1px solid var(--line-strong);
+    background: none;
+    color: var(--fg-strong);
+    font-size: 14px;
+    font-weight: 600;
+  }
+  .act.primary {
+    border-color: var(--blue);
+    background: var(--blue);
+    color: var(--on-accent);
   }
   .open {
     flex: 1;

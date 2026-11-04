@@ -29,7 +29,7 @@ const tree: Tree = {
   ...tree17,
   card: crowded.needs_you[0]!,
   path: `/home/me/.treehouse/${word}/17/app`,
-  ports: [{ port: 5173, process: `node /home/me/${word}/server.js`, pid: 4242 }],
+  ports: [{ port: 5173, process: `node /home/me/${word}/server.js`, pid: 4242, public: null }],
   pr: { ...tree17.pr!, detail: [`test/${word}.spec.ts: 2 of 3 passed`] },
   report: { ...tree17.report!, says: `Should ${word} keep its own table?` },
 };
