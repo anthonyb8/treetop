@@ -18,7 +18,7 @@ use ratatui::widgets::{
 use crate::agents::{Agent, Status};
 use crate::app::{
     App, DiffView, Group, Item, JobState, ListRow, LogEntry, Opening, Pending, Phone, Picker,
-    PortMenu, Review, SCRATCH, ScratchMenu, Shipping,
+    PortMenu, Reach, Review, SCRATCH, ScratchMenu, Shipping,
 };
 use crate::assistant;
 use crate::chat::Chat;
@@ -51,92 +51,132 @@ const KEYS: [(&str, &str); 13] = [
     ("q", "quit"),
 ];
 
-/// Every key on the list, for the `?` overlay.
-const HELP: [(&str, &str); 32] = [
+/// Every key on the list, for the `?` overlay, in the groups it draws:
+/// the agents first, since that is what the list is for, then the trees
+/// themselves, what they serve and where their work goes, and the ways
+/// round the list last.
+const HELP: [(&str, &[(&str, &str)]); 7] = [
     (
-        "Enter",
-        "open the agent: its chat, a cold one started again, else its tree; a heading folds, or opens main's agent",
+        "Agents",
+        &[
+            (
+                "Enter",
+                "open the agent: its chat, a cold one again, else its tree; a heading folds",
+            ),
+            (
+                "n",
+                "new agent in this tree, or main on its heading; a free tree is leased",
+            ),
+            (
+                "N",
+                "new agent in a fresh tree, on a branch named for the task",
+            ),
+            ("m", "message the agents in the marked trees, or this one"),
+            (
+                ":",
+                "ask the assistant about this tree; @17 or @name sends to that agent",
+            ),
+            (
+                "a",
+                "open the assistant's chat, starting it if there is none",
+            ),
+            (
+                "R",
+                "resume the tree's stopped or failed agent, with its conversation",
+            ),
+            (
+                "h",
+                "hand the agent's work to a new one, on a handoff it writes",
+            ),
+        ],
     ),
     (
-        "t",
-        "go to the tree: its tmux pane or a window in it, else a shell there",
+        "Trees",
+        &[
+            (
+                "t",
+                "go to the tree: its tmux pane or a window in it, else a shell there",
+            ),
+            ("d", "diff of the tree against its base"),
+            ("Space", "mark or unmark"),
+            (
+                "r",
+                "return the marked trees, or this one; D in the dialog destroys",
+            ),
+            (
+                "z Z",
+                "park the tree, or bring it back; open or fold Parked",
+            ),
+            ("b", "rename the tree's branch"),
+            (
+                "/",
+                "filter by tree, branch, holder, agent or PR, such as merged",
+            ),
+            ("Esc", "clear the filter, then the marks"),
+        ],
     ),
     (
-        "n",
-        "new agent in this tree, or the main checkout on its heading; a free tree is leased on a task branch",
+        "Ports",
+        &[
+            (
+                "o",
+                "open the port in the browser, or choose one of several",
+            ),
+            (
+                "p",
+                "share the port with your phone, or take the share down again",
+            ),
+            (
+                "P",
+                "put the port on the internet and copy its link, or take it off again",
+            ),
+            ("Q", "show a shared port's code and address again"),
+        ],
     ),
     (
-        "N",
-        "new agent in a fresh tree, on a branch named for the task",
-    ),
-    ("m", "message the agents in the marked trees, or this one"),
-    (
-        ":",
-        "ask the assistant about this tree; @17 or @name sends to that agent instead",
-    ),
-    (
-        "a",
-        "open the assistant's chat, where it answers; starts it if there is none",
-    ),
-    ("d", "diff of the tree against its base"),
-    (
-        "r",
-        "return the marked trees, or this one; D in the dialog destroys",
-    ),
-    ("Space", "mark or unmark"),
-    (
-        "z Z",
-        "park the tree, or bring it back; open or fold Parked",
+        "Ship",
+        &[
+            (
+                "s",
+                "start a ship run of the tree's branch, or show the one under way",
+            ),
+            ("O", "open the tree's PR"),
+            ("f", "send what failed on the tree's PR to its agent"),
+        ],
     ),
     (
-        "/",
-        "filter by tree, branch, holder, agent or PR, such as merged",
+        "Issues",
+        &[
+            ("Tab", "the repository's issues"),
+            (
+                "i",
+                "the issue the tree works on, on the whole screen, else choose it",
+            ),
+            ("I", "choose the issue the tree works on, or another"),
+        ],
     ),
     (
-        "o",
-        "open the port the tree serves, or choose one where it serves several",
+        "Moving",
+        &[("j k \u{2191} \u{2193}", "move"), ("g G", "top, bottom")],
     ),
     (
-        "p",
-        "share the port with your phone, as a QR code to scan; tether share by default",
+        "treetop",
+        &[
+            ("w", "switch workspace"),
+            (
+                "C",
+                "scratch chats, tied to no tree: start, open, or x twice to delete",
+            ),
+            ("U", "install a newer treetop release and restart on it"),
+            ("?", "this help"),
+            ("q", "quit"),
+        ],
     ),
-    (
-        "P",
-        "put the port on the internet and copy its public link; tether share --public by default",
-    ),
-    ("O", "open the tree's PR"),
-    ("f", "send what failed on the tree's PR to its agent"),
-    (
-        "h",
-        "hand the agent's work to a new one in this tree, on a handoff it writes",
-    ),
-    (
-        "R",
-        "resume the tree's stopped or failed agent, with its conversation",
-    ),
-    (
-        "s",
-        "start a ship run of the tree's branch, or show the one under way",
-    ),
-    ("b", "rename the tree's branch"),
-    ("w", "switch workspace"),
-    (
-        "C",
-        "scratch chats, tied to no tree: start one, open one, or x twice to delete one",
-    ),
-    ("Tab", "the repository's issues"),
-    (
-        "i",
-        "the issue the tree works on, on the whole screen, else choose it",
-    ),
-    ("I", "choose the issue the tree works on, or another"),
-    ("j k ↑ ↓", "move"),
-    ("g G", "top, bottom"),
-    ("Esc", "clear the filter, then the marks"),
-    ("U", "install a newer treetop release and restart on it"),
-    ("?", "this help"),
-    ("q", "quit"),
 ];
+
+/// How many of the groups go down the left column of the `?` overlay; the
+/// rest go down the right, so the whole list fits a short terminal.
+const HELP_SPLIT: usize = 3;
 
 /// Most useful first, as with `KEYS`; Esc stays early so the way out is
 /// never the key a narrow bar drops.
@@ -505,18 +545,37 @@ fn pr_cell(tree: &Tree) -> Cell<'static> {
 }
 
 /// Every port the tree serves, lowest first, so a frontend and a backend
-/// both show; `-` for none.
-fn ports_cell(tree: &Tree) -> Cell<'static> {
+/// both show; `-` for none. A port shared with the phone carries a `p`
+/// after it, and one on the internet a `P`: the key that put it there, so
+/// what anyone with the link can open is on the row, not only in the popup
+/// that shared it.
+fn ports_cell(app: &App, tree: &Tree) -> Cell<'static> {
+    Cell::from(Line::from(port_spans(app, tree)))
+}
+
+/// The PORTS cell's spans: each port, and the key that shared it where one
+/// did.
+fn port_spans(app: &App, tree: &Tree) -> Vec<Span<'static>> {
+    let t = theme();
     let ports = tree.ports();
     if ports.is_empty() {
-        return Cell::from("-").style(fg(theme().muted));
+        return vec![Span::styled("-", fg(t.muted))];
     }
-    let text = ports
-        .iter()
-        .map(|port| format!(":{port}"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    Cell::from(text).style(fg(theme().info))
+    let mut spans: Vec<Span> = Vec::new();
+    for port in ports {
+        if !spans.is_empty() {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(format!(":{port}"), fg(t.info)));
+        match app.reach_of(port) {
+            Some(true) => {
+                spans.push(Span::styled("P", fg(t.accent).add_modifier(Modifier::BOLD)));
+            }
+            Some(false) => spans.push(Span::styled("p", fg(t.accent))),
+            None => {}
+        }
+    }
+    spans
 }
 
 fn row(app: &App, tree: &Tree) -> Row<'static> {
@@ -545,7 +604,7 @@ fn row(app: &App, tree: &Tree) -> Row<'static> {
         .style(fg(t.accent)),
         branch,
         agent_cell(app, tree),
-        ports_cell(tree),
+        ports_cell(app, tree),
         git_cell(tree, 0),
     ];
     if app.is_shipping() {
@@ -672,7 +731,7 @@ fn heading_row(
         waits,
     ];
     if let Some(main) = main {
-        cells.push(ports_cell(main));
+        cells.push(ports_cell(app, main));
         cells.push(git_cell(main, app.behind));
     }
     Row::new(cells)
@@ -1187,8 +1246,9 @@ fn draw_scratch_menu(frame: &mut Frame, app: &App, menu: &ScratchMenu) {
     }
 }
 
-/// The ports `o` offers for a tree serving several, each with its number
-/// key and the process listening on it.
+/// The ports `o`, `p`, `P` and `Q` offer for a tree serving several, each
+/// with its number key and the process listening on it; the keys at the
+/// foot name what the one that opened the menu will do.
 fn draw_port_menu(frame: &mut Frame, menu: &PortMenu) {
     let t = theme();
     let screen = frame.area();
@@ -1197,7 +1257,13 @@ fn draw_port_menu(frame: &mut Frame, menu: &PortMenu) {
         .unwrap_or(u16::MAX)
         .saturating_add(2);
     let area = popup::centered(screen, width, height);
-    let keys = [("1-9", "open"), ("Enter", "open"), ("Esc", "close")];
+    let does = match menu.reach {
+        Reach::Browser => "open",
+        Reach::Phone => "share",
+        Reach::Public => "publish",
+        Reach::Code => "show",
+    };
+    let keys = [("1-9", does), ("Enter", does), ("Esc", "close")];
     let block = popup_block(Line::styled(
         format!(" Tree {} serves ", menu.tree),
         fg(t.title).add_modifier(Modifier::BOLD),
@@ -1263,7 +1329,7 @@ fn draw_phone(frame: &mut Frame, phone: &Phone) {
     let keys: &[(&str, &str)] = if phone.is_public {
         &[("x", "stop publishing"), ("Esc", "close")]
     } else {
-        &[("Esc", "close")]
+        &[("x", "stop sharing"), ("Esc", "close")]
     };
     // Each cell is two modules, one over the other, drawn as an upper half
     // block: its foreground the top module, its background the bottom one.
@@ -1640,31 +1706,44 @@ fn branch_line(prompt: &Prompt) -> Line<'static> {
     Line::from(vec![Span::styled("branch ", fg(t.muted)), name])
 }
 
-/// Every key, over the list, until any key closes it.
-fn draw_help(frame: &mut Frame, help: &[(&str, &str)]) {
+/// The `?` overlay: every key in its groups, the first HELP_SPLIT groups
+/// down the left column and the rest down the right.
+fn draw_help(frame: &mut Frame, help: &[(&str, &[(&str, &str)])]) {
+    const GAP: usize = 3;
     let t = theme();
-    // A space, the key in nine columns, a space, then what it does, inside
-    // the border and a column of air on the right.
-    let width = help
-        .iter()
-        .map(|(_, does)| does.chars().count())
-        .max()
-        .unwrap_or(0)
-        + 14;
-    let lines: Vec<Line> = help
-        .iter()
-        .map(|(key, does)| {
-            Line::from(vec![
-                Span::styled(
-                    format!(" {key:<9} "),
-                    fg(t.accent).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(does.to_string()),
-            ])
-        })
-        .collect();
-    let height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
+    let (left, right) = help.split_at(HELP_SPLIT.min(help.len()));
+    let (left, right) = (help_lines(left), help_lines(right));
+    let widest = |lines: &[Line]| lines.iter().map(Line::width).max().unwrap_or(0);
+    let (left_width, right_width) = (widest(&left), widest(&right));
+    // Each line starts with a space of its own, so the border wants one
+    // more column of air at the right and one for each side's border. Where
+    // two columns would run off a narrow screen, the groups go down one
+    // instead: taller, but every line whole.
+    let two = left_width + GAP + right_width + 3;
+    let (lines, width) = if two <= usize::from(frame.area().width) {
+        let rows = left.len().max(right.len());
+        let lines: Vec<Line> = (0..rows)
+            .map(|at| {
+                let mut spans: Vec<Span> = Vec::new();
+                let used = left.get(at).map_or(0, |line| {
+                    spans.extend(line.spans.iter().cloned());
+                    line.width()
+                });
+                if let Some(line) = right.get(at).filter(|line| line.width() > 0) {
+                    spans.push(Span::raw(" ".repeat(left_width + GAP - used)));
+                    spans.extend(line.spans.iter().cloned());
+                }
+                Line::from(spans)
+            })
+            .collect();
+        (lines, two)
+    } else {
+        let lines = help_lines(help);
+        let width = widest(&lines) + 3;
+        (lines, width)
+    };
     let width = u16::try_from(width).unwrap_or(u16::MAX);
+    let height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
     let area = popup::centered(frame.area(), width, height);
     frame.render_widget(Clear, area);
     frame.render_widget(
@@ -1677,6 +1756,33 @@ fn draw_help(frame: &mut Frame, help: &[(&str, &str)]) {
         ),
         area,
     );
+}
+
+/// One column of the overlay: each group's name over its keys, a space, the
+/// key in nine columns, a space, then what it does, with a blank line
+/// between groups.
+fn help_lines(groups: &[(&str, &[(&str, &str)])]) -> Vec<Line<'static>> {
+    let t = theme();
+    let mut lines: Vec<Line> = Vec::new();
+    for (name, keys) in groups {
+        if !lines.is_empty() {
+            lines.push(Line::raw(""));
+        }
+        lines.push(Line::styled(
+            format!(" {name}"),
+            fg(t.title).add_modifier(Modifier::BOLD),
+        ));
+        for (key, does) in *keys {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" {key:<9} "),
+                    fg(t.accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw((*does).to_string()),
+            ]));
+        }
+    }
+    lines
 }
 
 /// A dialog's frame: a border in `color` and its title in the theme's title
@@ -2544,6 +2650,48 @@ mod tests {
             ["tell the", "agent", "what"]
         );
         assert_eq!(word_wrap("abcdefghij", 4), ["abcd", "efgh", "ij"]);
+    }
+
+    #[test]
+    fn a_shared_port_carries_the_key_that_shared_it() {
+        use crate::phone::Shared;
+
+        let serving = |port, pid| crate::pool::Process {
+            pid,
+            name: "node".into(),
+            ports: vec![port],
+        };
+        let tree = Tree {
+            processes: vec![serving(5173, 41), serving(3000, 40)],
+            ..crate::pool::stand_in(std::path::PathBuf::from("/p/1/app"))
+        };
+        let text = |app: &App| {
+            port_spans(app, &tree)
+                .iter()
+                .map(|span| span.content.to_string())
+                .collect::<String>()
+        };
+        let mut app = App::default();
+        assert_eq!(text(&app), ":3000 :5173", "nothing shared");
+        app.apply_shares(vec![
+            Shared {
+                port: 3000,
+                is_public: false,
+                address: "https://box.tail1.ts.net:3000".into(),
+            },
+            Shared {
+                port: 5173,
+                is_public: true,
+                address: "https://box.tail1.ts.net".into(),
+            },
+        ]);
+        assert_eq!(text(&app), ":3000p :5173P");
+        let spans = port_spans(&app, &tree);
+        assert_eq!(spans[1].style.fg, Some(theme().accent), "p stands out");
+        assert!(
+            spans[4].style.add_modifier.contains(Modifier::BOLD),
+            "the public one stands out most"
+        );
     }
 
     #[test]

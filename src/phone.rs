@@ -8,6 +8,11 @@
 //! command, `tether share --public` unless the config names another, puts
 //! it there with Tailscale Funnel, and the unpublish command, `tether
 //! unshare`, takes it down again.
+//!
+//! Which ports are shared either way is read back from the shares command,
+//! `tether shares` unless the config names another, so the PORTS column
+//! marks them whoever shared them and whenever: a share outlives treetop,
+//! since it lives in Tailscale, not here.
 
 use std::process::Command;
 use std::sync::mpsc;
@@ -26,6 +31,14 @@ const DEFAULT_PUBLISH: &[&str] = &["tether", "share", "--public"];
 
 /// What a published port is taken down with when the config names nothing.
 const DEFAULT_UNPUBLISH: &[&str] = &["tether", "unshare"];
+
+/// What the shared ports are listed with when the config names nothing.
+const DEFAULT_SHARES: &[&str] = &["tether", "shares"];
+
+/// How long the shares command has to list them. It only reads Tailscale's
+/// serve config, so it answers at once or not at all; the PORTS column waits
+/// on nothing.
+const LISTING: Duration = Duration::from_secs(5);
 
 /// How long the share command has to print an address. `tether share`
 /// answers in a second or two, but on a tailnet without Serve it prints a
@@ -82,15 +95,17 @@ fn spawn((program, args): (String, Vec<String>), port: u16, is_public: bool) -> 
     }
 }
 
-/// Takes `port` off the internet with `unpublish`, the configured command,
-/// off this thread; the receiver gets what came of it, to show.
-pub fn unpublish(unpublish: &[String], port: u16) -> mpsc::Receiver<String> {
+/// Takes `port` off the phone and the internet both with `unpublish`, the
+/// configured command, off this thread; the receiver gets what came of it,
+/// to show. One command does both because `tether unshare` does: a port
+/// taken off the internet loses its tailnet share with it.
+pub fn unshare(unpublish: &[String], port: u16) -> mpsc::Receiver<String> {
     let (program, args) = command(unpublish, DEFAULT_UNPUBLISH, port);
     let (done, result) = mpsc::channel();
     thread::spawn(move || {
         let said = match stop(&program, &args, GRACE) {
-            Ok(()) => format!("unpublished :{port}"),
-            Err(err) => format!("could not unpublish :{port}: {err}"),
+            Ok(()) => format!("unshared :{port}"),
+            Err(err) => format!("could not unshare :{port}: {err}"),
         };
         let _ = done.send(said);
     });
@@ -124,6 +139,89 @@ fn stop(program: &str, args: &[String], grace: Duration) -> Result<(), String> {
     }
 }
 
+/// A port this machine shares: the port a dev server listens on, and
+/// whether it is on the internet, as `P` puts it there, rather than only
+/// the tailnet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shared {
+    pub port: u16,
+    pub is_public: bool,
+    /// The HTTPS address it is reached at, which `Q` draws as a QR code
+    /// without asking the share command for it again.
+    pub address: String,
+}
+
+/// Every port this machine shares, as `listing`, the configured command,
+/// lists them; `tether shares` where it names none. Shares made outside
+/// treetop, or before it started, are in it too: Tailscale holds them, not
+/// treetop.
+pub fn shares(listing: &[String]) -> Result<Vec<Shared>, String> {
+    let (program, args) = parts(listing, DEFAULT_SHARES);
+    let mut command = Command::new(&program);
+    command.args(&args);
+    let ran = child::run(&mut command, None, LISTING)
+        .map_err(|err| format!("could not run {program}: {err}"))?;
+    match ran.end {
+        End::Exited(status) if status.success() => {}
+        End::Exited(status) => {
+            return Err(crate::actions::failure(
+                &program,
+                &String::from_utf8_lossy(&ran.stderr),
+                &status.to_string(),
+            ));
+        }
+        End::TimedOut => {
+            return Err(format!(
+                "{program} did not finish within {}s",
+                LISTING.as_secs()
+            ));
+        }
+        End::HeldOpen(_) => return Err(format!("{program} left its output open")),
+    }
+    Ok(listed(&String::from_utf8_lossy(&ran.stdout)))
+}
+
+/// The ports in what the shares command printed: a line an address, as
+/// `https://host:5173 -> http://localhost:5173`, with ` (public)` on the
+/// ones Funnel puts on the internet. A port shared both ways is public,
+/// which is the reach worth showing.
+fn listed(printed: &str) -> Vec<Shared> {
+    let mut shares: Vec<Shared> = Vec::new();
+    for line in printed.lines() {
+        let Some((address, target)) = line.split_once("->") else {
+            continue;
+        };
+        let (target, is_public) = match target.trim().strip_suffix("(public)") {
+            Some(rest) => (rest.trim(), true),
+            None => (target.trim(), false),
+        };
+        let Some(port) = target_port(target) else {
+            continue;
+        };
+        let share = Shared {
+            port,
+            is_public,
+            address: address.trim().to_string(),
+        };
+        match shares.iter_mut().find(|seen| seen.port == port) {
+            // The public address is the one worth keeping: it is what
+            // anyone with the link opens.
+            Some(seen) if is_public && !seen.is_public => *seen = share,
+            Some(_) => {}
+            None => shares.push(share),
+        }
+    }
+    shares
+}
+
+/// The port a share forwards to: the one its target names, as
+/// `http://localhost:5173` or `localhost:5173/app` name 5173.
+fn target_port(target: &str) -> Option<u16> {
+    let rest = target.split_once("://").map_or(target, |(_, rest)| rest);
+    let (_, port) = rest.split('/').next()?.rsplit_once(':')?;
+    port.parse().ok()
+}
+
 /// Shares `port` with `share`, the configured command, and returns its
 /// address, or why there is none, once the command has answered.
 pub fn share(share: &[String], port: u16) -> Result<String, String> {
@@ -135,19 +233,27 @@ pub fn share(share: &[String], port: u16) -> Result<String, String> {
 /// `default` where there are none, with each `{port}` replaced, else the
 /// port added last.
 fn command(configured: &[String], default: &[&str], port: u16) -> (String, Vec<String>) {
-    let words: Vec<String> = if configured.is_empty() {
-        default.iter().map(|word| word.to_string()).collect()
-    } else {
-        configured.to_vec()
-    };
+    let (program, args) = parts(configured, default);
     let port = port.to_string();
-    let mut words: Vec<String> = if words.iter().any(|word| word.contains("{port}")) {
-        words
-            .iter()
+    let all: Vec<String> = std::iter::once(program).chain(args).collect();
+    let mut all: Vec<String> = if all.iter().any(|word| word.contains("{port}")) {
+        all.iter()
             .map(|word| word.replace("{port}", &port))
             .collect()
     } else {
-        words.into_iter().chain([port]).collect()
+        all.into_iter().chain([port]).collect()
+    };
+    let program = all.remove(0);
+    (program, all)
+}
+
+/// The program and arguments of a command that takes no port: the
+/// configured words, or `default` where there are none.
+fn parts(configured: &[String], default: &[&str]) -> (String, Vec<String>) {
+    let mut words: Vec<String> = if configured.is_empty() {
+        default.iter().map(|word| word.to_string()).collect()
+    } else {
+        configured.to_vec()
     };
     let program = words.remove(0);
     (program, words)
@@ -299,16 +405,79 @@ mod tests {
     }
 
     #[test]
-    fn unpublishing_says_whether_the_port_came_down() {
+    fn the_shared_ports_are_read_back_with_which_are_public() {
+        assert_eq!(
+            parts(&[], DEFAULT_SHARES),
+            ("tether".into(), words(&["shares"]))
+        );
+        let printed = "https://box.tail1.ts.net:5173 -> http://localhost:5173\n\
+                       https://box.tail1.ts.net -> http://localhost:3000 (public)\n";
+        assert_eq!(
+            listed(printed),
+            vec![
+                Shared {
+                    port: 5173,
+                    is_public: false,
+                    address: "https://box.tail1.ts.net:5173".into(),
+                },
+                Shared {
+                    port: 3000,
+                    is_public: true,
+                    address: "https://box.tail1.ts.net".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_port_shared_both_ways_is_public_and_a_line_without_a_port_is_skipped() {
+        // `tether shares` says so on stderr when there are none, and a share
+        // can forward somewhere that is not a local port.
+        let printed = "https://box.tail1.ts.net:5173 -> http://localhost:5173\n\
+                       https://box.tail1.ts.net -> http://localhost:5173 (public)\n\
+                       https://box.tail1.ts.net -> text proxy\n";
+        assert_eq!(
+            listed(printed),
+            vec![Shared {
+                port: 5173,
+                is_public: true,
+                // The public address, not the tailnet one it also has.
+                address: "https://box.tail1.ts.net".into(),
+            }]
+        );
+        assert_eq!(listed(""), vec![]);
+    }
+
+    #[test]
+    fn a_shares_command_that_fails_says_why() {
+        let got = shares(&words(&[
+            "sh",
+            "-c",
+            "echo 'tailscale is down' >&2; exit 1",
+        ]));
+        assert_eq!(got, Err("sh failed: tailscale is down".into()));
+        let script = "echo 'https://box.tail1.ts.net -> http://localhost:5173 (public)'";
+        assert_eq!(
+            shares(&words(&["sh", "-c", script])),
+            Ok(vec![Shared {
+                port: 5173,
+                is_public: true,
+                address: "https://box.tail1.ts.net".into(),
+            }])
+        );
+    }
+
+    #[test]
+    fn unsharing_says_whether_the_port_came_down() {
         let said = |script: &str| {
-            unpublish(&words(&["sh", "-c", script]), 5173)
+            unshare(&words(&["sh", "-c", script]), 5173)
                 .recv_timeout(Duration::from_secs(10))
                 .unwrap()
         };
-        assert_eq!(said("exit 0"), "unpublished :5173");
+        assert_eq!(said("exit 0"), "unshared :5173");
         assert_eq!(
             said("echo 'tailscale is not running' >&2; exit 1"),
-            "could not unpublish :5173: sh failed: tailscale is not running"
+            "could not unshare :5173: sh failed: tailscale is not running"
         );
     }
 

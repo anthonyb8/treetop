@@ -270,8 +270,9 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
     // The port `p` is sharing with the phone, or `P` publishing, off this
     // thread.
     let mut sharing: Option<phone::Sharing> = None;
-    // Ports being taken off the internet, each saying what came of it.
-    let mut unpublishing: Vec<mpsc::Receiver<String>> = Vec::new();
+    // Ports being taken off the phone and the internet, each saying what
+    // came of it.
+    let mut unsharing: Vec<mpsc::Receiver<String>> = Vec::new();
     // When `treetop status` was last written for this workspace.
     let mut snapshots = snapshot::Clock::default();
     // `U` installing a newer release, off this thread.
@@ -310,6 +311,7 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                 Update::Usage(usage) => app.usage = usage,
                 Update::Base(standing) => app.apply_base(standing),
                 Update::Release(tag) => app.apply_release(tag),
+                Update::Shares(shares) => app.apply_shares(shares),
                 Update::CatchUpHookFailed(why) => app.message = Some(why),
                 Update::Agents(agents) => {
                     app.apply_agents(&agents);
@@ -496,11 +498,15 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             }
             app.set_shared(share.port, shared);
             sharing = None;
+            // The PORTS column marks what is shared, so it reads it back
+            // rather than waiting out the tick.
+            refresher.refresh_shares();
             is_stale = true;
         }
-        unpublishing.retain(|result| match result.try_recv() {
+        unsharing.retain(|result| match result.try_recv() {
             Ok(said) => {
                 app.message = Some(said);
+                refresher.refresh_shares();
                 is_stale = true;
                 false
             }
@@ -736,9 +742,9 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                     phone::start(&config.share, port)
                 });
             }
-            Outcome::Unpublish(port) => {
+            Outcome::Unshare(port) => {
                 let unpublish = config::load().map(|c| c.unpublish).unwrap_or_default();
-                unpublishing.push(phone::unpublish(&unpublish, port));
+                unsharing.push(phone::unshare(&unpublish, port));
             }
             Outcome::Browse { port, tree } => {
                 let opening = actions::browse(port, &tree);
