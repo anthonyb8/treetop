@@ -267,8 +267,11 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
     // URLs a configured browser is opening, off this thread, each with
     // whether the Issues screen asked, so its outcome is said there.
     let mut opening_urls: Vec<(actions::Pending, bool)> = Vec::new();
-    // The port `p` is sharing with the phone, off this thread.
+    // The port `p` is sharing with the phone, or `P` publishing, off this
+    // thread.
     let mut sharing: Option<phone::Sharing> = None;
+    // Ports being taken off the internet, each saying what came of it.
+    let mut unpublishing: Vec<mpsc::Receiver<String>> = Vec::new();
     // When `treetop status` was last written for this workspace.
     let mut snapshots = snapshot::Clock::default();
     // `U` installing a newer release, off this thread.
@@ -481,10 +484,29 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
         if let Some(share) = &sharing
             && let Some(shared) = share.poll()
         {
+            // A public link is for handing to someone, so it goes straight
+            // to the clipboard.
+            if share.is_public
+                && let Ok(url) = &shared
+            {
+                app.message = Some(match actions::copy(url) {
+                    Ok(()) => "link copied".to_string(),
+                    Err(err) => format!("{err:#}"),
+                });
+            }
             app.set_shared(share.port, shared);
             sharing = None;
             is_stale = true;
         }
+        unpublishing.retain(|result| match result.try_recv() {
+            Ok(said) => {
+                app.message = Some(said);
+                is_stale = true;
+                false
+            }
+            Err(mpsc::TryRecvError::Empty) => true,
+            Err(mpsc::TryRecvError::Disconnected) => false,
+        });
         removing_scratch.retain(|result| match result.try_recv() {
             Ok(Ok(name)) => {
                 app.message = Some(format!("deleted {name}"));
@@ -706,9 +728,17 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                     opening_urls.push((pending, false));
                 }
             }
-            Outcome::Share(port) => {
-                let share = config::load().map(|c| c.share).unwrap_or_default();
-                sharing = Some(phone::start(&share, port));
+            Outcome::Share { port, is_public } => {
+                let config = config::load().unwrap_or_default();
+                sharing = Some(if is_public {
+                    phone::publish(&config.publish, port)
+                } else {
+                    phone::start(&config.share, port)
+                });
+            }
+            Outcome::Unpublish(port) => {
+                let unpublish = config::load().map(|c| c.unpublish).unwrap_or_default();
+                unpublishing.push(phone::unpublish(&unpublish, port));
             }
             Outcome::Browse { port, tree } => {
                 let opening = actions::browse(port, &tree);

@@ -68,6 +68,16 @@
 //! ```toml
 //! share = ["tether", "share"]
 //! ```
+//!
+//! `publish` is the command `P` puts a port on the internet with, for anyone
+//! with the link, `tether share --public` when it names none, and
+//! `unpublish` the one that takes it down again, `tether unshare` when it
+//! names none; `{port}` works in both as in `share`:
+//!
+//! ```toml
+//! publish = ["tether", "share", "--public"]
+//! unpublish = ["tether", "unshare"]
+//! ```
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -233,6 +243,14 @@ pub struct Config {
     /// address it is reached at; empty for `tether share`.
     #[serde(default)]
     pub share: Vec<String>,
+    /// The command a port is put on the internet with, which prints its
+    /// public address; empty for `tether share --public`.
+    #[serde(default)]
+    pub publish: Vec<String>,
+    /// The command a published port is taken off the internet with; empty
+    /// for `tether unshare`.
+    #[serde(default)]
+    pub unpublish: Vec<String>,
     /// `treetop serve`, the web app for a phone.
     #[serde(default)]
     pub mobile: Mobile,
