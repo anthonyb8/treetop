@@ -3,7 +3,7 @@
 // someone writes them.
 import { expect, test, type Page } from "@playwright/test";
 import type { Card, ChatMessage, Pool, Tree } from "../src/api";
-import { pool, serve, tree17 } from "./fixtures";
+import { pool, serve, shot, tree17 } from "./fixtures";
 
 /** An iPhone's home indicator, which headless Chromium does not have. */
 async function withHomeIndicator(page: Page) {
@@ -111,7 +111,7 @@ test.describe("a port a tap away", () => {
     await page.getByRole("button", { name: "Open port 5173" }).first().click();
     const link = page.getByRole("link", { name: "Open :5173" });
     await expect(link).toHaveAttribute("href", "https://server.example.ts.net:5173");
-    await page.screenshot({ path: "test-results/port-link.png" });
+    await shot(page, "test-results/port-link.png");
   });
 
   test("a port that could not be shared says why", async ({ page }) => {
@@ -238,7 +238,7 @@ test.describe("parking", () => {
     await page.getByRole("button", { name: "More" }).click();
     await page.getByRole("button", { name: "Park", exact: true }).click();
     await expect(page.getByText("parked", { exact: true })).toBeVisible();
-    await page.screenshot({ path: "test-results/tree-parked.png" });
+    await shot(page, "test-results/tree-parked.png");
     await page.getByRole("button", { name: "More" }).click();
     await page.getByRole("button", { name: "Unpark" }).click();
     await expect(page.getByText("parked", { exact: true })).toHaveCount(0);

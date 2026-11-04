@@ -3,7 +3,7 @@
 // settled once the agent has it, or kept with a retry when it could not go.
 import { expect, test, type Page } from "@playwright/test";
 import type { ChatMessage } from "../src/api";
-import { pool, serve, tree17 } from "./fixtures";
+import { pool, serve, shot, tree17 } from "./fixtures";
 
 const backlog: ChatMessage[] = [
   { id: "u1", kind: "you", at: "2026-11-01T13:40:00Z", text: "Fix the login redirect loop on expired sessions." },
@@ -73,7 +73,7 @@ test("the chat shows the conversation, each tool call a line that opens", async 
   await expect(chat.locator(".asks")).toContainText("Needs you");
   await expect(chat.locator(".asks")).toContainText("Which auth provider should the login use, Clerk or Supabase?");
   await expect(page.getByRole("region", { name: "Waiting on you" })).toHaveCount(0);
-  await page.screenshot({ path: "test-results/chat.png" });
+  await shot(page, "test-results/chat.png");
 
   await page.getByRole("button", { name: "Back to tree 17" }).click();
   await expect(page).toHaveURL(/\/trees\/17$/);
@@ -102,7 +102,7 @@ test("a line you send shows at once, then settles once the agent has it", async 
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.getByText("Sending…")).toBeVisible();
   await expect(page.getByRole("textbox", { name: "Message 17" })).toHaveValue("");
-  await page.screenshot({ path: "test-results/chat-sending.png" });
+  await shot(page, "test-results/chat-sending.png");
   release();
   await expect(page.getByText("Sending…")).toHaveCount(0);
   await expect(page.getByText("Use Clerk.")).toHaveCount(1);
@@ -124,7 +124,7 @@ test("a line that could not go says why and goes on a retry", async ({ page }) =
   await page.getByRole("textbox", { name: "Message 17" }).fill("Use Clerk.");
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.getByText("no agent with a chat to type into at 17 ·")).toBeVisible();
-  await page.screenshot({ path: "test-results/chat-failed.png" });
+  await shot(page, "test-results/chat-failed.png");
   await page.getByRole("button", { name: "Retry" }).click();
   await expect(page.getByText("Sent")).toBeVisible();
 });
@@ -149,7 +149,7 @@ test("scrolled up, a new message waits behind a pill instead of moving the chat"
   const pill = page.getByRole("button", { name: "1 new message" });
   await expect(pill).toBeVisible();
   await expect(chat.getByText("Step 1:", { exact: false })).toBeInViewport();
-  await page.screenshot({ path: "test-results/chat-pill.png" });
+  await shot(page, "test-results/chat-pill.png");
   await pill.click();
   await expect(chat.getByText("Tests pass now.")).toBeInViewport();
 });

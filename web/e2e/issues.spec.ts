@@ -3,11 +3,11 @@
 // at once, and putting an agent on one. The API is the fake in fixtures.ts;
 // `src/serve/issues.rs` owns what the server really answers.
 import { expect, test, type Page } from "@playwright/test";
-import { pool, serve, serveIssues } from "./fixtures";
+import { pool, serve, serveIssues, shot } from "./fixtures";
 
 /** A picture with everything moving at rest. */
-async function shot(page: Page, name: string) {
-  await page.screenshot({ path: `test-results/${name}.png`, animations: "disabled" });
+async function still(page: Page, name: string) {
+  await shot(page, `test-results/${name}.png`, { animations: "disabled" });
 }
 
 async function openIssues(page: Page) {
@@ -21,7 +21,7 @@ test("issues are a tab beside the trees, each row saying who is on it", async ({
   await openIssues(page);
   await expect(page.getByRole("link", { name: "New agent" })).toBeVisible();
   await expect(page.getByLabel("1 waiting on you")).toBeVisible();
-  await shot(page, "issues-trees");
+  await still(page, "issues-trees");
 
   await page.getByRole("link", { name: "Issues", exact: true }).click();
   await expect(page).toHaveURL(/\/issues$/);
@@ -33,7 +33,7 @@ test("issues are a tab beside the trees, each row saying who is on it", async ({
   const todo = page.getByRole("region", { name: "Todo" });
   await expect(todo.getByRole("link", { name: /END-141/ })).toContainText("ready");
   await expect(page.getByRole("link", { name: /END-150/ })).toHaveCount(0);
-  await shot(page, "issues-mine");
+  await still(page, "issues-mine");
 
   await page.getByRole("button", { name: "all", exact: true }).click();
   await expect(todo.getByRole("link", { name: /END-150/ })).toContainText("Mia");
@@ -42,7 +42,7 @@ test("issues are a tab beside the trees, each row saying who is on it", async ({
   await page.getByRole("button", { name: "by project" }).click();
   const login = page.getByRole("region", { name: "Login" });
   await expect(login.getByRole("link", { name: /END-123/ })).toContainText("In Progress");
-  await shot(page, "issues-by-project");
+  await still(page, "issues-by-project");
 
   await page.getByRole("button", { name: "this cycle" }).click();
   await expect(page.getByRole("link", { name: /END-123/ })).toContainText("In Progress");
@@ -62,7 +62,7 @@ test("search reaches closed issues too, and a closed group opens by hand", async
   await expect(page.getByRole("link", { name: /END-141/ })).toBeVisible();
   await expect(page.getByRole("link", { name: /END-127/ })).toContainText("Done");
   await expect(page.getByRole("link", { name: /END-123/ })).toHaveCount(0);
-  await shot(page, "issues-search");
+  await still(page, "issues-search");
   await page.getByLabel("Search issues by id or title").fill("zebra");
   await expect(page.getByText("No issues match.")).toBeVisible();
   await page.getByRole("button", { name: "Cancel" }).click();
@@ -70,7 +70,7 @@ test("search reaches closed issues too, and a closed group opens by hand", async
   await page.getByRole("button", { name: "Filters" }).click();
   await page.getByRole("dialog").getByRole("button", { name: /^Status/ }).click();
   await page.getByRole("dialog").getByRole("button", { name: "Any, closed too" }).click();
-  await shot(page, "issues-filters");
+  await still(page, "issues-filters");
   await page.getByRole("dialog").getByRole("button", { name: /^Show/ }).click();
   await expect(page.getByText("state:any")).toBeVisible();
   const done = page.getByRole("region", { name: "Done" });
@@ -91,11 +91,11 @@ test("a filter that leaves nothing says so and clears", async ({ page }) => {
   await sheet.getByRole("button", { name: "Billing" }).click();
   await sheet.getByRole("button", { name: /^Status/ }).click();
   await sheet.getByRole("button", { name: "In Review" }).click();
-  await shot(page, "issues-filters-set");
+  await still(page, "issues-filters-set");
   await sheet.getByRole("button", { name: /^Show/ }).click();
   await expect(page.getByText("No issues match.")).toBeVisible();
   await expect(page.getByText("state:\"In Review\" label:Billing")).toBeVisible();
-  await shot(page, "issues-no-match");
+  await still(page, "issues-no-match");
   await page.getByRole("button", { name: "Clear filters" }).click();
   await expect(page.getByRole("link", { name: /END-123/ })).toBeVisible();
 });
@@ -111,7 +111,7 @@ test("another source shows its own issues, and a repository with none says what 
   api.sources = { ...api.sources, own: null, why: 'app has no issue source: add [repos."app"] with issues = "work"' };
   await page.reload();
   await expect(page.getByText("app has no issue source")).toBeVisible();
-  await shot(page, "issues-no-source");
+  await still(page, "issues-no-source");
   await page.getByLabel("Issue source").selectOption("work");
   await expect(page.getByRole("link", { name: /END-123/ })).toBeVisible();
 });
@@ -124,7 +124,7 @@ test("with Linear out of reach the last list stays and says so", async ({ page }
   await page.reload();
   await expect(page.getByRole("status")).toHaveText("Linear did not answer - showing the list as it last was.");
   await expect(page.getByRole("link", { name: /END-123/ })).toBeVisible();
-  await shot(page, "issues-down");
+  await still(page, "issues-down");
 });
 
 test("an issue reads in full, with its agent's question", async ({ page }) => {
@@ -140,7 +140,7 @@ test("an issue reads in full, with its agent's question", async ({ page }) => {
   await expect(text.locator("strong")).toHaveText("straight back");
   await expect(text.locator("li")).toHaveCount(2);
   await expect(page.getByRole("region", { name: "Comments" })).toContainText("Seen on Safari too.");
-  await shot(page, "issue-waiting");
+  await still(page, "issue-waiting");
 
   await page.getByRole("link", { name: "Open tree 17" }).click();
   await expect(page).toHaveURL(/\/trees\/17$/);
@@ -153,13 +153,13 @@ test("a ready issue says why, and picking it up lands on its tree", async ({ pag
   await page.goto("/issues/END-141");
   await expect(page.getByRole("region", { name: "Ready" })).toHaveText("Ready. END-127 is done, so nothing blocks this.");
   await expect(page.getByRole("region", { name: "Links" })).toContainText("blocked by");
-  await shot(page, "issue-ready");
+  await still(page, "issue-ready");
 
   // A refusal stays on the sheet and says why.
   api.refuse = (path) => (path.endsWith("/pick") ? "no free tree" : null);
   await page.getByRole("button", { name: "Pick up" }).click();
   await page.getByLabel("Base").selectOption("feature/billing");
-  await shot(page, "issue-pick-up");
+  await still(page, "issue-pick-up");
   await page.getByRole("dialog").getByRole("button", { name: "Pick up" }).click();
   await expect(page.getByRole("alert")).toHaveText("no free tree");
 
@@ -186,7 +186,7 @@ test("status, assignee and labels change, say what they sent, and the list shows
   await page.getByRole("region", { name: "Todo" }).getByRole("link", { name: /END-141/ }).click();
 
   await page.getByRole("button", { name: "Status: Todo" }).click();
-  await shot(page, "issue-status");
+  await still(page, "issue-status");
   await page.getByRole("dialog").getByRole("button", { name: "In Review" }).click();
   await expect(page.getByRole("button", { name: "Status: In Review" })).toBeVisible();
   await expect.poll(() => api.posts.at(-1)).toEqual({ path: "/END-141", source: "work", body: { state_id: "s-review" } });
@@ -204,7 +204,7 @@ test("status, assignee and labels change, say what they sent, and the list shows
   await sheet.getByRole("button", { name: "Bug" }).click();
   await sheet.getByRole("button", { name: "Billing" }).click();
   await sheet.getByRole("button", { name: "Auth" }).click();
-  await shot(page, "issue-labels");
+  await still(page, "issue-labels");
   await sheet.getByRole("button", { name: "Apply" }).click();
   await expect(page.getByRole("button", { name: "Labels: Bug, Auth" })).toBeVisible();
   await expect.poll(() => api.posts.at(-1)?.body).toEqual({ label_ids: ["l-bug", "l-auth"] });
@@ -222,7 +222,7 @@ test("a change shows at once, and goes back saying why if Linear refuses it", as
   answer();
   await expect(page.getByRole("alert")).toHaveText("The status did not change: Linear said no.");
   await expect(page.getByRole("button", { name: "Status: Todo" })).toBeVisible();
-  await shot(page, "issue-refused");
+  await still(page, "issue-refused");
 });
 
 test("a comment is added to the issue", async ({ page }) => {
@@ -230,7 +230,7 @@ test("a comment is added to the issue", async ({ page }) => {
   await page.goto("/issues/END-141");
   await page.getByRole("button", { name: "Comment", exact: true }).click();
   await page.getByLabel("On END-141, in Markdown").fill("A plain preview it is.");
-  await shot(page, "issue-comment");
+  await still(page, "issue-comment");
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.getByRole("region", { name: "Comments" })).toContainText("A plain preview it is.");
   expect(api.posts.at(-1)).toEqual({ path: "/END-141/comment", source: "work", body: { body: "A plain preview it is." } });
@@ -253,7 +253,7 @@ test("a new issue is written in one form and opens once made", async ({ page }) 
   await page.getByRole("dialog").getByRole("button", { name: "Billing" }).click();
   await page.getByRole("dialog").getByRole("button", { name: "Done" }).click();
   await page.getByLabel("Description").fill("Customers only find out from the billing page.");
-  await shot(page, "issue-new");
+  await still(page, "issue-new");
   await page.getByRole("button", { name: "Create issue" }).click();
   await expect(page).toHaveURL(/\/issues\/END-161$/);
   await expect(page.getByRole("heading", { name: "Email a receipt when a payment fails" })).toBeVisible();
@@ -302,5 +302,5 @@ test("a source that cannot change its issues offers only what it can do", async 
   await expect(page.getByRole("link", { name: "Edit the issue" })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Comment", exact: true })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Pick up" })).toBeVisible();
-  await shot(page, "issue-read-only");
+  await still(page, "issue-read-only");
 });
