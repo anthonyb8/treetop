@@ -229,6 +229,21 @@ pub fn share(share: &[String], port: u16) -> Result<String, String> {
     run(&program, &args, GRACE)
 }
 
+/// Publishes `port` to the internet with `publish`, the configured
+/// command, and returns its public address, or why there is none, once the
+/// command has answered.
+pub fn publish_now(publish: &[String], port: u16) -> Result<String, String> {
+    let (program, args) = command(publish, DEFAULT_PUBLISH, port);
+    run(&program, &args, GRACE)
+}
+
+/// Takes `port` off the phone and the internet both with `unpublish`, the
+/// configured command, once it has finished.
+pub fn unshare_now(unpublish: &[String], port: u16) -> Result<(), String> {
+    let (program, args) = command(unpublish, DEFAULT_UNPUBLISH, port);
+    stop(&program, &args, GRACE)
+}
+
 /// The program and arguments that act on `port`: the configured words, or
 /// `default` where there are none, with each `{port}` replaced, else the
 /// port added last.

@@ -146,6 +146,16 @@ impl Pool {
             .send(());
     }
 
+    /// Notes how far `port` is shared, None for not at all, as a tap has just
+    /// changed it, so the next page shows it before the shares are read again.
+    pub fn set_share(&self, port: u16, share: Option<crate::phone::Shared>) {
+        let mut app = self.app.lock().unwrap_or_else(PoisonError::into_inner);
+        match share {
+            Some(share) => app.shares.insert(port, share),
+            None => app.shares.remove(&port),
+        };
+    }
+
     /// A tree of this pool, or its main checkout, listens on `port`.
     pub fn serves(&self, port: u16) -> bool {
         let app = self.app.lock().unwrap_or_else(PoisonError::into_inner);
@@ -282,6 +292,10 @@ pub struct State {
     push: Option<Arc<push::Push>>,
     /// The command a port is shared with, as `p` runs it.
     share: Vec<String>,
+    /// The command a port is put on the internet with, as `P` runs it.
+    publish: Vec<String>,
+    /// The command a port is taken off again with, as `x` runs it.
+    unpublish: Vec<String>,
 }
 
 impl State {
@@ -292,6 +306,8 @@ impl State {
             pools: Mutex::new(HashMap::new()),
             push: None,
             share: Vec::new(),
+            publish: Vec::new(),
+            unpublish: Vec::new(),
         }
     }
 
@@ -436,6 +452,8 @@ pub fn run(args: &[String], checkout: PathBuf) -> Result<()> {
         None => eprintln!("treetop serve: no pushes: no config directory"),
     }
     state.share.clone_from(&config.share);
+    state.publish.clone_from(&config.publish);
+    state.unpublish.clone_from(&config.unpublish);
     let state = Arc::new(state);
     // The default pool starts listing now, so the first page is not the
     // one that waits for it.
@@ -701,14 +719,16 @@ pub fn route(state: &State, asked: &Asked) -> Reply {
             if !is_same_site(asked) {
                 return Reply::error(403, "only treetop's own page can act");
             }
-            let port = path["/api/ports/".len()..]
-                .strip_suffix("/share")
-                .and_then(|port| port.parse().ok());
-            let Some(port) = port else {
-                return Reply::error(404, "no such call");
-            };
-            let pool = state.pool(asked.query.get("workspace").map(String::as_str));
-            actions::share_port(&pool, &state.share, port)
+            let call = path["/api/ports/".len()..]
+                .split_once('/')
+                .and_then(|(port, call)| Some((port.parse::<u16>().ok()?, call)));
+            let pool = || state.pool(asked.query.get("workspace").map(String::as_str));
+            match call {
+                Some((port, "share")) => actions::share_port(&pool(), &state.share, port),
+                Some((port, "publish")) => actions::publish_port(&pool(), &state.publish, port),
+                Some((port, "unshare")) => actions::unshare_port(&pool(), &state.unpublish, port),
+                _ => Reply::error(404, "no such call"),
+            }
         }
         (method, path) if path == "/api/issues" || path.starts_with("/api/issues/") => {
             if *method != Method::Get && !is_same_site(asked) {
@@ -1126,7 +1146,12 @@ mod tests {
     #[test]
     fn another_site_cannot_share_a_port_or_park_a_tree() {
         let state = State::new("me".into(), PathBuf::from("/nowhere"));
-        for path in ["/api/ports/5173/share", "/api/trees/17/park"] {
+        for path in [
+            "/api/ports/5173/share",
+            "/api/ports/5173/publish",
+            "/api/ports/5173/unshare",
+            "/api/trees/17/park",
+        ] {
             for origin in [None, Some("https://evil.example")] {
                 let reply = route(
                     &state,

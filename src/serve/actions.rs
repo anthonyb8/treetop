@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::jobs::{self, Job, Kind, Launch};
-use crate::phone;
+use crate::phone::{self, Shared};
 use crate::pool::{Tree, stand_in};
 use crate::sidecar::{self, Sidecar};
 
@@ -225,6 +225,45 @@ pub fn share_port(pool: &Pool, share: &[String], port: u16) -> Reply {
     }
 }
 
+/// Puts a port one of the pool's trees serves on the internet, as `P` does,
+/// and says its public address, to copy or send. Only those, as with
+/// sharing: nothing else listening on the server goes public from a tap.
+pub fn publish_port(pool: &Pool, publish: &[String], port: u16) -> Reply {
+    if !pool.serves(port) {
+        return Reply::error(404, &format!("no tree in {} serves port {port}", pool.name));
+    }
+    match phone::publish_now(publish, port) {
+        Ok(url) => {
+            pool.set_share(
+                port,
+                Some(Shared {
+                    port,
+                    is_public: true,
+                    address: url.clone(),
+                }),
+            );
+            Reply::json(200, &json!({ "url": url }))
+        }
+        Err(why) => Reply::error(502, &why),
+    }
+}
+
+/// Takes a port one of the pool's trees serves off the internet and the
+/// tailnet, as `x` does in `P`'s popup. Only those, so a tap cannot take
+/// treetop serve's own port off the tailnet and the phone with it.
+pub fn unshare_port(pool: &Pool, unpublish: &[String], port: u16) -> Reply {
+    if !pool.serves(port) {
+        return Reply::error(404, &format!("no tree in {} serves port {port}", pool.name));
+    }
+    match phone::unshare_now(unpublish, port) {
+        Ok(()) => {
+            pool.set_share(port, None);
+            Reply::json(200, &json!({}))
+        }
+        Err(why) => Reply::error(502, &why),
+    }
+}
+
 /// The last line a job wrote, which says why it failed; `otherwise` when it
 /// wrote none.
 fn last_line(output: &str, otherwise: &str) -> String {
@@ -258,6 +297,63 @@ mod tests {
             name: name.into(),
             ports: Vec::new(),
         }
+    }
+
+    /// A tap puts a port a tree serves on the internet, the Tree screen shows
+    /// it public at once, and a second takes it down; a port no tree serves
+    /// never reaches the command.
+    #[test]
+    fn a_port_a_tree_serves_goes_public_and_comes_down_again() {
+        let mut app = app_of_trees();
+        let tree17 = app.trees.iter_mut().find(|t| t.name == "17").unwrap();
+        tree17.processes = vec![Process {
+            pid: 42,
+            name: "vite".into(),
+            ports: vec![5173],
+        }];
+        let pool = Pool {
+            name: "app".into(),
+            checkout: PathBuf::from("/nowhere"),
+            kick: Mutex::new(std::sync::mpsc::channel().0),
+            push: None,
+            seen: Mutex::default(),
+            ready: Mutex::default(),
+            app: Mutex::new(app),
+        };
+        let sh = |script: &str| vec!["sh".to_string(), "-c".into(), script.into()];
+        let public = |pool: &Pool| {
+            let app = pool.app.lock().unwrap();
+            let tree = app.trees.iter().find(|t| t.name == "17").unwrap();
+            crate::serve::tree::tree_json(&app, tree, 0)["ports"][0]["public"].clone()
+        };
+        let body = |reply: &Reply| serde_json::from_slice::<Value>(&reply.body).unwrap();
+
+        let reply = publish_port(
+            &pool,
+            &sh("echo 'Available on the internet:'; echo https://box.ts.net/"),
+            5173,
+        );
+        assert_eq!(
+            (reply.status, body(&reply)["url"].as_str()),
+            (200, Some("https://box.ts.net/"))
+        );
+        assert_eq!(public(&pool), "https://box.ts.net/");
+
+        let reply = unshare_port(&pool, &sh("exit 0"), 5173);
+        assert_eq!(reply.status, 200);
+        assert_eq!(public(&pool), Value::Null);
+
+        let reply = publish_port(&pool, &sh("echo 'Funnel is not enabled' >&2; exit 1"), 5173);
+        assert_eq!(reply.status, 502);
+        assert_eq!(body(&reply)["error"], "sh failed: Funnel is not enabled");
+        assert_eq!(public(&pool), Value::Null);
+
+        let mark = std::env::temp_dir().join(format!("treetop-published-{}", std::process::id()));
+        let _ = fs::remove_file(&mark);
+        let touch = vec!["touch".to_string(), mark.display().to_string()];
+        assert_eq!(publish_port(&pool, &touch, 7777).status, 404);
+        assert_eq!(unshare_port(&pool, &touch, 7777).status, 404);
+        assert!(!mark.exists(), "no command ran for a port no tree serves");
     }
 
     /// ANB-29. The source is one no config has, so that a pick that gets as

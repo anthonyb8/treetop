@@ -726,6 +726,11 @@ A port is a button wherever it shows: on a tree's card, beside the main checkout
 A tap shares it as `p` does, with the `share` the config names, and opens it; where the phone holds that window back, a link to it stays at the foot of the screen to tap instead, as does why, if it could not be shared.
 Only a port one of the pool's trees is serving can be shared this way, and it stays shared until `tether unshare <port>`.
 
+On the tree's screen, `Public link` beside a port puts it on the internet as `P` does, with the `publish` the config names, for sending to someone off the tailnet.
+The link is copied as it arrives, and the foot of the screen shows it with `Share`, which opens the phone's share sheet to text or post it, and `Stop`, which takes it down with the `unpublish` the config names.
+A public port's button reads `Public`, in green, and a tap opens the share sheet with its link straight away.
+Only a port one of the pool's trees is serving can go public, as with sharing.
+
 Swipe a card left and let go to park the tree, as `z` does, or swipe a parked card to bring it back; a short swipe springs back.
 Park and Unpark are also at the top of the tree's screen.
 
