@@ -46,6 +46,8 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | `n` | start a new agent in the tree under the cursor: a free one is leased for it, on a branch named for the task, and a held one keeps its branch; on the main checkout's heading, start one in the main checkout, for work that needs no tree |
 | `N` | start a new agent in a fresh tree, on a branch named for the task (see [New agents](#new-agents)) |
 | `m` | write a message to the agents in the marked trees, or the tree under the cursor |
+| `e` | give the inbox the keys: `j`/`k` move, Enter opens the entry, `x` dismisses it, Esc gives the keys back to the list (see [The inbox](#the-inbox)) |
+| `E` | hide the inbox, giving the list its width back, or show it again |
 | `:` | ask the assistant about the tree under the cursor, or write `@17 ...` for that tree's agent (see [The assistant](#the-assistant)) |
 | `a` | open the assistant's chat, where it answers, starting it if there is none |
 | `d` | open the side-by-side diff of the tree under the cursor in a popup |
@@ -562,6 +564,24 @@ Opening treetop, or coming back to a workspace, opens only what is waiting there
 What you have seen is kept per workspace under `$XDG_STATE_HOME/treetop` (else `~/.local/state/treetop`), so neither a switch nor a restart opens it again.
 
 When an agent comes to need you, or finishes, treetop rings the terminal bell, and inside tmux shows it in the status line for five seconds, so it is heard from any window; the assistant finishing an answer rings it too.
+
+### The inbox
+
+Down the right of the list, the inbox names each tree that wants you, from this workspace and the others: an agent that needs you, died or finished, and a PR whose checks failed or that merged, the same things the phone is pushed.
+Each entry says its tree, its ticket and branch, how long ago it happened and, on its second line, what it is about, such as the agent's question.
+Another workspace's entry starts with that workspace's name; those are its background agents, placed in their trees by the workspace's last listing.
+What needs you comes first, then what failed, then what is done, newest first in each.
+
+Enter on an entry, or a click on it, opens it as Enter on its tree's row does: the agent's chat, with its question at the bottom.
+A PR's entry puts the cursor on its tree instead, with its checks in the detail pane, where `f` sends a failure to its agent.
+Another workspace's entry switches to it first, then opens the agent there.
+An opened entry dims and sinks under SEEN, and so does an ask whose chat opened for you; `x` dismisses an entry until it changes, such as the agent asking something new.
+What you opened and dismissed is kept in `inbox.json` under `$XDG_STATE_HOME/treetop` (else `~/.local/state/treetop`), so a restart or a switch keeps it.
+
+The inbox is beside the list from 180 columns, which leaves the list room for its branches and agents.
+On a narrower terminal a strip of counts stands in, `●` for what needs you, `✗` for what failed and `✓` for what is done, and `e` opens the inbox over the list until Esc.
+While the inbox is shown, treetop takes the mouse over the list so a click reaches it; most terminals still select text with Shift held.
+`E` hides it, and the mouse with it, until `E` again.
 
 ### The detail pane
 

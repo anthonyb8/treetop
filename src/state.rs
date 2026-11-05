@@ -4,7 +4,7 @@
 //! be read counts as empty, and one that cannot be written is skipped: losing
 //! it only means an ask may open once more.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -23,22 +23,24 @@ pub fn asked_file(checkout: &Path) -> Option<PathBuf> {
     Some(dir()?.join(format!("asked-{}.json", crate::cache::key(checkout))))
 }
 
-pub fn read_asked(file: &Path) -> BTreeSet<String> {
+/// What `file` holds, else the empty value: the seen asks, or the inbox's
+/// marks.
+pub fn read<T: serde::de::DeserializeOwned + Default>(file: &Path) -> T {
     fs::read_to_string(file)
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_default()
 }
 
-/// Written through a temporary file and a rename, so a reader never sees half
-/// of it.
-pub fn write_asked(file: &Path, asked: &BTreeSet<String>) {
+/// Writes `value` to `file` through a temporary file and a rename, so a reader
+/// never sees half of it.
+pub fn write<T: serde::Serialize>(file: &Path, value: &T) {
     let write = || -> std::io::Result<()> {
         if let Some(parent) = file.parent() {
             fs::create_dir_all(parent)?;
         }
         let partial = file.with_extension("json.partial");
-        fs::write(&partial, serde_json::to_string(asked)?)?;
+        fs::write(&partial, serde_json::to_string(value)?)?;
         fs::rename(partial, file)
     };
     let _ = write();

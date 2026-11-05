@@ -26,9 +26,8 @@ use ring::{aead, agreement, hkdf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::agents::Status;
 use crate::app::App;
-use crate::reports::State;
+use crate::inbox::{Kind, Said, pr_kind, said};
 use crate::ship::Stage;
 
 use super::pool::title;
@@ -364,15 +363,6 @@ pub struct Seen {
     trees: HashMap<String, (Option<Said>, Option<Stage>)>,
 }
 
-/// An agent's state as far as pushes go.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Said {
-    NeedsYou,
-    Done,
-    Died,
-    Other,
-}
-
 impl Seen {
     pub fn of(app: &App) -> Seen {
         let trees = app
@@ -380,17 +370,7 @@ impl Seen {
             .iter()
             .filter(|t| t.is_held() && !t.is_main)
             .map(|tree| {
-                let waiting = tree.agents.iter().any(|a| {
-                    a.status == Some(Status::Waiting) && !crate::assistant::is_assistant(&a.name)
-                });
-                let said = match app.says(tree).map(|i| i.state) {
-                    Some(State::Blocked) => Some(Said::NeedsYou),
-                    _ if waiting => Some(Said::NeedsYou),
-                    Some(State::Done) => Some(Said::Done),
-                    Some(State::Failed) => Some(Said::Died),
-                    Some(_) => Some(Said::Other),
-                    None => None,
-                };
+                let said = said(app, tree);
                 (
                     tree.name.clone(),
                     (said, tree.ship.as_ref().map(|s| s.stage)),
@@ -438,9 +418,9 @@ impl Seen {
                 }
             }
             if stage != was_stage {
-                let what = match stage {
-                    Some(Stage::CiFailed | Stage::Failed) => Some("Its PR's checks failed"),
-                    Some(Stage::Merged) => Some("Its PR merged"),
+                let what = match stage.and_then(pr_kind) {
+                    Some(Kind::Failed) => Some("Its PR's checks failed"),
+                    Some(Kind::Merged) => Some("Its PR merged"),
                     _ => None,
                 };
                 if let Some(what) = what {
@@ -460,8 +440,8 @@ impl Seen {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents::{Agent, Source};
-    use crate::reports::Report;
+    use crate::agents::{Agent, Source, Status};
+    use crate::reports::{Report, State};
     use crate::serve::pool::tests::tree;
     use crate::ship::Ship;
     use std::path::PathBuf;

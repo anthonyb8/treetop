@@ -17,14 +17,15 @@ use ratatui::widgets::{
 
 use crate::agents::{Agent, Status};
 use crate::app::{
-    App, DiffView, Group, Item, JobState, ListRow, LogEntry, Opening, Pending, Phone, Picker,
-    PortMenu, Reach, Review, SCRATCH, ScratchMenu, Shipping,
+    App, DiffView, Group, Item, JobState, ListRow, LogEntry, Opening, Outcome, Pending, Phone,
+    Picker, PortMenu, Reach, Review, SCRATCH, ScratchMenu, Shipping,
 };
 use crate::assistant;
 use crate::chat::Chat;
 use crate::diff::{Change, FileDiff, Layout as DiffLayout, Row as DiffRow, Side, ViewRow};
 use crate::dispatch::{Prompt, Purpose, Target};
 use crate::guard;
+use crate::inbox::{self, Entry, Kind};
 use crate::phone::QUIET_ZONE;
 use crate::plugin::{Context, Spend, Usage};
 use crate::pool::{Tree, Work};
@@ -35,9 +36,10 @@ use crate::theme::theme;
 
 /// The bar's keys, most useful first: on a narrow bar the keys at the end
 /// are the ones left out, and `?` lists them all.
-const KEYS: [(&str, &str); 13] = [
+const KEYS: [(&str, &str); 14] = [
     ("Enter", "open"),
     ("?", "help"),
+    ("e", "inbox"),
     ("n", "new here"),
     ("N", "new tree"),
     ("m", "message"),
@@ -68,6 +70,7 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
             ("a", "assistant's chat"),
             ("R", "resume agent"),
             ("h", "hand off work"),
+            ("e E", "inbox, hide it"),
         ],
     ),
     (
@@ -178,12 +181,19 @@ pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>, issues: Option<&i
         None => {
             let [main, footer] =
                 Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
+            let inbox = inbox_layout(app, main);
             let [body, detail] =
                 Layout::vertical([Constraint::Fill(1), Constraint::Length(DETAIL_HEIGHT)])
-                    .areas(main);
+                    .areas(inbox.list);
             draw_table(frame, app, body);
             draw_detail(frame, app, detail);
             draw_footer(frame, app, footer);
+            if let Some(area) = inbox.strip {
+                draw_inbox_strip(frame, app, area);
+            }
+            if let Some(area) = inbox.rail {
+                draw_inbox(frame, app, area);
+            }
         }
     }
     if chat.is_some()
@@ -1015,6 +1025,292 @@ fn state_style(state: State) -> (&'static str, Style) {
         State::Stopped => ("■", fg(t.muted)),
         State::Failed => ("✗", fg(t.danger)),
     }
+}
+
+/// Columns the inbox takes beside the list, its border included.
+const INBOX_WIDTH: u16 = 38;
+
+/// The narrowest terminal the inbox sits beside the list in full: the
+/// list's fixed columns take about a hundred, so this leaves BRANCH and
+/// AGENT room to read. Below it, a strip of counts stands in, and the
+/// inbox opens over the list while it has the keys.
+const INBOX_FULL_FROM: u16 = 180;
+
+/// Columns the strip of counts takes, its border included.
+const STRIP_WIDTH: u16 = 5;
+
+/// Where the list and the inbox go in `main`, the screen above the bar.
+struct InboxLayout {
+    list: Rect,
+    /// The inbox in full, beside the list or over it.
+    rail: Option<Rect>,
+    /// The strip of counts standing in for it on a narrow terminal.
+    strip: Option<Rect>,
+}
+
+fn inbox_layout(app: &App, main: Rect) -> InboxLayout {
+    let is_wide = main.width >= INBOX_FULL_FROM;
+    let beside = match (app.inbox.is_hidden, is_wide) {
+        (true, _) => 0,
+        (false, true) => INBOX_WIDTH,
+        (false, false) => STRIP_WIDTH,
+    };
+    let [list, side] =
+        Layout::horizontal([Constraint::Fill(1), Constraint::Length(beside)]).areas(main);
+    let side = (beside > 0).then_some(side);
+    if beside == INBOX_WIDTH {
+        return InboxLayout {
+            list,
+            rail: side,
+            strip: None,
+        };
+    }
+    // Narrow or hidden, it opens over the list's right side while it has
+    // the keys.
+    let over = app.rail.map(|_| {
+        let width = INBOX_WIDTH.min(main.width);
+        Rect {
+            x: main.right() - width,
+            width,
+            ..main
+        }
+    });
+    InboxLayout {
+        list,
+        rail: over,
+        strip: side,
+    }
+}
+
+/// What a click on the list's screen does: on an inbox entry, opens it; on
+/// the strip, gives the inbox the keys. None for anywhere else.
+pub fn click(
+    app: &mut App,
+    screen: Rect,
+    mouse: ratatui::crossterm::event::MouseEvent,
+) -> Option<Outcome> {
+    use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+    if mouse.kind != MouseEventKind::Down(MouseButton::Left) || !app.wants_mouse() {
+        return None;
+    }
+    let [main, _] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(screen);
+    let layout = inbox_layout(app, main);
+    let at = Position::new(mouse.column, mouse.row);
+    if let Some(rail) = layout.rail.filter(|r| r.contains(at)) {
+        let [_, body, _] = inbox_areas(app, rail);
+        let row = usize::from(at.y.checked_sub(body.y)?);
+        let index = inbox_lines(app, body).get(row)?.1?;
+        return Some(app.open_entry(index));
+    }
+    if layout.strip.is_some_and(|s| s.contains(at)) {
+        app.rail = Some(0);
+        return Some(Outcome::Continue);
+    }
+    // A click on the list while the inbox has the keys gives them back.
+    app.rail.take().map(|_| Outcome::Continue)
+}
+
+/// The inbox's title, entries and keys, inside its border, the same for
+/// drawing it as for finding the entry a click lands on.
+fn inbox_areas(app: &App, area: Rect) -> [Rect; 3] {
+    Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Fill(1),
+        Constraint::Length(1),
+    ])
+    .areas(inbox_block(app).inner(area))
+}
+
+fn inbox_block(app: &App) -> Block<'static> {
+    let t = theme();
+    let border = if app.rail.is_some() {
+        t.accent
+    } else {
+        t.border
+    };
+    Block::new()
+        .borders(Borders::LEFT)
+        .border_style(fg(border))
+        .padding(Padding::horizontal(1))
+}
+
+/// The mark an entry's kind goes by, as the AGENT column draws its
+/// agent's.
+fn entry_mark(kind: Kind) -> (&'static str, Style) {
+    let t = theme();
+    match kind {
+        Kind::NeedsYou => ("●", fg(t.warning).add_modifier(Modifier::BOLD)),
+        Kind::Failed | Kind::Died => ("✗", fg(t.danger)),
+        Kind::Done => ("✓", fg(t.success)),
+        Kind::Merged => ("✓", fg(t.special)),
+    }
+}
+
+/// `text` cut to `width` columns, with an ellipsis where it was cut.
+fn fit(text: &str, width: usize) -> String {
+    if Line::raw(text).width() <= width {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let w = Span::raw(c.encode_utf8(&mut [0; 4]).to_string()).width();
+        if used + w + 1 > width {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
+/// An entry's two lines: its mark, workspace, tree and title with its age
+/// at the right, then what it is about.
+fn entry_lines(entry: &Entry, width: usize, style: Style) -> [Line<'static>; 2] {
+    let t = theme();
+    let (mark, mark_style) = entry_mark(entry.kind);
+    let age = entry.at.map(reports::age).unwrap_or_default();
+    let mut head = vec![Span::styled(mark, mark_style), Span::raw(" ")];
+    if let Some(away) = &entry.away {
+        head.push(Span::styled(format!("{} ", away.name), fg(t.info)));
+    }
+    head.push(Span::styled(
+        entry.tree.clone(),
+        Style::new().add_modifier(Modifier::BOLD),
+    ));
+    let used = Line::from(head.clone()).width() + 1;
+    let room = width.saturating_sub(used + age.len() + 1);
+    let title = fit(entry.title.as_deref().unwrap_or(""), room);
+    head.push(Span::raw(format!(" {title}")));
+    let pad = width.saturating_sub(Line::from(head.clone()).width() + age.len());
+    head.push(Span::raw(" ".repeat(pad)));
+    head.push(Span::styled(age, fg(t.muted)));
+    let what = Line::styled(
+        format!("  {}", fit(&entry.what, width.saturating_sub(2))),
+        fg(t.muted),
+    );
+    [Line::from(head).style(style), what.patch_style(style)]
+}
+
+/// The inbox's lines for `inner`, each with the entry it belongs to:
+/// headings, then each entry's two lines, scrolled so the cursor's entry
+/// shows.
+fn inbox_lines(app: &App, inner: Rect) -> Vec<(Line<'static>, Option<usize>)> {
+    let t = theme();
+    let width = usize::from(inner.width);
+    let shown = inbox::shown(app);
+    if shown.is_empty() {
+        return vec![(Line::styled("Nothing needs you.", fg(t.muted)), None)];
+    }
+    let mut lines = Vec::new();
+    let mut heading = None;
+    for (index, (entry, is_seen)) in shown.iter().enumerate() {
+        let this = if *is_seen {
+            "SEEN"
+        } else {
+            entry.kind.heading()
+        };
+        if heading != Some(this) {
+            if heading.is_some() {
+                lines.push((Line::raw(""), None));
+            }
+            lines.push((
+                Line::styled(this, fg(t.muted).add_modifier(Modifier::BOLD)),
+                None,
+            ));
+            heading = Some(this);
+        }
+        let mut style = Style::new();
+        if *is_seen {
+            style = style.add_modifier(Modifier::DIM);
+        }
+        if app.rail == Some(index) {
+            style = t.cursor;
+        }
+        for line in entry_lines(entry, width, style) {
+            lines.push((line, Some(index)));
+        }
+    }
+    let height = usize::from(inner.height);
+    let last = app
+        .rail
+        .and_then(|at| lines.iter().rposition(|(_, i)| *i == Some(at)))
+        .unwrap_or(0);
+    let skip = (last + 1).saturating_sub(height);
+    lines.into_iter().skip(skip).take(height).collect()
+}
+
+/// The inbox in full: what needs you first, with the keys at the foot
+/// while it has them.
+fn draw_inbox(frame: &mut Frame, app: &App, area: Rect) {
+    let t = theme();
+    frame.render_widget(Clear, area);
+    frame.render_widget(inbox_block(app), area);
+    let [title, body, foot] = inbox_areas(app, area);
+    let waiting = inbox::shown(app)
+        .iter()
+        .filter(|(e, seen)| !seen && e.kind == Kind::NeedsYou)
+        .count();
+    let count = if waiting > 0 {
+        Span::styled(
+            format!("{waiting} need you"),
+            fg(t.warning).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::raw("")
+    };
+    let name = Span::styled("INBOX", fg(t.title).add_modifier(Modifier::BOLD));
+    let pad = usize::from(title.width).saturating_sub(5 + count.width());
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![name, Span::raw(" ".repeat(pad)), count])),
+        title,
+    );
+    let lines: Vec<Line> = inbox_lines(app, body).into_iter().map(|(l, _)| l).collect();
+    frame.render_widget(Paragraph::new(lines), body);
+    let keys = if app.rail.is_some() {
+        "Enter open  x dismiss  Esc back"
+    } else {
+        "e inbox  E hide"
+    };
+    frame.render_widget(Paragraph::new(Line::styled(keys, fg(t.muted))), foot);
+}
+
+/// The inbox folded to its counts: unseen entries needing you, failed and
+/// done, for a terminal too narrow for it in full.
+fn draw_inbox_strip(frame: &mut Frame, app: &App, area: Rect) {
+    let t = theme();
+    let block = Block::new()
+        .borders(Borders::LEFT)
+        .border_style(fg(t.border));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let unseen: Vec<Kind> = inbox::shown(app)
+        .into_iter()
+        .filter(|(_, seen)| !seen)
+        .map(|(e, _)| e.kind)
+        .collect();
+    let count = |kinds: &[Kind]| unseen.iter().filter(|k| kinds.contains(k)).count();
+    let mut lines = vec![Line::raw("")];
+    for (kinds, mark, style) in [
+        (
+            &[Kind::NeedsYou][..],
+            "●",
+            fg(t.warning).add_modifier(Modifier::BOLD),
+        ),
+        (&[Kind::Failed, Kind::Died][..], "✗", fg(t.danger)),
+        (&[Kind::Done, Kind::Merged][..], "✓", fg(t.success)),
+    ] {
+        let n = count(kinds);
+        let style = if n == 0 { fg(t.muted) } else { style };
+        lines.push(Line::styled(format!("{mark}{n}"), style));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled("e", fg(t.muted)));
+    frame.render_widget(
+        Paragraph::new(lines).alignment(ratatui::layout::Alignment::Center),
+        inner,
+    );
 }
 
 /// Rows the detail pane takes, borders included.
@@ -3114,5 +3410,86 @@ mod sidebar_tests {
         app.pending.as_mut().unwrap().runs.clear();
         let shown = screen(&app, 120, 30).join("\n");
         assert!(!shown.contains("keel run"), "{shown}");
+    }
+}
+
+#[cfg(test)]
+mod inbox_tests {
+    use super::*;
+    use crate::inbox::tests::app;
+    use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+    fn screen(app: &App, width: u16, height: u16) -> Vec<String> {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app, None, None)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    /// Clicks where `text` is drawn on screen.
+    fn click_on(app: &mut App, width: u16, height: u16, text: &str) -> Option<Outcome> {
+        let shown = screen(app, width, height);
+        let (row, line) = shown
+            .iter()
+            .enumerate()
+            .find(|(_, l)| l.contains(text))
+            .unwrap_or_else(|| panic!("{text} is not on screen:\n{}", shown.join("\n")));
+        let column = line[..line.find(text).unwrap()].chars().count();
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: u16::try_from(column).unwrap(),
+            row: u16::try_from(row).unwrap(),
+            modifiers: KeyModifiers::NONE,
+        };
+        click(app, Rect::new(0, 0, width, height), mouse)
+    }
+
+    #[test]
+    fn a_click_opens_the_entry_drawn_under_it() {
+        let mut app = app();
+        assert_eq!(
+            click_on(&mut app, 200, 30, "endodeals-web 12"),
+            Some(Outcome::SwitchTo {
+                checkout: "/code/endodeals-web".into(),
+                tree: "/other/12/web".into(),
+            })
+        );
+        let mut app = self::app();
+        assert!(matches!(
+            click_on(&mut app, 200, 30, "Where should the inbox sit?"),
+            Some(Outcome::Chat { tree, .. }) if tree == "4"
+        ));
+    }
+
+    #[test]
+    fn a_narrow_terminal_shows_counts_and_a_click_on_them_opens_the_inbox_over_the_list() {
+        let mut app = app();
+        let shown = screen(&app, 120, 30).join("\n");
+        assert!(!shown.contains("INBOX"), "{shown}");
+        for count in ["●2", "✗2", "✓1"] {
+            assert!(shown.contains(count), "{count} in\n{shown}");
+        }
+        assert_eq!(click_on(&mut app, 120, 30, "●2"), Some(Outcome::Continue));
+        assert_eq!(app.rail, Some(0));
+        let shown = screen(&app, 120, 30).join("\n");
+        assert!(shown.contains("INBOX"), "{shown}");
+        assert!(shown.contains("Enter open  x dismiss  Esc back"), "{shown}");
+    }
+
+    #[test]
+    fn hiding_the_inbox_gives_the_list_its_width_back() {
+        let mut app = app();
+        let wide = |app: &App| screen(app, 200, 30)[0].trim_end().len();
+        let beside = wide(&app);
+        app.handle_key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Char('E'),
+        ));
+        let shown = screen(&app, 200, 30).join("\n");
+        assert!(!shown.contains("INBOX"), "{shown}");
+        assert!(!shown.contains("●2"), "no strip either:\n{shown}");
+        assert!(wide(&app) < beside, "the list's own header ends the line");
     }
 }
