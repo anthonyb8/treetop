@@ -165,7 +165,7 @@ fn cached_listing(checkout: &Path) -> Result<Vec<Tree>> {
 }
 
 /// Fills in each tree's processes and agents.
-fn read_agents(trees: &mut [Tree]) {
+pub fn read_agents(trees: &mut [Tree]) {
     let processes = live::processes(trees);
     let sidecars = sidecar::read_all(trees);
     let mut agents = agents::find(trees, &processes, &sidecars);
@@ -178,7 +178,7 @@ fn read_agents(trees: &mut [Tree]) {
 
 /// Fills in where each held tree's PR stands, as the repository's ship
 /// plugins say; a plugin that cannot say leaves it out.
-fn read_ship(checkout: &Path, trees: &mut [Tree]) {
+pub fn read_ship(checkout: &Path, trees: &mut [Tree]) {
     let (plugins, _) = ship::plugins(checkout);
     let Ok(ship::Answer { mut ships, .. }) = ship::status(&plugins, checkout, &ship::asked(trees))
     else {

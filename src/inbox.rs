@@ -1,23 +1,26 @@
 //! The inbox down the right of the list: each tree whose agent needs you,
-//! died or finished, and each whose PR failed its checks or merged, with
-//! the agents of other workspaces whose reports place them in one of their
-//! trees. It is a view of how things stand now, not a log of what happened,
-//! so an agent already waiting when treetop opens is in it.
+//! died or finished, and each whose PR failed its checks or merged, from
+//! this workspace and the others. Another workspace's background agents are
+//! placed in its trees by their reports, and its PRs and its agents waiting
+//! in a pane come from a slower read of its pool. It is a view of how things
+//! stand now, not a log of what happened, so an agent already waiting when
+//! treetop opens is in it.
 //!
 //! What counts is decided here for the phone's pushes too, so the inbox and
 //! the phone never disagree. Which entries you have opened or dismissed is
 //! kept under treetop's state directory, so a restart or a switch keeps them.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::mpsc::{self, Receiver};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::agents::Status;
 use crate::app::App;
 use crate::assistant;
 use crate::pool::Tree;
 use crate::reports::{Report, State};
-use crate::ship::Stage;
+use crate::ship::{Ship, Stage};
 
 /// An agent's state as far as the inbox and pushes go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +131,80 @@ pub struct Pool {
     pub sidecars: std::collections::HashMap<PathBuf, crate::sidecar::Sidecar>,
 }
 
+/// How long another workspace goes between reads of its agents and PRs,
+/// slower than the open workspace's own, since each read runs its ship
+/// plugins.
+const READ_EVERY: Duration = Duration::from_secs(180);
+
+/// A workspace not opened for this long is not read.
+const STALE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Rounds of a reading made off the screen's thread, every so often,
+/// until this is dropped.
+pub struct Reader<T> {
+    pub rounds: Receiver<T>,
+    /// Dropped with the reader, which wakes its thread to stop at once
+    /// rather than after its next wait and read.
+    _stop: mpsc::Sender<()>,
+}
+
+/// Runs `read` now and then every `every`, sending each round, until the
+/// reader it returns is dropped.
+fn spawn_every<T: Send + 'static>(
+    every: Duration,
+    mut read: impl FnMut() -> T + Send + 'static,
+) -> Reader<T> {
+    let (sender, rounds) = mpsc::channel();
+    let (stop, stopped) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        loop {
+            if sender.send(read()).is_err() {
+                return;
+            }
+            // Waits out `every`, unless the reader is dropped first.
+            if let Err(mpsc::RecvTimeoutError::Disconnected) | Ok(()) = stopped.recv_timeout(every)
+            {
+                return;
+            }
+        }
+    });
+    Reader {
+        rounds,
+        _stop: stop,
+    }
+}
+
+/// The workspaces worth reading from the one at `here`: every other one
+/// opened within STALE of `now`, in seconds since the epoch. With only
+/// `here`, none.
+fn due(
+    workspaces: Vec<crate::workspaces::Workspace>,
+    here: &Path,
+    now: u64,
+) -> Vec<crate::workspaces::Workspace> {
+    workspaces
+        .into_iter()
+        .filter(|w| w.checkout != here && now.saturating_sub(w.opened) <= STALE.as_secs())
+        .collect()
+}
+
+/// Reads each other workspace opened within STALE, every READ_EVERY: its
+/// trees with their agents and PRs, by checkout. With no other workspace
+/// due it reads nothing. A switch drops it, which stops it.
+pub fn spawn_reader(here: PathBuf) -> Reader<HashMap<PathBuf, Vec<Tree>>> {
+    spawn_every(READ_EVERY, move || {
+        due(crate::workspaces::list(), &here, secs(SystemTime::now()))
+            .into_iter()
+            .filter_map(|w| {
+                let mut trees = crate::cache::read(&w.checkout)?;
+                crate::cli::read_agents(&mut trees);
+                crate::cli::read_ship(&w.checkout, &mut trees);
+                Some((w.checkout, trees))
+            })
+            .collect()
+    })
+}
+
 /// The other workspaces' pools, from their caches.
 pub fn other_pools(here: &Path) -> Vec<Pool> {
     crate::workspaces::list()
@@ -220,7 +297,7 @@ pub fn entries(app: &App) -> Vec<Entry> {
             && let Some(kind) = pr_kind(ship.stage)
         {
             entries.push(Entry {
-                key: format!("{kind:?}:{}:{}", tree.path.display(), ship.label),
+                key: pr_key(kind, tree, ship),
                 kind,
                 away: None,
                 tree: tree.name.clone(),
@@ -236,9 +313,75 @@ pub fn entries(app: &App) -> Vec<Entry> {
     entries
 }
 
-/// The other workspaces' agents that need you, died or finished, each
-/// placed in the tree its report says it works in.
+/// What a PR entry is remembered by: the commit its PR is on, so a new push
+/// that fails again is new, else its label.
+fn pr_key(kind: Kind, tree: &Tree, ship: &Ship) -> String {
+    let at = ship.head.as_deref().unwrap_or(&ship.label);
+    format!("{kind:?}:{}:{at}", tree.path.display())
+}
+
+/// The other workspaces' entries: their background agents that need you,
+/// died or finished, each placed in the tree its report says it works in;
+/// then, from the last read of each pool, its PRs that failed or merged and
+/// its agents waiting on you that no report speaks for.
 fn away_entries(app: &App) -> Vec<Entry> {
+    let mut entries = reported_away(app);
+    for pool in &app.pools {
+        let Some(live) = app.away_live.get(&pool.away.checkout) else {
+            continue;
+        };
+        for tree in pool.trees.iter().filter(|t| t.is_held() && !t.is_main) {
+            let title = title_of(tree, pool.sidecars.get(&tree.path));
+            let entry = |kind: Kind, key: String, what: String| Entry {
+                key,
+                kind,
+                away: Some(pool.away.clone()),
+                tree: tree.name.clone(),
+                path: tree.path.clone(),
+                title: title.clone(),
+                what,
+                at: None,
+                asking: None,
+            };
+            let read = live.iter().find(|t| t.path == tree.path);
+            if let Some(ship) = read.and_then(|t| t.ship.as_deref())
+                && let Some(kind) = pr_kind(ship.stage)
+            {
+                entries.push(entry(kind, pr_key(kind, tree, ship), ship.label.clone()));
+            }
+            let is_asking = entries
+                .iter()
+                .any(|e| e.kind == Kind::NeedsYou && e.path == tree.path);
+            let waiting = read
+                .into_iter()
+                .flat_map(|t| &t.agents)
+                .find(|a| a.status == Some(Status::Waiting) && !assistant::is_assistant(&a.name));
+            if let Some(agent) = waiting.filter(|_| !is_asking) {
+                let key = format!(
+                    "{:?}:{}:{}@{}",
+                    Kind::NeedsYou,
+                    tree.path.display(),
+                    agent.name,
+                    agent.active_at.unwrap_or(0)
+                );
+                let mut waits = entry(
+                    Kind::NeedsYou,
+                    key,
+                    "waiting at a prompt in its pane".into(),
+                );
+                waits.at = agent
+                    .active_at
+                    .map(|at| UNIX_EPOCH + Duration::from_secs(at));
+                entries.push(waits);
+            }
+        }
+    }
+    entries
+}
+
+/// The other workspaces' background agents that need you, died or
+/// finished, each placed in the tree its report says it works in.
+fn reported_away(app: &App) -> Vec<Entry> {
     app.reports
         .iter()
         .filter(|r| !assistant::is_assistant(&r.name))
@@ -608,12 +751,13 @@ pub mod tests {
             Outcome::SwitchTo {
                 checkout: "/code/endodeals-web".into(),
                 tree: "/other/12/web".into(),
+                kind: Kind::NeedsYou,
             }
         );
 
         // The pool of endodeals-web, as the switch opens it.
         let mut there = App::new(None);
-        there.arriving = Some("/other/12/web".into());
+        there.arriving = Some(("/other/12/web".into(), Kind::NeedsYou));
         there.trees = vec![tree(
             "/other/12/web",
             "12",
@@ -697,6 +841,190 @@ pub mod tests {
             Some(&(Kind::NeedsYou, "4".into(), true))
         );
         let _ = fs::remove_file(&file);
+    }
+
+    /// endodeals-web's last read: tree 7's PR failing on commit `abc`, and
+    /// tree 5's agent waiting in a tmux pane with no report.
+    fn read_elsewhere(app: &mut App, head: &str) {
+        let mut failing = tree("/other/7/web", "7", "me/END-91-fix-login", Vec::new());
+        failing.ship = Some(Box::new(Ship {
+            branch: "me/END-91-fix-login".into(),
+            stage: Stage::CiFailed,
+            label: "#218 ✗ ci".into(),
+            url: None,
+            head: Some(head.into()),
+            detail: Vec::new(),
+            plugin: "github".into(),
+        }));
+        let pane = Agent {
+            attach: None,
+            job: None,
+            is_background: false,
+            active_at: Some(1_793_900_000),
+            ..agent("claude", "", Status::Waiting)
+        };
+        let waiting = tree("/other/5/web", "5", "me/seo-meta", vec![pane]);
+        app.pools[0]
+            .trees
+            .extend([failing.clone(), waiting.clone()]);
+        app.away_live = [("/code/endodeals-web".into(), vec![failing, waiting])].into();
+    }
+
+    fn entry_of(app: &App, tree: &str) -> Entry {
+        shown(app)
+            .into_iter()
+            .map(|(e, _)| e)
+            .find(|e| e.tree == tree && e.away.is_some())
+            .unwrap_or_else(|| panic!("no entry for {tree} in {:?}", order(app)))
+    }
+
+    #[test]
+    fn another_workspaces_failed_pr_lands_on_its_tree_there() {
+        let mut app = app();
+        read_elsewhere(&mut app, "abc");
+        let failed = entry_of(&app, "7");
+        assert_eq!(
+            (failed.kind, failed.what.as_str()),
+            (Kind::Failed, "#218 ✗ ci")
+        );
+        assert_eq!(failed.title.as_deref(), Some("END-91 fix-login"));
+
+        app.rail = shown(&app).iter().position(|(e, _)| e.key == failed.key);
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Outcome::SwitchTo {
+                checkout: "/code/endodeals-web".into(),
+                tree: "/other/7/web".into(),
+                kind: Kind::Failed,
+            }
+        );
+
+        // endodeals-web, as the switch opens it.
+        let mut there = App::new(None);
+        there.trees = vec![tree("/other/7/web", "7", "me/END-91-fix-login", Vec::new())];
+        there.is_agents_read = true;
+        there.arriving = Some(("/other/7/web".into(), Kind::Failed));
+        assert_eq!(there.arrival(), None, "no chat opens for a PR");
+        assert_eq!(there.current().map(|t| t.name.as_str()), Some("7"));
+        assert!(
+            there.message.as_deref().unwrap().contains("f sends"),
+            "{:?}",
+            there.message
+        );
+    }
+
+    #[test]
+    fn an_agent_waiting_in_a_pane_elsewhere_needs_you_once() {
+        let mut app = app();
+        read_elsewhere(&mut app, "abc");
+        let waiting = entry_of(&app, "5");
+        assert_eq!(
+            (waiting.kind, waiting.what.as_str()),
+            (Kind::NeedsYou, "waiting at a prompt in its pane")
+        );
+        // Tree 12's agent asks through its report; a pane waiting there too
+        // is the same ask, not a second entry.
+        let mut asking = app.pools[0].trees[0].clone();
+        asking.agents = vec![agent("checkout-tax", "j12", Status::Waiting)];
+        app.away_live
+            .get_mut(&PathBuf::from("/code/endodeals-web"))
+            .unwrap()
+            .push(asking);
+        let twelves = order(&app).iter().filter(|(_, t, _)| t == "12").count();
+        assert_eq!(twelves, 1);
+    }
+
+    #[test]
+    fn a_pane_agent_elsewhere_is_gone_to_in_tmux_and_left_for_t_outside() {
+        let pane = Agent {
+            attach: None,
+            ..agent("claude", "", Status::Waiting)
+        };
+        let arrive = |is_in_tmux: bool| {
+            let mut there = App::new(None);
+            there.is_in_tmux = is_in_tmux;
+            there.trees = vec![tree("/other/5/web", "5", "me/seo-meta", vec![pane.clone()])];
+            there.is_agents_read = true;
+            there.arriving = Some(("/other/5/web".into(), Kind::NeedsYou));
+            (there.arrival(), there.message)
+        };
+        assert!(matches!(arrive(true).0, Some(Outcome::Enter(t)) if t.name == "5"));
+        let (outcome, message) = arrive(false);
+        assert_eq!(outcome, None, "no shell opens by itself");
+        assert!(message.unwrap().contains("t goes to it"));
+    }
+
+    #[test]
+    fn a_dismissed_pr_comes_back_when_a_new_push_fails_again() {
+        let away_seven = |app: &App| {
+            shown(app)
+                .into_iter()
+                .find(|(e, _)| e.tree == "7" && e.away.is_some())
+                .map(|(_, seen)| seen)
+        };
+        let mut app = app();
+        read_elsewhere(&mut app, "abc");
+        let failed = entry_of(&app, "7");
+        app.rail = shown(&app).iter().position(|(e, _)| e.key == failed.key);
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(away_seven(&app), None, "dismissed");
+        // The next read finds a new push, failing too.
+        let live = app
+            .away_live
+            .get_mut(&PathBuf::from("/code/endodeals-web"))
+            .unwrap();
+        live[0].ship.as_mut().unwrap().head = Some("def".into());
+        assert_eq!(
+            away_seven(&app),
+            Some(false),
+            "back, unseen, on the new push"
+        );
+    }
+
+    #[test]
+    fn a_dropped_reader_stops_at_once_rather_than_after_its_next_round() {
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&reads);
+        // Far longer than the test may take, so only stopping at once,
+        // which drops `read` and its count, gets the count back to one.
+        let reader = spawn_every(Duration::from_secs(3600), move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        reader.rounds.recv().unwrap();
+        drop(reader);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::sync::Arc::strong_count(&reads) > 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the reader's thread is still waiting out its round"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn only_other_workspaces_opened_this_week_are_read() {
+        let now = 1_793_900_000;
+        let opened = |checkout: &str, days_ago: u64| crate::workspaces::Workspace {
+            checkout: checkout.into(),
+            opened: now - days_ago * 86_400,
+        };
+        let here = Path::new("/code/treetop");
+        assert!(due(vec![opened("/code/treetop", 0)], here, now).is_empty());
+        let read: Vec<PathBuf> = due(
+            vec![
+                opened("/code/treetop", 0),
+                opened("/code/endodeals-web", 2),
+                opened("/code/lander", 30),
+            ],
+            here,
+            now,
+        )
+        .into_iter()
+        .map(|w| w.checkout)
+        .collect();
+        assert_eq!(read, [PathBuf::from("/code/endodeals-web")]);
     }
 
     #[test]

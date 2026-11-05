@@ -569,13 +569,17 @@ When an agent comes to need you, or finishes, treetop rings the terminal bell, a
 
 Down the right of the list, the inbox names each tree that wants you, from this workspace and the others: an agent that needs you, died or finished, and a PR whose checks failed or that merged, the same things the phone is pushed.
 Each entry says its tree, its ticket and branch, how long ago it happened and, on its second line, what it is about, such as the agent's question.
-Another workspace's entry starts with that workspace's name; those are its background agents, placed in their trees by the workspace's last listing.
+Another workspace's entry starts with that workspace's name.
+Its background agents are placed in their trees by the workspace's last listing; its PRs that failed or merged, and its agents waiting at a prompt in a tmux pane, come from a read of its pool every three minutes, for the workspaces opened in the last week, so they can show a few minutes late.
+With only one workspace nothing extra is read.
 What needs you comes first, then what failed, then what is done, newest first in each.
 
 Enter on an entry, or a click on it, opens it as Enter on its tree's row does: the agent's chat, with its question at the bottom.
 A PR's entry puts the cursor on its tree instead, with its checks in the detail pane, where `f` sends a failure to its agent.
-Another workspace's entry switches to it first, then opens the agent there.
-An opened entry dims and sinks under SEEN, and so does an ask whose chat opened for you; `x` dismisses an entry until it changes, such as the agent asking something new.
+Another workspace's entry switches to it first, then opens it there; an agent with no chat, such as `claude` in a tmux pane, is gone to inside tmux, as `t` does.
+A chat, the diff or the compose box opens in the room left of the inbox, which stays bright and keeps updating beside it; clicking an entry from inside a chat leaves that chat for the one clicked.
+An opened entry dims and sinks under SEEN, and so does an ask whose chat opened for you; `x` dismisses an entry until it changes, such as the agent asking something new, or a PR failing again on a new push.
+The `w` picker counts each workspace's unseen entries after its held trees, `●` for what needs you, `✗` for what failed and `✓` for what is done.
 What you opened and dismissed is kept in `inbox.json` under `$XDG_STATE_HOME/treetop` (else `~/.local/state/treetop`), so a restart or a switch keeps it.
 
 The inbox is beside the list from 180 columns, which leaves the list room for its branches and agents.
