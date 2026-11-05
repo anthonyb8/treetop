@@ -88,6 +88,18 @@
 //! ```toml
 //! shares = ["tether", "shares"]
 //! ```
+//!
+//! `[claude]` lists the Claude Code config dirs treetop finds sessions in,
+//! for setups that run some sessions under their own `CLAUDE_CONFIG_DIR`,
+//! such as keel's `~/.keel/claude` beside `~/.claude`. Each session is
+//! attached, resumed and stopped under the dir it came from, and a new agent
+//! starts under the first. With none listed, it is `CLAUDE_CONFIG_DIR`,
+//! else `~/.claude`, as Claude Code itself picks:
+//!
+//! ```toml
+//! [claude]
+//! config_dirs = ["~/.claude", "~/.keel/claude"]
+//! ```
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -205,6 +217,29 @@ pub struct Mobile {
     pub port: Option<u16>,
 }
 
+/// The Claude Code setups treetop looks in.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Claude {
+    /// Its config dirs, the first where new agents start; empty for the one
+    /// Claude Code uses by default.
+    #[serde(default)]
+    pub config_dirs: Vec<String>,
+}
+
+impl Claude {
+    /// The config dirs listed, with `~` expanded and repeats dropped.
+    pub fn dirs(&self) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for dir in self.config_dirs.iter().map(|dir| expand(dir)) {
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+        dirs
+    }
+}
+
 /// What a repository uses, keyed by its main checkout's path.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -268,6 +303,9 @@ pub struct Config {
     /// `treetop serve`, the web app for a phone.
     #[serde(default)]
     pub mobile: Mobile,
+    /// The Claude Code config dirs sessions are found in.
+    #[serde(default)]
+    pub claude: Claude,
 }
 
 /// `path` with a leading `~` as the home directory.
@@ -362,6 +400,19 @@ mod tests {
         assert!(config.hooks.on_dispatch.is_empty());
         let config = parse("[guard]\nin_tree = [\"docker compose down\"]\n").unwrap();
         assert_eq!(config.guard.in_tree, ["docker compose down"]);
+    }
+
+    #[test]
+    fn claude_config_dirs_expand_home_and_drop_repeats() {
+        assert!(Config::default().claude.dirs().is_empty());
+        let config =
+            parse("[claude]\nconfig_dirs = [\"~/.claude\", \"/x/keel\", \"~/.claude\"]\n").unwrap();
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
+        assert_eq!(
+            config.claude.dirs(),
+            [home.join(".claude"), PathBuf::from("/x/keel")]
+        );
+        assert!(parse("[claude]\nconfig_dir = []\n").is_err());
     }
 
     #[test]

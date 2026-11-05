@@ -32,7 +32,12 @@ impl Pool {
             std::env::temp_dir().join(format!("treetop-guard-{}-{test}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let repo = root.join("repo");
-        for dir in [&repo, &root.join("home/.config"), &root.join("claude")] {
+        for dir in [
+            &repo,
+            &root.join("home/.config"),
+            &root.join("claude"),
+            &root.join("bin"),
+        ] {
             fs::create_dir_all(dir).unwrap();
         }
         let pool = Pool { root, repo };
@@ -63,6 +68,15 @@ impl Pool {
             .env("XDG_STATE_HOME", self.root.join("home/.state"))
             .env("CLAUDE_CONFIG_DIR", self.root.join("claude"))
             .env("TREEHOUSE_ROOT", self.root.join("pool"))
+            // Stand-ins such as `keel` a test puts here come first.
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    self.root.join("bin").display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@t")
@@ -231,6 +245,53 @@ fn a_finished_tree_nobody_runs_in_may_be_returned_from_anywhere() {
 
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert!(!pool.is_leased(&done));
+}
+
+/// A stand-in `keel` whose `status --json` lists `runs`.
+fn keel_lists(pool: &Pool, runs: &Value) {
+    use std::os::unix::fs::PermissionsExt;
+    let keel = pool.root.join("bin/keel");
+    fs::write(&keel, format!("#!/bin/sh\ncat <<'J'\n{runs}\nJ\n")).unwrap();
+    fs::set_permissions(&keel, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn a_tree_a_keel_run_holds_is_returned_by_no_agent_until_the_run_stops() {
+    let Some(pool) = Pool::new("keel-run") else {
+        return;
+    };
+    let held = pool.lease("keel:fix/retry");
+    let name = pool.name(&held);
+    let run = |state: &str| {
+        serde_json::json!([{
+            "version": 1, "tree": held, "playbook": "bug-fix", "state": state,
+            "steps": [{"title": "Reproduce it", "state": "doing"}], "current": 1,
+            "attention": 0, "stale": false
+        }])
+    };
+    keel_lists(&pool, &run("active"));
+
+    let out = pool.give_back(&pool.repo, &name);
+    assert!(!out.status.success(), "{}", text(&out.stdout));
+    let why = text(&out.stderr);
+    assert!(why.contains("keel run (bug-fix 1/1)"), "{why}");
+    assert!(why.contains("keel run stop"), "{why}");
+    let refused = pool.hook(&pool.repo, &format!("treehouse return {}", held.display()));
+    assert!(
+        refused
+            .as_deref()
+            .is_some_and(|why| why.contains("keel run")),
+        "{refused:?}"
+    );
+    keel_lists(&pool, &run("paused"));
+    assert!(!pool.give_back(&pool.repo, &name).status.success());
+    assert!(pool.is_leased(&held));
+
+    // A run that has ended no longer holds it.
+    keel_lists(&pool, &run("done"));
+    let out = pool.give_back(&pool.repo, &name);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(!pool.is_leased(&held));
 }
 
 /// What happened to tree 28: the agent of another tree stopped its stack,

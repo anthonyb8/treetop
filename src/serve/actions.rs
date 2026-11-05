@@ -409,6 +409,7 @@ mod tests {
             active_at: None,
             context: None,
             spend: None,
+            label: None,
         };
         let with = |processes: Vec<Process>| Tree {
             agents: vec![agent.clone()],

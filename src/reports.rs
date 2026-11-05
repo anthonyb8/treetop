@@ -231,14 +231,13 @@ impl Reader {
     /// Every job, however long ago it settled, since a finished agent still
     /// belongs to the tree it worked in.
     pub fn read_all(&mut self) -> Vec<Report> {
-        let Some(jobs) = crate::agents::config_dir().map(|c| c.join("jobs")) else {
-            return Vec::new();
-        };
-        let Ok(entries) = fs::read_dir(&jobs) else {
-            return Vec::new();
-        };
+        let entries: Vec<fs::DirEntry> = crate::agents::claude::config_dirs()
+            .iter()
+            .filter_map(|config| fs::read_dir(config.join("jobs")).ok())
+            .flat_map(|entries| entries.flatten())
+            .collect();
         let mut seen = HashMap::new();
-        for entry in entries.flatten() {
+        for entry in entries {
             let dir = entry.path();
             let Some(job) = dir.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
                 continue;

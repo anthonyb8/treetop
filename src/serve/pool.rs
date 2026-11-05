@@ -118,6 +118,16 @@ pub fn card(app: &App, tree: &Tree, now: u64) -> Value {
             "url": s.url,
         })),
         "active_ago": app.active_at(tree).map(|at| now.saturating_sub(at)),
+        "run": app.run_of(tree).map(|run| json!({
+            "playbook": run.playbook,
+            "step": run.step(),
+            "step_title": run.step_title(),
+            "state": run.state,
+            "goal": run.goal,
+            "attention": run.attention,
+            "stale": run.stale,
+            "holds": run.holds_tree(),
+        })),
     })
 }
 
@@ -255,6 +265,7 @@ pub(super) mod tests {
             active_at: Some(active_at),
             context: None,
             spend: None,
+            label: None,
         }
     }
 
@@ -351,7 +362,28 @@ pub(super) mod tests {
 
     #[test]
     fn the_json_has_exactly_the_fields_the_app_reads() {
-        let json = pool_json(&pool(), "app");
+        let mut app = pool();
+        app.runs = crate::keel::parse(
+            r#"[{"tree":"/pool/12","playbook":"bug-fix","state":"active","goal":"g",
+                 "steps":[{"title":"Reproduce it","state":"doing"}],"current":1}]"#,
+        );
+        let json = pool_json(&app, "app");
+        let cards: Vec<&Value> = json["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["cards"].as_array().unwrap())
+            .collect();
+        let run = cards
+            .iter()
+            .find_map(|c| c["run"].as_object())
+            .expect("the tree with a run carries it");
+        assert_eq!(
+            run.keys().cloned().collect::<BTreeSet<_>>(),
+            declared("Run")
+        );
+        assert_eq!(run["step"], "1/1");
+        assert_eq!(run["holds"], true);
         assert_eq!(keys(&json), declared("Pool"));
         assert_eq!(keys(&json["needs_you"][0]), declared("Card"));
         assert_eq!(keys(&json["groups"][0]), declared("Group"));

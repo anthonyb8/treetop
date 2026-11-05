@@ -469,7 +469,35 @@ fn agent_cell(app: &App, tree: &Tree) -> Cell<'static> {
         0 => String::new(),
         n => format!(" +{n}"),
     };
-    Cell::from(format!("{glyph} {}{more}", first.name)).style(style)
+    let label = first
+        .label
+        .as_deref()
+        .map(|label| format!(" [{label}]"))
+        .unwrap_or_default();
+    Cell::from(format!("{glyph} {}{label}{more}", first.name)).style(style)
+}
+
+/// The tree's keel run in a few words: its playbook and step, then what
+/// needs looking at; empty for a tree with none.
+fn run_cell(app: &App, tree: &Tree) -> Cell<'static> {
+    let t = theme();
+    let Some(run) = app.run_of(tree) else {
+        return Cell::from("");
+    };
+    let mut spans = vec![Span::raw(format!("{} {}", run.playbook, run.step()))];
+    if run.state != "active" {
+        spans.push(Span::styled(format!(" {}", run.state), fg(t.muted)));
+    }
+    if run.attention > 0 {
+        spans.push(Span::styled(
+            format!(" !{}", run.attention),
+            fg(t.warning).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if run.stale {
+        spans.push(Span::styled(" stale", fg(t.danger)));
+    }
+    Cell::from(Line::from(spans))
 }
 
 /// How a PR's stage reads: what needs you is loud, a failure the loudest,
@@ -555,9 +583,11 @@ fn row(app: &App, tree: &Tree) -> Row<'static> {
         .style(fg(t.accent)),
         branch,
         agent_cell(app, tree),
-        ports_cell(app, tree),
-        git_cell(tree, 0),
     ];
+    if !app.runs.is_empty() {
+        cells.push(run_cell(app, tree));
+    }
+    cells.extend([ports_cell(app, tree), git_cell(tree, 0)]);
     if app.is_shipping() {
         cells.push(pr_cell(tree));
     }
@@ -570,9 +600,11 @@ fn row(app: &App, tree: &Tree) -> Row<'static> {
 
 fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
     let t = theme();
-    let mut titles = vec![
-        "", "#", "STATUS", "TICKET", "BRANCH", "AGENT", "PORTS", "GIT",
-    ];
+    let mut titles = vec!["", "#", "STATUS", "TICKET", "BRANCH", "AGENT"];
+    if !app.runs.is_empty() {
+        titles.push("RUN");
+    }
+    titles.extend(["PORTS", "GIT"]);
     if app.is_shipping() {
         titles.push("PR");
     }
@@ -606,9 +638,11 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
         Constraint::Length(9),
         Constraint::Fill(3),
         Constraint::Fill(2),
-        Constraint::Length(17),
-        Constraint::Length(14),
     ];
+    if !app.runs.is_empty() {
+        widths.push(Constraint::Length(18));
+    }
+    widths.extend([Constraint::Length(17), Constraint::Length(14)]);
     if app.is_shipping() {
         widths.push(Constraint::Length(14));
     }
@@ -762,10 +796,47 @@ fn detail_lines(app: &App, tree: &Tree) -> Vec<Line<'static>> {
             Span::raw(procs),
         ]),
     ];
+    if let Some(run) = app.run_of(tree) {
+        lines.push(run_line(run));
+    }
     if app.is_shipping() && tree.is_held() && !tree.is_main {
         lines.push(pr_line(app, tree));
     }
     lines
+}
+
+/// The tree's keel run: its playbook, the step it is on, its state and
+/// what needs looking at, then its goal.
+fn run_line(run: &crate::keel::Run) -> Line<'static> {
+    let t = theme();
+    let mut spans = vec![
+        Span::styled("run       ", fg(t.muted)),
+        Span::styled(
+            run.playbook.clone(),
+            Style::new().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!("  step {}", run.step())),
+    ];
+    if let Some(title) = run.step_title() {
+        spans.push(Span::raw(format!(" {title}")));
+    }
+    spans.push(Span::styled(format!("  {}", run.state), fg(t.muted)));
+    if run.attention > 0 {
+        spans.push(Span::styled(
+            format!("  {} need attention", run.attention),
+            fg(t.warning).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if run.stale {
+        spans.push(Span::styled(
+            "  stale: no process in the tree",
+            fg(t.danger),
+        ));
+    }
+    if !run.goal.is_empty() {
+        spans.push(Span::styled(format!("  ·  {}", run.goal), fg(t.muted)));
+    }
+    Line::from(spans)
 }
 
 /// The tree's PR: its label, its link and what its plugin says about it;
@@ -829,6 +900,9 @@ fn agent_spans(agent: &Agent) -> Vec<Span<'static>> {
     }
     if agent.is_background {
         about.push("background".into());
+    }
+    if let Some(label) = &agent.label {
+        about.insert(0, label.clone());
     }
     vec![
         Span::styled(format!("{glyph} {}", agent.name), style),
@@ -1874,6 +1948,12 @@ fn draw_confirm(frame: &mut Frame, pending: &Pending) {
             t.branch.as_deref().unwrap_or("(detached)")
         )));
         lines.push(Line::from(risk(t)));
+        if let Some(run) = pending.runs.get(&t.path) {
+            lines.push(Line::styled(
+                format!("      keel run {} holds it", run.summary()),
+                fg(theme().danger).add_modifier(Modifier::BOLD),
+            ));
+        }
         lines.extend(live_lines(t, usize::from(width - 4)));
     }
     let is_live = pending
@@ -1895,6 +1975,16 @@ fn draw_confirm(frame: &mut Frame, pending: &Pending) {
             " The live processes above are stopped."
         };
         lines.push(Line::styled(text, fg(theme().danger)));
+    }
+    if !pending.runs.is_empty() {
+        lines.push(Line::styled(
+            " A keel run is not finished: its steps are left undone and it stays",
+            fg(theme().danger),
+        ));
+        lines.push(Line::styled(
+            " listed until `keel run stop`. keel itself never returns such a tree.",
+            fg(theme().danger),
+        ));
     }
     lines.push(Line::raw(
         " y returns them to the pool, D destroys them from disk after a preview;",
@@ -2795,6 +2885,7 @@ mod sidebar_tests {
                 cache_write: 412_000,
                 output: 88_000,
             }),
+            label: None,
         }
     }
 
@@ -2925,5 +3016,103 @@ mod sidebar_tests {
                 "not known for this agent",
             ]
         );
+    }
+
+    fn run() -> crate::keel::Run {
+        serde_json::from_value(serde_json::json!({
+            "version": 1, "tree": "/p/1/app", "playbook": "bug-fix", "state": "active",
+            "goal": "users get two notifications after a retry",
+            "steps": [
+                {"title": "Reproduce it", "state": "done"},
+                {"title": "Narrow the cause", "state": "doing"},
+                {"title": "Fix it at the root", "state": "pending"}
+            ],
+            "current": 2, "attention": 2, "stale": false
+        }))
+        .unwrap()
+    }
+
+    /// A tree with a keel session working in it under a keel run.
+    fn keel_app() -> App {
+        let mut app = App::new(None);
+        let mut agent = agent();
+        agent.name = "fix-retry".into();
+        agent.label = Some("keel".into());
+        agent.status = Some(Status::Busy);
+        app.trees = vec![Tree {
+            path: "/p/1/app".into(),
+            holder: Some("keel:fix/retry".into()),
+            agents: vec![agent],
+            ..tree()
+        }];
+        app.runs = [(std::path::PathBuf::from("/p/1/app"), run())].into();
+        app
+    }
+
+    #[test]
+    fn the_detail_pane_shows_the_run_and_labels_a_keel_session() {
+        let app = keel_app();
+        let text = text(&detail_lines(&app, &app.trees[0]));
+        assert!(
+            text.iter().any(|l| l
+                == "run       bug-fix  step 2/3 Narrow the cause  active  2 need attention  \
+                    ·  users get two notifications after a retry"),
+            "{text:#?}"
+        );
+        assert!(
+            text.iter()
+                .any(|l| l.starts_with("agents    ● fix-retry (keel, busy")),
+            "{text:#?}"
+        );
+    }
+
+    /// Everything on screen, row by row.
+    fn screen(app: &App, width: u16, height: u16) -> Vec<String> {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app, None, None)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_run_column_shows_only_once_keel_lists_a_run() {
+        let mut app = keel_app();
+        let shown = screen(&app, 160, 24);
+        let header = shown.iter().find(|l| l.contains("BRANCH")).unwrap();
+        assert!(header.contains("RUN"), "{header}");
+        let row = shown
+            .iter()
+            .find(|l| l.contains("fix-retry [keel]"))
+            .unwrap();
+        assert!(row.contains("bug-fix 2/3 !2"), "{row}");
+        app.runs.clear();
+        let shown = screen(&app, 160, 24);
+        let header = shown.iter().find(|l| l.contains("BRANCH")).unwrap();
+        assert!(!header.contains("RUN"), "{header}");
+    }
+
+    #[test]
+    fn the_return_dialog_warns_of_a_run_that_holds_the_tree() {
+        let mut app = keel_app();
+        app.pending = Some(Pending {
+            trees: app.trees.clone(),
+            runs: app.runs.clone(),
+        });
+        let shown = screen(&app, 120, 30).join("\n");
+        assert!(
+            shown.contains("keel run bug-fix 2/3 · 2 need attention holds it"),
+            "{shown}"
+        );
+        assert!(shown.contains("listed until `keel run stop`"), "{shown}");
+        app.pending.as_mut().unwrap().runs.clear();
+        let shown = screen(&app, 120, 30).join("\n");
+        assert!(!shown.contains("keel run"), "{shown}");
     }
 }

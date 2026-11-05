@@ -641,6 +641,7 @@ mod tests {
             active_at: None,
             context: None,
             spend: None,
+            label: None,
         }];
         seventeen.ship = ship(Stage::Checks);
         app.set_trees(vec![seventeen, tree("14", "me/END-140-limits")]);

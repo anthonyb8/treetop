@@ -36,6 +36,14 @@
         {#if card.pr}<PrBadge pr={card.pr} />{/if}
       </div>
       {#if card.says}<p class="question">{card.says}</p>{/if}
+      {#if card.run}
+        <p class="run">
+          {card.run.playbook}
+          {card.run.step}{#if card.run.state !== "active"}{" · "}{card.run.state}{/if}{#if card.run.attention}<span
+              class="attention">{" · "}{card.run.attention} need attention</span
+            >{/if}{#if card.run.stale}<span class="stale">{" · stale"}</span>{/if}
+        </p>
+      {/if}
     </a>
     <div class="meta">
       <GitCounts git={card.git} />
@@ -53,6 +61,14 @@
         <span class="title">{card.title ?? card.branch ?? "no branch"}</span>
       </div>
       <p class="line">{line}{#if card.more} <span class="more">+{card.more}</span>{/if}</p>
+      {#if card.run}
+        <p class="run">
+          {card.run.playbook}
+          {card.run.step}{#if card.run.state !== "active"}{" · "}{card.run.state}{/if}{#if card.run.attention}<span
+              class="attention">{" · "}{card.run.attention} need attention</span
+            >{/if}{#if card.run.stale}<span class="stale">{" · stale"}</span>{/if}
+        </p>
+      {/if}
     </a>
     {#if card.active_ago !== null}<span class="when side">{ago(card.active_ago)}</span>{/if}
     <div class="meta side">
@@ -64,6 +80,21 @@
 {/if}
 
 <style>
+  .run {
+    margin: 0;
+    font-size: 13px;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .run .attention {
+    color: var(--yellow);
+    font-weight: 600;
+  }
+  .run .stale {
+    color: var(--red);
+  }
   .card {
     position: relative;
     padding: 13px 14px;

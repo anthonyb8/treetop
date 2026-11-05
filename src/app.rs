@@ -221,6 +221,9 @@ pub struct LoadedDiff {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pending {
     pub trees: Vec<Tree>,
+    /// The keel runs that hold any of them, by tree, which the dialog warns
+    /// about.
+    pub runs: HashMap<PathBuf, crate::keel::Run>,
 }
 
 /// A ship run of a tree's branch, waiting on y/n, since it pushes and opens
@@ -419,6 +422,8 @@ pub struct App {
     /// How much of the plan the agents run on is used, as the last agent
     /// plugin that could say reported it.
     pub usage: Option<Usage>,
+    /// keel's runs, by the tree each works in; empty without keel.
+    pub runs: HashMap<PathBuf, crate::keel::Run>,
     /// How many commits the main checkout sits behind its upstream, left
     /// there because it has work of its own or a busy agent.
     pub behind: usize,
@@ -547,6 +552,11 @@ impl App {
             here,
             ..App::default()
         }
+    }
+
+    /// The keel run working in `tree`, if any.
+    pub fn run_of(&self, tree: &Tree) -> Option<&crate::keel::Run> {
+        self.runs.get(&tree.path)
     }
 
     pub fn is_here(&self, tree: &Tree) -> bool {
@@ -3109,7 +3119,12 @@ impl App {
                 // every tree a destroy could, available ones too.
                 let trees = self.targets(Kind::Destroy);
                 if !trees.is_empty() {
-                    self.pending = Some(Pending { trees });
+                    let runs = trees
+                        .iter()
+                        .filter_map(|t| crate::keel::holding(&self.runs, &t.path))
+                        .map(|run| (run.tree.clone(), run.clone()))
+                        .collect();
+                    self.pending = Some(Pending { trees, runs });
                 }
             }
             _ => {}
@@ -3314,6 +3329,7 @@ mod tests {
             active_at: None,
             context: None,
             spend: None,
+            label: None,
         };
         let interactive = Agent {
             is_background: false,
@@ -4085,6 +4101,7 @@ mod tests {
             active_at: None,
             context: None,
             spend: None,
+            label: None,
         }
     }
 

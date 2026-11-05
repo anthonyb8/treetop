@@ -600,6 +600,10 @@ fn give_back(checkout: &Path, name: &str, start: &Path) -> Result<()> {
     if let Err(why) = guard::may_return(&trees, tree, &Caller::this(start)) {
         bail!("not returned: {why}");
     }
+    let runs = crate::keel::status().unwrap_or_default();
+    if let Some(run) = crate::keel::holding(&runs, &tree.path) {
+        bail!("not returned: {}", crate::keel::refusal(name, run));
+    }
     let mut job = Job::new(Kind::Return, tree.clone());
     let (is_ok, output) = jobs::run(&mut job);
     print!("{output}");
@@ -671,6 +675,7 @@ mod tests {
             active_at: None,
             context: None,
             spend: None,
+            label: None,
         }
     }
 

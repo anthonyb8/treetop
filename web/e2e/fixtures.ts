@@ -36,6 +36,7 @@ export function card(tree: string, fields: Partial<Card> = {}): Card {
     ports: [],
     pr: null,
     active_ago: 120,
+    run: null,
     ...fields,
   };
 }
@@ -79,7 +80,7 @@ export const tree17: Tree = {
   holder: "me",
   base: "main",
   task: "Fix the login redirect loop on expired sessions.",
-  agents: [{ name: "login", status: "waiting", has_chat: true, active_ago: 720 }],
+  agents: [{ name: "login", status: "waiting", has_chat: true, active_ago: 720, label: null }],
   ports: [{ port: 5173, process: "vite", pid: 4242, public: null }],
   pr: {
     label: "#41 ✗ ci",

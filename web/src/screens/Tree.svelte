@@ -193,6 +193,7 @@
           <Mark mark={card.mark} />
           {#if agent}
             <span class="agent-name">{agent.name}</span>
+            {#if agent.label}<span class="label">{agent.label}</span>{/if}
             {#if tree.report}
               <span class="said" style:color={said[tree.report.state].tone}>· {said[tree.report.state].label}</span>
             {:else if agent.status}
@@ -220,10 +221,28 @@
         {/if}
         {#if tree.agents.length > 1}
           <p class="others">
-            Also here: {tree.agents.slice(1).map((a) => `${a.name}${a.status ? ` (${a.status})` : ""}`).join(", ")}
+            Also here: {tree.agents
+              .slice(1)
+              .map((a) => `${a.name}${a.label ? ` [${a.label}]` : ""}${a.status ? ` (${a.status})` : ""}`)
+              .join(", ")}
           </p>
         {/if}
       </section>
+
+      {#if card.run}
+        <section class="run" aria-label="Run">
+          <div class="run-top">
+            <span class="playbook">{card.run.playbook}</span>
+            <span class="step">step {card.run.step}{card.run.step_title ? ` · ${card.run.step_title}` : ""}</span>
+          </div>
+          {#if card.run.goal}<p class="goal">{card.run.goal}</p>{/if}
+          <div class="run-flags">
+            {#if card.run.state !== "active"}<span class="flag">{card.run.state}</span>{/if}
+            {#if card.run.attention}<span class="flag attention">{card.run.attention} need attention</span>{/if}
+            {#if card.run.stale}<span class="flag stale">stale: no process in the tree</span>{/if}
+          </div>
+        </section>
+      {/if}
 
       <section class="facts" aria-label="Tree">
         <div class="fact">
@@ -329,6 +348,12 @@
           <li>Nothing uncommitted or unpushed.</li>
         {/if}
         {#if tree.agents.length}<li>Its agent{tree.agents.length === 1 ? " is" : "s are"} stopped first.</li>{/if}
+        {#if card.run?.holds}
+          <li class="danger">
+            keel run {card.run.playbook} is {card.run.state} at step {card.run.step}: its steps are left undone,
+            and keel keeps listing it until <span class="mono">keel run stop</span>.
+          </li>
+        {/if}
       </ul>
       <p class="note">The tree goes back to the pool for the next agent.</p>
       <div class="actions">
@@ -342,6 +367,60 @@
 </div>
 
 <style>
+  .label {
+    font-size: 12px;
+    padding: 1px 7px;
+    border-radius: 999px;
+    color: var(--blue);
+    border: 1px solid var(--blue);
+  }
+  .run {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 12px 14px;
+    border-radius: 14px;
+    background: var(--bg-high);
+  }
+  .run-top {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 8px;
+    min-width: 0;
+  }
+  .playbook {
+    font-weight: 600;
+  }
+  .step,
+  .goal {
+    color: var(--muted);
+    font-size: 14px;
+    overflow-wrap: anywhere;
+  }
+  .goal {
+    margin: 0;
+  }
+  .run-flags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .run-flags:empty {
+    display: none;
+  }
+  .flag {
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .flag.attention {
+    color: var(--yellow);
+    font-weight: 600;
+  }
+  .flag.stale,
+  li.danger {
+    color: var(--red);
+  }
   /* In a scrolling column, a section that clips its corners would shrink to
      nothing once the content outgrows the screen. */
   main > :global(*) {
