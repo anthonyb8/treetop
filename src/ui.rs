@@ -53,130 +53,81 @@ const KEYS: [(&str, &str); 13] = [
 
 /// Every key on the list, for the `?` overlay, in the groups it draws:
 /// the agents first, since that is what the list is for, then the trees
-/// themselves, what they serve and where their work goes, and the ways
-/// round the list last.
+/// themselves and the ways round them, what they serve and where their work
+/// goes, and treetop itself last. Each says what it does in a few words, so
+/// four columns fit a laptop's terminal.
 const HELP: [(&str, &[(&str, &str)]); 7] = [
     (
         "Agents",
         &[
-            (
-                "Enter",
-                "open the agent: its chat, a cold one again, else its tree; a heading folds",
-            ),
-            (
-                "n",
-                "new agent in this tree, or main on its heading; a free tree is leased",
-            ),
-            (
-                "N",
-                "new agent in a fresh tree, on a branch named for the task",
-            ),
-            ("m", "message the agents in the marked trees, or this one"),
-            (
-                ":",
-                "ask the assistant about this tree; @17 or @name sends to that agent",
-            ),
-            (
-                "a",
-                "open the assistant's chat, starting it if there is none",
-            ),
-            (
-                "R",
-                "resume the tree's stopped or failed agent, with its conversation",
-            ),
-            (
-                "h",
-                "hand the agent's work to a new one, on a handoff it writes",
-            ),
+            ("Enter", "open, fold heading"),
+            ("n", "new agent here"),
+            ("N", "agent in new tree"),
+            ("m", "message agents"),
+            (":", "ask the assistant"),
+            ("a", "assistant's chat"),
+            ("R", "resume agent"),
+            ("h", "hand off work"),
         ],
     ),
     (
         "Trees",
         &[
-            (
-                "t",
-                "go to the tree: its tmux pane or a window in it, else a shell there",
-            ),
-            ("d", "diff of the tree against its base"),
-            ("Space", "mark or unmark"),
-            (
-                "r",
-                "return the marked trees, or this one; D in the dialog destroys",
-            ),
-            (
-                "z Z",
-                "park the tree, or bring it back; open or fold Parked",
-            ),
-            ("b", "rename the tree's branch"),
-            (
-                "/",
-                "filter by tree, branch, holder, agent or PR, such as merged",
-            ),
-            ("Esc", "clear the filter, then the marks"),
+            ("t", "go to tree"),
+            ("d", "diff vs base"),
+            ("Space", "mark"),
+            ("r", "return tree"),
+            ("z Z", "park, fold Parked"),
+            ("b", "rename branch"),
+            ("/", "filter"),
+            ("Esc", "clear filter, marks"),
         ],
+    ),
+    (
+        "Moving",
+        &[("j k \u{2191}\u{2193}", "move"), ("g G", "top, bottom")],
     ),
     (
         "Ports",
         &[
-            (
-                "o",
-                "open the port in the browser, or choose one of several",
-            ),
-            (
-                "p",
-                "share the port with your phone, or take the share down again",
-            ),
-            (
-                "P",
-                "put the port on the internet and copy its link, or take it off again",
-            ),
-            ("Q", "show a shared port's code and address again"),
+            ("o", "open in browser"),
+            ("p", "share to phone"),
+            ("P", "public link"),
+            ("Q", "show share code"),
         ],
     ),
     (
         "Ship",
         &[
-            (
-                "s",
-                "start a ship run of the tree's branch, or show the one under way",
-            ),
-            ("O", "open the tree's PR"),
-            ("f", "send what failed on the tree's PR to its agent"),
+            ("s", "ship branch"),
+            ("O", "open PR"),
+            ("f", "send CI failures"),
         ],
     ),
     (
         "Issues",
         &[
-            ("Tab", "the repository's issues"),
-            (
-                "i",
-                "the issue the tree works on, on the whole screen, else choose it",
-            ),
-            ("I", "choose the issue the tree works on, or another"),
+            ("Tab", "all issues"),
+            ("i", "tree's issue"),
+            ("I", "choose issue"),
         ],
-    ),
-    (
-        "Moving",
-        &[("j k \u{2191} \u{2193}", "move"), ("g G", "top, bottom")],
     ),
     (
         "treetop",
         &[
             ("w", "switch workspace"),
-            (
-                "C",
-                "scratch chats, tied to no tree: start, open, or x twice to delete",
-            ),
-            ("U", "install a newer treetop release and restart on it"),
+            ("C", "scratch chats"),
+            ("U", "update treetop"),
             ("?", "this help"),
             ("q", "quit"),
         ],
     ),
 ];
 
-/// How many of the groups go down the left column of the `?` overlay; the
-/// rest go down the right, so the whole list fits a short terminal.
-const HELP_SPLIT: usize = 3;
+/// How many of HELP's groups go down each column of the `?` overlay, left
+/// to right, so the columns come out about as tall as each other. Where
+/// four do not fit, neighbours share a column: two, else one.
+const HELP_COLUMNS: [usize; 4] = [1, 2, 2, 2];
 
 /// Most useful first, as with `KEYS`; Esc stays early so the way out is
 /// never the key a narrow bar drops.
@@ -1706,42 +1657,11 @@ fn branch_line(prompt: &Prompt) -> Line<'static> {
     Line::from(vec![Span::styled("branch ", fg(t.muted)), name])
 }
 
-/// The `?` overlay: every key in its groups, the first HELP_SPLIT groups
-/// down the left column and the rest down the right.
+/// The `?` overlay: every key in its groups, in the HELP_COLUMNS columns
+/// side by side, or fewer where the screen is too narrow for them.
 fn draw_help(frame: &mut Frame, help: &[(&str, &[(&str, &str)])]) {
-    const GAP: usize = 3;
     let t = theme();
-    let (left, right) = help.split_at(HELP_SPLIT.min(help.len()));
-    let (left, right) = (help_lines(left), help_lines(right));
-    let widest = |lines: &[Line]| lines.iter().map(Line::width).max().unwrap_or(0);
-    let (left_width, right_width) = (widest(&left), widest(&right));
-    // Each line starts with a space of its own, so the border wants one
-    // more column of air at the right and one for each side's border. Where
-    // two columns would run off a narrow screen, the groups go down one
-    // instead: taller, but every line whole.
-    let two = left_width + GAP + right_width + 3;
-    let (lines, width) = if two <= usize::from(frame.area().width) {
-        let rows = left.len().max(right.len());
-        let lines: Vec<Line> = (0..rows)
-            .map(|at| {
-                let mut spans: Vec<Span> = Vec::new();
-                let used = left.get(at).map_or(0, |line| {
-                    spans.extend(line.spans.iter().cloned());
-                    line.width()
-                });
-                if let Some(line) = right.get(at).filter(|line| line.width() > 0) {
-                    spans.push(Span::raw(" ".repeat(left_width + GAP - used)));
-                    spans.extend(line.spans.iter().cloned());
-                }
-                Line::from(spans)
-            })
-            .collect();
-        (lines, two)
-    } else {
-        let lines = help_lines(help);
-        let width = widest(&lines) + 3;
-        (lines, width)
-    };
+    let (lines, width) = help_layout(help, usize::from(frame.area().width));
     let width = u16::try_from(width).unwrap_or(u16::MAX);
     let height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
     let area = popup::centered(frame.area(), width, height);
@@ -1758,8 +1678,64 @@ fn draw_help(frame: &mut Frame, help: &[(&str, &[(&str, &str)])]) {
     );
 }
 
+/// The overlay's lines and the width of its box: the most columns of
+/// HELP_COLUMNS, then half as many, then one, that fit `room` columns of
+/// screen. Every line stays whole; a narrow screen gets a taller box.
+fn help_layout(help: &[(&str, &[(&str, &str)])], room: usize) -> (Vec<Line<'static>>, usize) {
+    const GAP: usize = 3;
+    let widest = |lines: &[Line]| lines.iter().map(Line::width).max().unwrap_or(0);
+    let mut layout = (Vec::new(), 0);
+    for together in [1, 2, HELP_COLUMNS.len()] {
+        // Each `together` neighbours of HELP_COLUMNS make one column, and the
+        // last takes whatever groups are left.
+        let sizes: Vec<usize> = HELP_COLUMNS
+            .chunks(together)
+            .map(|s| s.iter().sum())
+            .collect();
+        let mut columns: Vec<Vec<Line>> = Vec::new();
+        let mut rest = help;
+        for (at, size) in sizes.iter().enumerate() {
+            let take = if at + 1 == sizes.len() {
+                rest.len()
+            } else {
+                (*size).min(rest.len())
+            };
+            let (column, after) = rest.split_at(take);
+            columns.push(help_lines(column));
+            rest = after;
+        }
+        let widths: Vec<usize> = columns.iter().map(|column| widest(column)).collect();
+        // Each line starts with a space of its own, so the border wants one
+        // more column of air at the right and one for each side's border.
+        let width = widths.iter().sum::<usize>() + GAP * (widths.len() - 1) + 3;
+        let rows = columns.iter().map(Vec::len).max().unwrap_or(0);
+        let lines = (0..rows)
+            .map(|at| {
+                let mut spans: Vec<Span> = Vec::new();
+                let mut owed = 0;
+                for (column, column_width) in columns.iter().zip(&widths) {
+                    match column.get(at).filter(|line| line.width() > 0) {
+                        Some(line) => {
+                            spans.push(Span::raw(" ".repeat(owed)));
+                            spans.extend(line.spans.iter().cloned());
+                            owed = column_width + GAP - line.width();
+                        }
+                        None => owed += column_width + GAP,
+                    }
+                }
+                Line::from(spans)
+            })
+            .collect();
+        layout = (lines, width);
+        if width <= room {
+            break;
+        }
+    }
+    layout
+}
+
 /// One column of the overlay: each group's name over its keys, a space, the
-/// key in nine columns, a space, then what it does, with a blank line
+/// key in seven columns, a space, then what it does, with a blank line
 /// between groups.
 fn help_lines(groups: &[(&str, &[(&str, &str)])]) -> Vec<Line<'static>> {
     let t = theme();
@@ -1775,7 +1751,7 @@ fn help_lines(groups: &[(&str, &[(&str, &str)])]) -> Vec<Line<'static>> {
         for (key, does) in *keys {
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!(" {key:<9} "),
+                    format!(" {key:<7} "),
                     fg(t.accent).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw((*does).to_string()),
@@ -2650,6 +2626,40 @@ mod tests {
             ["tell the", "agent", "what"]
         );
         assert_eq!(word_wrap("abcdefghij", 4), ["abcd", "efgh", "ij"]);
+    }
+
+    /// The `?` overlay puts its groups in four columns where a laptop's
+    /// terminal has room, two where it has less and one on a phone's width,
+    /// never cutting a line or dropping a key.
+    #[test]
+    fn help_goes_four_columns_wide_then_two_then_one() {
+        let text = |line: &Line| {
+            line.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
+        let keys: usize = HELP.iter().map(|(_, keys)| keys.len()).sum();
+        let mut last_rows = 0;
+        for (room, headings) in [
+            (130, vec!["Agents", "Trees", "Ports", "Issues"]),
+            (80, vec!["Agents", "Ports"]),
+            (40, vec!["Agents"]),
+        ] {
+            let (lines, width) = help_layout(&HELP, room);
+            assert!(width <= room, "{width} columns fit in {room}");
+            let first = text(&lines[0]);
+            let found: Vec<&str> = first.split_whitespace().collect();
+            assert_eq!(found, headings, "at {room} columns");
+            let described: usize = HELP
+                .iter()
+                .flat_map(|(_, keys)| keys.iter())
+                .filter(|(_, does)| lines.iter().any(|line| text(line).contains(does)))
+                .count();
+            assert_eq!(described, keys, "every key at {room} columns");
+            assert!(lines.len() > last_rows, "fewer columns, taller box");
+            last_rows = lines.len();
+        }
     }
 
     #[test]
