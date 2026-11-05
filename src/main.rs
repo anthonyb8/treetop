@@ -61,7 +61,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyEventKind,
+    Event, KeyEventKind, MouseButton, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -108,10 +108,11 @@ fn leave_screen() -> Result<()> {
 }
 
 /// The size of the terminal a chat runs in: its popup under the bar, less
-/// its sidebar.
-fn chat_size(term: &Term) -> Result<(u16, u16)> {
+/// its sidebar, on the screen left of the inbox.
+fn chat_size(term: &Term, app: &App) -> Result<(u16, u16)> {
     let size = term.size()?;
-    Ok(popup::terminal_size(size.height, size.width))
+    let stage = ui::stage(app, Rect::new(0, 0, size.width, size.height));
+    Ok(popup::terminal_size(stage.height, stage.width))
 }
 
 /// Opens an agent's chat in a popup over treetop, or says why it could not.
@@ -123,7 +124,7 @@ fn open_chat(
     agent: String,
     tree: String,
 ) -> Result<()> {
-    let size = chat_size(term)?;
+    let size = chat_size(term, app)?;
     let hints = app
         .trees
         .iter()
@@ -204,7 +205,7 @@ fn send(
     to: Vec<Recipient>,
     text: &str,
 ) -> Result<()> {
-    let size = chat_size(term)?;
+    let size = chat_size(term, app)?;
     for recipient in to {
         if let Some(job) = app.send_cold(&recipient, text) {
             worker.push(job);
@@ -229,8 +230,9 @@ fn send(
 enum Exit {
     Quit,
     /// Show the pool of the repository checked out here instead, and open
-    /// the agent of the tree at the second path once it is read.
-    Switch(PathBuf, Option<PathBuf>),
+    /// what the inbox entry for the tree at the second path opens, once it
+    /// is read.
+    Switch(PathBuf, Option<(PathBuf, inbox::Kind)>),
     /// Start the treetop installed over this one, on this workspace.
     Restart,
 }
@@ -251,6 +253,7 @@ fn choices() -> Vec<Choice> {
 fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
     let refresher = Refresher::spawn(checkout.to_path_buf(), app.trees.clone());
     let worker = Worker::spawn();
+    let away = inbox::spawn_reader(checkout.to_path_buf());
     app.base = diff::base(checkout);
     let diffs = diff::Loader::spawn(app.base.clone());
     // The Issues screen, made the first time it is shown.
@@ -265,6 +268,8 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
     // Whether the mouse is captured for an open issue or the inbox, apart
     // from a chat's.
     let mut is_issue_mouse = false;
+    // The size the chats' terminals were last given.
+    let mut chat_sized: Option<(u16, u16)> = None;
     // A scratch chat starting, and those being deleted, off this thread.
     let mut starting_scratch: Option<mpsc::Receiver<Result<scratch::Scratch, String>>> = None;
     let mut removing_scratch: Vec<mpsc::Receiver<Result<String, String>>> = Vec::new();
@@ -553,14 +558,29 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
         }
         // An inbox entry from another workspace opens its agent here once
         // the pool is read, before any ask takes the screen.
-        if !chats.is_open()
-            && let Some(Outcome::Chat {
-                command,
-                agent,
-                tree,
-            }) = app.arrival()
-        {
-            open_chat(term, app, &mut chats, &command, agent, tree)?;
+        if !chats.is_open() {
+            match app.arrival() {
+                Some(Outcome::Chat {
+                    command,
+                    agent,
+                    tree,
+                }) => {
+                    open_chat(term, app, &mut chats, &command, agent, tree)?;
+                    is_stale = true;
+                }
+                // An agent with no chat here runs in a tmux pane, which
+                // arrival only offers inside tmux.
+                Some(Outcome::Enter(tree)) => {
+                    app.message = Some(tmux::open(&tree).unwrap_or_else(|err| format!("{err:#}")));
+                    is_stale = true;
+                }
+                _ => {}
+            }
+        }
+        // The other workspaces' agents and PRs, as their slower read last
+        // found them.
+        while let Ok(live) = away.rounds.try_recv() {
+            app.away_live = live;
             is_stale = true;
         }
         // An agent asking you something gets its chat opened once nothing
@@ -616,13 +636,17 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
         // A key or a resize: either way the screen is drawn again.
         is_stale = true;
         let event = event::read()?;
-        if let Event::Resize(cols, rows) = event {
-            let (rows, cols) = popup::terminal_size(rows, cols);
-            chats.resize(rows, cols);
+        // A resize, or the inbox shown or hidden, changes the room a chat
+        // has beside it.
+        let size = chat_size(term, app)?;
+        if chat_sized != Some(size) {
+            chats.resize(size.0, size.1);
+            chat_sized = Some(size);
         }
         if let Some(open) = chats.open_mut() {
-            match event {
-                Event::Key(key) if key.kind != KeyEventKind::Release => {
+            let mut is_inbox_click = false;
+            match &event {
+                &Event::Key(key) if key.kind != KeyEventKind::Release => {
                     if chat::is_exit(key) {
                         let (agent, tree) = (open.agent.clone(), open.tree.clone());
                         chats.hide();
@@ -642,15 +666,28 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                         open.send_key(key);
                     }
                 }
-                Event::Paste(text) => open.paste(&text),
-                Event::Mouse(mouse) => {
+                Event::Paste(text) => open.paste(text),
+                &Event::Mouse(mouse) => {
                     let size = term.size()?;
                     let screen = Rect::new(0, 0, size.width, size.height);
-                    open.send_mouse(mouse, popup::chat(screen));
+                    // A click on the inbox beside the chat leaves the chat
+                    // for the entry clicked, which the list's own click
+                    // below opens.
+                    is_inbox_click = mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                        && ui::is_on_inbox(app, screen, mouse);
+                    if is_inbox_click {
+                        let (agent, tree) = (open.agent.clone(), open.tree.clone());
+                        chats.hide();
+                        chat_closed(app, &agent, &tree)?;
+                    } else {
+                        open.send_mouse(mouse, popup::chat(ui::stage(app, screen)));
+                    }
                 }
                 _ => {}
             }
-            continue;
+            if !is_inbox_click {
+                continue;
+            }
         }
         let outcome = if let Event::Mouse(mouse) = event {
             if let Some(screen) = issues.as_mut().filter(|_| app.is_issues) {
@@ -741,9 +778,11 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                 removing_scratch.push(result);
             }
             Outcome::Switch(path) => return Ok(Exit::Switch(path, None)),
-            Outcome::SwitchTo { checkout, tree } => {
-                return Ok(Exit::Switch(checkout, Some(tree)));
-            }
+            Outcome::SwitchTo {
+                checkout,
+                tree,
+                kind,
+            } => return Ok(Exit::Switch(checkout, Some((tree, kind)))),
             Outcome::Restart => return Ok(Exit::Restart),
             Outcome::Update => {
                 app.is_updating = true;

@@ -273,11 +273,12 @@ pub enum Outcome {
     /// Show the pool of the repository checked out here instead.
     Switch(PathBuf),
     /// Show the pool of the repository checked out at `checkout`, and open
-    /// the agent of its tree at `tree` once it is read: an inbox entry of
-    /// another workspace.
+    /// what its inbox entry of `kind` for the tree at `tree` opens once it
+    /// is read: an inbox entry of another workspace.
     SwitchTo {
         checkout: PathBuf,
         tree: PathBuf,
+        kind: crate::inbox::Kind,
     },
     /// Start the newer treetop installed over this one, on this workspace.
     Restart,
@@ -472,6 +473,9 @@ pub struct App {
     /// The other workspaces' pools as their caches list them, where the
     /// inbox places their agents.
     pub pools: Vec<crate::inbox::Pool>,
+    /// The other workspaces' trees with their agents and PRs, as the last
+    /// read of each found them, by its checkout.
+    pub away_live: HashMap<PathBuf, Vec<Tree>>,
     /// The inbox entries opened and dismissed, and whether it is hidden.
     pub inbox: crate::inbox::Marks,
     /// Where `inbox` is kept. None keeps it in memory only.
@@ -480,7 +484,7 @@ pub struct App {
     pub rail: Option<usize>,
     /// The tree whose agent opens once this workspace's agents are read:
     /// an inbox entry chosen from another workspace.
-    pub arriving: Option<PathBuf>,
+    pub arriving: Option<(PathBuf, crate::inbox::Kind)>,
 }
 
 /// How long a started agent may take to show up before treetop stops
@@ -1581,13 +1585,21 @@ impl App {
             return Outcome::SwitchTo {
                 checkout: away.checkout,
                 tree: entry.path,
+                kind: entry.kind,
             };
         }
-        self.reveal(entry.path.clone());
-        let Some(tree) = self.trees.iter().find(|t| t.path == entry.path) else {
+        self.open_tree(entry.path, entry.kind)
+    }
+
+    /// Puts the cursor on the tree at `path` and opens what an inbox entry
+    /// of `kind` for it opens: for a PR, its checks in the detail pane;
+    /// else its agent, as Enter on its row does.
+    fn open_tree(&mut self, path: PathBuf, kind: crate::inbox::Kind) -> Outcome {
+        self.reveal(path.clone());
+        let Some(tree) = self.trees.iter().find(|t| t.path == path) else {
             return Outcome::Continue;
         };
-        match entry.kind {
+        match kind {
             crate::inbox::Kind::Failed => {
                 self.message = Some(format!(
                     "tree {}'s PR failed its checks; f sends the failure to its agent",
@@ -1603,27 +1615,31 @@ impl App {
         }
     }
 
-    /// The chat of the tree an inbox entry switched here for, once the
-    /// agents are read and nothing else is on screen; the cursor goes to
-    /// the tree either way.
+    /// What the inbox entry another workspace switched here for opens, once
+    /// the agents are read and nothing else is on screen, the cursor going
+    /// to its tree either way: its chat, or inside tmux the pane its agent
+    /// runs in. Outside tmux an agent with no chat is left for `t`, rather
+    /// than a shell opening by itself.
     pub fn arrival(&mut self) -> Option<Outcome> {
         if !self.is_agents_read || !self.is_free() {
             return None;
         }
-        let path = self.arriving.take()?;
-        let Some(tree) = self.trees.iter().find(|t| t.path == path) else {
+        let (path, kind) = self.arriving.take()?;
+        if !self.trees.iter().any(|t| t.path == path) {
             self.message = Some(format!("{} is no longer in this pool", path.display()));
             return None;
-        };
-        let chat = Self::chat_of(tree);
-        if chat.is_none() {
-            self.message = Some(format!(
-                "tree {} has no chat to open here; t goes to it",
-                tree.name
-            ));
         }
-        self.reveal(path);
-        chat
+        match self.open_tree(path, kind) {
+            Outcome::Enter(tree) if !self.is_in_tmux => {
+                self.message = Some(format!(
+                    "tree {} has no chat to open here; t goes to it",
+                    tree.name
+                ));
+                None
+            }
+            Outcome::Continue => None,
+            outcome => Some(outcome),
+        }
     }
 
     /// The chat running `command` is on screen, so whatever its agent asks

@@ -206,7 +206,9 @@ pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>, issues: Option<&i
         || app.scratch_menu.is_some()
         || app.is_help
     {
-        let area = frame.area();
+        // The inbox beside the list stays bright and live; only what the
+        // popup sits over dims.
+        let area = stage(app, frame.area());
         frame
             .buffer_mut()
             .set_style(area, Style::new().add_modifier(Modifier::DIM));
@@ -218,7 +220,7 @@ pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>, issues: Option<&i
     } else if let Some(view) = &app.view {
         draw_diff_view(frame, app, view);
     } else if let Some(prompt) = &app.prompt {
-        draw_prompt(frame, prompt);
+        draw_prompt(frame, stage(app, frame.area()), prompt);
     } else if let Some(picker) = &app.picker {
         draw_picker(frame, app, picker);
     } else if let Some(menu) = &app.port_menu {
@@ -1082,6 +1084,35 @@ fn inbox_layout(app: &App, main: Rect) -> InboxLayout {
     }
 }
 
+/// Where a popup goes on the list's screen `screen`: all of it but the
+/// inbox beside the list, so the inbox stays in view and keeps updating
+/// beside a chat, a diff or the compose box. Where the inbox is hidden, or
+/// on the Issues screen, the whole screen.
+pub fn stage(app: &App, screen: Rect) -> Rect {
+    if app.is_issues {
+        return screen;
+    }
+    let [main, _] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(screen);
+    Rect {
+        width: inbox_layout(app, main).list.width,
+        ..screen
+    }
+}
+
+/// The inbox beside the list, as a column or a strip, is under `mouse`.
+pub fn is_on_inbox(app: &App, screen: Rect, mouse: ratatui::crossterm::event::MouseEvent) -> bool {
+    if app.is_issues {
+        return false;
+    }
+    let [main, _] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(screen);
+    let layout = inbox_layout(app, main);
+    let at = Position::new(mouse.column, mouse.row);
+    layout
+        .rail
+        .or(layout.strip)
+        .is_some_and(|area| area.contains(at))
+}
+
 /// What a click on the list's screen does: on an inbox entry, opens it; on
 /// the strip, gives the inbox the keys. None for anywhere else.
 pub fn click(
@@ -1277,6 +1308,35 @@ fn draw_inbox(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(Line::styled(keys, fg(t.muted))), foot);
 }
 
+/// The inbox's three counts of `kinds`, as its strip and the picker draw
+/// them: needs you, failed and done, each by its own mark and colour.
+const COUNTS: [(&[Kind], &str); 3] = [
+    (&[Kind::NeedsYou], "●"),
+    (&[Kind::Failed, Kind::Died], "✗"),
+    (&[Kind::Done, Kind::Merged], "✓"),
+];
+
+fn count_style(mark: &str) -> Style {
+    let t = theme();
+    match mark {
+        "●" => fg(t.warning).add_modifier(Modifier::BOLD),
+        "✗" => fg(t.danger),
+        _ => fg(t.success),
+    }
+}
+
+/// `kinds` counted as the picker shows them: only the counts above zero,
+/// so a workspace with nothing waiting says nothing.
+fn count_spans(kinds: &[Kind]) -> Vec<Span<'static>> {
+    COUNTS
+        .iter()
+        .filter_map(|(of, mark)| {
+            let n = kinds.iter().filter(|k| of.contains(k)).count();
+            (n > 0).then(|| Span::styled(format!("{mark}{n} "), count_style(mark)))
+        })
+        .collect()
+}
+
 /// The inbox folded to its counts: unseen entries needing you, failed and
 /// done, for a terminal too narrow for it in full.
 fn draw_inbox_strip(frame: &mut Frame, app: &App, area: Rect) {
@@ -1291,19 +1351,14 @@ fn draw_inbox_strip(frame: &mut Frame, app: &App, area: Rect) {
         .filter(|(_, seen)| !seen)
         .map(|(e, _)| e.kind)
         .collect();
-    let count = |kinds: &[Kind]| unseen.iter().filter(|k| kinds.contains(k)).count();
     let mut lines = vec![Line::raw("")];
-    for (kinds, mark, style) in [
-        (
-            &[Kind::NeedsYou][..],
-            "●",
-            fg(t.warning).add_modifier(Modifier::BOLD),
-        ),
-        (&[Kind::Failed, Kind::Died][..], "✗", fg(t.danger)),
-        (&[Kind::Done, Kind::Merged][..], "✓", fg(t.success)),
-    ] {
-        let n = count(kinds);
-        let style = if n == 0 { fg(t.muted) } else { style };
+    for (kinds, mark) in COUNTS {
+        let n = unseen.iter().filter(|k| kinds.contains(k)).count();
+        let style = if n == 0 {
+            fg(t.muted)
+        } else {
+            count_style(mark)
+        };
         lines.push(Line::styled(format!("{mark}{n}"), style));
     }
     lines.push(Line::raw(""));
@@ -1463,6 +1518,11 @@ fn draw_picker(frame: &mut Frame, app: &App, picker: &Picker) {
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
+    let unseen: Vec<Entry> = inbox::shown(app)
+        .into_iter()
+        .filter(|(_, seen)| !seen)
+        .map(|(e, _)| e)
+        .collect();
     let rows: Vec<Row> = picker
         .choices
         .iter()
@@ -1472,10 +1532,19 @@ fn draw_picker(frame: &mut Frame, app: &App, picker: &Picker) {
                 Some(n) => format!("{n} held"),
                 None => "not listed yet".into(),
             };
+            let mine: Vec<Kind> = unseen
+                .iter()
+                .filter(|e| match &e.away {
+                    Some(away) => away.checkout == choice.checkout,
+                    None => is_here,
+                })
+                .map(|e| e.kind)
+                .collect();
             Row::new(vec![
                 Cell::from(if is_here { "●" } else { " " }).style(fg(t.accent)),
                 Cell::from(choice.name.clone()).style(Style::new().add_modifier(Modifier::BOLD)),
                 Cell::from(held).style(fg(t.info)),
+                Cell::from(Line::from(count_spans(&mine))),
                 Cell::from(choice.checkout.display().to_string()).style(fg(t.muted)),
             ])
         })
@@ -1484,6 +1553,7 @@ fn draw_picker(frame: &mut Frame, app: &App, picker: &Picker) {
         Constraint::Length(1),
         Constraint::Length(20),
         Constraint::Length(14),
+        Constraint::Length(12),
         Constraint::Fill(1),
     ];
     let table = Table::new(rows, widths).row_highlight_style(t.cursor);
@@ -1775,9 +1845,8 @@ const COMPOSE_ROWS: (u16, u16) = (7, 16);
 
 /// The compose box in the middle of the screen: who the text goes to, the
 /// text, wrapped and growing as it is typed, and the keys.
-fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
+fn draw_prompt(frame: &mut Frame, screen: Rect, prompt: &Prompt) {
     let t = theme();
-    let screen = frame.area();
     let width = screen.width.saturating_sub(4).min(116);
     let text_width = usize::from(width.saturating_sub(4));
     let rows = wrap_chars(&prompt.text, text_width);
@@ -2488,7 +2557,7 @@ fn draw_diff_view(frame: &mut Frame, app: &App, view: &DiffView) {
     // What the diff is sits in a bar on the popup's first row, and the keys
     // in one on its last, both drawn like a file header.
     let [body, key_row] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)])
-        .areas(popup::body(frame.area()));
+        .areas(popup::body(stage(app, frame.area())));
     let tree = app.trees.iter().find(|tree| tree.path == view.path);
     let mut title = vec![
         Span::styled(" diff ", t.badge),
@@ -2526,7 +2595,7 @@ fn draw_diff_view(frame: &mut Frame, app: &App, view: &DiffView) {
             )));
         }
     }
-    bar_popup(frame, title, Vec::new());
+    bar_popup(frame, stage(app, frame.area()), title, Vec::new());
     frame.render_widget(
         Paragraph::new(Line::from(fitting_keys(&DIFF_KEYS, key_row.width))).style(t.diff.header),
         key_row,
@@ -2614,8 +2683,9 @@ fn chat_frame(frame: &mut Frame, app: &App, agent: &str, tree: &str, seen: Optio
         ]
     };
     let keys = key_bar(&[("^Q", "back to treetop"), ("^\\", "next chat")]);
-    bar_popup(frame, title, keys);
-    if let Some(side) = popup::sidebar(frame.area()) {
+    let screen = stage(app, frame.area());
+    bar_popup(frame, screen, title, keys);
+    if let Some(side) = popup::sidebar(screen) {
         let block = Block::new()
             .borders(Borders::LEFT)
             .border_style(fg(theme().border))
@@ -2629,7 +2699,7 @@ fn chat_frame(frame: &mut Frame, app: &App, agent: &str, tree: &str, seen: Optio
         let lines = sidebar_lines(seen, tree, app.usage.as_ref(), now, inner.width);
         frame.render_widget(Paragraph::new(lines), inner);
     }
-    popup::chat(frame.area())
+    popup::chat(screen)
 }
 
 /// The chat's agent: the one its command attaches to, else the one of its
@@ -2915,8 +2985,12 @@ fn tree_lines(tree: &Tree, width: u16) -> Vec<Line<'static>> {
 /// A popup with a bar on the first row inside its border, drawn like a
 /// diff's file header: `title` at its left and `keys` at its right, the keys
 /// left out where the two would not fit. Returns the rows under the bar.
-fn bar_popup(frame: &mut Frame, title: Vec<Span<'static>>, keys: Vec<Span<'static>>) -> Rect {
-    let screen = frame.area();
+fn bar_popup(
+    frame: &mut Frame,
+    screen: Rect,
+    title: Vec<Span<'static>>,
+    keys: Vec<Span<'static>>,
+) -> Rect {
     let area = popup::area(screen);
     let bar = popup::bar(screen);
     frame.render_widget(Clear, area);
@@ -3456,6 +3530,7 @@ mod inbox_tests {
             Some(Outcome::SwitchTo {
                 checkout: "/code/endodeals-web".into(),
                 tree: "/other/12/web".into(),
+                kind: Kind::NeedsYou,
             })
         );
         let mut app = self::app();
@@ -3504,6 +3579,97 @@ mod inbox_tests {
                 lines[row]
             );
         }
+    }
+
+    #[test]
+    fn the_picker_counts_what_waits_unseen_in_each_workspace() {
+        let mut app = app();
+        app.checkout = "/code/treetop".into();
+        let choice = |name: &str, checkout: &str| crate::app::Choice {
+            checkout: checkout.into(),
+            name: name.into(),
+            held: Some(2),
+        };
+        app.picker = Some(Picker {
+            choices: vec![
+                choice("treetop", "/code/treetop"),
+                choice("endodeals-web", "/code/endodeals-web"),
+                choice("lander", "/code/lander"),
+            ],
+            selected: 0,
+        });
+        // The picker's rows are the lines that end in their checkout.
+        let row = |shown: &[String], name: &str| {
+            shown
+                .iter()
+                .find(|l| l.contains(&format!("/code/{name}")))
+                .unwrap()
+                .clone()
+        };
+        let shown = screen(&app, 200, 30);
+        assert!(
+            row(&shown, "treetop").contains("●1 ✗2 ✓1"),
+            "{}",
+            row(&shown, "treetop")
+        );
+        assert!(
+            row(&shown, "endodeals-web").contains("●1"),
+            "{}",
+            row(&shown, "endodeals-web")
+        );
+        assert!(
+            !row(&shown, "lander").contains('●'),
+            "{}",
+            row(&shown, "lander")
+        );
+        // Tree 4's ask, once its chat has opened, no longer counts.
+        app.saw_chat(&["claude".into(), "attach".into(), "j4".into()]);
+        let shown = screen(&app, 200, 30);
+        let treetop = row(&shown, "treetop");
+        assert!(
+            treetop.contains("✗2 ✓1") && !treetop.contains("●1"),
+            "{treetop}"
+        );
+    }
+
+    #[test]
+    fn a_popup_dims_the_list_but_leaves_the_inbox_bright_beside_it() {
+        let mut app = app();
+        app.picker = Some(Picker {
+            choices: Vec::new(),
+            selected: 0,
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(200, 30)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &app, None, None))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let lines = screen(&app, 200, 30);
+        let row = lines.iter().position(|l| l.contains("4 ANB-41")).unwrap();
+        let column = lines[row][..lines[row].find("4 ANB-41").unwrap()]
+            .chars()
+            .count();
+        let at = |x: usize| &buffer[(u16::try_from(x).unwrap(), u16::try_from(row).unwrap())];
+        assert!(
+            !at(column).modifier.contains(Modifier::DIM),
+            "the inbox stays bright"
+        );
+        assert!(
+            at(4).modifier.contains(Modifier::DIM),
+            "the list under the popup dims"
+        );
+    }
+
+    #[test]
+    fn a_chat_opens_left_of_the_inbox_and_takes_the_width_back_once_it_hides() {
+        let mut app = app();
+        let screen = Rect::new(0, 0, 200, 30);
+        let inbox_starts = 200 - INBOX_WIDTH;
+        // The chat's popup, its border and sidebar included.
+        assert!(popup::area(stage(&app, screen)).right() <= inbox_starts);
+        app.inbox.is_hidden = true;
+        assert!(popup::area(stage(&app, screen)).right() > inbox_starts);
     }
 
     #[test]
