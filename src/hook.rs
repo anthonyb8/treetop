@@ -126,7 +126,15 @@ fn judge(act: &Act, caller: &Caller) -> Result<(), String> {
             {
                 return Ok(());
             }
-            guard::may_return(&trees, tree, caller).map_err(|why| format!("no {verb}: {why}"))
+            guard::may_return(&trees, tree, caller).map_err(|why| format!("no {verb}: {why}"))?;
+            let runs = crate::keel::status().unwrap_or_default();
+            match crate::keel::holding(&runs, &tree.path) {
+                Some(run) if !tree.is_main => Err(format!(
+                    "no {verb}: {}",
+                    crate::keel::refusal(&tree.name, run)
+                )),
+                _ => Ok(()),
+            }
         }
         Act::InTree { command, dir } => {
             let Ok(checkout) = pool::main_checkout(dir) else {

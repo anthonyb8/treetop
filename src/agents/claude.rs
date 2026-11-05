@@ -105,14 +105,92 @@ pub fn config_dir() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".claude")))
 }
 
-fn attach(id: &str) -> Vec<String> {
-    vec!["claude".into(), "attach".into(), id.into()]
+/// Every config dir sessions are found in, the first where new agents
+/// start: `[claude] config_dirs` in treetop's config, else the one Claude
+/// Code uses by default.
+pub fn config_dirs() -> Vec<PathBuf> {
+    let listed = crate::config::load()
+        .map(|config| config.claude.dirs())
+        .unwrap_or_default();
+    if listed.is_empty() {
+        config_dir().into_iter().collect()
+    } else {
+        listed
+    }
+}
+
+/// Whether `claude` run with no `CLAUDE_CONFIG_DIR` of its own uses `home`.
+/// Only another dir is ever named: naming `~/.claude` would move Claude
+/// Code's `.claude.json` from the home directory into it.
+fn is_default(home: &Path) -> bool {
+    config_dir().as_deref() == Some(home)
+}
+
+/// What a session under `home` is labelled with: nothing under the default
+/// dir, else the setup's name, `keel` for `~/.keel/claude`.
+fn label(home: &Path) -> Option<String> {
+    if is_default(home) {
+        return None;
+    }
+    let name = home.file_name()?.to_str()?;
+    let name = if name.trim_start_matches('.') == "claude" {
+        home.parent()?.file_name()?.to_str()?
+    } else {
+        name
+    };
+    Some(name.trim_start_matches('.').to_string()).filter(|name| !name.is_empty())
+}
+
+/// The command that opens job `id` under `home` in a terminal.
+fn attach(home: &Path, id: &str) -> Vec<String> {
+    let mut argv = Vec::new();
+    if !is_default(home) {
+        argv.extend([
+            "env".into(),
+            format!("CLAUDE_CONFIG_DIR={}", home.display()),
+        ]);
+    }
+    argv.extend(["claude".into(), "attach".into(), id.into()]);
+    argv
+}
+
+/// The config dir job `id` belongs to: the one with a job or a running
+/// session by that id, else none.
+fn home_of(id: &str) -> Option<PathBuf> {
+    let homes = config_dirs();
+    let has_session = |home: &Path| {
+        dirs(&home.join("sessions")).iter().any(|path| {
+            fs::read_to_string(path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<Session>(&text).ok())
+                .is_some_and(|s| s.job_id.as_deref() == Some(id) || s.session_id.starts_with(id))
+        })
+    };
+    homes
+        .iter()
+        .find(|home| home.join("jobs").join(id).is_dir())
+        .or_else(|| homes.iter().find(|home| has_session(home)))
+        .cloned()
+}
+
+/// The command that opens job `id` in a terminal, under the config dir it
+/// belongs to.
+pub fn attach_job(id: &str) -> Vec<String> {
+    match home_of(id) {
+        Some(home) => attach(&home, id),
+        None => vec!["claude".into(), "attach".into(), id.into()],
+    }
+}
+
+/// The config dir of job `id`, for reading its files.
+pub fn job_home(id: &str) -> Option<PathBuf> {
+    home_of(id)
 }
 
 /// The session working in `dir`, if it is still running: its pid is alive
 /// and started when the session file says, so a pid reused since does not
 /// count. `start` is the pid's start time now, None when it has exited.
-fn live_session(session: &Session, start: Option<u64>, dir: PathBuf) -> Option<Seen> {
+fn live_session(home: &Path, session: &Session, start: Option<u64>, dir: PathBuf) -> Option<Seen> {
     let start = start?;
     let recorded = match &session.proc_start {
         Some(Value::String(text)) => text.parse().ok(),
@@ -134,10 +212,11 @@ fn live_session(session: &Session, start: Option<u64>, dir: PathBuf) -> Option<S
         pid: Some(session.pid),
         status: session.status.clone(),
         background: is_background,
-        attach: short.map(attach),
+        attach: short.map(|id| attach(home, id)),
         active_at: None,
         context: None,
         spend: None,
+        label: label(home),
     })
 }
 
@@ -455,16 +534,20 @@ fn dirs(dir: &Path) -> Vec<PathBuf> {
 
 /// The jobs whose session is running now, by job id.
 pub fn running_jobs() -> HashSet<String> {
-    let Some(config) = config_dir() else {
-        return HashSet::new();
-    };
-    dirs(&config.join("sessions"))
+    config_dirs()
         .iter()
-        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
-        .filter_map(|path| serde_json::from_str::<Session>(&fs::read_to_string(path).ok()?).ok())
-        .filter_map(|session| {
-            let start = live::stat(session.pid).map(|s| s.start);
-            live_session(&session, start, PathBuf::new())?.id
+        .flat_map(|home| {
+            dirs(&home.join("sessions"))
+                .iter()
+                .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+                .filter_map(|path| {
+                    serde_json::from_str::<Session>(&fs::read_to_string(path).ok()?).ok()
+                })
+                .filter_map(|session| {
+                    let start = live::stat(session.pid).map(|s| s.start);
+                    live_session(home, &session, start, PathBuf::new())?.id
+                })
+                .collect::<Vec<_>>()
         })
         .collect()
 }
@@ -499,7 +582,13 @@ fn live_sessions(config: &Path) -> Vec<Seen> {
                 .and_then(|path| fs::metadata(path).and_then(|m| m.modified()).ok())
                 .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|since| since.as_secs());
-            live_session(&session, live::stat(session.pid).map(|s| s.start), cwd).map(|seen| Seen {
+            live_session(
+                config,
+                &session,
+                live::stat(session.pid).map(|s| s.start),
+                cwd,
+            )
+            .map(|seen| Seen {
                 active_at,
                 context,
                 spend,
@@ -516,6 +605,7 @@ static JOBS: LazyLock<Mutex<Reader>> = LazyLock::new(Mutex::default);
 /// last worked.
 fn cold(live: &[Seen]) -> Vec<Seen> {
     let running: HashSet<&str> = live.iter().filter_map(|s| s.id.as_deref()).collect();
+    let homes = config_dirs();
     let reports = JOBS
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -529,9 +619,14 @@ fn cold(live: &[Seen]) -> Vec<Seen> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .ok()
                 .map(|since| since.as_secs());
+            let home = homes
+                .iter()
+                .find(|home| home.join("jobs").join(&report.job).is_dir())
+                .or(homes.first())?;
             Some(Seen {
                 active_at,
-                attach: Some(attach(&report.job)),
+                attach: Some(attach(home, &report.job)),
+                label: label(home),
                 id: Some(report.job),
                 name: report.name,
                 dir: report.dir?,
@@ -548,10 +643,10 @@ fn cold(live: &[Seen]) -> Vec<Seen> {
 
 /// Every Claude Code agent, running or cold.
 fn find() -> Vec<Seen> {
-    let Some(config) = config_dir() else {
-        return Vec::new();
-    };
-    let mut seen = live_sessions(&config);
+    let mut seen: Vec<Seen> = config_dirs()
+        .iter()
+        .flat_map(|home| live_sessions(home))
+        .collect();
     seen.extend(cold(&seen));
     seen
 }
@@ -569,10 +664,14 @@ pub fn attach_id(output: &str) -> Option<&str> {
     })
 }
 
-/// Runs `claude` with `args` in `dir`, and returns its stdout.
-fn claude(args: &[&str], dir: Option<&Path>) -> Result<String, Error> {
+/// Runs `claude` under config dir `home` with `args` in `dir`, and returns
+/// its stdout.
+fn claude(home: &Path, args: &[&str], dir: Option<&Path>) -> Result<String, Error> {
     let mut command = Command::new("claude");
     command.args(args);
+    if !is_default(home) {
+        command.env("CLAUDE_CONFIG_DIR", home);
+    }
     if let Some(dir) = dir {
         command.current_dir(dir);
     }
@@ -604,9 +703,14 @@ fn claude(args: &[&str], dir: Option<&Path>) -> Result<String, Error> {
 /// Waits for Claude Code to list session `id`, which is what says it
 /// started: `claude --bg` exits 0 once the session is queued, not running.
 pub fn confirm(id: &str) -> Result<(), Error> {
+    confirm_in(&config_dir().unwrap_or_default(), id)
+}
+
+/// `confirm`, for a session under config dir `home`.
+fn confirm_in(home: &Path, id: &str) -> Result<(), Error> {
     let deadline = Instant::now() + CONFIRM_LIMIT;
     loop {
-        let is_listed = claude(&["agents", "--json", "--all"], None).is_ok_and(|json| {
+        let is_listed = claude(home, &["agents", "--json", "--all"], None).is_ok_and(|json| {
             serde_json::from_str::<Vec<Value>>(&json).is_ok_and(|sessions| {
                 sessions
                     .iter()
@@ -679,15 +783,20 @@ fn start(args: &Value) -> Result<Value, Error> {
     let dir = PathBuf::from(required(args, "dir")?);
     let is_isolated = args.get("isolated").and_then(Value::as_bool) == Some(true);
     let told = is_isolated.then(|| stay(&dir));
+    let home = config_dirs()
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::new(Code::Unavailable, "no HOME"))?;
     let out = claude(
+        &home,
         &start_args(text(args, "name"), told.as_deref(), text(args, "prompt")),
         Some(&dir),
     )?;
     let id = attach_id(&out)
         .ok_or_else(|| Error::new(Code::Failed, "claude printed no session id"))?
         .to_string();
-    if let Err(err) = confirm(&id) {
-        let _ = claude(&["stop", &id], None);
+    if let Err(err) = confirm_in(&home, &id) {
+        let _ = claude(&home, &["stop", &id], None);
         return Err(err);
     }
     Ok(json!({ "id": id }))
@@ -729,14 +838,19 @@ fn job_state(text: &str) -> Option<JobState> {
     serde_json::from_str(text).ok()
 }
 
-fn read_job(id: &str) -> Option<JobState> {
-    let path = config_dir()?.join("jobs").join(id).join("state.json");
+fn read_job(home: &Path, id: &str) -> Option<JobState> {
+    let path = home.join("jobs").join(id).join("state.json");
     job_state(&fs::read_to_string(path).ok()?)
 }
 
 /// The session a background job ran as, which `--resume` takes.
-fn resume_id(id: &str) -> Option<String> {
-    read_job(id)?.session().map(str::to_string)
+fn resume_id(home: &Path, id: &str) -> Option<String> {
+    read_job(home, id)?.session().map(str::to_string)
+}
+
+/// Job `id`'s config dir, or an error naming the job when there is none.
+fn home_for(id: &str) -> Result<PathBuf, Error> {
+    home_of(id).ok_or_else(|| Error::new(Code::NotFound, format!("no background job {id}")))
 }
 
 /// Sends `text` to a cold session by starting it again in the background
@@ -751,9 +865,10 @@ fn send(args: &Value) -> Result<Value, Error> {
             format!("{id} is running; type into its chat"),
         ));
     }
-    let session = resume_id(id)
+    let home = home_for(id)?;
+    let session = resume_id(&home, id)
         .ok_or_else(|| Error::new(Code::NotFound, format!("no background job {id}")))?;
-    claude(&["--bg", "--resume", &session, "--", message], None)?;
+    claude(&home, &["--bg", "--resume", &session, "--", message], None)?;
     Ok(json!({ "delivered": true }))
 }
 
@@ -772,9 +887,9 @@ fn resume(args: &Value) -> Result<Value, Error> {
             let since = SystemTime::UNIX_EPOCH + Duration::from_secs(since);
             worked_in(&dir)
                 .into_iter()
-                .filter(|(id, at)| *at >= since && !is_live(id))
-                .max_by_key(|(_, at)| *at)
-                .map(|(id, _)| id)
+                .filter(|(_, id, at)| *at >= since && !is_live(id))
+                .max_by_key(|(_, _, at)| *at)
+                .map(|(_, id, _)| id)
                 .ok_or_else(|| {
                     Error::new(
                         Code::NotFound,
@@ -789,11 +904,10 @@ fn resume(args: &Value) -> Result<Value, Error> {
             format!("{id} is running; open its chat"),
         ));
     }
-    let state = read_job(&id)
+    let home = home_for(&id)?;
+    let state = read_job(&home, &id)
         .ok_or_else(|| Error::new(Code::NotFound, format!("no background job {id}")))?;
-    let projects = config_dir()
-        .map(|config| dirs(&config.join("projects")))
-        .unwrap_or_default();
+    let projects = dirs(&home.join("projects"));
     let session = state
         .session()
         .filter(|session| transcript(&projects, session).is_some())
@@ -806,11 +920,11 @@ fn resume(args: &Value) -> Result<Value, Error> {
     let mut argv = vec!["--bg", "--resume", session];
     argv.extend(state.respawn_flags.iter().map(String::as_str));
     let dir = state.cwd.as_deref().filter(|dir| dir.is_dir());
-    let out = claude(&argv, dir)?;
+    let out = claude(&home, &argv, dir)?;
     let started = attach_id(&out)
         .ok_or_else(|| Error::new(Code::Failed, "claude printed no session id"))?
         .to_string();
-    confirm(&started)?;
+    confirm_in(&home, &started)?;
     Ok(json!({ "id": started, "resumed": id }))
 }
 
@@ -862,8 +976,7 @@ impl Drop for PinsLock {
 
 /// Pins `ids`, or unpins them, in `<config>/jobs/pins.json`. A file that is
 /// not the list of ids Claude Code writes is left as it is.
-fn set_pinned(ids: &[&str], is_pinned: bool) -> Result<(), Error> {
-    let config = config_dir().ok_or_else(|| Error::new(Code::Unavailable, "no HOME"))?;
+fn set_pinned(config: &Path, ids: &[&str], is_pinned: bool) -> Result<(), Error> {
     let pins = config.join("jobs").join("pins.json");
     fs::create_dir_all(config.join("jobs"))
         .map_err(|err| Error::new(Code::Failed, format!("{}: {err}", pins.display())))?;
@@ -923,10 +1036,11 @@ fn keep(args: &Value) -> Result<Value, Error> {
         return Ok(json!({ "woken": [] }));
     }
     let seen = find();
-    let projects = config_dir()
-        .map(|config| dirs(&config.join("projects")))
-        .unwrap_or_default();
-    let resumable = |id: &str| resume_id(id).filter(|s| transcript(&projects, s).is_some());
+    let resumable = |id: &str| {
+        let home = home_of(id)?;
+        let projects = dirs(&home.join("projects"));
+        resume_id(&home, id).filter(|s| transcript(&projects, s).is_some())
+    };
     let ids: Vec<&str> = ids
         .into_iter()
         .filter(|id| {
@@ -936,7 +1050,9 @@ fn keep(args: &Value) -> Result<Value, Error> {
     if ids.is_empty() {
         return Ok(json!({ "woken": [] }));
     }
-    set_pinned(&ids, true)?;
+    for (home, ids) in by_home(&ids) {
+        set_pinned(&home, &ids, true)?;
+    }
     let mut woken = Vec::new();
     for id in ids {
         let Some(agent) = seen.iter().find(|s| s.id.as_deref() == Some(id)) else {
@@ -956,14 +1072,17 @@ fn keep(args: &Value) -> Result<Value, Error> {
             continue;
         };
         let dir = Some(agent.dir.as_path()).filter(|dir| dir.is_dir());
-        let Ok(output) = claude(&["--bg", "--resume", &session], dir) else {
+        let Some(home) = home_of(id) else {
+            continue;
+        };
+        let Ok(output) = claude(&home, &["--bg", "--resume", &session], dir) else {
             continue;
         };
         match attach_id(&output) {
             // It came up as a job of its own rather than as `id`, which
             // stays cold: the new one is no agent anyone started.
             Some(other) if other != id => {
-                let _ = claude(&["rm", other], None);
+                let _ = claude(&home, &["rm", other], None);
             }
             _ => woken.push(id),
         }
@@ -974,9 +1093,10 @@ fn keep(args: &Value) -> Result<Value, Error> {
 /// Lets job `id` rest: unpins it, and stops it if it runs.
 fn stop(args: &Value) -> Result<Value, Error> {
     let id = required(args, "id")?;
-    set_pinned(&[id], false)?;
+    let home = home_for(id)?;
+    set_pinned(&home, &[id], false)?;
     if find().iter().any(|s| s.live && s.id.as_deref() == Some(id)) {
-        claude(&["stop", id], None)?;
+        claude(&home, &["stop", id], None)?;
     }
     Ok(json!({}))
 }
@@ -986,35 +1106,56 @@ fn stop(args: &Value) -> Result<Value, Error> {
 /// tree back through the `WorktreeRemove` hook as it goes.
 fn remove(args: &Value) -> Result<Value, Error> {
     let id = required(args, "id")?;
-    set_pinned(&[id], false)?;
-    claude(&["rm", id], None)?;
+    let home = home_for(id)?;
+    set_pinned(&home, &[id], false)?;
+    claude(&home, &["rm", id], None)?;
     Ok(json!({}))
 }
 
 /// Every background job that worked in `dir` or under it, in any state:
 /// failed ones too, which no report shows.
-fn jobs_in(dir: &Path) -> Vec<String> {
-    let mut ids: Vec<String> = worked_in(dir).into_iter().map(|(id, _)| id).collect();
+fn jobs_in(dir: &Path) -> Vec<(PathBuf, String)> {
+    let mut ids: Vec<(PathBuf, String)> = worked_in(dir)
+        .into_iter()
+        .map(|(home, id, _)| (home, id))
+        .collect();
     ids.sort();
     ids
 }
 
-/// Every background job that worked in `dir` or under it, with when its
-/// state was last written.
-fn worked_in(dir: &Path) -> Vec<(String, SystemTime)> {
-    let Some(jobs) = config_dir().map(|config| config.join("jobs")) else {
-        return Vec::new();
-    };
-    dirs(&jobs)
+/// Every background job that worked in `dir` or under it, in any config
+/// dir, with that dir and when its state was last written.
+fn worked_in(dir: &Path) -> Vec<(PathBuf, String, SystemTime)> {
+    config_dirs()
         .into_iter()
-        .filter_map(|job| {
-            let state = job.join("state.json");
-            let worked = job_state(&fs::read_to_string(&state).ok()?)?.dir()?;
-            let at = fs::metadata(&state).and_then(|m| m.modified()).ok()?;
-            let id = job.file_name()?.to_str()?.to_string();
-            worked.starts_with(dir).then_some((id, at))
+        .flat_map(|home| {
+            dirs(&home.join("jobs"))
+                .into_iter()
+                .filter_map(|job| {
+                    let state = job.join("state.json");
+                    let worked = job_state(&fs::read_to_string(&state).ok()?)?.dir()?;
+                    let at = fs::metadata(&state).and_then(|m| m.modified()).ok()?;
+                    let id = job.file_name()?.to_str()?.to_string();
+                    worked.starts_with(dir).then(|| (home.clone(), id, at))
+                })
+                .collect::<Vec<_>>()
         })
         .collect()
+}
+
+/// `ids` grouped by the config dir each belongs to.
+fn by_home<'a>(ids: &[&'a str]) -> Vec<(PathBuf, Vec<&'a str>)> {
+    let mut groups: Vec<(PathBuf, Vec<&'a str>)> = Vec::new();
+    for id in ids {
+        let Some(home) = home_of(id) else {
+            continue;
+        };
+        match groups.iter_mut().find(|(h, _)| *h == home) {
+            Some((_, group)) => group.push(id),
+            None => groups.push((home, vec![id])),
+        }
+    }
+    groups
 }
 
 /// Deletes every background job that worked in `dir`, running or not, so a
@@ -1025,10 +1166,17 @@ fn clear(args: &Value) -> Result<Value, Error> {
     if ids.is_empty() {
         return Ok(json!({ "removed": [], "failed": [] }));
     }
-    set_pinned(&ids.iter().map(String::as_str).collect::<Vec<_>>(), false)?;
+    for (home, _) in &ids {
+        let here: Vec<&str> = ids
+            .iter()
+            .filter(|(h, _)| h == home)
+            .map(|(_, id)| id.as_str())
+            .collect();
+        set_pinned(home, &here, false)?;
+    }
     let (mut removed, mut failed) = (Vec::new(), Vec::new());
-    for id in ids {
-        match claude(&["rm", &id], None) {
+    for (home, id) in ids {
+        match claude(&home, &["rm", &id], None) {
             Ok(_) => removed.push(id),
             Err(err) => failed.push(format!("{id}: {err}")),
         }
@@ -1219,7 +1367,7 @@ pub fn op(op: &str, args: &Value) -> Result<Value, Error> {
         })),
         "find" => Ok(json!({ "agents": find() })),
         "start" => start(args),
-        "attach" => Ok(json!({ "argv": attach(required(args, "id")?) })),
+        "attach" => Ok(json!({ "argv": attach_job(required(args, "id")?) })),
         "send" => send(args),
         "resume" => resume(args),
         "usage" => usage(),
@@ -1254,7 +1402,13 @@ mod tests {
 
     #[test]
     fn a_live_session_is_seen_with_its_name_status_and_chat() {
-        let seen = live_session(&session(), Some(163482243), here()).unwrap();
+        let seen = live_session(
+            &config_dir().unwrap_or_default(),
+            &session(),
+            Some(163482243),
+            here(),
+        )
+        .unwrap();
         assert_eq!(seen.name, "trading-card-check");
         assert_eq!(seen.status.as_deref(), Some("waiting"));
         assert!(seen.background && seen.live);
@@ -1270,15 +1424,32 @@ mod tests {
         let interactive: Session =
             serde_json::from_str(&SESSION.replace(r#""kind":"bg""#, r#""kind":"interactive""#))
                 .unwrap();
-        let seen = live_session(&interactive, Some(163482243), here()).unwrap();
+        let seen = live_session(
+            &config_dir().unwrap_or_default(),
+            &interactive,
+            Some(163482243),
+            here(),
+        )
+        .unwrap();
         assert!(!seen.background);
         assert_eq!((seen.attach, seen.id), (None, None));
     }
 
     #[test]
     fn an_exited_or_reused_pid_is_no_live_session() {
-        assert_eq!(live_session(&session(), None, here()), None);
-        assert_eq!(live_session(&session(), Some(999), here()), None);
+        assert_eq!(
+            live_session(&config_dir().unwrap_or_default(), &session(), None, here()),
+            None
+        );
+        assert_eq!(
+            live_session(
+                &config_dir().unwrap_or_default(),
+                &session(),
+                Some(999),
+                here()
+            ),
+            None
+        );
     }
 
     #[test]

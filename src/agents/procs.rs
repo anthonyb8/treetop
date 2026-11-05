@@ -96,6 +96,7 @@ pub fn find(processes: &HashMap<PathBuf, Vec<Process>>) -> Vec<Sighting> {
                         active_at: None,
                         context: None,
                         spend: None,
+                        label: None,
                     };
                     Some((agent, live::stat(p.pid).map(|s| s.ppid)))
                 })
@@ -156,6 +157,7 @@ mod tests {
             active_at: None,
             context: None,
             spend: None,
+            label: None,
         };
         let found = vec![
             (agent(10), Some(1)),

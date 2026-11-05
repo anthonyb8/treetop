@@ -56,6 +56,7 @@ pub fn tree_json(app: &App, tree: &Tree, now: u64) -> Value {
             "status": a.status.map(status),
             "has_chat": a.attach.is_some(),
             "active_ago": a.active_at.map(|at| now.saturating_sub(at)),
+            "label": a.label,
         })).collect::<Vec<_>>(),
         "ports": ports.iter().map(|(port, name, pid)| json!({
             "port": port,

@@ -28,12 +28,14 @@ fn scratch(test: &str) -> PathBuf {
         &fake,
         format!(
             "#!/bin/sh\necho \"$(pwd) $*\" >> {calls}\n\
+             echo \"${{CLAUDE_CONFIG_DIR:-}}\" >> {homes}\n\
              if [ \"$1\" = agents ]; then echo '[{{\"id\":\"0000aaaa\"}}]'; exit 0; fi\n\
              id=0000aaaa\n\
              if [ \"$2\" = --resume ]; then id=$(echo \"$3\" | cut -c1-8); fi\n\
              if [ -f {new} ]; then id=$(cat {new}); fi\n\
              echo \"  claude attach $id    open in this terminal\"\n",
             calls = root.join("calls").display(),
+            homes = root.join("homes").display(),
             new = root.join("new-job").display(),
         ),
     )
@@ -96,6 +98,9 @@ fn call_raw(root: &Path, op: &str, args: Value) -> Value {
         .args(["plugin", "claude"])
         .current_dir(std::env::temp_dir())
         .env("CLAUDE_CONFIG_DIR", root.join("claude"))
+        // treetop's own config, which may list more config dirs, is the
+        // test's, never the machine's.
+        .env("XDG_CONFIG_HOME", root.join("config"))
         .env("PATH", path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -550,4 +555,81 @@ fn usage_reports_the_plans_limits_as_claude_code_last_read_them() {
 fn usage_with_nothing_read_yet_has_no_limits() {
     let root = scratch("no-usage");
     assert_eq!(call(&root, "usage", json!({}))["limits"], json!([]));
+}
+
+/// The `CLAUDE_CONFIG_DIR` each run of the stand-in `claude` had.
+fn homes(root: &Path) -> Vec<String> {
+    fs::read_to_string(root.join("homes"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn sessions_under_a_second_config_dir_are_found_labelled_and_run_under_it() {
+    let root = scratch("homes");
+    let tree = root.join("tree");
+    let keel = root.join("keel/claude");
+    fs::create_dir_all(root.join("config/treetop")).unwrap();
+    fs::write(
+        root.join("config/treetop/config.toml"),
+        format!(
+            "[claude]\nconfig_dirs = [{:?}, {:?}]\n",
+            root.join("claude"),
+            keel
+        ),
+    )
+    .unwrap();
+    finished_job(&root, "0aaaaaaa", &tree, DAY);
+    // The same job laid out under keel's config dir instead.
+    finished_job(&root, "0bbbbbbb", &tree, DAY);
+    fs::create_dir_all(keel.join("jobs")).unwrap();
+    fs::rename(
+        root.join("claude/jobs/0bbbbbbb"),
+        keel.join("jobs/0bbbbbbb"),
+    )
+    .unwrap();
+    fs::create_dir_all(keel.join("projects")).unwrap();
+    fs::rename(
+        root.join("claude/projects/-tree"),
+        keel.join("projects/-tree"),
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("claude/projects/-tree")).unwrap();
+    fs::write(
+        root.join("claude/projects/-tree/0aaaaaaa-1111-2222-3333-444444444444.jsonl"),
+        "{}\n",
+    )
+    .unwrap();
+
+    let found = call(&root, "find", json!({ "dirs": [tree] }));
+    let agents = found["agents"].as_array().unwrap();
+    let by_id = |id: &str| agents.iter().find(|a| a["id"] == id).unwrap().clone();
+    let (plain, keeled) = (by_id("0aaaaaaa"), by_id("0bbbbbbb"));
+    assert_eq!(plain["label"], Value::Null, "{plain}");
+    assert_eq!(plain["attach"], json!(["claude", "attach", "0aaaaaaa"]));
+    assert_eq!(keeled["label"], "keel", "{keeled}");
+    let env = format!("CLAUDE_CONFIG_DIR={}", keel.display());
+    assert_eq!(
+        keeled["attach"],
+        json!(["env", env, "claude", "attach", "0bbbbbbb"])
+    );
+    assert_eq!(
+        call(&root, "attach", json!({ "id": "0bbbbbbb" }))["argv"],
+        keeled["attach"]
+    );
+
+    // Every resume comes up as the job the stand-in lists as running.
+    fs::write(root.join("new-job"), "0000aaaa").unwrap();
+    call(&root, "resume", json!({ "id": "0bbbbbbb" }));
+    call(&root, "resume", json!({ "id": "0aaaaaaa" }));
+    let (asked, homes) = (asked(&root), homes(&root));
+    let ran = |args: &str| homes[asked.iter().position(|a| a.starts_with(args)).unwrap()].clone();
+    assert_eq!(ran("--bg --resume 0bbbbbbb"), keel.display().to_string());
+    // The default dir is the one claude picks anyway, never named again.
+    assert_eq!(
+        ran("--bg --resume 0aaaaaaa"),
+        root.join("claude").display().to_string()
+    );
 }

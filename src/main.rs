@@ -25,6 +25,7 @@ mod guard;
 mod handoff;
 mod hook;
 mod jobs;
+mod keel;
 mod keeper;
 mod live;
 mod naming;
@@ -309,6 +310,7 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                     }
                 }
                 Update::Usage(usage) => app.usage = usage,
+                Update::Runs(runs) => app.runs = runs.unwrap_or_default(),
                 Update::Base(standing) => app.apply_base(standing),
                 Update::Release(tag) => app.apply_release(tag),
                 Update::Shares(shares) => app.apply_shares(shares),

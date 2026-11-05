@@ -15,8 +15,6 @@ pub mod claude;
 mod holder;
 mod procs;
 
-pub use claude::config_dir;
-
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -104,6 +102,9 @@ pub struct Agent {
     pub context: Option<Context>,
     /// The tokens its session has spent, where its source can tell.
     pub spend: Option<Spend>,
+    /// What sets it apart from its plugin's other agents, such as `keel`
+    /// for a Claude Code session under keel's config dir.
+    pub label: Option<String>,
 }
 
 /// An agent and the directory it works in, before it is placed in a tree.
@@ -132,6 +133,7 @@ fn from_plugin(plugin: &str, seen: Seen) -> Sighting {
         active_at: seen.active_at,
         context: seen.context,
         spend: seen.spend,
+        label: seen.label,
     };
     (seen.dir, agent)
 }
@@ -293,6 +295,7 @@ mod tests {
             active_at: None,
             context: None,
             spend: None,
+            label: None,
         }
     }
 
@@ -361,6 +364,7 @@ mod tests {
                     active_at: None,
                     context: None,
                     spend: None,
+                    label: None,
                 },
             )
         };
@@ -411,6 +415,7 @@ mod tests {
                     active_at: None,
                     context: None,
                     spend: None,
+                    label: None,
                 },
             )
         };
@@ -466,6 +471,7 @@ mod tests {
                     active_at: None,
                     context: None,
                     spend: None,
+                    label: None,
                 },
             )
         };
@@ -526,6 +532,7 @@ mod tests {
                 active_at: None,
                 context: None,
                 spend: None,
+                label: None,
             },
         );
         let active = HashMap::from([("83f4be50".to_string(), at("2026-10-18T17:14:24Z"))]);

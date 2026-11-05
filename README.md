@@ -49,7 +49,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | `:` | ask the assistant about the tree under the cursor, or write `@17 ...` for that tree's agent (see [The assistant](#the-assistant)) |
 | `a` | open the assistant's chat, where it answers, starting it if there is none |
 | `d` | open the side-by-side diff of the tree under the cursor in a popup |
-| `r` | return the marked trees, or the one under the cursor, to the pool; its dialog names each tree's branch, its uncommitted and unpushed counts and the pid of every live process a return would stop, and `D` in it destroys them from disk instead, after reviewing treehouse's preview of each |
+| `r` | return the marked trees, or the one under the cursor, to the pool; its dialog names each tree's branch, its uncommitted and unpushed counts, the pid of every live process a return would stop and any [keel run](#keel-runs) that holds it, and `D` in it destroys them from disk instead, after reviewing treehouse's preview of each |
 | Space | mark or unmark the tree under the cursor |
 | `z` | park the tree under the cursor, setting it aside under Parked, or bring it back; `Z` opens or folds Parked |
 | `/` | filter by number, branch, holder or agent; Enter keeps it, Esc clears it |
@@ -84,6 +84,7 @@ treetop reads which ports are shared back from `tether shares`, or the `shares` 
 AGENT names the coding agent working in the tree, from the sources under [Agents](#agents); `no agent` on a held tree marks one nobody is working in.
 Where a tree has several, it names the most pressing live one, waiting on you, then busy, then idle, the most recently active first, and counts the other live ones as `+N`; a stopped agent shows only where nothing is live, and Enter opens the same agent the row names.
 The assistant is never a tree's agent.
+A Claude Code session under a config dir other than the default one is labelled with it, `● fix-login [keel]` for one under `~/.keel/claude` (see [Config](#config)).
 Its mark is `●` in bold when the tree's agent needs you, `✓` when it is done and `✗` when its process died, as on a restart (see [What agents say](#what-agents-say)), else the agent's own status: `●` busy, `○` idle, `◌` cold.
 The list is in groups, each under a heading with a blank line above it: a group per base the held trees were cut from (see [New agents](#new-agents)), the pool's base first and the rest by name, then the free trees, then Parked.
 The repository's main checkout is no row of its own: it heads its branch's group, `main · main checkout`, with its ports, agent and git state.
@@ -97,6 +98,7 @@ An agent's last activity is its latest report, or when its Claude Code transcrip
 The cursor stops on headings too, and Enter on one folds its group to the heading, which then says how many of its trees wait on you, or opens it again; a filter opens every group and leaves out those it finds nothing in.
 Trees held for later but not worked on now can be parked with `z`: they go under the Parked heading at the bottom, folded, and `Z` opens it.
 A parked tree stays under Parked even when it needs you, sorting to the top of it, a filter still finds parked trees, and returning a tree clears it, since parking is kept in its `treetop.json` as `parked`.
+RUN shows only once [keel](#keel-runs) lists a run: the playbook the tree's run follows and the step it is on out of the playbook's, `bug-fix 2/6`, then `paused` or another state when it is not active, `!2` when two of its decisions are flagged for attention, and `stale` when no process was in the tree at keel's last sweep.
 PR is where the tree's branch stands after its agent: its pull request's number and stage, or the step of a pipeline it is going through (see [After the agent](#after-the-agent)).
 The pane below shows the tree under the cursor in full: its path and holder, its agents, ports and processes, everything its agent last said with its latest steps, and the outcome of its last action with the end of its output.
 
@@ -144,7 +146,7 @@ A pid two sources both see counts once, where the more specific source saw it; a
   { "name": "fix-login", "pid": 4242, "status": "waiting", "attach": ["my-agent", "attach", "fix-login"] }
   ```
 
-- **Agent plugins** (see [Plugins](#plugins)), each asked what agents it sees. Claude Code's is built in: Claude Code's `EnterWorktree` moves a session into a tree without changing its process's working directory, so the plugin reads its running sessions from `~/.claude/sessions` (or `$CLAUDE_CONFIG_DIR`), checks each pid is the one that started the session, and takes the tree from the latest `cwd` in the session's transcript.
+- **Agent plugins** (see [Plugins](#plugins)), each asked what agents it sees. Claude Code's is built in: Claude Code's `EnterWorktree` moves a session into a tree without changing its process's working directory, so the plugin reads its running sessions from `~/.claude/sessions` (or `$CLAUDE_CONFIG_DIR`, or each dir `[claude] config_dirs` lists, see [Config](#config)), checks each pid is the one that started the session, and takes the tree from the latest `cwd` in the session's transcript.
   This gives the session's name and whether it is busy, idle or waiting on you.
   It also reports every background job in `~/.claude/jobs` with no running session as a **cold** agent, drawn `◌`: Enter attaches to it, which starts it again with its conversation kept.
   An agent a plugin reports, running or cold, shows in the tree whose `treetop.json` names its job, else in the tree it last worked in when that was since the tree's lease began, so one started by hand stays on its tree while a tree that has been returned and handed out again never shows the last lease's agent, even one still running.
@@ -276,6 +278,18 @@ Where the command is missing or fails, no port is marked and nothing is said: sh
 ```toml
 shares = ["tether", "shares"]
 ```
+
+`[claude]` lists the Claude Code config dirs treetop finds sessions in, for a setup that runs some sessions under a `CLAUDE_CONFIG_DIR` of their own, as keel's `keel claude` does with `~/.keel/claude`:
+
+```toml
+[claude]
+config_dirs = ["~/.claude", "~/.keel/claude"]
+```
+
+Sessions, background jobs and their reports are read from every dir, and each session is attached, messaged, resumed, kept awake, stopped and cleared under the dir it came from: its attach command is `env CLAUDE_CONFIG_DIR=<dir> claude attach <id>` for any dir but the default one, which is never named, since naming it would move Claude Code's `.claude.json`.
+A new agent starts under the first dir listed.
+Plan usage is read from the default dir's login.
+With no `[claude]` table it is `$CLAUDE_CONFIG_DIR`, else `~/.claude`, as Claude Code picks.
 
 `treetop tickets` lists the repository's open tickets from its source, `--mine` those assigned to you, and any other words search their titles; it is the quickest check that a key and team are right.
 treetop calls `https://api.linear.app/graphql` over HTTPS itself, so the key never appears in a process list.
@@ -440,6 +454,7 @@ With neither running it reads the pool itself, which takes seconds, `treehouse s
 `treetop return` never stops a process for whoever runs it.
 It refuses a tree that any live process works in, other than the caller's own: a process standing in it, or an agent treetop places in it.
 Beyond that, the caller may return the tree its own agent works in, or, when it is no agent, the tree it stands in; any other tree only once its PR has merged or it is on no branch, with nothing uncommitted and nothing unpushed.
+It also refuses a tree a [keel run](#keel-runs) holds, active or paused, whoever asks, and says to stop the run with `keel run stop` first.
 treehouse's own `--if-lease-holder` checks only the name it is handed, so this is the check to go through; everything it refuses is yours to return with `r`, whose dialog names what would be lost.
 `treetop guard <tree>` gives the same verdict without acting, and `--in-tree` the verdict on a command that acts on the tree it runs in, which the caller may run only in a tree it holds, or in one back in the pool that nothing runs in.
 
@@ -555,6 +570,14 @@ Only this workspace's agents open their chat; agents elsewhere are counted in th
 The summary counts the trees that need you, and, as "elsewhere", agents outside the pool waiting on you, which have no row.
 A question more than a day old whose session no longer runs counts nowhere, since its process ended without saying so and nothing is left to answer it.
 These job files are internal to Claude Code, like its session files, so a release that changes them blanks those marks until treetop catches up.
+
+## keel runs
+
+[keel](https://github.com/anthonyb8/keel) records each routed task as a run: the playbook it follows, the step it is on, its goal, and the decisions flagged for attention.
+treetop reads them with `keel status --json` every 5 seconds, which only reads keel's files, and joins each run to the tree whose path it names.
+The RUN column, the detail pane's `run` line and the phone's tree card and screen show it; with no `keel` on PATH there is no column and nothing is asked again.
+keel keeps a tree whose run is active or paused out of its own sweeps and hooks, since its steps are not done even with every change pushed.
+treetop's return dialog and the phone's sheet warn of such a run, and `treetop return` and the guard hook refuse the tree to agents until `keel run stop` ends the run.
 
 ## After the agent
 
@@ -748,7 +771,7 @@ Each answer attaches to the session only for that moment, so the chat popup on y
 
 New agent, at the foot of the pool, starts an agent on a task in a fresh tree cut from the base you pick, as `N` does, and opens its tree once it is going; New agent here, on a tree, starts one in that tree on its branch, as `n` does.
 On a tree whose agent has stopped or died, Resume starts it again with its conversation, as `R` does.
-Return… gives the tree back to the pool, as `r` does, after a sheet that names its branch and what it holds that is not pushed or committed; its agents are stopped first.
+Return… gives the tree back to the pool, as `r` does, after a sheet that names its branch and what it holds that is not pushed or committed, and warns of a keel run that holds it; its agents are stopped first.
 Anything else running in the tree, such as a dev server, keeps it from the phone, and the refusal says what, since stopping it is a call to make at treetop with the return dialog's list of what would stop.
 The pool refreshes every five seconds while the app is open, and when you pull down.
 

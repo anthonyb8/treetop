@@ -319,6 +319,10 @@ pub struct Seen {
     /// The tokens its session has spent so far, where the plugin can tell.
     #[serde(default)]
     pub spend: Option<Spend>,
+    /// A word that sets it apart from the plugin's other agents, such as
+    /// the setup it runs under; None for the usual one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 /// The tokens a session has spent across all its requests, each request

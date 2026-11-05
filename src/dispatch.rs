@@ -57,7 +57,7 @@ impl Recipient {
         Recipient {
             agent: agent.to_string(),
             tree,
-            command: vec!["claude".into(), "attach".into(), job.to_string()],
+            command: crate::agents::claude::attach_job(job),
             plugin: Some("claude".into()),
             job: Some(job.to_string()),
             is_cold: !is_running,

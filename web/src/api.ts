@@ -58,6 +58,24 @@ export interface Card {
   pr: Pr | null;
   /** Seconds since its agents last worked. */
   active_ago: number | null;
+  /** The keel run working in it, if any. */
+  run: Run | null;
+}
+
+/** A keel run: a routed task, the playbook it follows and how far it is. */
+export interface Run {
+  playbook: string;
+  /** The step being worked on out of the playbook's, as "2/6". */
+  step: string;
+  step_title: string | null;
+  state: "active" | "paused" | "done" | "stopped" | "failed";
+  goal: string;
+  /** Decisions flagged for a look. */
+  attention: number;
+  /** Active, but no process was in the tree at keel's last sweep. */
+  stale: boolean;
+  /** keel keeps the tree until the run stops. */
+  holds: boolean;
 }
 
 export interface Group {
@@ -99,6 +117,8 @@ export interface AgentRow {
   status: "busy" | "idle" | "waiting" | "cold" | null;
   has_chat: boolean;
   active_ago: number | null;
+  /** What sets it apart, such as "keel" for a session under keel. */
+  label: string | null;
 }
 
 export interface Port {

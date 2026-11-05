@@ -216,6 +216,7 @@ impl Pool {
                 app.apply_ship(answer);
             }
             Update::Usage(usage) => app.usage = usage,
+            Update::Runs(runs) => app.runs = runs.unwrap_or_default(),
             Update::Base(standing) => app.apply_base(standing),
             Update::Release(tag) => app.apply_release(tag),
             Update::CatchUpHookFailed(why) => app.message = Some(why),
@@ -765,7 +766,7 @@ fn tree_route(pool: &Pool, method: &Method, rest: &str, asked: &Asked) -> Reply 
             let transcript = App::agents_of(found)
                 .iter()
                 .filter_map(|a| a.job.as_deref())
-                .find_map(|job| chat::transcript_of(&crate::agents::claude::config_dir()?, job));
+                .find_map(|job| chat::transcript_of(&crate::agents::claude::job_home(job)?, job));
             match transcript {
                 Some(path) => Reply::events(chat::stream(path)),
                 None => Reply::error(

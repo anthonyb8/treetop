@@ -55,6 +55,8 @@ const SHIP: Duration = Duration::from_secs(60);
 const SHIP_GAP: Duration = Duration::from_secs(15);
 const SHIP_BACKOFF: Duration = Duration::from_secs(300);
 const USAGE: Duration = Duration::from_secs(60);
+/// How often keel's runs are read: each is a few small files.
+const RUNS: Duration = Duration::from_secs(5);
 const BASE: Duration = Duration::from_secs(300);
 const SHARES: Duration = Duration::from_secs(10);
 const RELEASE: Duration = Duration::from_secs(60 * 60);
@@ -87,6 +89,8 @@ pub enum Update {
     Release(String),
     /// Every port this machine shares, and whether each is public.
     Shares(Vec<Shared>),
+    /// keel's runs, by tree; None when keel is not installed.
+    Runs(Option<HashMap<PathBuf, crate::keel::Run>>),
 }
 
 pub struct Refresher {
@@ -140,6 +144,10 @@ impl Refresher {
         thread::spawn({
             let (updates_tx, paused) = (updates_tx.clone(), Arc::clone(&paused));
             move || shares_clock(&updates_tx, &shares_kick_rx, &paused)
+        });
+        thread::spawn({
+            let (updates_tx, paused) = (updates_tx.clone(), Arc::clone(&paused));
+            move || runs_clock(&updates_tx, &paused)
         });
         thread::spawn({
             let (updates_tx, paused, main_busy, checkout) = (
@@ -391,6 +399,21 @@ fn shares_clock(updates: &Sender<Update>, kicks: &Receiver<()>, paused: &AtomicB
 
 /// Asks how much of the plan is used, every USAGE while treetop is not
 /// paused, until treetop moves on.
+/// Reads keel's runs until treetop moves on, or stops at once where keel is
+/// not installed.
+fn runs_clock(updates: &Sender<Update>, paused: &AtomicBool) {
+    loop {
+        if !paused.load(Ordering::Relaxed) {
+            let runs = crate::keel::status();
+            let is_absent = runs.is_none();
+            if updates.send(Update::Runs(runs)).is_err() || is_absent {
+                return;
+            }
+        }
+        thread::sleep(RUNS);
+    }
+}
+
 fn usage_clock(updates: &Sender<Update>, paused: &AtomicBool) {
     loop {
         if !paused.load(Ordering::Relaxed) && updates.send(Update::Usage(agents::usage())).is_err()

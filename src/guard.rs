@@ -186,6 +186,7 @@ mod tests {
             active_at: None,
             context: None,
             spend: None,
+            label: None,
         }
     }
 

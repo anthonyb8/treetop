@@ -44,6 +44,7 @@ fn parse(text: &str) -> Option<Agent> {
         active_at: None,
         context: None,
         spend: None,
+        label: None,
     })
 }
 
