@@ -24,6 +24,7 @@ mod github_plugin;
 mod guard;
 mod handoff;
 mod hook;
+mod inbox;
 mod jobs;
 mod keel;
 mod keeper;
@@ -227,8 +228,9 @@ fn send(
 /// Why `run` stopped showing a pool.
 enum Exit {
     Quit,
-    /// Show the pool of the repository checked out here instead.
-    Switch(PathBuf),
+    /// Show the pool of the repository checked out here instead, and open
+    /// the agent of the tree at the second path once it is read.
+    Switch(PathBuf, Option<PathBuf>),
     /// Start the treetop installed over this one, on this workspace.
     Restart,
 }
@@ -260,7 +262,8 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
     let mut drawn_at = Instant::now();
     let mut chats = Chats::default();
     let mut keeper = Keeper::default();
-    // Whether the mouse is captured for an open issue, apart from a chat's.
+    // Whether the mouse is captured for an open issue or the inbox, apart
+    // from a chat's.
     let mut is_issue_mouse = false;
     // A scratch chat starting, and those being deleted, off this thread.
     let mut starting_scratch: Option<mpsc::Receiver<Result<scratch::Scratch, String>>> = None;
@@ -294,6 +297,9 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                 }
                 Update::Work(work) => app.apply_work(&work),
                 Update::Reports(reports) => {
+                    // Another workspace leases trees as its agents start, so
+                    // its cache is read again to place their reports.
+                    app.pools = inbox::other_pools(checkout);
                     let news = app.apply_reports(reports);
                     if !news.is_empty() {
                         announce(&news)?;
@@ -426,12 +432,18 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             }
         }
         was_issues = app.is_issues;
-        // An open issue takes the mouse, for its links and the wheel; a
-        // chat captures it on its own, and gives it back when it closes.
+        // An open issue takes the mouse, for its links and the wheel, and
+        // the list does while the inbox is beside it, for clicks on its
+        // entries; a chat captures it on its own, and gives it back when it
+        // closes.
         if chats.is_open() {
             is_issue_mouse = false;
         } else {
-            let wants = app.is_issues && issues.as_ref().is_some_and(|s| s.wants_mouse());
+            let wants = if app.is_issues {
+                issues.as_ref().is_some_and(|s| s.wants_mouse())
+            } else {
+                app.wants_mouse()
+            };
             if wants != is_issue_mouse {
                 if wants {
                     execute!(io::stdout(), EnableMouseCapture)?;
@@ -539,6 +551,18 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             open_chat(term, app, &mut chats, &command, agent, tree)?;
             is_stale = true;
         }
+        // An inbox entry from another workspace opens its agent here once
+        // the pool is read, before any ask takes the screen.
+        if !chats.is_open()
+            && let Some(Outcome::Chat {
+                command,
+                agent,
+                tree,
+            }) = app.arrival()
+        {
+            open_chat(term, app, &mut chats, &command, agent, tree)?;
+            is_stale = true;
+        }
         // An agent asking you something gets its chat opened once nothing
         // else is on screen, the next as the last one closes.
         match chats.open() {
@@ -628,62 +652,70 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             }
             continue;
         }
-        if let Event::Mouse(mouse) = &event {
+        let outcome = if let Event::Mouse(mouse) = event {
             if let Some(screen) = issues.as_mut().filter(|_| app.is_issues) {
-                screen.handle_mouse(*mouse);
+                screen.handle_mouse(mouse);
                 is_stale = true;
+                continue;
             }
-            continue;
-        }
-        if let Event::Paste(text) = &event {
-            match issues.as_mut().filter(|_| app.is_issues) {
-                Some(screen) => screen.paste(text),
-                None => app.paste(text),
+            let size = term.size()?;
+            match ui::click(app, Rect::new(0, 0, size.width, size.height), mouse) {
+                Some(outcome) => outcome,
+                None => continue,
             }
-            continue;
-        }
-        let Event::Key(key) = event else {
-            continue;
-        };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
-        let on_issues = issues
-            .as_mut()
-            .filter(|_| app.is_issues && app.prompt.is_none());
-        let outcome = match on_issues {
-            Some(screen) => match screen.handle_key(key) {
-                issues::Action::None => Outcome::Continue,
-                issues::Action::Back => {
-                    app.is_issues = false;
-                    app.stop_attaching();
-                    Outcome::Continue
+        } else {
+            if let Event::Paste(text) = &event {
+                match issues.as_mut().filter(|_| app.is_issues) {
+                    Some(screen) => screen.paste(text),
+                    None => app.paste(text),
                 }
-                issues::Action::Quit => app.quit(),
-                issues::Action::Pick(issue) => app.pick(issue.id, screen.source_name().to_string()),
-                issues::Action::Ask(context) => {
-                    app.open_ask(Some(context));
-                    Outcome::Continue
-                }
-                issues::Action::Attach(issue) => {
-                    if let Some((tree, record)) =
-                        app.attach(issue.id, screen.source_name().to_string())
-                        && let Err(err) = sidecar::write(&tree, &record)
-                    {
-                        app.message = Some(format!("could not record the issue: {err}"));
+                continue;
+            }
+            let Event::Key(key) = event else {
+                continue;
+            };
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            let on_issues = issues
+                .as_mut()
+                .filter(|_| app.is_issues && app.prompt.is_none());
+            match on_issues {
+                Some(screen) => match screen.handle_key(key) {
+                    issues::Action::None => Outcome::Continue,
+                    issues::Action::Back => {
+                        app.is_issues = false;
+                        app.stop_attaching();
+                        Outcome::Continue
                     }
-                    Outcome::Continue
-                }
-                issues::Action::Open(url) => {
-                    let opening = actions::open_url(&url);
-                    screen.say(opening.said_now());
-                    if let actions::Opening::Pending(pending) = opening {
-                        opening_urls.push((pending, true));
+                    issues::Action::Quit => app.quit(),
+                    issues::Action::Pick(issue) => {
+                        app.pick(issue.id, screen.source_name().to_string())
                     }
-                    Outcome::Continue
-                }
-            },
-            None => app.handle_key(key),
+                    issues::Action::Ask(context) => {
+                        app.open_ask(Some(context));
+                        Outcome::Continue
+                    }
+                    issues::Action::Attach(issue) => {
+                        if let Some((tree, record)) =
+                            app.attach(issue.id, screen.source_name().to_string())
+                            && let Err(err) = sidecar::write(&tree, &record)
+                        {
+                            app.message = Some(format!("could not record the issue: {err}"));
+                        }
+                        Outcome::Continue
+                    }
+                    issues::Action::Open(url) => {
+                        let opening = actions::open_url(&url);
+                        screen.say(opening.said_now());
+                        if let actions::Opening::Pending(pending) = opening {
+                            opening_urls.push((pending, true));
+                        }
+                        Outcome::Continue
+                    }
+                },
+                None => app.handle_key(key),
+            }
         };
         match outcome {
             Outcome::Continue => {}
@@ -708,7 +740,10 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                 });
                 removing_scratch.push(result);
             }
-            Outcome::Switch(path) => return Ok(Exit::Switch(path)),
+            Outcome::Switch(path) => return Ok(Exit::Switch(path, None)),
+            Outcome::SwitchTo { checkout, tree } => {
+                return Ok(Exit::Switch(checkout, Some(tree)));
+            }
             Outcome::Restart => return Ok(Exit::Restart),
             Outcome::Update => {
                 app.is_updating = true;
@@ -817,6 +852,7 @@ fn show(
 ) -> Result<Option<PathBuf>> {
     let mut here = Some(start);
     let mut is_issues = is_issues;
+    let mut arriving = None;
     loop {
         std::env::set_current_dir(&checkout)?;
         workspaces::record(&checkout);
@@ -828,6 +864,11 @@ fn show(
         if let Some(file) = state::asked_file(&checkout) {
             app.keep_asked_in(file);
         }
+        if let Some(file) = inbox::file() {
+            app.keep_inbox_in(file);
+        }
+        app.arriving = arriving.take();
+        app.pools = inbox::other_pools(&checkout);
         app.ship_plugins = ship::plugins(&checkout).0;
         app.is_issues = std::mem::take(&mut is_issues);
         if let Some(mut cached) = cache::read(&checkout) {
@@ -836,7 +877,10 @@ fn show(
         }
         match run(term, &mut app, &checkout)? {
             Exit::Quit => return Ok(None),
-            Exit::Switch(next) => checkout = next,
+            Exit::Switch(next, tree) => {
+                checkout = next;
+                arriving = tree;
+            }
             Exit::Restart => return Ok(Some(checkout)),
         }
     }

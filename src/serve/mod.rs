@@ -20,6 +20,8 @@ mod pool;
 mod push;
 mod tree;
 
+pub use pool::title;
+
 use std::collections::HashMap;
 use std::io::{IsTerminal as _, Read};
 use std::path::{Path, PathBuf};

@@ -272,6 +272,13 @@ pub enum Outcome {
     RemoveScratch(Scratch),
     /// Show the pool of the repository checked out here instead.
     Switch(PathBuf),
+    /// Show the pool of the repository checked out at `checkout`, and open
+    /// the agent of its tree at `tree` once it is read: an inbox entry of
+    /// another workspace.
+    SwitchTo {
+        checkout: PathBuf,
+        tree: PathBuf,
+    },
     /// Start the newer treetop installed over this one, on this workspace.
     Restart,
     /// Install the newer release, then restart on it.
@@ -462,6 +469,18 @@ pub struct App {
     is_cursor_placed: bool,
     /// An agent writing the handoff for the one that takes over from it.
     handing: Option<Handing>,
+    /// The other workspaces' pools as their caches list them, where the
+    /// inbox places their agents.
+    pub pools: Vec<crate::inbox::Pool>,
+    /// The inbox entries opened and dismissed, and whether it is hidden.
+    pub inbox: crate::inbox::Marks,
+    /// Where `inbox` is kept. None keeps it in memory only.
+    inbox_file: Option<PathBuf>,
+    /// The inbox has the keys, with its cursor on this entry.
+    pub rail: Option<usize>,
+    /// The tree whose agent opens once this workspace's agents are read:
+    /// an inbox entry chosen from another workspace.
+    pub arriving: Option<PathBuf>,
 }
 
 /// How long a started agent may take to show up before treetop stops
@@ -1416,6 +1435,7 @@ impl App {
             && !self.is_filtering
             && !self.is_issues
             && !self.is_quitting
+            && self.rail.is_none()
     }
 
     /// The chat of the next agent asking you something that has not been
@@ -1452,8 +1472,18 @@ impl App {
         let (path, tree, agent, command) = asks
             .into_iter()
             .find(|(.., command)| !self.asked.contains(&command.join(" ")))?;
-        self.asked.insert(command.join(" "));
-        self.save_asked();
+        self.mark_asked(&command);
+        self.reveal(path);
+        Some(Outcome::Chat {
+            command,
+            agent,
+            tree,
+        })
+    }
+
+    /// Puts the cursor on the tree at `path`, clearing a filter that hides
+    /// it and opening its folded group.
+    fn reveal(&mut self, path: PathBuf) {
         if !self.visible().iter().any(|t| t.path == path) {
             self.filter.clear();
             let group = self
@@ -1466,20 +1496,161 @@ impl App {
             }
         }
         self.reselect(Some(path));
-        Some(Outcome::Chat {
-            command,
-            agent,
-            tree,
-        })
+    }
+
+    /// The agent running the chat `command` has had its ask on screen.
+    pub fn has_asked(&self, command: &str) -> bool {
+        self.asked.contains(command)
+    }
+
+    /// Keeps the inbox's marks in `file`, starting from those it holds.
+    pub fn keep_inbox_in(&mut self, file: PathBuf) {
+        self.inbox = crate::state::read(&file);
+        self.inbox_file = Some(file);
+    }
+
+    fn save_inbox(&mut self) {
+        if let Some(file) = &self.inbox_file {
+            self.inbox.write(file);
+        }
+    }
+
+    /// The list is on screen with nothing over it but a dialog, and the
+    /// inbox beside it, so a click can open an entry. Elsewhere the mouse
+    /// is left to the terminal, so text selects as it always has.
+    pub fn wants_mouse(&self) -> bool {
+        (!self.inbox.is_hidden || self.rail.is_some())
+            && !self.is_issues
+            && self.view.is_none()
+            && self.prompt.is_none()
+            && self.picker.is_none()
+            && self.port_menu.is_none()
+            && self.phone.is_none()
+            && self.scratch_menu.is_none()
+            && self.opening.is_none()
+            && !self.is_help
+    }
+
+    /// The keys while the inbox has them: move, open, dismiss, and back to
+    /// the list.
+    fn handle_inbox_key(&mut self, key: KeyEvent, at: usize) -> Outcome {
+        let last = crate::inbox::shown(self).len().saturating_sub(1);
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => self.rail = Some((at + 1).min(last)),
+            KeyCode::Up | KeyCode::Char('k') => self.rail = Some(at.saturating_sub(1)),
+            KeyCode::Home | KeyCode::Char('g') => self.rail = Some(0),
+            KeyCode::End | KeyCode::Char('G') => self.rail = Some(last),
+            KeyCode::Enter => return self.open_entry(at),
+            KeyCode::Char('x') => {
+                if let Some((entry, _)) = crate::inbox::shown(self).into_iter().nth(at) {
+                    self.inbox.dismissed.insert(entry.key);
+                    self.save_inbox();
+                    self.rail = Some(at.min(last.saturating_sub(1)));
+                }
+            }
+            KeyCode::Char('E') => self.toggle_inbox(),
+            // Tab opens Issues from the list, but here it only gives the
+            // keys back, as Esc does.
+            KeyCode::Esc | KeyCode::Tab | KeyCode::Char('e') | KeyCode::Left => self.rail = None,
+            KeyCode::Char('?') => self.is_help = true,
+            KeyCode::Char('q') => return self.quit(),
+            _ => {}
+        }
+        Outcome::Continue
+    }
+
+    /// `E`: hides the inbox, giving the list its width back, or shows it.
+    fn toggle_inbox(&mut self) {
+        self.inbox.is_hidden = !self.inbox.is_hidden;
+        self.rail = None;
+        self.save_inbox();
+    }
+
+    /// Opens the inbox's entry at `at`, as Enter on its tree's row would,
+    /// and marks it seen. A PR's entry puts the cursor on its tree, with
+    /// its checks in the detail pane; another workspace's switches there
+    /// first.
+    pub fn open_entry(&mut self, at: usize) -> Outcome {
+        let Some((entry, _)) = crate::inbox::shown(self).into_iter().nth(at) else {
+            return Outcome::Continue;
+        };
+        self.rail = None;
+        self.inbox.seen.insert(entry.key.clone());
+        self.save_inbox();
+        if let Some(away) = entry.away {
+            return Outcome::SwitchTo {
+                checkout: away.checkout,
+                tree: entry.path,
+            };
+        }
+        self.reveal(entry.path.clone());
+        let Some(tree) = self.trees.iter().find(|t| t.path == entry.path) else {
+            return Outcome::Continue;
+        };
+        match entry.kind {
+            crate::inbox::Kind::Failed => {
+                self.message = Some(format!(
+                    "tree {}'s PR failed its checks; f sends the failure to its agent",
+                    tree.name
+                ));
+                Outcome::Continue
+            }
+            crate::inbox::Kind::Merged => {
+                self.message = Some(format!("tree {}'s PR merged; r returns it", tree.name));
+                Outcome::Continue
+            }
+            _ => Self::chat_of(tree).unwrap_or_else(|| Outcome::Enter(tree.clone())),
+        }
+    }
+
+    /// The chat of the tree an inbox entry switched here for, once the
+    /// agents are read and nothing else is on screen; the cursor goes to
+    /// the tree either way.
+    pub fn arrival(&mut self) -> Option<Outcome> {
+        if !self.is_agents_read || !self.is_free() {
+            return None;
+        }
+        let path = self.arriving.take()?;
+        let Some(tree) = self.trees.iter().find(|t| t.path == path) else {
+            self.message = Some(format!("{} is no longer in this pool", path.display()));
+            return None;
+        };
+        let chat = Self::chat_of(tree);
+        if chat.is_none() {
+            self.message = Some(format!(
+                "tree {} has no chat to open here; t goes to it",
+                tree.name
+            ));
+        }
+        self.reveal(path);
+        chat
     }
 
     /// The chat running `command` is on screen, so whatever its agent asks
     /// now has been seen and does not open again when it closes.
     pub fn saw_chat(&mut self, command: &[String]) {
         if self.asks().iter().any(|(.., c)| c.as_slice() == command)
-            && self.asked.insert(command.join(" "))
+            && !self.asked.contains(&command.join(" "))
         {
-            self.save_asked();
+            self.mark_asked(command);
+        }
+    }
+
+    /// The ask in the chat `command` has been on screen: it does not open
+    /// again here, and its inbox entry is seen from every workspace, since
+    /// the asks seen are kept per workspace but the inbox is one.
+    fn mark_asked(&mut self, command: &[String]) {
+        let command = command.join(" ");
+        let keys: Vec<String> = crate::inbox::entries(self)
+            .into_iter()
+            .filter(|e| e.asking.as_deref() == Some(command.as_str()))
+            .map(|e| e.key)
+            .collect();
+        self.asked.insert(command);
+        self.save_asked();
+        if !keys.is_empty() {
+            self.inbox.seen.extend(keys);
+            self.save_inbox();
         }
     }
 
@@ -1525,13 +1696,13 @@ impl App {
 
     /// Keeps the asks seen in `file`, starting from those it already holds.
     pub fn keep_asked_in(&mut self, file: PathBuf) {
-        self.asked = crate::state::read_asked(&file);
+        self.asked = crate::state::read(&file);
         self.asked_file = Some(file);
     }
 
     fn save_asked(&self) {
         if let Some(file) = &self.asked_file {
-            crate::state::write_asked(file, &self.asked);
+            crate::state::write(file, &self.asked);
         }
     }
 
@@ -3039,6 +3210,9 @@ impl App {
         if !self.is_quitting {
             self.message = None;
         }
+        if let Some(at) = self.rail {
+            return self.handle_inbox_key(key, at);
+        }
         if key.code == KeyCode::Char('w') {
             return Outcome::Workspaces;
         }
@@ -3071,6 +3245,8 @@ impl App {
             }
             KeyCode::Char('i') => self.show_issue(),
             KeyCode::Char('I') => self.choose_issue(),
+            KeyCode::Char('e') => self.rail = Some(0),
+            KeyCode::Char('E') => self.toggle_inbox(),
             KeyCode::Char('m') => self.open_message(),
             KeyCode::Char('q') => return self.quit(),
             KeyCode::Char('U') => return self.restart(),
