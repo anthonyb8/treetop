@@ -160,10 +160,15 @@ fn first_line(text: &str) -> String {
         .to_string()
 }
 
-fn title_of(tree: &Tree) -> Option<String> {
-    let ticket = tree.sidecar.as_ref().and_then(|s| s.ticket.as_deref());
+/// The tree's ticket and branch, as `END-123 fix-login`, the ticket from
+/// `sidecar`, treetop's record of the tree, where it has one.
+fn title_of(tree: &Tree, sidecar: Option<&crate::sidecar::Sidecar>) -> Option<String> {
+    let ticket = sidecar.and_then(|s| s.ticket.as_deref());
     crate::serve::title(tree.branch.as_deref(), ticket)
 }
+
+/// What a died agent's entry says, wherever it lives.
+const DIED: &str = "its agent died; R resumes it";
 
 /// Every entry, unsorted: the trees on screen, then the other workspaces'
 /// agents placed in their trees.
@@ -187,7 +192,7 @@ pub fn entries(app: &App) -> Vec<Entry> {
                         || "waiting at a prompt in its chat".into(),
                         |i| first_line(i.text()),
                     ),
-                Kind::Died => "its agent died; R resumes it".into(),
+                Kind::Died => DIED.into(),
                 _ => item
                     .as_ref()
                     .map_or_else(String::new, |i| first_line(i.text())),
@@ -203,7 +208,7 @@ pub fn entries(app: &App) -> Vec<Entry> {
                 away: None,
                 tree: tree.name.clone(),
                 path: tree.path.clone(),
-                title: title_of(tree),
+                title: title_of(tree, tree.sidecar.as_deref()),
                 what,
                 at,
                 asking: (kind == Kind::NeedsYou)
@@ -220,7 +225,7 @@ pub fn entries(app: &App) -> Vec<Entry> {
                 away: None,
                 tree: tree.name.clone(),
                 path: tree.path.clone(),
-                title: title_of(tree),
+                title: title_of(tree, tree.sidecar.as_deref()),
                 what: ship.label.clone(),
                 at: None,
                 asking: None,
@@ -256,8 +261,12 @@ fn away_entries(app: &App) -> Vec<Entry> {
                 away: Some(pool.away.clone()),
                 tree: tree.name.clone(),
                 path: tree.path.clone(),
-                title: title_of(tree),
-                what: first_line(&report.text),
+                title: title_of(tree, pool.sidecars.get(&tree.path)),
+                what: if kind == Kind::Died {
+                    DIED.into()
+                } else {
+                    first_line(&report.text)
+                },
                 at: Some(report.updated),
                 asking: None,
             })
@@ -647,6 +656,27 @@ pub mod tests {
         assert!(!order(&app).iter().any(|(_, tree, _)| tree == "12"));
         app.pools[0].sidecars = [("/other/12/web".into(), named("j12"))].into();
         assert!(order(&app).iter().any(|(_, tree, _)| tree == "12"));
+    }
+
+    #[test]
+    fn another_workspaces_entry_names_the_ticket_its_sidecar_records() {
+        let mut app = app();
+        app.pools[0].trees[0].branch = Some("me/checkout-tax".into());
+        app.pools[0].sidecars = [(
+            "/other/12/web".into(),
+            Sidecar {
+                job: Some("j12".into()),
+                ticket: Some("END-88".into()),
+                ..Sidecar::leased_now()
+            },
+        )]
+        .into();
+        let away = shown(&app)
+            .into_iter()
+            .find(|(e, _)| e.tree == "12")
+            .unwrap()
+            .0;
+        assert_eq!(away.title.as_deref(), Some("END-88 checkout-tax"));
     }
 
     #[test]
