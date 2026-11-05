@@ -1472,8 +1472,7 @@ impl App {
         let (path, tree, agent, command) = asks
             .into_iter()
             .find(|(.., command)| !self.asked.contains(&command.join(" ")))?;
-        self.asked.insert(command.join(" "));
-        self.save_asked();
+        self.mark_asked(&command);
         self.reveal(path);
         Some(Outcome::Chat {
             command,
@@ -1629,9 +1628,27 @@ impl App {
     /// now has been seen and does not open again when it closes.
     pub fn saw_chat(&mut self, command: &[String]) {
         if self.asks().iter().any(|(.., c)| c.as_slice() == command)
-            && self.asked.insert(command.join(" "))
+            && !self.asked.contains(&command.join(" "))
         {
-            self.save_asked();
+            self.mark_asked(command);
+        }
+    }
+
+    /// The ask in the chat `command` has been on screen: it does not open
+    /// again here, and its inbox entry is seen from every workspace, since
+    /// the asks seen are kept per workspace but the inbox is one.
+    fn mark_asked(&mut self, command: &[String]) {
+        let command = command.join(" ");
+        let keys: Vec<String> = crate::inbox::entries(self)
+            .into_iter()
+            .filter(|e| e.asking.as_deref() == Some(command.as_str()))
+            .map(|e| e.key)
+            .collect();
+        self.asked.insert(command);
+        self.save_asked();
+        if !keys.is_empty() {
+            self.inbox.seen.extend(keys);
+            self.save_inbox();
         }
     }
 

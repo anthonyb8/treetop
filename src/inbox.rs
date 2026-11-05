@@ -123,6 +123,9 @@ pub struct Entry {
 pub struct Pool {
     pub away: Away,
     pub trees: Vec<Tree>,
+    /// treetop's record of each tree it leased there, by path: a tree whose
+    /// record names a job is that job's.
+    pub sidecars: std::collections::HashMap<PathBuf, crate::sidecar::Sidecar>,
 }
 
 /// The other workspaces' pools, from their caches.
@@ -131,8 +134,10 @@ pub fn other_pools(here: &Path) -> Vec<Pool> {
         .into_iter()
         .filter(|w| w.checkout != here)
         .filter_map(|w| {
+            let trees = crate::cache::read(&w.checkout)?;
             Some(Pool {
-                trees: crate::cache::read(&w.checkout)?,
+                sidecars: crate::sidecar::read_all(&trees),
+                trees,
                 away: Away {
                     name: w.name(),
                     checkout: w.checkout,
@@ -261,20 +266,26 @@ fn away_entries(app: &App) -> Vec<Entry> {
 }
 
 /// The other workspace's held tree `report`'s agent works in: the one its
-/// directory is in, if it wrote since that tree's lease began, as agents are
-/// placed, since a tree returned and handed out again is not still the old
-/// agent's.
+/// directory is in, as agents are placed: one whose sidecar names a job only
+/// for that job, else only if it wrote since that tree's lease began, since
+/// a tree returned and handed out again is not still the old agent's.
 fn place<'a>(report: &Report, pools: &'a [Pool]) -> Option<(&'a Pool, &'a Tree)> {
     let dir = report.dir.as_deref()?;
     let wrote = secs(report.updated);
     pools.iter().find_map(|pool| {
         let tree = pool.trees.iter().find(|t| {
-            t.is_held()
-                && dir.starts_with(&t.path)
-                && t.leased_at
+            if !t.is_held() || !dir.starts_with(&t.path) {
+                return false;
+            }
+            // A tree whose sidecar names a job is that job's alone.
+            match pool.sidecars.get(&t.path).and_then(|s| s.job.as_deref()) {
+                Some(job) => job == report.job,
+                None => t
+                    .leased_at
                     .as_deref()
                     .and_then(crate::pool::seconds)
-                    .is_some_and(|began| wrote >= began)
+                    .is_some_and(|began| wrote >= began),
+            }
         })?;
         Some((pool, tree))
     })
@@ -444,6 +455,7 @@ pub mod tests {
         app.is_loaded = true;
         app.is_agents_read = true;
         app.pools = vec![Pool {
+            sidecars: Default::default(),
             away: Away {
                 name: "endodeals-web".into(),
                 checkout: "/code/endodeals-web".into(),
@@ -622,6 +634,39 @@ pub mod tests {
         let mut app = app();
         app.pools[0].trees[0].leased_at = Some("2099-01-01T09:00:00-05:00".into());
         assert!(!order(&app).iter().any(|(_, tree, _)| tree == "12"));
+    }
+
+    #[test]
+    fn a_tree_whose_sidecar_names_another_job_is_not_that_reports() {
+        let mut app = app();
+        let named = |job: &str| Sidecar {
+            job: Some(job.into()),
+            ..Sidecar::leased_now()
+        };
+        app.pools[0].sidecars = [("/other/12/web".into(), named("someone-else"))].into();
+        assert!(!order(&app).iter().any(|(_, tree, _)| tree == "12"));
+        app.pools[0].sidecars = [("/other/12/web".into(), named("j12"))].into();
+        assert!(order(&app).iter().any(|(_, tree, _)| tree == "12"));
+    }
+
+    #[test]
+    fn an_ask_seen_in_one_workspace_is_seen_from_every_other() {
+        let file =
+            std::env::temp_dir().join(format!("treetop-inbox-asked-{}.json", std::process::id()));
+        let _ = fs::remove_file(&file);
+        let mut here = app();
+        here.keep_inbox_in(file.clone());
+        here.saw_chat(&["claude".into(), "attach".into(), "j4".into()]);
+
+        // Another workspace's treetop: its own asked file, the same inbox.
+        let mut there = app();
+        there.keep_inbox_in(file.clone());
+        assert!(!there.has_asked("claude attach j4"));
+        assert_eq!(
+            order(&there).last(),
+            Some(&(Kind::NeedsYou, "4".into(), true))
+        );
+        let _ = fs::remove_file(&file);
     }
 
     #[test]
