@@ -46,7 +46,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | `n` | start a new agent in the tree under the cursor: a free one is leased for it, on a branch named for the task, and a held one keeps its branch; on the main checkout's heading, start one in the main checkout, for work that needs no tree |
 | `N` | start a new agent in a fresh tree, on a branch named for the task (see [New agents](#new-agents)) |
 | `m` | write a message to the agents in the marked trees, or the tree under the cursor |
-| `e` | give the inbox the keys: `j`/`k` move, Enter opens the entry, `x` dismisses it, Esc gives the keys back to the list (see [The inbox](#the-inbox)) |
+| `e` | give the inbox the keys: `j`/`k` move, Enter opens the entry, `x` dismisses it, Esc or Tab gives the keys back to the list (see [The inbox](#the-inbox)) |
 | `E` | hide the inbox, giving the list its width back, or show it again |
 | `:` | ask the assistant about the tree under the cursor, or write `@17 ...` for that tree's agent (see [The assistant](#the-assistant)) |
 | `a` | open the assistant's chat, where it answers, starting it if there is none |

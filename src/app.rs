@@ -1549,7 +1549,9 @@ impl App {
                 }
             }
             KeyCode::Char('E') => self.toggle_inbox(),
-            KeyCode::Esc | KeyCode::Char('e') | KeyCode::Left => self.rail = None,
+            // Tab opens Issues from the list, but here it only gives the
+            // keys back, as Esc does.
+            KeyCode::Esc | KeyCode::Tab | KeyCode::Char('e') | KeyCode::Left => self.rail = None,
             KeyCode::Char('?') => self.is_help = true,
             KeyCode::Char('q') => return self.quit(),
             _ => {}

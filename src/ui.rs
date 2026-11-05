@@ -1186,10 +1186,11 @@ fn entry_lines(entry: &Entry, width: usize, style: Style) -> [Line<'static>; 2] 
     let pad = width.saturating_sub(Line::from(head.clone()).width() + age.len());
     head.push(Span::raw(" ".repeat(pad)));
     head.push(Span::styled(age, fg(t.muted)));
-    let what = Line::styled(
-        format!("  {}", fit(&entry.what, width.saturating_sub(2))),
-        fg(t.muted),
-    );
+    // Padded to the full width, as the first line is, so the cursor covers
+    // the whole entry.
+    let what = format!("  {}", fit(&entry.what, width.saturating_sub(2)));
+    let pad = width.saturating_sub(Line::raw(what.as_str()).width());
+    let what = Line::styled(format!("{what}{}", " ".repeat(pad)), fg(t.muted));
     [Line::from(head).style(style), what.patch_style(style)]
 }
 
@@ -3477,6 +3478,32 @@ mod inbox_tests {
         let shown = screen(&app, 120, 30).join("\n");
         assert!(shown.contains("INBOX"), "{shown}");
         assert!(shown.contains("Enter open  x dismiss  Esc back"), "{shown}");
+    }
+
+    #[test]
+    fn the_cursor_covers_both_lines_of_its_entry_to_the_edge() {
+        let mut app = app();
+        app.rail = Some(0);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(200, 30)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &app, None, None))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let lines = screen(&app, 200, 30);
+        let first = lines.iter().position(|l| l.contains("4 ANB-41")).unwrap();
+        let cursor = theme().cursor.bg;
+        // The rail's last column, inside its padding, on each of the entry's
+        // two lines.
+        for row in [first, first + 1] {
+            let cell = &buffer[(198, u16::try_from(row).unwrap())];
+            assert_eq!(
+                cell.bg,
+                cursor.unwrap_or_default(),
+                "row {row}: {}",
+                lines[row]
+            );
+        }
     }
 
     #[test]

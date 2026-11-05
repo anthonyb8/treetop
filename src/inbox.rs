@@ -717,6 +717,10 @@ pub mod tests {
         assert_eq!(app.next_ask(), None, "no chat opens over the inbox");
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.rail, None);
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.rail, None, "Tab gives the keys back too");
+        assert!(!app.is_issues, "rather than opening Issues");
         assert!(matches!(app.next_ask(), Some(Outcome::Chat { tree, .. }) if tree == "4"));
     }
 }
