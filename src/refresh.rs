@@ -220,13 +220,45 @@ fn slow(
             if updates.send(Update::ListingStarted).is_err() {
                 return;
             }
-            let listing = pool::status(checkout).map(|(mut listing, raw)| {
+            let is_first = trees
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty();
+            let mut listing = pool::status(checkout).map(|(mut listing, raw)| {
                 cache::write(checkout, &raw);
                 listing.insert(0, pool::main_tree(checkout));
                 listing.clone_into(&mut trees.lock().unwrap_or_else(PoisonError::into_inner));
                 listing
             });
+            // With no cache on screen, the first listing is what the screen
+            // first draws, so it comes with what places each tree: its
+            // sidecar names its group, and its agents and their reports its
+            // place in it. Left to the git clock, they would land after the
+            // trees are drawn, and the trees would move. The reports go
+            // first, being kept apart from the trees, and the agents again
+            // after, so the screen counts them read.
+            let mut agents = None;
+            if is_first && let Ok(listing) = &mut listing {
+                crate::cli::read_agents(listing);
+                agents = Some(
+                    listing
+                        .iter()
+                        .map(|t| (t.path.clone(), t.agents.clone()))
+                        .collect(),
+                );
+                if updates
+                    .send(Update::Reports(reports::Reader::default().read()))
+                    .is_err()
+                {
+                    return;
+                }
+            }
             if updates.send(Update::Listing(listing)).is_err() {
+                return;
+            }
+            if let Some(agents) = agents
+                && updates.send(Update::Agents(agents)).is_err()
+            {
                 return;
             }
         }
@@ -281,13 +313,16 @@ fn fast(
                         let _ = kicks.ship.send(());
                         let _ = kicks.base.send(());
                     }
-                    work.extend(live::work(watcher.take(&known, &work)));
-                    work.retain(|path, _| known.iter().any(|t| t.is_held() && t.path == *path));
+                    // Sent before git runs, which takes seconds across a
+                    // pool on its first read: they decide each tree's group
+                    // and place in it, which the list must not wait on.
                     sent = updates
-                        .send(Update::Work(work.clone()))
-                        .and_then(|()| updates.send(Update::Sidecars(sidecars)))
+                        .send(Update::Sidecars(sidecars))
                         .and_then(|()| updates.send(Update::Agents(agents)))
                         .and_then(|()| updates.send(Update::Reports(reports.read())));
+                    work.extend(live::work(watcher.take(&known, &work)));
+                    work.retain(|path, _| known.iter().any(|t| t.is_held() && t.path == *path));
+                    sent = sent.and_then(|()| updates.send(Update::Work(work.clone())));
                 }
                 sent = sent.and_then(|()| updates.send(Update::Processes(processes)));
                 if sent.is_err() {

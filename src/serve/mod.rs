@@ -133,7 +133,7 @@ impl Pool {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .has_reports;
-        if !app.is_agents_read || !has_reports || !clock.is_due() {
+        if !app.is_agents_read || !has_reports || !app.is_work_read || !clock.is_due() {
             return;
         }
         let ready = self
