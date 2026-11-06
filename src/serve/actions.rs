@@ -12,7 +12,7 @@ use serde_json::json;
 use crate::jobs::{self, Job, Kind, Launch};
 use crate::phone::{self, Shared};
 use crate::pool::{Tree, stand_in};
-use crate::sidecar::{self, Sidecar};
+use crate::sidecar::{self, Shelf, Sidecar};
 
 use super::{Pool, Reply};
 
@@ -170,24 +170,40 @@ pub fn may_give_back(tree: &Tree) -> Result<(), String> {
     }
 }
 
-/// Sets the tree aside under Parked, or brings it back, as `z` does. The
-/// phone says which it wants rather than asking for a flip, so a second tap
-/// on a screen that had not caught up changes nothing.
-pub fn park(pool: &Pool, name: &str, body: &[u8]) -> Reply {
+/// Sets the tree aside on `shelf`, Parked or Backburner, or brings it back
+/// from there, as `z` and `x` do. The phone says which it wants rather than
+/// asking for a flip, so a second tap on a screen that had not caught up
+/// changes nothing: `{"parked": bool}` for Parked, `{"backburner": bool}`
+/// for Backburner.
+pub fn shelve(pool: &Pool, name: &str, shelf: Shelf, body: &[u8]) -> Reply {
     #[derive(Deserialize)]
-    struct Park {
-        parked: bool,
+    struct Asked {
+        parked: Option<bool>,
+        backburner: Option<bool>,
     }
-    let Ok(Park { parked }) = serde_json::from_slice(body) else {
-        return Reply::error(400, "park takes {\"parked\": true | false}");
+    let asked = serde_json::from_slice::<Asked>(body).ok();
+    let Some(on) = asked.and_then(|asked| match shelf {
+        Shelf::Parked => asked.parked,
+        Shelf::Backburner => asked.backburner,
+    }) else {
+        return Reply::error(
+            400,
+            match shelf {
+                Shelf::Parked => "park takes {\"parked\": true | false}",
+                Shelf::Backburner => "backburner takes {\"backburner\": true | false}",
+            },
+        );
     };
     let Some(tree) = pool.tree(name) else {
         return Reply::error(404, &format!("no tree {name} in {}", pool.name));
     };
     if tree.is_main || !tree.is_held() {
-        return Reply::error(409, &format!("tree {name} is not leased: nothing to park"));
+        return Reply::error(
+            409,
+            &format!("tree {name} is not leased: nothing to set aside"),
+        );
     }
-    match set_parked(&tree, parked) {
+    match set_shelf(&tree, shelf, on) {
         Ok(record) => {
             let mut app = pool.app.lock().unwrap_or_else(PoisonError::into_inner);
             if let Some(tree) = app.trees.iter_mut().find(|t| t.name == name) {
@@ -201,13 +217,19 @@ pub fn park(pool: &Pool, name: &str, body: &[u8]) -> Reply {
     }
 }
 
-/// Records `parked` in the tree's `treetop.json`, over what the file says
-/// now rather than what the pool last read, so nothing written since is lost.
-fn set_parked(tree: &Tree, parked: bool) -> std::io::Result<Sidecar> {
+/// Puts the tree on `shelf` when `on`, else takes it off that shelf, in its
+/// `treetop.json`, over what the file says now rather than what the pool
+/// last read, so nothing written since is lost. Taking it off a shelf it is
+/// not on leaves it where it is.
+fn set_shelf(tree: &Tree, shelf: Shelf, on: bool) -> std::io::Result<Sidecar> {
     let mut record = sidecar::read(&tree.path)
         .or_else(|| tree.sidecar.as_deref().cloned())
         .unwrap_or_else(Sidecar::leased_now);
-    record.parked = parked;
+    if on {
+        record.shelve(Some(shelf));
+    } else if record.shelf() == Some(shelf) {
+        record.shelve(None);
+    }
     sidecar::write(&tree.path, &record)?;
     Ok(record)
 }
@@ -470,21 +492,41 @@ mod tests {
             ..Sidecar::leased_now()
         };
         sidecar::write(&tree.path, &on_disk).unwrap();
-        let parked = set_parked(&tree, true).unwrap();
+        let parked = set_shelf(&tree, Shelf::Parked, true).unwrap();
         assert!(parked.parked);
         assert_eq!(parked.job.as_deref(), Some("written-since"));
         assert_eq!(sidecar::read(&tree.path), Some(parked));
         // Asked twice over, it stays what was asked.
-        assert!(set_parked(&tree, true).unwrap().parked);
-        assert!(!set_parked(&tree, false).unwrap().parked);
+        assert!(set_shelf(&tree, Shelf::Parked, true).unwrap().parked);
+        assert!(!set_shelf(&tree, Shelf::Parked, false).unwrap().parked);
         assert!(!sidecar::read(&tree.path).unwrap().parked);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_tree_sits_on_one_shelf_and_leaving_another_keeps_it_there() {
+        let (root, tree) = tree_on_disk("shelves");
+        let record = set_shelf(&tree, Shelf::Backburner, true).unwrap();
+        assert_eq!(record.shelf(), Some(Shelf::Backburner));
+        let record = set_shelf(&tree, Shelf::Parked, false).unwrap();
+        assert_eq!(
+            record.shelf(),
+            Some(Shelf::Backburner),
+            "not parked, so unparking leaves it"
+        );
+        let record = set_shelf(&tree, Shelf::Parked, true).unwrap();
+        assert!(record.parked && !record.backburner);
+        assert_eq!(
+            sidecar::read(&tree.path).unwrap().shelf(),
+            Some(Shelf::Parked)
+        );
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn a_held_tree_treetop_has_no_record_of_can_still_be_parked() {
         let (root, tree) = tree_on_disk("unrecorded");
-        assert!(set_parked(&tree, true).unwrap().parked);
+        assert!(set_shelf(&tree, Shelf::Parked, true).unwrap().parked);
         assert!(sidecar::read(&tree.path).unwrap().parked);
         let _ = fs::remove_dir_all(root);
     }

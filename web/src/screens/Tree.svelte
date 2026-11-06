@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { ApiError, fetchTree, giveBack, park, resume, type ReportState, type Tree } from "../api";
+  import { ApiError, backburner, fetchTree, giveBack, park, resume, type ReportState, type Tree } from "../api";
   import GitCounts from "../components/GitCounts.svelte";
   import Mark from "../components/Mark.svelte";
   import PortButton from "../components/PortButton.svelte";
@@ -58,7 +58,7 @@
   }
 
   /** The action under way, and why the last one failed. */
-  let doing = $state<"resume" | "return" | "park" | null>(null);
+  let doing = $state<"resume" | "return" | "park" | "backburner" | null>(null);
   let actionFailure = $state<string | null>(null);
   let isConfirming = $state(false);
   let isMenuOpen = $state(false);
@@ -96,12 +96,20 @@
   }
 
   async function togglePark() {
+    await shelve("park", () => park(nav.workspace, name, !tree!.card.parked));
+  }
+
+  async function toggleBackburner() {
+    await shelve("backburner", () => backburner(nav.workspace, name, !tree!.card.backburner));
+  }
+
+  async function shelve(what: "park" | "backburner", ask: () => Promise<void>) {
     if (!tree) return;
     isMenuOpen = false;
-    doing = "park";
+    doing = what;
     actionFailure = null;
     try {
-      await park(nav.workspace, name, !tree.card.parked);
+      await ask();
       await load();
     } catch (err) {
       actionFailure = err instanceof ApiError ? err.message : "It did not go through";
@@ -148,6 +156,7 @@
       <p class="branch mono">
         {card.branch}{#if tree?.base}<span class="from" aria-label="from">←</span>{tree.base}{/if}
         {#if card.parked}<span class="parked">parked</span>{/if}
+        {#if card.backburner}<span class="parked">backburner</span>{/if}
       </p>
     {/if}
   </header>
@@ -155,6 +164,9 @@
   {#if isMenuOpen && card}
     <button type="button" class="menu-back" aria-label="Close menu" onclick={() => (isMenuOpen = false)}></button>
     <div class="menu">
+      <button type="button" disabled={doing !== null} onclick={toggleBackburner}
+        >{card.backburner ? "Off the backburner" : "Backburner"}</button
+      >
       <button type="button" disabled={doing !== null} onclick={togglePark}>{card.parked ? "Unpark" : "Park"}</button>
       <button
         type="button"

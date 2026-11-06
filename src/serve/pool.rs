@@ -11,6 +11,7 @@ use crate::agents::Status;
 use crate::app::{App, Group};
 use crate::pool::Tree;
 use crate::reports::State;
+use crate::sidecar::Shelf;
 
 /// The whole Pool screen.
 pub fn pool_json(app: &App, workspace: &str) -> Value {
@@ -40,10 +41,12 @@ pub fn pool_json(app: &App, workspace: &str) -> Value {
             "cards": cards,
         }));
     }
-    let parked: Vec<Value> = members(app, &Group::Parked)
-        .into_iter()
-        .map(|t| card(app, t, now))
-        .collect();
+    let shelf = |group: Group| -> Vec<Value> {
+        members(app, &group)
+            .into_iter()
+            .map(|t| card(app, t, now))
+            .collect()
+    };
     json!({
         "workspace": workspace,
         // The listing on show is the last one saved, not yet a live one.
@@ -51,8 +54,9 @@ pub fn pool_json(app: &App, workspace: &str) -> Value {
         "error": app.error,
         "needs_you": needs_you,
         "groups": groups,
+        "backburner": shelf(Group::Backburner),
         "free": members(app, &Group::Free).len(),
-        "parked": parked,
+        "parked": shelf(Group::Parked),
         "bases": app.bases_in_use(),
     })
 }
@@ -110,6 +114,7 @@ pub fn card(app: &App, tree: &Tree, now: u64) -> Value {
         "says": says.map(|i| i.report.text.clone()).filter(|t| !t.is_empty()),
         "needs_you": app.needs_you(tree),
         "parked": App::is_parked(tree),
+        "backburner": App::shelf_of(tree) == Some(Shelf::Backburner),
         "git": git(tree),
         "ports": tree.ports(),
         "pr": tree.ship.as_ref().map(|s| json!({

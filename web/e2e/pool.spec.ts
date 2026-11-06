@@ -4,7 +4,7 @@
 import { expect, test } from "@playwright/test";
 import { pool, serve, shot } from "./fixtures";
 
-test("the pool shows what needs you first, then each base's trees", async ({ page }) => {
+test("the pool shows what needs you first, then each base's trees, then the backburner", async ({ page }) => {
   await serve(page, () => pool);
   await page.goto("/");
 
@@ -19,8 +19,10 @@ test("the pool shows what needs you first, then each base's trees", async ({ pag
   const trees = main.getByRole("link");
   await expect(trees).toHaveText([/14\s*END-140 rate-limits/, /12\s*END-131 copy-tweak/]);
   await expect(main).toContainText(":7777");
+  const backburner = page.getByRole("region", { name: "Backburner" });
+  await expect(backburner.getByRole("link")).toHaveText([/9\s*END-147 exports/]);
   await expect(page.getByText("3 free trees")).toBeVisible();
-  await expect(page.getByRole("banner")).toContainText(/1\s*needs you\s*2\s*held\s*3\s*free/);
+  await expect(page.getByRole("banner")).toContainText(/1\s*needs you\s*3\s*held\s*3\s*free/);
   await shot(page, "test-results/pool.png");
 
   await expect(page.getByRole("link", { name: "tree 6" })).toHaveCount(0);

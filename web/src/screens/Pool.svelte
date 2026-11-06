@@ -96,12 +96,13 @@
     pool !== null &&
       pool.needs_you.length === 0 &&
       pool.groups.every((g) => g.cards.length === 0) &&
+      pool.backburner.length === 0 &&
       pool.parked.length === 0,
   );
   let shownName = $derived(pool?.workspace ?? nav.workspace ?? "treetop");
   // The pool at a glance, as the icon's bars draw it: what waits on you, what
   // else is held, and what is free.
-  let held = $derived(pool ? pool.groups.reduce((sum, g) => sum + g.cards.length, 0) : 0);
+  let held = $derived(pool ? pool.groups.reduce((sum, g) => sum + g.cards.length, pool.backburner.length) : 0);
 </script>
 
 <div class="screen">
@@ -215,6 +216,19 @@
           </section>
         {/if}
       {/each}
+
+      {#if pool.backburner.length}
+        <section aria-label="Backburner">
+          <h2 class="base"><span>Backburner</span></h2>
+          <div class="list">
+            {#each pool.backburner as card (card.tree)}
+              <div animate:flip={{ duration: 250 }}>
+                <SwipeRow label="Park" onswipe={() => swipeAside(card)}><Card {card} /></SwipeRow>
+              </div>
+            {/each}
+          </div>
+        </section>
+      {/if}
 
       {#if isEmpty}
         <div class="state">

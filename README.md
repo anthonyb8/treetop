@@ -53,6 +53,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | `d` | open the side-by-side diff of the tree under the cursor in a popup |
 | `r` | return the marked trees, or the one under the cursor, to the pool; its dialog names each tree's branch, its uncommitted and unpushed counts, the pid of every live process a return would stop and any [keel run](#keel-runs) that holds it, and `D` in it destroys them from disk instead, after reviewing treehouse's preview of each |
 | Space | mark or unmark the tree under the cursor |
+| `x` | put the tree under the cursor on the Backburner, or bring it back, with the cursor following it; `X` folds or opens Backburner |
 | `z` | park the tree under the cursor, setting it aside under Parked, or bring it back; `Z` opens or folds Parked |
 | `/` | filter by number, branch, holder or agent; Enter keeps it, Esc clears it |
 | `o` | open the port the tree serves, `http://localhost:<port>`, in the browser, or the `browser` the config names (see [Config](#config)), or copy it to the clipboard where there is no desktop; a tree serving several, such as a frontend and a backend, offers a menu of them |
@@ -88,7 +89,7 @@ Where a tree has several, it names the most pressing live one, waiting on you, t
 The assistant is never a tree's agent.
 A Claude Code session under a config dir other than the default one is labelled with it, `● fix-login [keel]` for one under `~/.keel/claude` (see [Config](#config)).
 Its mark is `●` in bold when the tree's agent needs you, `✓` when it is done and `✗` when its process died, as on a restart (see [What agents say](#what-agents-say)), else the agent's own status: `●` busy, `○` idle, `◌` cold.
-The list is in groups, each under a heading with a blank line above it: a group per base the held trees were cut from (see [New agents](#new-agents)), the pool's base first and the rest by name, then the free trees, then Parked.
+The list is in groups, each under a heading with a blank line above it: a group per base the held trees were cut from (see [New agents](#new-agents)), the pool's base first and the rest by name, then Backburner, then the free trees, then Parked.
 The repository's main checkout is no row of its own: it heads its branch's group, `main · main checkout`, with its ports, agent and git state.
 treetop keeps it on its upstream: it fetches every five minutes, and whenever the shared refs move, as an agent's fetch or push moves them, it fast-forwards the checkout and says so on the status line.
 It only ever fast-forwards, and only a checkout on a branch with an upstream, with no tracked changes, no commits of its own and no agent busy in it; one it leaves shows how far behind it is as `⇣25` in its git state.
@@ -98,8 +99,10 @@ The assistant is never shown there, and neither is a stopped session, since sess
 Within a group, trees waiting on you come first, then those with the most recently active agent, so trees nobody has worked in for a while sink to the bottom.
 An agent's last activity is its latest report, or when its Claude Code transcript last grew.
 The cursor stops on headings too, and Enter on one folds its group to the heading, which then says how many of its trees wait on you, or opens it again; a filter opens every group and leaves out those it finds nothing in.
-Trees held for later but not worked on now can be parked with `z`: they go under the Parked heading at the bottom, folded, and `Z` opens it.
-A parked tree stays under Parked even when it needs you, sorting to the top of it, a filter still finds parked trees, and returning a tree clears it, since parking is kept in its `treetop.json` as `parked`.
+Trees still being worked on, but not right now, can go on the Backburner with `x`: they go under the Backburner heading below the trees in hand, open, and the cursor goes with them.
+Trees held for later but not worked on at all can be parked with `z`: they go under the Parked heading at the bottom, folded, and `Z` opens it.
+A tree sits on one of the two at a time, so `z` on a tree on the Backburner parks it, and `x` on a parked one puts it on the Backburner.
+A tree on either stays there even when it needs you, sorting to the top of it, a filter still finds it, and returning a tree clears it, since both are kept in its `treetop.json`, as `backburner` and `parked`.
 RUN shows only once [keel](#keel-runs) lists a run: the playbook the tree's run follows and the step it is on out of the playbook's, `bug-fix 2/6`, then `paused` or another state when it is not active, `!2` when two of its decisions are flagged for attention, and `stale` when no process was in the tree at keel's last sweep.
 PR is where the tree's branch stands after its agent: its pull request's number and stage, or the step of a pipeline it is going through (see [After the agent](#after-the-agent)).
 The pane below shows the tree under the cursor in full: its path and holder, its agents, ports and processes, everything its agent last said with its latest steps, and the outcome of its last action with the end of its output.
@@ -779,7 +782,7 @@ A public port's button reads `Public`, in green, and a tap opens the share sheet
 Only a port one of the pool's trees is serving can go public, as with sharing.
 
 Swipe a card left and let go to park the tree, as `z` does, or swipe a parked card to bring it back; a short swipe springs back.
-Park and Unpark are also at the top of the tree's screen.
+Park and Unpark are also at the top of the tree's screen, with Backburner and Off the backburner beside them; the pool shows the Backburner's trees under their own heading, after the bases'.
 
 Open chat, on a tree whose agent is a background Claude Code session, shows its conversation as it happens, read from the session's transcript on the server: what you sent, what Claude wrote, and each tool call folded to one line, such as `Edited src/guard.ts +12 −4` or `Ran the tests ✗`, that opens to what it printed.
 Scrolled to the end it follows new messages; scrolled up, it stays put and a pill says how many came in.
