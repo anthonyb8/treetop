@@ -1339,11 +1339,17 @@ fn count_spans(kinds: &[Kind]) -> Vec<Span<'static>> {
 }
 
 /// Shades the top row of `area` as the list's headings are, so the
-/// heading bar runs on across the inbox beside the list.
+/// heading bar runs on across the inbox beside the list. Only its
+/// background: the border keeps its own colour, and the text drawn there
+/// takes the headings' style itself.
 fn heading_bar(frame: &mut Frame, area: Rect) {
+    let shade = theme()
+        .header
+        .bg
+        .map_or_else(Style::new, |bg| Style::new().bg(bg));
     frame
         .buffer_mut()
-        .set_style(Rect { height: 1, ..area }, theme().header);
+        .set_style(Rect { height: 1, ..area }, shade);
 }
 
 /// The inbox's mark in its heading: yellow while `waiting` agents need
@@ -3739,6 +3745,15 @@ mod inbox_tests {
             for x in [icon - 1, width - 1] {
                 assert_eq!(drawn[(x, row)].bg, header.unwrap(), "at {x} of {width}");
             }
+            let divider = (0..icon)
+                .rev()
+                .find(|&x| drawn[(x, row)].symbol() == "│")
+                .unwrap();
+            assert_eq!(
+                drawn[(divider, row)].fg,
+                theme().border,
+                "the divider stays dim"
+            );
         }
         assert!(screen(&app, 200, 20).iter().any(|l| l.contains("✉ INBOX")));
     }

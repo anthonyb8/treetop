@@ -12,7 +12,7 @@ use tiny_http::Method;
 
 use super::{Asked, Pool, Reply};
 use crate::app::App;
-use crate::inbox::{self, Kind, Marks};
+use crate::inbox::{self, Kind};
 
 /// `GET /api/inbox`, and `POST /api/inbox/seen` or `/api/inbox/dismiss`
 /// with `{"key": "..."}`.
@@ -49,13 +49,13 @@ pub fn route(pool: &Pool, method: &Method, call: &str, asked: &Asked) -> Reply {
 
 /// Marks the entry `key` seen, or dismissed, in `file`.
 fn mark(file: &Path, is_dismissed: bool, key: String) {
-    let mut marks: Marks = crate::state::read(file);
-    if is_dismissed {
-        marks.dismissed.insert(key);
-    } else {
-        marks.seen.insert(key);
-    }
-    marks.write(file);
+    inbox::change(file, |marks| {
+        if is_dismissed {
+            marks.dismissed.insert(key);
+        } else {
+            marks.seen.insert(key);
+        }
+    });
 }
 
 fn kind_name(kind: Kind) -> &'static str {
@@ -95,6 +95,7 @@ pub fn inbox_json(app: &App, now: SystemTime) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inbox::Marks;
     use crate::serve::pool::tests::{declared, keys};
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -147,6 +148,27 @@ mod tests {
         app.keep_inbox_in(file.clone());
         assert!(app.inbox.seen.contains("opened"));
         assert!(app.inbox.dismissed.contains("gone"));
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn swipes_at_the_same_moment_all_stay_dismissed() {
+        let file = std::env::temp_dir().join(format!(
+            "treetop-serve-inbox-race-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&file);
+        let swipes: Vec<_> = (0..40)
+            .map(|n| {
+                let file = file.clone();
+                std::thread::spawn(move || mark(&file, true, format!("swipe {n}")))
+            })
+            .collect();
+        for swipe in swipes {
+            swipe.join().unwrap();
+        }
+        let kept: Marks = crate::state::read(&file);
+        assert_eq!(kept.dismissed.len(), 40, "{kept:?}");
         let _ = std::fs::remove_file(&file);
     }
 }

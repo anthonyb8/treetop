@@ -490,16 +490,47 @@ impl Marks {
     /// there since this one read it, so an entry opened on the phone is not
     /// unopened again by the desktop's next write, or the other way round.
     pub fn write(&mut self, file: &Path) {
-        let theirs: Marks = crate::state::read(file);
-        self.seen.extend(theirs.seen);
-        self.dismissed.extend(theirs.dismissed);
-        for set in [&mut self.seen, &mut self.dismissed] {
-            if set.len() > KEPT {
-                set.clear();
-            }
-        }
-        crate::state::write(file, self);
+        let mine = std::mem::take(self);
+        *self = change(file, |marks| {
+            marks.seen.extend(mine.seen);
+            marks.dismissed.extend(mine.dismissed);
+            marks.is_hidden = mine.is_hidden;
+        });
     }
+}
+
+/// Applies `change` to the marks in `file` as they stand and writes them
+/// back, returning them. A lock beside the file is held throughout, so
+/// another write at the same moment, from this treetop or the desktop's or
+/// the phone's server, waits for this one rather than writing over it.
+pub fn change(file: &Path, change: impl FnOnce(&mut Marks)) -> Marks {
+    // Without the lock, as where the directory cannot be written, the
+    // write goes ahead unguarded: a lost mark only shows an entry again.
+    let _lock = lock_beside(file);
+    let mut marks: Marks = crate::state::read(file);
+    change(&mut marks);
+    for set in [&mut marks.seen, &mut marks.dismissed] {
+        if set.len() > KEPT {
+            set.clear();
+        }
+    }
+    crate::state::write(file, &marks);
+    marks
+}
+
+/// An exclusive lock on a file beside `file`, released when dropped.
+fn lock_beside(file: &Path) -> Option<std::fs::File> {
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(file.with_extension("json.lock"))
+        .ok()?;
+    lock.lock().ok()?;
+    Some(lock)
 }
 
 /// The file the marks are kept in. One for every workspace, since an
