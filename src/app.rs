@@ -21,7 +21,7 @@ use crate::pool::{self, Process, Tree, Work};
 use crate::reports::{Report, State};
 use crate::scratch::Scratch;
 use crate::ship::{Answer, Stage};
-use crate::sidecar::{Shelf, Sidecar};
+use crate::sidecar::{self, Shelf, Sidecar};
 
 /// Where a tree's latest job stands, shown in its STATUS cell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -358,6 +358,10 @@ pub struct App {
     /// Agents have been read at least once; until then a tree with none is
     /// unknown, not orphaned.
     pub is_agents_read: bool,
+    /// The held trees' git counts have been read at least once. They land
+    /// after the agents, since git takes seconds across a pool, and the
+    /// status snapshot waits for them rather than print them unknown.
+    pub is_work_read: bool,
     pub marked: BTreeSet<PathBuf>,
     pub selected: usize,
     pub pending: Option<Pending>,
@@ -926,9 +930,13 @@ impl App {
         );
     }
 
-    /// Shows the cached listing until a live one lands.
+    /// Shows the cached listing until a live one lands, with each held
+    /// tree's sidecar read from disk: it names the group the tree is listed
+    /// under, so without it every tree would show under its base, then jump
+    /// to Backburner or Parked once the git clock reads it.
     pub fn set_cached(&mut self, trees: Vec<Tree>) {
         self.replace_trees(trees);
+        self.apply_sidecars(sidecar::read_all(&self.trees));
         self.is_cached = true;
     }
 
@@ -948,6 +956,7 @@ impl App {
                 tree.work = *entry;
             }
         }
+        self.is_work_read = true;
     }
 
     /// Takes the sidecars read on the git clock. A tree absent from the map
@@ -4135,6 +4144,35 @@ mod tests {
             matches!(press(&mut app, KeyCode::Char('z')), Outcome::Continue),
             "an available tree has nothing to park"
         );
+    }
+
+    #[test]
+    fn a_workspace_opened_from_its_cache_lists_shelved_trees_in_their_groups_at_once() {
+        let root = std::env::temp_dir().join(format!("treetop-cached-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let listing: Vec<String> = [("4", Some(Shelf::Backburner)), ("8", Some(Shelf::Parked)), ("9", None)]
+            .into_iter()
+            .map(|(name, shelf)| {
+                let tree = root.join(name);
+                std::fs::create_dir_all(tree.join(".git")).unwrap();
+                let mut record = Sidecar::leased_now();
+                record.shelve(shelf);
+                sidecar::write(&tree, &record).unwrap();
+                format!(
+                    r#"{{"name":"{name}","status":"leased","branch":"b{name}","lease_holder":"me","path":"{}","leased_at":null,"processes":[]}}"#,
+                    tree.display()
+                )
+            })
+            .collect();
+        let mut app = App::new(None);
+        app.set_cached(parse(&format!("[{}]", listing.join(","))).unwrap());
+        assert_eq!(
+            shape(&app),
+            ["▾ 1", "9", "▾backburner 1", "4", "▸parked 1"],
+            "before the git clock has read a single sidecar"
+        );
+        assert_eq!(app.current().map(|t| t.name.as_str()), Some("9"));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

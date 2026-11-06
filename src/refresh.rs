@@ -281,13 +281,16 @@ fn fast(
                         let _ = kicks.ship.send(());
                         let _ = kicks.base.send(());
                     }
-                    work.extend(live::work(watcher.take(&known, &work)));
-                    work.retain(|path, _| known.iter().any(|t| t.is_held() && t.path == *path));
+                    // Sent before git runs, which takes seconds across a
+                    // pool on its first read: they decide each tree's group
+                    // and place in it, which the list must not wait on.
                     sent = updates
-                        .send(Update::Work(work.clone()))
-                        .and_then(|()| updates.send(Update::Sidecars(sidecars)))
+                        .send(Update::Sidecars(sidecars))
                         .and_then(|()| updates.send(Update::Agents(agents)))
                         .and_then(|()| updates.send(Update::Reports(reports.read())));
+                    work.extend(live::work(watcher.take(&known, &work)));
+                    work.retain(|path, _| known.iter().any(|t| t.is_held() && t.path == *path));
+                    sent = sent.and_then(|()| updates.send(Update::Work(work.clone())));
                 }
                 sent = sent.and_then(|()| updates.send(Update::Processes(processes)));
                 if sent.is_err() {

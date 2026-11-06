@@ -366,7 +366,7 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             }
             is_stale = true;
         }
-        if app.is_read() && snapshots.is_due() {
+        if app.is_read() && app.is_work_read && snapshots.is_due() {
             let ready: Vec<String> = app.ready.iter().cloned().collect();
             let status = cli::status_json(&app.trees, &app.reports, &ready, SystemTime::now());
             snapshot::write(checkout, &status);
