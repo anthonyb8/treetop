@@ -52,6 +52,8 @@ export interface Card {
   needs_you: boolean;
   /** Set aside under Parked. */
   parked: boolean;
+  /** Worked on, but not now: under Backburner. */
+  backburner: boolean;
   /** "unknown" where git could not read a held tree; null for a free one. */
   git: Git | "unknown" | null;
   ports: number[];
@@ -91,6 +93,8 @@ export interface Pool {
   error: string | null;
   needs_you: Card[];
   groups: Group[];
+  /** Held trees worked on, but not now, between the groups and the free trees. */
+  backburner: Card[];
   free: number;
   parked: Card[];
   /** The bases trees are cut from, the pool's own first. */
@@ -451,6 +455,11 @@ export function giveBack(workspace: string | null, tree: string): Promise<void> 
 /** Sets the tree aside under Parked, or brings it back. */
 export function park(workspace: string | null, tree: string, parked: boolean): Promise<void> {
   return post<void>(`/api/trees/${encodeURIComponent(tree)}/park${workspaceQuery(workspace)}`, { parked });
+}
+
+/** Puts the tree on the Backburner, or brings it back. */
+export function backburner(workspace: string | null, tree: string, backburner: boolean): Promise<void> {
+  return post<void>(`/api/trees/${encodeURIComponent(tree)}/backburner${workspaceQuery(workspace)}`, { backburner });
 }
 
 /** Shares a port a tree serves with the phone, and says where to reach it. */

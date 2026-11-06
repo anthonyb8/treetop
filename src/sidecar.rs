@@ -54,6 +54,30 @@ pub struct Sidecar {
     /// folds it away under Parked.
     #[serde(default)]
     pub parked: bool,
+    /// Still being worked on, but not now, so the list shows it under
+    /// Backburner, between the trees in hand and Parked. Never set with
+    /// `parked`: [`Sidecar::shelve`] keeps the two apart.
+    #[serde(default)]
+    pub backburner: bool,
+}
+
+/// Where a held tree is set aside from the trees in hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shelf {
+    /// Worked on, but not now.
+    Backburner,
+    /// Not worked on at all.
+    Parked,
+}
+
+impl Shelf {
+    /// The word the list's heading and messages use.
+    pub fn name(self) -> &'static str {
+        match self {
+            Shelf::Backburner => "Backburner",
+            Shelf::Parked => "Parked",
+        }
+    }
 }
 
 impl Sidecar {
@@ -67,6 +91,7 @@ impl Sidecar {
             source: None,
             task: None,
             parked: false,
+            backburner: false,
             branch: None,
             base: None,
             lease_id: None,
@@ -74,6 +99,24 @@ impl Sidecar {
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |since| since.as_secs()),
         }
+    }
+
+    /// Where the tree is set aside, if anywhere. Parked wins over a
+    /// Backburner a hand-edited file also sets.
+    pub fn shelf(&self) -> Option<Shelf> {
+        if self.parked {
+            Some(Shelf::Parked)
+        } else if self.backburner {
+            Some(Shelf::Backburner)
+        } else {
+            None
+        }
+    }
+
+    /// Sets the tree aside on `shelf`, or brings it back with None.
+    pub fn shelve(&mut self, shelf: Option<Shelf>) {
+        self.parked = shelf == Some(Shelf::Parked);
+        self.backburner = shelf == Some(Shelf::Backburner);
     }
 }
 

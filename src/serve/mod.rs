@@ -42,6 +42,7 @@ use crate::phone;
 use crate::pool as treehouse;
 use crate::refresh::{Refresher, Update};
 use crate::ship;
+use crate::sidecar::Shelf;
 use crate::workspaces;
 
 mod assets {
@@ -858,7 +859,11 @@ fn tree_route(pool: &Pool, method: &Method, rest: &str, asked: &Asked) -> Reply 
         }
         (Method::Post, "park") => {
             drop(app);
-            actions::park(pool, &name, asked.body)
+            actions::shelve(pool, &name, Shelf::Parked, asked.body)
+        }
+        (Method::Post, "backburner") => {
+            drop(app);
+            actions::shelve(pool, &name, Shelf::Backburner, asked.body)
         }
         (Method::Post, "resume") => {
             drop(app);

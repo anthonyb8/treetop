@@ -21,7 +21,7 @@ use crate::pool::{self, Process, Tree, Work};
 use crate::reports::{Report, State};
 use crate::scratch::Scratch;
 use crate::ship::{Answer, Stage};
-use crate::sidecar::Sidecar;
+use crate::sidecar::{Shelf, Sidecar};
 
 /// Where a tree's latest job stands, shown in its STATUS cell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,9 +162,11 @@ pub struct Phone {
 pub enum Group {
     /// The trees cut from this base; the main checkout heads its branch's.
     Base(String),
+    /// The trees worked on, but not now.
+    Backburner,
     /// The trees nobody holds.
     Free,
-    /// The trees set aside.
+    /// The trees set aside, not worked on at all.
     Parked,
 }
 
@@ -618,7 +620,12 @@ impl App {
 
     /// The tree is set aside, under Parked.
     pub fn is_parked(tree: &Tree) -> bool {
-        tree.sidecar.as_ref().is_some_and(|s| s.parked)
+        Self::shelf_of(tree) == Some(Shelf::Parked)
+    }
+
+    /// Where the tree is set aside, if anywhere.
+    pub fn shelf_of(tree: &Tree) -> Option<Shelf> {
+        tree.sidecar.as_ref().and_then(|s| s.shelf())
     }
 
     /// The bases the list groups trees under: the main checkout's branch,
@@ -643,20 +650,20 @@ impl App {
         bases
     }
 
-    /// The group `tree` is listed under: Parked for one set aside, even when
-    /// it waits on you, the free trees, else the base it was cut from. None
-    /// for the main checkout, which heads its branch's group rather than
-    /// being a row; its agents are started and shown on that heading.
+    /// The group `tree` is listed under: Parked or Backburner for one set
+    /// aside, even when it waits on you, the free trees, else the base it
+    /// was cut from. None for the main checkout, which heads its branch's
+    /// group rather than being a row; its agents are started and shown on
+    /// that heading.
     pub fn group_of(&self, tree: &Tree) -> Option<Group> {
         if tree.is_main {
             return None;
         }
-        Some(if Self::is_parked(tree) {
-            Group::Parked
-        } else if !tree.is_held() {
-            Group::Free
-        } else {
-            Group::Base(self.base_of(tree).unwrap_or_default())
+        Some(match Self::shelf_of(tree) {
+            Some(Shelf::Parked) => Group::Parked,
+            Some(Shelf::Backburner) => Group::Backburner,
+            None if !tree.is_held() => Group::Free,
+            None => Group::Base(self.base_of(tree).unwrap_or_default()),
         })
     }
 
@@ -698,8 +705,8 @@ impl App {
     }
 
     /// The list as it shows: each group under its heading, the bases first,
-    /// the pool's leading, then the free trees, then Parked. Within a group,
-    /// trees waiting on you come first, then the most recently active, and
+    /// the pool's leading, then Backburner, the free trees and Parked.
+    /// Within a group, trees waiting on you come first, then the most recently active, and
     /// trees with no activity in pool order last. A folded group shows its
     /// heading alone; a filter opens every group and leaves out those it
     /// finds nothing in, but the main checkout's branch keeps its heading.
@@ -708,8 +715,9 @@ impl App {
         let bases = self.bases_in_use();
         let rank = |group: &Group| match group {
             Group::Base(base) => bases.iter().position(|b| b == base).unwrap_or(0),
-            Group::Free => bases.len(),
-            Group::Parked => bases.len() + 1,
+            Group::Backburner => bases.len(),
+            Group::Free => bases.len() + 1,
+            Group::Parked => bases.len() + 2,
         };
         let mut trees: Vec<(Group, &Tree)> = self
             .trees
@@ -723,10 +731,11 @@ impl App {
             .iter()
             .find(|t| t.is_main)
             .and_then(|t| t.branch.clone());
-        let groups = bases
-            .iter()
-            .map(|b| Group::Base(b.clone()))
-            .chain([Group::Free, Group::Parked]);
+        let groups = bases.iter().map(|b| Group::Base(b.clone())).chain([
+            Group::Backburner,
+            Group::Free,
+            Group::Parked,
+        ]);
         let mut rows = Vec::new();
         for group in groups {
             let members: Vec<&Tree> = trees
@@ -799,34 +808,52 @@ impl App {
             .find(|t| t.is_main && t.branch.as_ref() == Some(&base))
     }
 
-    /// `z`: sets the tree under the cursor aside under Parked, or brings it
-    /// back. Only a leased tree can be parked.
-    fn toggle_park(&mut self) -> Outcome {
+    /// `z` and `x`: sets the tree under the cursor aside on `shelf`, Parked
+    /// or Backburner, or brings it back from there. Only a leased tree can
+    /// be set aside. The cursor follows the tree to its new group, which
+    /// opens for it if folded, since its trees are worked on; Parked alone
+    /// stays folded, its trees out of sight.
+    fn toggle_shelf(&mut self, shelf: Shelf) -> Outcome {
         let Some(tree) = self.current() else {
             return Outcome::Continue;
         };
+        let name = tree.name.clone();
         if tree.is_main || !tree.is_held() {
-            self.message = Some(format!("tree {} is not leased: nothing to park", tree.name));
+            let verb = match shelf {
+                Shelf::Parked => "park",
+                Shelf::Backburner => "put on the Backburner",
+            };
+            self.message = Some(format!("tree {name} is not leased: nothing to {verb}"));
             return Outcome::Continue;
         }
         let path = tree.path.clone();
-        let name = tree.name.clone();
         let mut record = tree
             .sidecar
             .as_deref()
             .cloned()
             .unwrap_or_else(Sidecar::leased_now);
-        record.parked = !record.parked;
-        self.message = Some(if record.parked {
-            format!("parked tree {name}; Z opens Parked")
-        } else {
-            format!("tree {name} is back from Parked")
+        let to = (record.shelf() != Some(shelf)).then_some(shelf);
+        record.shelve(to);
+        self.message = Some(match to {
+            Some(Shelf::Parked) => format!("parked tree {name}; Z opens Parked"),
+            Some(Shelf::Backburner) => format!("tree {name} is on the Backburner"),
+            None => format!("tree {name} is back from {}", shelf.name()),
         });
         if let Some(tree) = self.trees.iter_mut().find(|t| t.path == path) {
             tree.sidecar = Some(Box::new(record.clone()));
         }
+        if let Some(group) = self
+            .trees
+            .iter()
+            .find(|t| t.path == path)
+            .and_then(|t| self.group_of(t))
+            && group != Group::Parked
+        {
+            self.folded.remove(&group);
+        }
         let last = self.rows().len().saturating_sub(1);
         self.selected = self.selected.min(last);
+        self.reselect(Some(path.clone()));
         Outcome::Record { path, record }
     }
 
@@ -3294,7 +3321,13 @@ impl App {
             KeyCode::Char('R') => return self.resume(),
             KeyCode::Char('h') => return self.hand_off(),
             KeyCode::Char('s') => return self.ship(),
-            KeyCode::Char('z') => return self.toggle_park(),
+            KeyCode::Char('z') => return self.toggle_shelf(Shelf::Parked),
+            KeyCode::Char('x') => return self.toggle_shelf(Shelf::Backburner),
+            KeyCode::Char('X') => {
+                self.toggle_fold(&Group::Backburner);
+                let last = self.rows().len().saturating_sub(1);
+                self.selected = self.selected.min(last);
+            }
             KeyCode::Char('Z') => {
                 self.is_parked_open = !self.is_parked_open;
                 let last = self.rows().len().saturating_sub(1);
@@ -3891,6 +3924,7 @@ mod tests {
                 } => {
                     let name = match group {
                         Group::Base(base) => base,
+                        Group::Backburner => "backburner".into(),
                         Group::Free => "free".into(),
                         Group::Parked => "parked".into(),
                     };
@@ -4101,6 +4135,85 @@ mod tests {
             matches!(press(&mut app, KeyCode::Char('z')), Outcome::Continue),
             "an available tree has nothing to park"
         );
+    }
+
+    #[test]
+    fn x_puts_a_tree_on_the_backburner_with_the_cursor_and_x_again_brings_it_back() {
+        let mut app = app();
+        let Outcome::Record { path, record } = press(&mut app, KeyCode::Char('x')) else {
+            panic!("x records the backburner");
+        };
+        assert_eq!(path, PathBuf::from("/p/4/app"));
+        assert_eq!(record.shelf(), Some(Shelf::Backburner));
+        assert_eq!(app.message.as_deref(), Some("tree 4 is on the Backburner"));
+        assert_eq!(
+            shape(&app),
+            ["▾ 1", "8", "▾backburner 1", "4", "▾free 1", "7"],
+            "between the trees in hand and the free ones, open"
+        );
+        assert_eq!(
+            app.current().map(|t| t.name.as_str()),
+            Some("4"),
+            "the cursor follows it"
+        );
+        press(&mut app, KeyCode::Char('X'));
+        assert_eq!(shape(&app), ["▾ 1", "8", "▸backburner 1", "▾free 1", "7"]);
+        press(&mut app, KeyCode::Char('X'));
+        select(&mut app, "4");
+        let Outcome::Record { record, .. } = press(&mut app, KeyCode::Char('z')) else {
+            panic!("z parks it from the Backburner");
+        };
+        assert_eq!(
+            record.shelf(),
+            Some(Shelf::Parked),
+            "on one shelf at a time"
+        );
+        assert!(!record.backburner);
+        assert_eq!(shape(&app), ["▾ 1", "8", "▾free 1", "7", "▸parked 1"]);
+        press(&mut app, KeyCode::Char('Z'));
+        select(&mut app, "4");
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.current().map(|t| t.name.as_str()), Some("4"));
+        let Outcome::Record { record, .. } = press(&mut app, KeyCode::Char('x')) else {
+            panic!("x records it back");
+        };
+        assert_eq!(record.shelf(), None);
+        assert_eq!(
+            app.message.as_deref(),
+            Some("tree 4 is back from Backburner")
+        );
+        assert_eq!(shape(&app), ["▾ 2", "4", "8", "▾free 1", "7"]);
+        assert_eq!(
+            app.current().map(|t| t.name.as_str()),
+            Some("4"),
+            "and back with it"
+        );
+    }
+
+    #[test]
+    fn x_opens_a_backburner_folded_while_it_was_empty_so_the_cursor_follows() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('X'));
+        select(&mut app, "4");
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(
+            shape(&app),
+            ["▾ 1", "8", "▾backburner 1", "4", "▾free 1", "7"]
+        );
+        assert_eq!(app.current().map(|t| t.name.as_str()), Some("4"));
+    }
+
+    #[test]
+    fn x_back_into_a_folded_base_opens_it_so_the_cursor_follows() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('x'));
+        app.selected = 0;
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(shape(&app), ["▸ 1", "▾backburner 1", "4", "▾free 1", "7"]);
+        select(&mut app, "4");
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(shape(&app), ["▾ 2", "4", "8", "▾free 1", "7"]);
+        assert_eq!(app.current().map(|t| t.name.as_str()), Some("4"));
     }
 
     #[test]
