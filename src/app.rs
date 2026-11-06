@@ -787,9 +787,9 @@ impl App {
 
     /// `z` and `x`: sets the tree under the cursor aside on `shelf`, Parked
     /// or Backburner, or brings it back from there. Only a leased tree can
-    /// be set aside. The cursor follows the tree to its new group: a
-    /// Backburner folded opens for it, since its trees are still worked on;
-    /// Parked stays folded, its trees out of sight.
+    /// be set aside. The cursor follows the tree to its new group, which
+    /// opens for it if folded, since its trees are worked on; Parked alone
+    /// stays folded, its trees out of sight.
     fn toggle_shelf(&mut self, shelf: Shelf) -> Outcome {
         let Some(tree) = self.current() else {
             return Outcome::Continue;
@@ -819,8 +819,14 @@ impl App {
         if let Some(tree) = self.trees.iter_mut().find(|t| t.path == path) {
             tree.sidecar = Some(Box::new(record.clone()));
         }
-        if to == Some(Shelf::Backburner) {
-            self.folded.remove(&Group::Backburner);
+        if let Some(group) = self
+            .trees
+            .iter()
+            .find(|t| t.path == path)
+            .and_then(|t| self.group_of(t))
+            && group != Group::Parked
+        {
+            self.folded.remove(&group);
         }
         let last = self.rows().len().saturating_sub(1);
         self.selected = self.selected.min(last);
@@ -4002,6 +4008,19 @@ mod tests {
             shape(&app),
             ["▾ 1", "8", "▾backburner 1", "4", "▾free 1", "7"]
         );
+        assert_eq!(app.current().map(|t| t.name.as_str()), Some("4"));
+    }
+
+    #[test]
+    fn x_back_into_a_folded_base_opens_it_so_the_cursor_follows() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('x'));
+        app.selected = 0;
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(shape(&app), ["▸ 1", "▾backburner 1", "4", "▾free 1", "7"]);
+        select(&mut app, "4");
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(shape(&app), ["▾ 2", "4", "8", "▾free 1", "7"]);
         assert_eq!(app.current().map(|t| t.name.as_str()), Some("4"));
     }
 
