@@ -172,3 +172,28 @@ test("after opening another workspace's entry, this workspace's entries still op
   await page.getByRole("button", { name: "tree 17 in app, PR failed" }).click();
   await asked;
 });
+
+test("a poll answered before a swipe does not bring the swiped entry back", async ({ page }) => {
+  await serve(page, () => pool);
+  let release: () => void = () => undefined;
+  let hold = false;
+  await page.route("**/api/inbox**", async (route) => {
+    if (route.request().method() === "POST") return route.fulfill({ json: {} });
+    if (hold) await new Promise<void>((done) => (release = done));
+    return route.fulfill({ json: full });
+  });
+  await page.goto("/inbox");
+  await expect(page.getByRole("button", { name: "tree 12, done" })).toBeVisible();
+  hold = true;
+  const held = page.waitForRequest((r) => r.url().includes("/api/inbox") && r.method() === "GET");
+  await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
+  await held;
+  await swipe(page, ".swipe:has([aria-label='tree 12, done'])", 160);
+  await expect(page.getByRole("button", { name: "tree 12, done" })).toHaveCount(0);
+  hold = false;
+  const answered = page.waitForResponse((r) => r.url().includes("/api/inbox") && r.request().method() === "GET");
+  release();
+  await answered;
+  await expect(page.getByRole("button", { name: "tree 12, done" })).toHaveCount(0);
+  await expect(page.getByRole("link", { name: /Inbox/ }).getByLabel("3 new in the inbox")).toBeAttached();
+});

@@ -199,6 +199,11 @@ mod tests {
         pool.app.lock().unwrap().is_agents_read = true;
         assert!(!is_read(&pool), "agents read, reports not yet");
         pool.seen.lock().unwrap().has_reports = true;
+        assert!(
+            !is_read(&pool),
+            "PRs not read yet, so a failed one would be missing"
+        );
+        pool.seen.lock().unwrap().has_ship = true;
         assert!(is_read(&pool));
     }
 

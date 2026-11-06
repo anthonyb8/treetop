@@ -193,15 +193,15 @@ impl Pool {
         away.is_read
     }
 
-    /// The pool's agents and its reports have been read, so what `app`
-    /// says of them is how they stand rather than not known yet.
+    /// The pool's agents, reports and PRs have been read, so what `app`
+    /// says of them is how they stand rather than not known yet. As for
+    /// pushes, a repository whose ship plugins cannot say is not waited on
+    /// past SHIP_WAIT.
     fn is_read(&self, app: &App) -> bool {
-        app.is_agents_read
-            && self
-                .seen
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .has_reports
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_read(app)
     }
 
     /// The tree called `name` as the pool last read it.
@@ -274,10 +274,7 @@ impl Pool {
         let Some(push) = &self.push else {
             return;
         };
-        let is_read = app.is_agents_read
-            && watch.has_reports
-            && (watch.has_ship || watch.started.elapsed() >= SHIP_WAIT);
-        if !is_read {
+        if !watch.is_read(&app) {
             return;
         }
         let now = push::Seen::of(&app);
@@ -311,6 +308,16 @@ struct Watch {
     has_reports: bool,
     has_ship: bool,
     last: Option<push::Seen>,
+}
+
+impl Watch {
+    /// `app`'s agents, reports and PRs have all been read, or the PRs not
+    /// within SHIP_WAIT, for a repository whose ship plugins cannot say.
+    fn is_read(&self, app: &App) -> bool {
+        app.is_agents_read
+            && self.has_reports
+            && (self.has_ship || self.started.elapsed() >= SHIP_WAIT)
+    }
 }
 
 impl Default for Watch {
