@@ -14,8 +14,12 @@ export async function loadInbox(): Promise<void> {
     const asked = nav.workspace;
     const fresh = await fetchInbox(asked);
     if (asked !== nav.workspace) return;
-    inbox.list = fresh;
     inbox.failure = null;
+    // Partway through reading a pool the server knows only some of what
+    // waits, and an empty answer would say nothing does: the last list
+    // stays, or the screen stays loading, until it has read them all.
+    if (fresh.is_reading) return;
+    inbox.list = fresh;
   } catch (err) {
     inbox.failure = err instanceof ApiError ? err.message : "Something went wrong";
   }
@@ -56,6 +60,7 @@ export async function dismissEntry(entry: InboxEntry): Promise<void> {
   await markInbox(entry.key, "dismiss");
   if (inbox.list) {
     inbox.list = {
+      ...inbox.list,
       entries: inbox.list.entries.filter((e) => e.key !== entry.key),
       unseen: inbox.list.unseen - (entry.seen ? 0 : 1),
     };

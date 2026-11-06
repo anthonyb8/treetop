@@ -76,11 +76,15 @@ pub struct Pool {
     ready: Mutex<(Merged, Vec<String>)>,
     /// The other workspaces' agents and PRs, read slowly for the inbox from
     /// the first time the phone asks for it.
-    away: Mutex<Option<AwayReader>>,
+    away: Mutex<Option<Away>>,
     pub app: Mutex<App>,
 }
 
-type AwayReader = crate::inbox::Reader<HashMap<PathBuf, Vec<treehouse::Tree>>>;
+/// The other workspaces' reading, and whether a round of it has come in.
+struct Away {
+    reader: crate::inbox::Reader<HashMap<PathBuf, Vec<treehouse::Tree>>>,
+    is_read: bool,
+}
 
 impl Pool {
     /// The pool of `checkout`, set up as the screen sets one up, with its
@@ -174,13 +178,30 @@ impl Pool {
     }
 
     /// Gives `app` the other workspaces' agents and PRs as last read,
-    /// starting their reading the first time.
-    fn read_away(&self, app: &mut App) {
+    /// starting their reading the first time, and says whether any round
+    /// of it has come in yet.
+    fn read_away(&self, app: &mut App) -> bool {
         let mut away = self.away.lock().unwrap_or_else(PoisonError::into_inner);
-        let reader = away.get_or_insert_with(|| crate::inbox::spawn_reader(self.checkout.clone()));
-        while let Ok(live) = reader.rounds.try_recv() {
+        let away = away.get_or_insert_with(|| Away {
+            reader: crate::inbox::spawn_reader(self.checkout.clone()),
+            is_read: false,
+        });
+        while let Ok(live) = away.reader.rounds.try_recv() {
             app.away_live = live;
+            away.is_read = true;
         }
+        away.is_read
+    }
+
+    /// The pool's agents and its reports have been read, so what `app`
+    /// says of them is how they stand rather than not known yet.
+    fn is_read(&self, app: &App) -> bool {
+        app.is_agents_read
+            && self
+                .seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .has_reports
     }
 
     /// The tree called `name` as the pool last read it.

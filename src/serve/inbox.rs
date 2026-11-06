@@ -23,14 +23,15 @@ pub fn route(pool: &Pool, method: &Method, call: &str, asked: &Asked) -> Reply {
     match (method, call) {
         (Method::Get, "") => {
             let mut app = pool.app.lock().unwrap_or_else(PoisonError::into_inner);
-            pool.read_away(&mut app);
+            let is_away_read = pool.read_away(&mut app);
+            let is_reading = !is_away_read || !pool.is_read(&app);
             // The desktop, or another phone, may have opened or dismissed
             // entries since the last ask.
             app.keep_inbox_in(file);
             if let Some(asked) = crate::state::asked_file(&pool.checkout) {
                 app.keep_asked_in(asked);
             }
-            Reply::json(200, &inbox_json(&app, SystemTime::now()))
+            Reply::json(200, &inbox_json(&app, SystemTime::now(), is_reading))
         }
         (Method::Post, "seen" | "dismiss") => {
             #[derive(serde::Deserialize)]
@@ -68,8 +69,10 @@ fn kind_name(kind: Kind) -> &'static str {
     }
 }
 
-/// The inbox as the phone draws it, in the desktop's order, as of `now`.
-pub fn inbox_json(app: &App, now: SystemTime) -> Value {
+/// The inbox as the phone draws it, in the desktop's order, as of `now`;
+/// `is_reading` while the pools are still being read, so the phone does not
+/// take what is not read yet for nothing waiting.
+pub fn inbox_json(app: &App, now: SystemTime, is_reading: bool) -> Value {
     let shown = inbox::shown(app);
     let unseen = shown.iter().filter(|(_, seen)| !seen).count();
     let entries: Vec<Value> = shown
@@ -89,7 +92,7 @@ pub fn inbox_json(app: &App, now: SystemTime) -> Value {
             })
         })
         .collect();
-    json!({ "entries": entries, "unseen": unseen })
+    json!({ "entries": entries, "unseen": unseen, "is_reading": is_reading })
 }
 
 #[cfg(test)]
@@ -109,7 +112,7 @@ mod tests {
         let first = desktop[0].0.clone();
         app.inbox.seen.insert(first.clone());
 
-        let json = inbox_json(&app, UNIX_EPOCH + Duration::from_secs(1_000));
+        let json = inbox_json(&app, UNIX_EPOCH + Duration::from_secs(1_000), false);
         assert_eq!(keys(&json), declared("Inbox"));
         let entries = json["entries"].as_array().unwrap();
         assert_eq!(keys(&entries[0]), declared("InboxEntry"));
@@ -170,5 +173,27 @@ mod tests {
         let kept: Marks = crate::state::read(&file);
         assert_eq!(kept.dismissed.len(), 40, "{kept:?}");
         let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn a_pool_still_being_read_is_not_taken_for_one_with_nothing_waiting() {
+        let mut app = crate::inbox::tests::app();
+        app.is_agents_read = false;
+        let pool = Pool {
+            name: "app".into(),
+            checkout: std::path::PathBuf::from("/nowhere"),
+            kick: std::sync::Mutex::new(std::sync::mpsc::channel().0),
+            push: None,
+            seen: std::sync::Mutex::default(),
+            ready: std::sync::Mutex::default(),
+            away: std::sync::Mutex::new(None),
+            app: std::sync::Mutex::new(app),
+        };
+        let is_read = |pool: &Pool| pool.is_read(&pool.app.lock().unwrap());
+        assert!(!is_read(&pool), "nothing read yet");
+        pool.app.lock().unwrap().is_agents_read = true;
+        assert!(!is_read(&pool), "agents read, reports not yet");
+        pool.seen.lock().unwrap().has_reports = true;
+        assert!(is_read(&pool));
     }
 }

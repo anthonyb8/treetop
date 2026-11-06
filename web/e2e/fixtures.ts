@@ -105,7 +105,7 @@ export const tree17: Tree = {
 /** Answers the app's API calls with `answer` for the pool, and an empty
  * inbox, which a test can answer otherwise by routing it after. */
 export async function serve(page: Page, answer: () => Pool | "down") {
-  await page.route("**/api/inbox**", (route) => route.fulfill({ json: { entries: [], unseen: 0 } satisfies Inbox }));
+  await page.route("**/api/inbox**", (route) => route.fulfill({ json: { entries: [], unseen: 0, is_reading: false } satisfies Inbox }));
   await page.route("**/api/workspaces", (route) =>
     route.fulfill({ json: { default: "app", workspaces: ["app", "treetop"] } }),
   );

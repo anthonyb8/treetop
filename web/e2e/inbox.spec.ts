@@ -21,6 +21,7 @@ function entry(tree: string, fields: Partial<InboxEntry> = {}): InboxEntry {
 
 const full: Inbox = {
   unseen: 4,
+  is_reading: false,
   entries: [
     entry("17", { title: "END-123 fix-login", what: "Which auth provider should the login use, Clerk or Supabase?", ago: 720 }),
     entry("3", {
@@ -86,6 +87,7 @@ test("another workspace's entry switches to that workspace before opening", asyn
     route.fulfill({
       json: {
         unseen: 1,
+        is_reading: false,
         entries: [entry("14", { kind: "failed", workspace: "app", what: "#44 ✗ e2e", ago: null })],
       } satisfies Inbox,
     }),
@@ -106,10 +108,35 @@ test("swiping an entry away dismisses it", async ({ page }) => {
 });
 
 test("with nothing waiting the inbox says so", async ({ page }) => {
-  await serveInbox(page, { entries: [], unseen: 0 });
+  await serveInbox(page, { entries: [], unseen: 0, is_reading: false });
   await page.goto("/inbox");
   await expect(page.getByText("Nothing needs you.")).toBeVisible();
   await expect(page.getByText("All caught up")).toBeVisible();
   await expect(page.getByRole("link", { name: /Inbox/ }).locator(".badge")).toHaveCount(0);
   await shot(page, "test-results/inbox-empty.png");
+});
+
+test("while the server is still reading a workspace the inbox keeps what it showed", async ({ page }) => {
+  let reading = false;
+  await serve(page, () => pool);
+  await page.route("**/api/inbox**", (route) =>
+    route.fulfill({ json: reading ? { entries: [], unseen: 0, is_reading: true } : full }),
+  );
+  await page.goto("/inbox");
+  await expect(page.getByRole("button", { name: "tree 17, needs you" })).toBeVisible();
+  reading = true;
+  await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
+  await page.waitForResponse("**/api/inbox**");
+  await expect(page.getByText("All caught up")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "tree 17, needs you" })).toBeVisible();
+  await expect(page.getByRole("link", { name: /Inbox/ }).getByLabel("4 new in the inbox")).toBeAttached();
+});
+
+test("a first answer that is still reading shows the inbox loading, not empty", async ({ page }) => {
+  await serve(page, () => pool);
+  await page.route("**/api/inbox**", (route) => route.fulfill({ json: { entries: [], unseen: 0, is_reading: true } }));
+  await page.goto("/inbox");
+  await page.waitForResponse("**/api/inbox**");
+  await expect(page.locator("main:visible [aria-busy='true']")).toBeVisible();
+  await expect(page.getByText("Nothing needs you.")).toHaveCount(0);
 });

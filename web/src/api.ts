@@ -220,6 +220,9 @@ export interface InboxEntry {
 export interface Inbox {
   entries: InboxEntry[];
   unseen: number;
+  /** The server has not finished reading the pools yet, so the entries
+   *  may be missing some, or all. */
+  is_reading: boolean;
 }
 
 export interface IssueRow {
