@@ -2,7 +2,7 @@
   import { flip } from "svelte/animate";
   import { ApiError, type InboxEntry, type InboxKind } from "../api";
   import SwipeRow from "../components/SwipeRow.svelte";
-  import { dismissEntry, inbox, loadInbox, openEntry } from "../inbox.svelte";
+  import { dismissEntry, inbox, isElsewhere, loadInbox, openEntry } from "../inbox.svelte";
   import { Pull, PULL_PX } from "../pull.svelte";
   import { ago } from "../time";
 
@@ -120,7 +120,7 @@
               <div animate:flip={{ duration: 250 }}>
                 <SwipeRow label="Dismiss" onswipe={() => dismiss(entry)}>
                   <button type="button" class="entry" class:seen={entry.seen} onclick={() => openEntry(entry)}
-                    aria-label="tree {entry.tree}{entry.workspace ? ` in ${entry.workspace}` : ''}, {labels[entry.kind]}">
+                    aria-label="tree {entry.tree}{isElsewhere(entry) ? ` in ${entry.workspace}` : ''}, {labels[entry.kind]}">
                     <span class="mark {entry.kind}" aria-hidden="true">
                       {#if entry.kind === "needs_you"}
                         <svg viewBox="0 0 16 16" width="16" height="16"><circle cx="8" cy="8" r="6.5" fill="currentColor" /></svg>
@@ -139,7 +139,7 @@
                         {#if entry.ago !== null}<span class="when">{ago(entry.ago)}</span>{/if}
                       </span>
                       <span class="what">{entry.what || labels[entry.kind]}</span>
-                      {#if entry.workspace}
+                      {#if isElsewhere(entry)}
                         <span class="where mono">{entry.workspace}</span>
                       {/if}
                     </span>

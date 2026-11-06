@@ -31,7 +31,10 @@ pub fn route(pool: &Pool, method: &Method, call: &str, asked: &Asked) -> Reply {
             if let Some(asked) = crate::state::asked_file(&pool.checkout) {
                 app.keep_asked_in(asked);
             }
-            Reply::json(200, &inbox_json(&app, SystemTime::now(), is_reading))
+            Reply::json(
+                200,
+                &inbox_json(&app, &pool.name, SystemTime::now(), is_reading),
+            )
         }
         (Method::Post, "seen" | "dismiss") => {
             #[derive(serde::Deserialize)]
@@ -69,10 +72,12 @@ fn kind_name(kind: Kind) -> &'static str {
     }
 }
 
-/// The inbox as the phone draws it, in the desktop's order, as of `now`;
-/// `is_reading` while the pools are still being read, so the phone does not
-/// take what is not read yet for nothing waiting.
-pub fn inbox_json(app: &App, now: SystemTime, is_reading: bool) -> Value {
+/// The inbox of workspace `here` as the phone draws it, in the desktop's
+/// order, as of `now`; `is_reading` while the pools are still being read,
+/// so the phone does not take what is not read yet for nothing waiting.
+/// Each entry names its own workspace, `here`'s too, so it opens there
+/// whichever workspace the phone has moved to since.
+pub fn inbox_json(app: &App, here: &str, now: SystemTime, is_reading: bool) -> Value {
     let shown = inbox::shown(app);
     let unseen = shown.iter().filter(|(_, seen)| !seen).count();
     let entries: Vec<Value> = shown
@@ -81,7 +86,7 @@ pub fn inbox_json(app: &App, now: SystemTime, is_reading: bool) -> Value {
             json!({
                 "key": entry.key,
                 "kind": kind_name(entry.kind),
-                "workspace": entry.away.map(|a| a.name),
+                "workspace": entry.away.map_or_else(|| here.to_string(), |a| a.name),
                 "tree": entry.tree,
                 "title": entry.title,
                 // The desktop's names the key that resumes it, which the
@@ -92,7 +97,7 @@ pub fn inbox_json(app: &App, now: SystemTime, is_reading: bool) -> Value {
             })
         })
         .collect();
-    json!({ "entries": entries, "unseen": unseen, "is_reading": is_reading })
+    json!({ "workspace": here, "entries": entries, "unseen": unseen, "is_reading": is_reading })
 }
 
 #[cfg(test)]
@@ -112,7 +117,7 @@ mod tests {
         let first = desktop[0].0.clone();
         app.inbox.seen.insert(first.clone());
 
-        let json = inbox_json(&app, UNIX_EPOCH + Duration::from_secs(1_000), false);
+        let json = inbox_json(&app, "app", UNIX_EPOCH + Duration::from_secs(1_000), false);
         assert_eq!(keys(&json), declared("Inbox"));
         let entries = json["entries"].as_array().unwrap();
         assert_eq!(keys(&entries[0]), declared("InboxEntry"));
@@ -195,5 +200,19 @@ mod tests {
         assert!(!is_read(&pool), "agents read, reports not yet");
         pool.seen.lock().unwrap().has_reports = true;
         assert!(is_read(&pool));
+    }
+
+    #[test]
+    fn every_entry_names_its_workspace_so_it_opens_there_from_any_other() {
+        let app = crate::inbox::tests::app();
+        let json = inbox_json(&app, "app", UNIX_EPOCH, false);
+        assert_eq!(json["workspace"], "app");
+        let named: Vec<&str> = json["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["workspace"].as_str().expect("named"))
+            .collect();
+        assert!(named.contains(&"app"), "{named:?}");
     }
 }

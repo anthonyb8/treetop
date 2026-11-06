@@ -9,7 +9,7 @@ function entry(tree: string, fields: Partial<InboxEntry> = {}): InboxEntry {
   return {
     key: `NeedsYou:/pool/${tree}:job@1`,
     kind: "needs_you",
-    workspace: null,
+    workspace: "app",
     tree,
     title: `END-${tree} work`,
     what: "waiting at a prompt in its chat",
@@ -20,6 +20,7 @@ function entry(tree: string, fields: Partial<InboxEntry> = {}): InboxEntry {
 }
 
 const full: Inbox = {
+  workspace: "app",
   unseen: 4,
   is_reading: false,
   entries: [
@@ -86,6 +87,7 @@ test("another workspace's entry switches to that workspace before opening", asyn
   await page.route("**/api/inbox**", (route) =>
     route.fulfill({
       json: {
+        workspace: "treetop",
         unseen: 1,
         is_reading: false,
         entries: [entry("14", { kind: "failed", workspace: "app", what: "#44 ✗ e2e", ago: null })],
@@ -108,7 +110,7 @@ test("swiping an entry away dismisses it", async ({ page }) => {
 });
 
 test("with nothing waiting the inbox says so", async ({ page }) => {
-  await serveInbox(page, { entries: [], unseen: 0, is_reading: false });
+  await serveInbox(page, { workspace: "app", entries: [], unseen: 0, is_reading: false });
   await page.goto("/inbox");
   await expect(page.getByText("Nothing needs you.")).toBeVisible();
   await expect(page.getByText("All caught up")).toBeVisible();
@@ -120,7 +122,7 @@ test("while the server is still reading a workspace the inbox keeps what it show
   let reading = false;
   await serve(page, () => pool);
   await page.route("**/api/inbox**", (route) =>
-    route.fulfill({ json: reading ? { entries: [], unseen: 0, is_reading: true } : full }),
+    route.fulfill({ json: reading ? { workspace: "app", entries: [], unseen: 0, is_reading: true } : full }),
   );
   await page.goto("/inbox");
   await expect(page.getByRole("button", { name: "tree 17, needs you" })).toBeVisible();
@@ -134,9 +136,39 @@ test("while the server is still reading a workspace the inbox keeps what it show
 
 test("a first answer that is still reading shows the inbox loading, not empty", async ({ page }) => {
   await serve(page, () => pool);
-  await page.route("**/api/inbox**", (route) => route.fulfill({ json: { entries: [], unseen: 0, is_reading: true } }));
+  await page.route("**/api/inbox**", (route) => route.fulfill({ json: { workspace: "app", entries: [], unseen: 0, is_reading: true } }));
   await page.goto("/inbox");
   await page.waitForResponse("**/api/inbox**");
   await expect(page.locator("main:visible [aria-busy='true']")).toBeVisible();
   await expect(page.getByText("Nothing needs you.")).toHaveCount(0);
+});
+
+test("after opening another workspace's entry, this workspace's entries still open here", async ({ page }) => {
+  await serve(page, () => pool);
+  await page.route("**/api/inbox**", (route) => {
+    const asked = new URL(route.request().url()).searchParams.get("workspace");
+    return route.fulfill({
+      json:
+        asked === "treetop"
+          ? { workspace: "treetop", entries: [], unseen: 0, is_reading: true }
+          : {
+              workspace: "app",
+              unseen: 2,
+              is_reading: false,
+              entries: [
+                entry("17", { kind: "failed", ago: null }),
+                entry("3", { key: "Failed:/other/3:x", kind: "failed", workspace: "treetop", ago: null }),
+              ],
+            },
+    });
+  });
+  await page.goto("/inbox");
+  await page.getByRole("button", { name: "tree 3 in treetop, PR failed" }).click();
+  await expect(page).toHaveURL(/\/trees\/3$/);
+  await page.goBack();
+  await expect(page).toHaveURL(/\/inbox$/);
+  await expect(page.getByRole("button", { name: "tree 17 in app, PR failed" })).toBeVisible();
+  const asked = page.waitForRequest((r) => r.url().includes("/api/trees/17?workspace=app"));
+  await page.getByRole("button", { name: "tree 17 in app, PR failed" }).click();
+  await asked;
 });

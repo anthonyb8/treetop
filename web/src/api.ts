@@ -206,8 +206,9 @@ export interface InboxEntry {
   /** What opening and dismissing it are remembered by. */
   key: string;
   kind: InboxKind;
-  /** The workspace it lives in, where that is not the one asked about. */
-  workspace: string | null;
+  /** The workspace it lives in, named even when it is the one asked about,
+   *  so it opens there from any other. */
+  workspace: string;
   tree: string;
   title: string | null;
   what: string;
@@ -218,6 +219,8 @@ export interface InboxEntry {
 
 /** Every workspace's entries, unseen first, then seen. */
 export interface Inbox {
+  /** The workspace it was asked about. */
+  workspace: string;
   entries: InboxEntry[];
   unseen: number;
   /** The server has not finished reading the pools yet, so the entries

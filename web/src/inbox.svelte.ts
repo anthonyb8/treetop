@@ -42,6 +42,11 @@ export function watchInbox(): () => void {
   };
 }
 
+/** The entry lives in a workspace other than the one on show. */
+export function isElsewhere(entry: InboxEntry): boolean {
+  return entry.workspace !== (nav.workspace ?? inbox.list?.workspace);
+}
+
 /** Opens what the entry is about, as a notification of it would: an agent's
  * chat, else its tree. Another workspace's entry switches there first. */
 export function openEntry(entry: InboxEntry): void {
@@ -50,7 +55,7 @@ export function openEntry(entry: InboxEntry): void {
     inbox.list.unseen = Math.max(0, inbox.list.unseen - 1);
   }
   void markInbox(entry.key, "seen").catch(() => undefined);
-  if (entry.workspace) chooseWorkspace(entry.workspace);
+  if (isElsewhere(entry)) chooseWorkspace(entry.workspace);
   const tree = `/trees/${encodeURIComponent(entry.tree)}`;
   go(entry.kind === "needs_you" || entry.kind === "done" ? `${tree}/chat` : tree);
 }
