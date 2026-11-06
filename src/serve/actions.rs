@@ -340,6 +340,7 @@ mod tests {
             push: None,
             seen: Mutex::default(),
             ready: Mutex::default(),
+            away: Mutex::new(None),
             app: Mutex::new(app),
         };
         let sh = |script: &str| vec!["sh".to_string(), "-c".into(), script.into()];
@@ -393,6 +394,7 @@ mod tests {
             push: None,
             seen: Mutex::default(),
             ready: Mutex::default(),
+            away: Mutex::new(None),
             app: Mutex::new(app),
         };
         let ask = |id: &str, body: &[u8]| {

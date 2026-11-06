@@ -3,8 +3,10 @@
   import { fly } from "svelte/transition";
   import PortToast from "./components/PortToast.svelte";
   import TabBar from "./components/TabBar.svelte";
+  import { watchInbox } from "./inbox.svelte";
   import { nav, parse } from "./nav.svelte";
   import Chat from "./screens/Chat.svelte";
+  import Inbox from "./screens/Inbox.svelte";
   import Issue from "./screens/Issue.svelte";
   import IssueForm from "./screens/IssueForm.svelte";
   import Issues from "./screens/Issues.svelte";
@@ -19,17 +21,21 @@
   const slide = { x: window.innerWidth, duration: 280, easing: cubicOut, opacity: 1 };
 
   let isIssueRoute = $derived(route.screen === "issues" || route.screen === "issue" || route.screen === "issue-form");
-  // A tree opened from an issue keeps Issues underneath it.
-  let tab = $state<"trees" | "issues">("trees");
+  // A tree opened from an issue, or from the inbox, keeps that tab
+  // underneath it.
+  let tab = $state<"trees" | "inbox" | "issues">("trees");
   let hasOpenedIssues = $state(false);
   $effect(() => {
     if (route.screen === "pool") tab = "trees";
+    if (route.screen === "inbox") tab = "inbox";
     if (isIssueRoute) {
       tab = "issues";
       hasOpenedIssues = true;
     }
   });
-  let isRoot = $derived(route.screen === "pool" || route.screen === "issues");
+  let isRoot = $derived(route.screen === "pool" || route.screen === "inbox" || route.screen === "issues");
+  // The inbox is asked for on every screen, so its tab's count is current.
+  $effect(() => watchInbox());
   let tree = $derived(
     route.screen === "tree" || route.screen === "chat" || (route.screen === "new" && route.tree !== null)
       ? route.tree
@@ -41,6 +47,7 @@
   <div class="layer root" inert={!isRoot}>
     <div class="pages">
       <div class="page" class:shown={tab === "trees"}><Pool /></div>
+      <div class="page" class:shown={tab === "inbox"}><Inbox /></div>
       {#if hasOpenedIssues}
         <div class="page" class:shown={tab === "issues"}><Issues isActive={route.screen === "issues"} /></div>
       {/if}

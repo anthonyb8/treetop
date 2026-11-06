@@ -3,7 +3,7 @@
 // someone writes them.
 import { expect, test, type Page } from "@playwright/test";
 import type { Card, ChatMessage, Pool, Tree } from "../src/api";
-import { pool, serve, shot, tree17 } from "./fixtures";
+import { pool, serve, shot, swipe, tree17 } from "./fixtures";
 
 /** An iPhone's home indicator, which headless Chromium does not have. */
 async function withHomeIndicator(page: Page) {
@@ -242,23 +242,6 @@ test.describe("a public link to send", () => {
     await expect(page.getByRole("alert")).toContainText("Could not publish :5173: tether failed: Funnel is not enabled");
   });
 });
-
-/** Drags a finger across `selector` from its right edge, `by` pixels left. */
-async function swipe(page: Page, selector: string, by: number, lift = true) {
-  await page.locator(selector).first().scrollIntoViewIfNeeded();
-  const box = (await page.locator(selector).first().boundingBox())!;
-  const y = box.y + box.height / 2;
-  const x = box.x + box.width - 20;
-  const cdp = await page.context().newCDPSession(page);
-  const touch = (type: string, at: number) =>
-    cdp.send("Input.dispatchTouchEvent", {
-      type: type as "touchStart",
-      touchPoints: type === "touchEnd" ? [] : [{ x: at, y }],
-    });
-  await touch("touchStart", x);
-  for (let dx = 10; dx <= by; dx += 10) await touch("touchMove", x - dx);
-  if (lift) await touch("touchEnd", x - by);
-}
 
 test.describe("parking", () => {
   function parkedPool(): { current: Pool; asked: unknown[] } {

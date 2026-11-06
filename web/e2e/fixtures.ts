@@ -1,5 +1,5 @@
 import type { Page } from "@playwright/test";
-import type { Card, IssueDetail, IssueRow, IssueSources, IssueTeam, IssueView, Pool, Tree } from "../src/api";
+import type { Card, Inbox, IssueDetail, IssueRow, IssueSources, IssueTeam, IssueView, Pool, Tree } from "../src/api";
 
 /** What `shot` takes besides the file it writes. */
 type ShotOptions = Omit<NonNullable<Parameters<Page["screenshot"]>[0]>, "path">;
@@ -102,8 +102,10 @@ export const tree17: Tree = {
   },
 };
 
-/** Answers the app's API calls with `answer` for the pool. */
+/** Answers the app's API calls with `answer` for the pool, and an empty
+ * inbox, which a test can answer otherwise by routing it after. */
 export async function serve(page: Page, answer: () => Pool | "down") {
+  await page.route("**/api/inbox**", (route) => route.fulfill({ json: { workspace: "app", entries: [], unseen: 0, is_reading: false } satisfies Inbox }));
   await page.route("**/api/workspaces", (route) =>
     route.fulfill({ json: { default: "app", workspaces: ["app", "treetop"] } }),
   );
@@ -310,4 +312,21 @@ export async function serveIssues(page: Page): Promise<IssuesApi> {
     return route.fulfill({ json: { sections } });
   });
   return api;
+}
+
+/** Drags a finger across `selector` from its right edge, `by` pixels left. */
+export async function swipe(page: Page, selector: string, by: number, lift = true) {
+  await page.locator(selector).first().scrollIntoViewIfNeeded();
+  const box = (await page.locator(selector).first().boundingBox())!;
+  const y = box.y + box.height / 2;
+  const x = box.x + box.width - 20;
+  const cdp = await page.context().newCDPSession(page);
+  const touch = (type: string, at: number) =>
+    cdp.send("Input.dispatchTouchEvent", {
+      type: type as "touchStart",
+      touchPoints: type === "touchEnd" ? [] : [{ x: at, y }],
+    });
+  await touch("touchStart", x);
+  for (let dx = 10; dx <= by; dx += 10) await touch("touchMove", x - dx);
+  if (lift) await touch("touchEnd", x - by);
 }

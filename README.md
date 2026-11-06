@@ -587,6 +587,7 @@ What you opened and dismissed is kept in `inbox.json` under `$XDG_STATE_HOME/tre
 
 The inbox is beside the list from 180 columns, which leaves the list room for its branches and agents.
 On a narrower terminal a strip of counts stands in, `●` for what needs you, `✗` for what failed and `✓` for what is done, and `e` opens the inbox over the list until Esc.
+Either way the list's heading bar runs on across its top with `✉`, yellow while something needs you.
 While the inbox is shown, treetop takes the mouse over the list so a click reaches it; most terminals still select text with Shift held.
 `E` hides it, and the mouse with it, until `E` again.
 
@@ -806,6 +807,11 @@ The bell in the pool's header turns on notifications, which iOS offers only to t
 Your phone then buzzes when an agent comes to need you, finishes or dies, and when a tree's PR fails its checks or merges, each once; tapping one opens that tree's chat, or the tree for a PR, in the tree's own workspace, whichever one the phone was showing.
 A notification names the tree and what happened, such as `17 · END-123 fix-login` and `Needs you`, never what the agent wrote, and goes encrypted for your phone through Apple's push service, the one thing the server sends off your tailnet.
 The server keeps its push key and the phones that turned notifications on in `push/` beside the config, readable by you alone; a phone that turns them off in Settings is dropped the next time a push finds it gone.
+
+Inbox, in the tab bar, is the desktop's [inbox](#the-inbox) on the phone, so what the notifications said is in one place after you swipe them away.
+It lists the same entries from every workspace, in the same order under the same headings, and its tab counts what you have not opened yet.
+A tap opens an entry as its notification would, the agent's chat or the tree for a PR or an agent that died, switching to its workspace first; swiping one left dismisses it.
+What you open or dismiss on either is kept in the one `inbox.json`, so the desktop's inbox shows it too once it next reads that file, at a restart or a switch.
 With the server out of reach, it opens on the pool as it last saw it and says so.
 
 ### Working on the app

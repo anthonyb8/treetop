@@ -486,14 +486,51 @@ pub struct Marks {
 const KEPT: usize = 1_000;
 
 impl Marks {
+    /// Writes the marks to `file`, keeping those another treetop wrote
+    /// there since this one read it, so an entry opened on the phone is not
+    /// unopened again by the desktop's next write, or the other way round.
     pub fn write(&mut self, file: &Path) {
-        for set in [&mut self.seen, &mut self.dismissed] {
-            if set.len() > KEPT {
-                set.clear();
-            }
-        }
-        crate::state::write(file, self);
+        let mine = std::mem::take(self);
+        *self = change(file, |marks| {
+            marks.seen.extend(mine.seen);
+            marks.dismissed.extend(mine.dismissed);
+            marks.is_hidden = mine.is_hidden;
+        });
     }
+}
+
+/// Applies `change` to the marks in `file` as they stand and writes them
+/// back, returning them. A lock beside the file is held throughout, so
+/// another write at the same moment, from this treetop or the desktop's or
+/// the phone's server, waits for this one rather than writing over it.
+pub fn change(file: &Path, change: impl FnOnce(&mut Marks)) -> Marks {
+    // Without the lock, as where the directory cannot be written, the
+    // write goes ahead unguarded: a lost mark only shows an entry again.
+    let _lock = lock_beside(file);
+    let mut marks: Marks = crate::state::read(file);
+    change(&mut marks);
+    for set in [&mut marks.seen, &mut marks.dismissed] {
+        if set.len() > KEPT {
+            set.clear();
+        }
+    }
+    crate::state::write(file, &marks);
+    marks
+}
+
+/// An exclusive lock on a file beside `file`, released when dropped.
+fn lock_beside(file: &Path) -> Option<std::fs::File> {
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(file.with_extension("json.lock"))
+        .ok()?;
+    lock.lock().ok()?;
+    Some(lock)
 }
 
 /// The file the marks are kept in. One for every workspace, since an
@@ -739,6 +776,26 @@ pub mod tests {
         reports[0] = report("j4", "/pool/4/app", State::Blocked, "And the strip?", 5);
         again.apply_reports(reports);
         assert_eq!(order(&again)[0], (Kind::NeedsYou, "4".into(), false));
+        let _ = fs::remove_file(&file);
+    }
+
+    #[test]
+    fn what_the_phone_dismissed_survives_the_desktop_writing_its_own_marks() {
+        let file =
+            std::env::temp_dir().join(format!("treetop-inbox-both-{}.json", std::process::id()));
+        let _ = fs::remove_file(&file);
+        let mut desktop = app();
+        desktop.keep_inbox_in(file.clone());
+        let mut phone = Marks::default();
+        phone.dismissed.insert("from the phone".into());
+        phone.write(&file);
+
+        desktop.rail = Some(0);
+        press(&mut desktop, KeyCode::Char('x'));
+
+        let kept: Marks = crate::state::read(&file);
+        assert!(kept.dismissed.contains("from the phone"));
+        assert_eq!(kept.dismissed.len(), 2, "{kept:?}");
         let _ = fs::remove_file(&file);
     }
 

@@ -199,6 +199,35 @@ export interface Workspaces {
   workspaces: string[];
 }
 
+export type InboxKind = "needs_you" | "failed" | "died" | "done" | "merged";
+
+/** One thing that wants you, as the desktop's inbox lists it. */
+export interface InboxEntry {
+  /** What opening and dismissing it are remembered by. */
+  key: string;
+  kind: InboxKind;
+  /** The workspace it lives in, named even when it is the one asked about,
+   *  so it opens there from any other. */
+  workspace: string;
+  tree: string;
+  title: string | null;
+  what: string;
+  /** Seconds since it happened, where that is known. */
+  ago: number | null;
+  seen: boolean;
+}
+
+/** Every workspace's entries, unseen first, then seen. */
+export interface Inbox {
+  /** The workspace it was asked about. */
+  workspace: string;
+  entries: InboxEntry[];
+  unseen: number;
+  /** The server has not finished reading the pools yet, so the entries
+   *  may be missing some, or all. */
+  is_reading: boolean;
+}
+
 export interface IssueRow {
   id: string;
   title: string;
@@ -362,6 +391,15 @@ export function fetchPrompt(workspace: string | null, tree: string): Promise<{ a
 
 export function fetchWorkspaces(): Promise<Workspaces> {
   return get<Workspaces>("/api/workspaces");
+}
+
+export function fetchInbox(workspace: string | null): Promise<Inbox> {
+  return get<Inbox>(`/api/inbox${workspaceQuery(workspace)}`);
+}
+
+/** Marks an inbox entry opened, or takes it out of the inbox. */
+export function markInbox(key: string, as: "seen" | "dismiss"): Promise<void> {
+  return post<unknown>(`/api/inbox/${as}`, { key }).then(() => undefined);
 }
 
 export function chatUrl(workspace: string | null, tree: string): string {

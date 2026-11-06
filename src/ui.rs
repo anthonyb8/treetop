@@ -1290,19 +1290,15 @@ fn draw_inbox(frame: &mut Frame, app: &App, area: Rect) {
         .filter(|(e, seen)| !seen && e.kind == Kind::NeedsYou)
         .count();
     let count = if waiting > 0 {
-        Span::styled(
-            format!("{waiting} need you"),
-            fg(t.warning).add_modifier(Modifier::BOLD),
-        )
+        Span::styled(format!("{waiting} need you"), t.header.fg(t.warning))
     } else {
         Span::raw("")
     };
-    let name = Span::styled("INBOX", fg(t.title).add_modifier(Modifier::BOLD));
-    let pad = usize::from(title.width).saturating_sub(5 + count.width());
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![name, Span::raw(" ".repeat(pad)), count])),
-        title,
-    );
+    heading_bar(frame, area);
+    let mut heading = Line::from(vec![inbox_icon(waiting), Span::styled(" INBOX", t.header)]);
+    let pad = usize::from(title.width).saturating_sub(heading.width() + count.width());
+    heading.spans.extend([Span::raw(" ".repeat(pad)), count]);
+    frame.render_widget(Paragraph::new(heading), title);
     let lines: Vec<Line> = inbox_lines(app, body).into_iter().map(|(l, _)| l).collect();
     frame.render_widget(Paragraph::new(lines), body);
     let keys = if app.rail.is_some() {
@@ -1342,6 +1338,30 @@ fn count_spans(kinds: &[Kind]) -> Vec<Span<'static>> {
         .collect()
 }
 
+/// Shades the top row of `area` as the list's headings are, so the
+/// heading bar runs on across the inbox beside the list. Only its
+/// background: the border keeps its own colour, and the text drawn there
+/// takes the headings' style itself.
+fn heading_bar(frame: &mut Frame, area: Rect) {
+    let shade = theme()
+        .header
+        .bg
+        .map_or_else(Style::new, |bg| Style::new().bg(bg));
+    frame
+        .buffer_mut()
+        .set_style(Rect { height: 1, ..area }, shade);
+}
+
+/// The inbox's mark in its heading: yellow while `waiting` agents need
+/// you, grey when none do.
+fn inbox_icon(waiting: usize) -> Span<'static> {
+    let t = theme();
+    Span::styled(
+        "✉",
+        t.header.fg(if waiting > 0 { t.warning } else { t.muted }),
+    )
+}
+
 /// The inbox folded to its counts: unseen entries needing you, failed and
 /// done, for a terminal too narrow for it in full.
 fn draw_inbox_strip(frame: &mut Frame, app: &App, area: Rect) {
@@ -1351,12 +1371,14 @@ fn draw_inbox_strip(frame: &mut Frame, app: &App, area: Rect) {
         .border_style(fg(t.border));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    heading_bar(frame, area);
     let unseen: Vec<Kind> = inbox::shown(app)
         .into_iter()
         .filter(|(_, seen)| !seen)
         .map(|(e, _)| e.kind)
         .collect();
-    let mut lines = vec![Line::raw("")];
+    let waiting = unseen.iter().filter(|k| **k == Kind::NeedsYou).count();
+    let mut lines = vec![Line::from(inbox_icon(waiting))];
     for (kinds, mark) in COUNTS {
         let n = unseen.iter().filter(|k| kinds.contains(k)).count();
         let style = if n == 0 {
@@ -3689,5 +3711,50 @@ mod inbox_tests {
         assert!(!shown.contains("INBOX"), "{shown}");
         assert!(!shown.contains("●2"), "no strip either:\n{shown}");
         assert!(wide(&app) < beside, "the list's own header ends the line");
+    }
+
+    /// The screen as drawn, cell by cell, for what a cell's colours are.
+    fn cells(app: &App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app, None, None)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn the_inbox_carries_the_list_s_heading_bar_on_with_its_icon_folded_or_not() {
+        let app = app();
+        let header = theme().header.bg;
+        for width in [120, 200] {
+            let shown = screen(&app, width, 20);
+            let row = shown
+                .iter()
+                .position(|l| l.contains("BRANCH"))
+                .expect("the list's headings");
+            assert!(shown[row].contains('✉'), "{}", shown[row]);
+            let drawn = cells(&app, width, 20);
+            let row = u16::try_from(row).unwrap();
+            let icon = (0..width)
+                .find(|&x| drawn[(x, row)].symbol() == "✉")
+                .unwrap();
+            assert_eq!(
+                drawn[(icon, row)].fg,
+                theme().warning,
+                "something needs you"
+            );
+            for x in [icon - 1, width - 1] {
+                assert_eq!(drawn[(x, row)].bg, header.unwrap(), "at {x} of {width}");
+            }
+            let divider = (0..icon)
+                .rev()
+                .find(|&x| drawn[(x, row)].symbol() == "│")
+                .unwrap();
+            assert_eq!(
+                drawn[(divider, row)].fg,
+                theme().border,
+                "the divider stays dim"
+            );
+        }
+        assert!(screen(&app, 200, 20).iter().any(|l| l.contains("✉ INBOX")));
     }
 }
