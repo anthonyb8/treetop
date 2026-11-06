@@ -486,7 +486,13 @@ pub struct Marks {
 const KEPT: usize = 1_000;
 
 impl Marks {
+    /// Writes the marks to `file`, keeping those another treetop wrote
+    /// there since this one read it, so an entry opened on the phone is not
+    /// unopened again by the desktop's next write, or the other way round.
     pub fn write(&mut self, file: &Path) {
+        let theirs: Marks = crate::state::read(file);
+        self.seen.extend(theirs.seen);
+        self.dismissed.extend(theirs.dismissed);
         for set in [&mut self.seen, &mut self.dismissed] {
             if set.len() > KEPT {
                 set.clear();
@@ -739,6 +745,26 @@ pub mod tests {
         reports[0] = report("j4", "/pool/4/app", State::Blocked, "And the strip?", 5);
         again.apply_reports(reports);
         assert_eq!(order(&again)[0], (Kind::NeedsYou, "4".into(), false));
+        let _ = fs::remove_file(&file);
+    }
+
+    #[test]
+    fn what_the_phone_dismissed_survives_the_desktop_writing_its_own_marks() {
+        let file =
+            std::env::temp_dir().join(format!("treetop-inbox-both-{}.json", std::process::id()));
+        let _ = fs::remove_file(&file);
+        let mut desktop = app();
+        desktop.keep_inbox_in(file.clone());
+        let mut phone = Marks::default();
+        phone.dismissed.insert("from the phone".into());
+        phone.write(&file);
+
+        desktop.rail = Some(0);
+        press(&mut desktop, KeyCode::Char('x'));
+
+        let kept: Marks = crate::state::read(&file);
+        assert!(kept.dismissed.contains("from the phone"));
+        assert_eq!(kept.dismissed.len(), 2, "{kept:?}");
         let _ = fs::remove_file(&file);
     }
 

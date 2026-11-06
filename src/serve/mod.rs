@@ -14,6 +14,7 @@
 mod actions;
 mod answer;
 mod chat;
+mod inbox;
 mod install;
 mod issues;
 mod pool;
@@ -72,8 +73,13 @@ pub struct Pool {
     seen: Mutex<Watch>,
     /// The merged tickets last looked at, and what they left ready.
     ready: Mutex<(Merged, Vec<String>)>,
+    /// The other workspaces' agents and PRs, read slowly for the inbox from
+    /// the first time the phone asks for it.
+    away: Mutex<Option<AwayReader>>,
     pub app: Mutex<App>,
 }
+
+type AwayReader = crate::inbox::Reader<HashMap<PathBuf, Vec<treehouse::Tree>>>;
 
 impl Pool {
     /// The pool of `checkout`, set up as the screen sets one up, with its
@@ -84,6 +90,7 @@ impl Pool {
         app.user = crate::branch::user();
         app.ship_plugins = ship::plugins(&checkout).0;
         app.base = diff::base(&checkout);
+        app.pools = crate::inbox::other_pools(&checkout);
         if let Some(mut cached) = cache::read(&checkout) {
             cached.insert(0, treehouse::main_tree(&checkout));
             app.set_cached(cached);
@@ -96,6 +103,7 @@ impl Pool {
             push,
             seen: Mutex::new(Watch::default()),
             ready: Mutex::default(),
+            away: Mutex::new(None),
             app: Mutex::new(app),
         });
         thread::spawn({
@@ -164,6 +172,16 @@ impl Pool {
         app.trees.iter().any(|t| t.ports().contains(&port))
     }
 
+    /// Gives `app` the other workspaces' agents and PRs as last read,
+    /// starting their reading the first time.
+    fn read_away(&self, app: &mut App) {
+        let mut away = self.away.lock().unwrap_or_else(PoisonError::into_inner);
+        let reader = away.get_or_insert_with(|| crate::inbox::spawn_reader(self.checkout.clone()));
+        while let Ok(live) = reader.rounds.try_recv() {
+            app.away_live = live;
+        }
+    }
+
     /// The tree called `name` as the pool last read it.
     pub fn tree(&self, name: &str) -> Option<crate::pool::Tree> {
         let app = self.app.lock().unwrap_or_else(PoisonError::into_inner);
@@ -211,6 +229,9 @@ impl Pool {
             Update::Processes(processes) => app.apply_processes(&processes),
             Update::Work(work) => app.apply_work(&work),
             Update::Reports(reports) => {
+                // Another workspace leases trees as its agents start, so its
+                // cache is read again to place their reports in the inbox.
+                app.pools = crate::inbox::other_pools(&self.checkout);
                 app.apply_reports(reports);
             }
             Update::Sidecars(sidecars) => app.apply_sidecars(sidecars),
@@ -740,6 +761,18 @@ pub fn route(state: &State, asked: &Asked) -> Reply {
             let pool = state.pool(asked.query.get("workspace").map(String::as_str));
             let rest = path["/api/issues".len()..].trim_start_matches('/');
             issues::route(&pool, &decode(rest), asked)
+        }
+        (method, path) if path == "/api/inbox" || path.starts_with("/api/inbox/") => {
+            if *method != Method::Get && !is_same_site(asked) {
+                return Reply::error(403, "only treetop's own page can act");
+            }
+            let pool = state.pool(asked.query.get("workspace").map(String::as_str));
+            inbox::route(
+                &pool,
+                method,
+                path["/api/inbox".len()..].trim_start_matches('/'),
+                asked,
+            )
         }
         (method, path) if path.starts_with("/api/trees/") => {
             let pool = state.pool(asked.query.get("workspace").map(String::as_str));

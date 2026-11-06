@@ -1,11 +1,14 @@
 <script lang="ts">
+  import { inbox } from "../inbox.svelte";
   import { link, nav } from "../nav.svelte";
 
-  /** The two screens treetop has, as Tab switches them in the terminal, and
-   *  what the screen on show starts, one tap away. */
-  let { tab }: { tab: "trees" | "issues" } = $props();
+  /** The screens treetop has, as Tab switches them in the terminal, the
+   *  inbox the desktop keeps beside the list, and what the screen on show
+   *  starts, one tap away. */
+  let { tab }: { tab: "trees" | "inbox" | "issues" } = $props();
 
-  let canAdd = $derived(tab === "trees" || nav.canCreate);
+  let canAdd = $derived(tab !== "issues" || nav.canCreate);
+  let unseen = $derived(inbox.list?.unseen ?? 0);
 </script>
 
 <nav aria-label="Screens">
@@ -15,16 +18,23 @@
     <span>Trees</span>
     {#if nav.needs > 0}<span class="badge" aria-label="{nav.needs} waiting on you">{nav.needs}</span>{/if}
   </a>
+  <a class="tab" class:on={tab === "inbox"} href="/inbox" onclick={link} aria-current={tab === "inbox" ? "page" : undefined}>
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+      stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"
+      ><path d="M3 13h5l1.5 3h5L16 13h5" /><path d="M5.5 5h13L21 13v6H3v-6z" /></svg>
+    <span>Inbox</span>
+    {#if unseen > 0}<span class="badge" aria-label="{unseen} new in the inbox">{unseen}</span>{/if}
+  </a>
   <a class="tab" class:on={tab === "issues"} href="/issues" onclick={link} aria-current={tab === "issues" ? "page" : undefined}>
     <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
       stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M8.5 12.5l2.5 2.5 4.5-5.5" /></svg>
     <span>Issues</span>
   </a>
   {#if canAdd}
-    <a class="add" href={tab === "trees" ? "/new" : "/issues/new"} onclick={link}>
+    <a class="add" href={tab === "issues" ? "/issues/new" : "/new"} onclick={link}>
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
         stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
-      {tab === "trees" ? "New agent" : "New issue"}
+      {tab === "issues" ? "New issue" : "New agent"}
     </a>
   {/if}
 </nav>
