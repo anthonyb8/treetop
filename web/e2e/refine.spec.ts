@@ -326,6 +326,28 @@ test.describe("parking", () => {
     await expect(page.getByRole("link", { name: "tree 14" })).toBeVisible();
   });
 
+  test("a tree goes on the backburner and comes off it from its own screen", async ({ page }) => {
+    let tree: Tree = tree17;
+    const asked: boolean[] = [];
+    await serve(page, () => pool);
+    await page.route("**/api/trees/17", (route) => route.fulfill({ json: tree }));
+    await page.route("**/api/trees/17/backburner**", (route) => {
+      const { backburner } = route.request().postDataJSON() as { backburner: boolean };
+      asked.push(backburner);
+      tree = { ...tree, card: { ...tree.card, backburner } };
+      return route.fulfill({ json: {} });
+    });
+    await page.goto("/trees/17");
+    await page.getByRole("button", { name: "More" }).click();
+    await page.getByRole("button", { name: "Backburner", exact: true }).click();
+    await expect(page.getByText("backburner", { exact: true })).toBeVisible();
+    await shot(page, "test-results/tree-backburner.png");
+    await page.getByRole("button", { name: "More" }).click();
+    await page.getByRole("button", { name: "Off the backburner" }).click();
+    await expect(page.getByText("backburner", { exact: true })).toHaveCount(0);
+    expect(asked).toEqual([true, false]);
+  });
+
   test("a tree parks and comes back from its own screen", async ({ page }) => {
     let tree: Tree = tree17;
     const asked: boolean[] = [];

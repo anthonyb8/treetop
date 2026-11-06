@@ -32,6 +32,7 @@ export function card(tree: string, fields: Partial<Card> = {}): Card {
     says: null,
     needs_you: false,
     parked: false,
+    backburner: false,
     git: { unpushed: 0, staged: 0, unstaged: 0, untracked: 0 },
     ports: [],
     pr: null,
@@ -41,7 +42,7 @@ export function card(tree: string, fields: Partial<Card> = {}): Card {
   };
 }
 
-/** A pool with a tree waiting on you, two working, one parked, three free. */
+/** A pool with a tree waiting on you, two working, one on the backburner, one parked, three free. */
 export const pool: Pool = {
   workspace: "app",
   is_stale: false,
@@ -68,6 +69,7 @@ export const pool: Pool = {
       ],
     },
   ],
+  backburner: [card("9", { title: "END-147 exports", mark: "idle", backburner: true, active_ago: 7200 })],
   free: 3,
   bases: ["main", "feature/billing"],
   parked: [card("6", { title: "END-152 invoices", mark: "cold", parked: true, active_ago: 172800 })],

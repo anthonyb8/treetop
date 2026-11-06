@@ -77,6 +77,7 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
             ("d", "diff vs base"),
             ("Space", "mark"),
             ("r", "return tree"),
+            ("x X", "backburner, fold it"),
             ("z Z", "park, fold Parked"),
             ("b", "rename branch"),
             ("/", "filter"),
@@ -686,6 +687,10 @@ fn heading_row(
                 ),
                 Span::styled(format!("  {count}"), fg(t.muted)),
             ],
+        ),
+        Group::Backburner => (
+            "backburner",
+            vec![Span::styled(format!("{count} not now"), fg(t.muted))],
         ),
         Group::Free => (
             "free",
