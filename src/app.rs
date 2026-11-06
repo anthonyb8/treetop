@@ -21,7 +21,7 @@ use crate::pool::{self, Process, Tree, Work};
 use crate::reports::{Report, State};
 use crate::scratch::Scratch;
 use crate::ship::{Answer, Stage};
-use crate::sidecar::{self, Shelf, Sidecar};
+use crate::sidecar::{Shelf, Sidecar};
 
 /// Where a tree's latest job stands, shown in its STATUS cell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -930,13 +930,17 @@ impl App {
         );
     }
 
-    /// Shows the cached listing until a live one lands, with each held
-    /// tree's sidecar read from disk: it names the group the tree is listed
-    /// under, so without it every tree would show under its base, then jump
-    /// to Backburner or Parked once the git clock reads it.
-    pub fn set_cached(&mut self, trees: Vec<Tree>) {
+    /// Shows the cached listing until a live one lands, with what places
+    /// each tree read first: its sidecar names its group, and its agents and
+    /// their reports its place in it. Left to the git clock, they would land
+    /// a moment after the first frame, and the trees would show in pool
+    /// order under their bases and then move; read here, they cost about a
+    /// third of a second before it.
+    pub fn set_cached(&mut self, mut trees: Vec<Tree>) {
+        crate::cli::read_agents(&mut trees);
+        self.apply_reports(crate::reports::Reader::default().read());
         self.replace_trees(trees);
-        self.apply_sidecars(sidecar::read_all(&self.trees));
+        self.is_agents_read = true;
         self.is_cached = true;
     }
 
@@ -4157,7 +4161,7 @@ mod tests {
                 std::fs::create_dir_all(tree.join(".git")).unwrap();
                 let mut record = Sidecar::leased_now();
                 record.shelve(shelf);
-                sidecar::write(&tree, &record).unwrap();
+                crate::sidecar::write(&tree, &record).unwrap();
                 format!(
                     r#"{{"name":"{name}","status":"leased","branch":"b{name}","lease_holder":"me","path":"{}","leased_at":null,"processes":[]}}"#,
                     tree.display()
