@@ -1239,8 +1239,17 @@ impl App {
         Some((path, base))
     }
 
+    /// A diff read, or the coloured copy of one already shown, which keeps
+    /// the counts it was asked at; a copy of a diff dropped since, by `^R`
+    /// or moved counts, is dropped too.
     pub fn diff_loaded(&mut self, path: PathBuf, layout: Result<Layout, String>) {
-        let work = self.diff_requests.remove(&path).flatten();
+        let work = match self.diff_requests.remove(&path) {
+            Some(work) => work,
+            None => match self.diffs.get(&path) {
+                Some(loaded) => loaded.work,
+                None => return,
+            },
+        };
         self.diffs.insert(path, LoadedDiff { layout, work });
     }
 
@@ -3897,6 +3906,31 @@ mod tests {
     }
 
     #[test]
+    fn a_coloured_copy_keeps_its_diffs_counts_and_one_dropped_since_is_dropped() {
+        let mut app = app();
+        with_work(&mut app, 1);
+        let path = PathBuf::from("/p/4/app");
+        press(&mut app, KeyCode::Char('d'));
+        app.wanted_diff();
+        app.diff_loaded(path.clone(), two_files());
+        app.diff_loaded(path.clone(), two_files());
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(
+            app.wanted_diff(),
+            None,
+            "the coloured copy is as fresh as the plain one"
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        app.diff_loaded(path.clone(), two_files());
+        assert_eq!(
+            app.wanted_diff(),
+            Some((path, None)),
+            "a copy of a diff dropped for reading again is not shown"
+        );
+    }
+
+    #[test]
     fn a_tree_cut_from_another_base_is_diffed_against_it() {
         let mut app = app();
         app.base = Some("development".into());
@@ -4413,6 +4447,7 @@ mod tests {
         let mut app = app();
         app.screen_height = 10;
         press(&mut app, KeyCode::Char('d'));
+        app.wanted_diff();
         app.diff_loaded(PathBuf::from("/p/4/app"), two_files());
         let scroll = |app: &App| app.view.as_ref().unwrap().scroll;
         press(&mut app, KeyCode::Char('n'));

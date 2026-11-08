@@ -43,6 +43,7 @@ mod ship;
 mod sidecar;
 mod snapshot;
 mod state;
+mod syntax;
 mod theme;
 mod tickets;
 mod tmux;

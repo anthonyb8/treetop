@@ -8,6 +8,37 @@ use std::sync::OnceLock;
 
 use ratatui::style::{Color, Modifier, Style};
 
+use crate::syntax::Token;
+
+/// Code's colours in the diff, by kind of token: Neovim's treesitter groups
+/// under gruvbox-material, which italicises comments.
+pub struct SyntaxPalette {
+    pub keyword: Color,
+    pub function: Color,
+    pub string: Color,
+    pub constant: Color,
+    pub kind: Color,
+    pub comment: Color,
+    pub operator: Color,
+    pub member: Color,
+}
+
+impl SyntaxPalette {
+    pub fn style(&self, token: Token) -> Style {
+        let color = match token {
+            Token::Keyword => self.keyword,
+            Token::Function => self.function,
+            Token::String => self.string,
+            Token::Constant => self.constant,
+            Token::Type => self.kind,
+            Token::Comment => return Style::new().fg(self.comment).add_modifier(Modifier::ITALIC),
+            Token::Operator => self.operator,
+            Token::Member => self.member,
+        };
+        Style::new().fg(color)
+    }
+}
+
 pub struct DiffPalette {
     /// Text on every diff line; Reset is the terminal's own foreground, as
     /// Neovim's Normal is under a transparent background.
@@ -20,8 +51,11 @@ pub struct DiffPalette {
     pub added: Color,
     pub removed_word: Color,
     pub added_word: Color,
-    /// Text on a changed word's background.
+    /// Text on a changed word's background, where code has no colour.
     pub word_text: Color,
+    /// None leaves code one colour, as the 16 ANSI colours are too few to
+    /// tell a keyword from a type beside the diff's own.
+    pub syntax: Option<SyntaxPalette>,
     pub hunk: Color,
     pub divider: Color,
     pub header: Style,
@@ -82,9 +116,21 @@ const GRUVBOX_MATERIAL: Theme = Theme {
         change_text: None,
         removed: rgb(0x402120),
         added: rgb(0x34381b),
-        removed_word: rgb(0xea6962),
-        added_word: rgb(0xa9b665),
-        word_text: rgb(0x282828),
+        // A brighter shade of the line's own background rather than
+        // solid red and green, so code keeps its colours on it.
+        removed_word: rgb(0x6a302d),
+        added_word: rgb(0x525a29),
+        word_text: Color::Reset,
+        syntax: Some(SyntaxPalette {
+            keyword: rgb(0xea6962),
+            function: rgb(0xa9b665),
+            string: rgb(0x89b482),
+            constant: rgb(0xd3869b),
+            kind: rgb(0xd8a657),
+            comment: rgb(0x928374),
+            operator: rgb(0xe78a4e),
+            member: rgb(0x7daea3),
+        }),
         hunk: rgb(0x928374),
         divider: rgb(0x5a524c),
         header: Style::new()
@@ -125,6 +171,7 @@ const ANSI: Theme = Theme {
         removed_word: Color::LightRed,
         added_word: Color::LightGreen,
         word_text: Color::Black,
+        syntax: None,
         hunk: Color::Cyan,
         divider: Color::White,
         header: Style::new()

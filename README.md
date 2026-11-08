@@ -122,7 +122,11 @@ On opening, treetop draws the last listing it saved under `$XDG_CACHE_HOME/treet
 `d` opens the tree under the cursor in a side-by-side diff, in a popup over the pool, the way a pull request shows it: everything its branch changes against its base, the branch it was cut from (see [New agents](#new-agents)) or else the pool's (`base_branch` in `treehouse.toml`, else `origin/HEAD`), measured from their merge base, plus uncommitted and untracked files.
 Removed lines sit on the left and the added lines that replace them on the right, row by row, with line numbers on both sides; within a changed line, the words that differ are highlighted.
 Every file runs in one scroll, each under a header with its path and its additions and deletions, and the header of the file you are reading stays pinned to the top.
-Its colours are the diff highlight groups Neovim uses under gruvbox-material (medium): `DiffDelete` and `DiffAdd` behind lines, `LineNr` for numbers, `diffLine` for hunks, `diffFile` for paths.
+Code is coloured as an editor colours it, by the grammars [bat](https://github.com/sharkdp/bat) ships, for every language they cover, such as Rust, TypeScript, Svelte, TOML and Markdown; a file with none, such as plain text, stays one colour.
+Each hunk is coloured on its own, since the lines between hunks are not there to carry a comment or a string across.
+The diff opens plain and its colours come in a moment later, read in the background; past 20,000 lines the rest stays plain.
+Its colours are Neovim's under gruvbox-material (medium): its syntax groups for code, `DiffDelete` and `DiffAdd` behind lines, a brighter shade of each behind the words that differ, `LineNr` for numbers, `diffLine` for hunks, `diffFile` for paths.
+In a terminal without true colour, code stays one colour, since 16 colours cannot tell a keyword from a type beside the diff's own red and green.
 
 | Key | Does |
 |---|---|

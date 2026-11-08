@@ -2441,25 +2441,37 @@ fn side_line(
     let Some(side) = side else {
         return Paragraph::new("");
     };
-    let skip = usize::from(hscroll);
-    let chars: Vec<char> = side.text.chars().skip(skip).collect();
-    let (from, to) = side.emphasis.map_or((0, 0), |(from, to)| {
-        (
-            from.saturating_sub(skip).min(chars.len()),
-            to.saturating_sub(skip).min(chars.len()),
-        )
-    });
-    let piece = |range: std::ops::Range<usize>| chars[range].iter().collect::<String>();
     let on_change = side.is_change.then_some(palette.change_text).flatten();
-    let spans = vec![
-        Span::styled(
-            format!("{:>number_width$} ", side.number),
-            fg(on_change.unwrap_or(palette.number)),
-        ),
-        Span::raw(piece(0..from)),
-        Span::styled(piece(from..to), fg(palette.word_text).bg(word)),
-        Span::raw(piece(to..chars.len())),
-    ];
+    let mut spans = vec![Span::styled(
+        format!("{:>number_width$} ", side.number),
+        fg(on_change.unwrap_or(palette.number)),
+    )];
+    // Each char takes its token's colour, and the changed words their
+    // background over it; a run of chars styled alike is one span.
+    let (from, to) = side.emphasis.unwrap_or((0, 0));
+    let syntax = palette.syntax.as_ref();
+    let mut tokens = side.tokens.iter().peekable();
+    let mut run = (String::new(), Style::new());
+    for (i, c) in side.text.chars().enumerate().skip(usize::from(hscroll)) {
+        while tokens.next_if(|(range, _)| range.end <= i).is_some() {}
+        let mut style = match (syntax, tokens.peek()) {
+            (Some(syntax), Some((range, token))) if range.start <= i => syntax.style(*token),
+            _ => Style::new(),
+        };
+        if (from..to).contains(&i) {
+            style = style.bg(word);
+            if style.fg.is_none() {
+                style = style.fg(palette.word_text);
+            }
+        }
+        if style != run.1 && !run.0.is_empty() {
+            let (text, style) = std::mem::take(&mut run);
+            spans.push(Span::styled(text, style));
+        }
+        run.1 = style;
+        run.0.push(c);
+    }
+    spans.push(Span::styled(run.0, run.1));
     let style = fg(on_change.unwrap_or(palette.text));
     let style = if side.is_change {
         style.bg(line)
