@@ -175,10 +175,22 @@ fn finding(text: &str, default: Kind) -> Finding {
         }
         skip_blanks(&mut lines);
     }
+    // A security finding rates itself under labelled lines, such as
+    // `**Reachability:** External`, before its title; they follow its text.
+    let mut labels = Vec::new();
+    while let Some(line) = lines.next_if(|l| l.starts_with("**") && l.contains(":**")) {
+        labels.push(line.replace("**", ""));
+        skip_blanks(&mut lines);
+    }
     if let Some(title) = lines.next_if(|l| l.starts_with("**") && l.ends_with("**")) {
         found.title = title.trim_matches('*').trim().to_string();
     }
     found.body = lines.collect::<Vec<_>>().join("\n").trim().to_string();
+    if !labels.is_empty() {
+        found.body = format!("{}\n\n{}", found.body, labels.join("\n"))
+            .trim()
+            .to_string();
+    }
     if found.title.is_empty() {
         // An old or unreadable comment: its first paragraph names it.
         let (title, body) = found.body.split_once('\n').unwrap_or((&found.body, ""));
@@ -633,5 +645,29 @@ mod tests {
              `1148-1148`: **Trivial** · **Style**\n\n**Name it.**\n\nIt reads better.\n\n<!-- cr-comment:v1:e -->\n",
         );
         assert_eq!(found[0].lines.as_deref(), Some("1148"));
+    }
+
+    #[test]
+    fn a_security_findings_labels_are_not_its_title() {
+        let found = line_comment(
+            "**Major** · **Security**\n\n<!-- cr-reachability -->\n**Reachability:** External\n**Exploitability:** Moderate\n\
+             **CWE:** CWE-611\n<!-- /cr-reachability -->\n\n**Block XML external entities before parsing server responses.**\n\n\
+             The parser resolves external entities.",
+        );
+        let f = &found[0];
+        assert_eq!(
+            f.title,
+            "Block XML external entities before parsing server responses."
+        );
+        assert!(
+            f.body.starts_with("The parser resolves external entities."),
+            "{}",
+            f.body
+        );
+        assert!(
+            f.body.contains("Reachability: External"),
+            "the labels stay, after the text: {}",
+            f.body
+        );
     }
 }

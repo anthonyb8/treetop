@@ -3013,7 +3013,12 @@ fn pr_overview(pr: &PrView, width: usize) -> Vec<Line<'static>> {
             )),
         ];
         if bot.reviewing {
-            parts.push(Span::styled("   reviewing the newest push", fg(t.warning)));
+            let note = if bot.reviewed.as_deref() == Some(pr.head.as_str()) {
+                "   reviewing it again"
+            } else {
+                "   reviewing the newest push"
+            };
+            parts.push(Span::styled(note, fg(t.warning)));
         }
         lines.extend(row("CodeRabbit", parts));
     }
@@ -3083,13 +3088,17 @@ fn draw_pr_checks(frame: &mut Frame, pr: &PrView, selected: usize, area: Rect) {
         );
         return;
     }
+    // A name takes what the row has beside its mark, workflow and time.
+    let name = usize::from(area.width)
+        .saturating_sub(3 + 20 + 8 + 2)
+        .max(28);
     let mut rows: Vec<Line> = Vec::new();
     for (i, check) in pr.checks.iter().enumerate() {
         let (mark, color) = check_mark(check.outcome);
         let time = check.seconds.map(duration).unwrap_or_default();
         let line = Line::from(vec![
             Span::styled(format!(" {mark} "), fg(color).add_modifier(Modifier::BOLD)),
-            Span::raw(pad(&fit(&check.name, 27), 28)),
+            Span::raw(pad(&fit(&check.name, name - 1), name)),
             Span::styled(pad(&fit(&check.workflow, 19), 20), muted),
             Span::raw(format!("{time:>8}")),
         ]);
@@ -3123,7 +3132,7 @@ fn draw_pr_checks(frame: &mut Frame, pr: &PrView, selected: usize, area: Rect) {
             ));
             let log = log.unwrap_or("Its log could not be read, or it is not an Actions run.");
             let room = usize::from(log_area.width).saturating_sub(2).max(1);
-            let all: Vec<String> = log.lines().flat_map(|l| wrap_chars(l, room)).collect();
+            let all: Vec<String> = log.lines().flat_map(|l| word_wrap(l, room)).collect();
             // Under its heading, above the line naming the keys.
             let fits = usize::from(log_area.height).saturating_sub(2).max(1);
             let from = all.len().saturating_sub(fits);
@@ -3240,35 +3249,56 @@ fn wrap_led(
 ) -> Vec<Line<'static>> {
     let hang: usize = lead.iter().map(Span::width).sum();
     let width = width.max(hang + 10);
-    let fits = |used: usize, word: &str| used + word.trim_end().chars().count() <= width;
+    // Words run across spans, as a link's `(` and its styled text do, and
+    // end at a space, which they keep.
+    let mut words: Vec<Vec<(String, Style)>> = vec![Vec::new()];
+    for span in &spans {
+        for c in span.content.chars() {
+            let word = words.last_mut().expect("words starts with one");
+            match word.last_mut() {
+                Some((text, style)) if *style == span.style => text.push(c),
+                _ => word.push((c.to_string(), span.style)),
+            }
+            if c == ' ' {
+                words.push(Vec::new());
+            }
+        }
+    }
+    let size =
+        |word: &[(String, Style)]| word.iter().map(|(t, _)| t.chars().count()).sum::<usize>();
+    let bare = |word: &[(String, Style)]| {
+        size(word)
+            - word
+                .last()
+                .map_or(0, |(t, _)| t.chars().count() - t.trim_end().chars().count())
+    };
     let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
     let (mut used, mut is_empty) = (0, true);
-    for span in spans {
-        for word in span.content.split_inclusive(' ') {
-            let mut word = word.to_string();
-            // A word longer than a whole row is cut where it stands rather
-            // than leaving the row before it, a bullet say, on its own.
-            let fits_a_row = word.trim_end().chars().count() <= width - hang;
-            if !is_empty && !fits(used, &word) && fits_a_row {
-                rows.push(lead.clone());
-                used = hang;
-            }
-            while !fits(used, &word) {
+    for word in words.into_iter().filter(|w| !w.is_empty()) {
+        // A word longer than a whole row is cut where it stands rather than
+        // leaving the row before it, a bullet say, on its own.
+        if !is_empty && used + bare(&word) > width && bare(&word) <= width - hang {
+            rows.push(lead.clone());
+            used = hang;
+        }
+        for (text, style) in word {
+            let mut text = text;
+            while used + text.trim_end().chars().count() > width {
                 let room = width.saturating_sub(used).max(1);
-                let head: String = word.chars().take(room).collect();
-                word = word.chars().skip(room).collect();
+                let head: String = text.chars().take(room).collect();
+                text = text.chars().skip(room).collect();
                 if let Some(row) = rows.last_mut() {
-                    row.push(Span::styled(head, span.style));
+                    row.push(Span::styled(head, style));
                 }
                 rows.push(lead.clone());
                 used = hang;
             }
-            used += word.chars().count();
-            is_empty = false;
+            used += text.chars().count();
             if let Some(row) = rows.last_mut() {
-                row.push(Span::styled(word, span.style));
+                row.push(Span::styled(text, style));
             }
         }
+        is_empty = false;
     }
     rows.into_iter().map(Line::from).collect()
 }
@@ -5389,6 +5419,54 @@ mod pr_view_tests {
         assert!(
             !shown.contains("newest push") && shown.contains("reviewing it again"),
             "a re-review of the head is not a newer push:\n{shown}"
+        );
+    }
+
+    #[test]
+    fn names_rereviews_and_links_use_the_room_they_have() {
+        let mut app = app();
+        let path = std::path::PathBuf::from("/pool/4/app");
+        while app.current().is_none_or(|t| t.path != path) {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Char('v'));
+        let mut pr = pr();
+        pr.checks[0].name = "Test on java-version 8.0.x and os ubuntu-latest".into();
+        pr.checks[1].name = "Test on java-version 8.0.x and os windows-latest".into();
+        pr.checks[0].log = Some(
+            "Process 'command git' finished with non-zero exit value 255 after a long while".into(),
+        );
+        pr.threads[0].body = "Extend the guard to cover the whole verdict payload. ([raw.githubusercontent.com](https://raw.githubusercontent.com/o/r/a8/src/verdict.ts))".into();
+        if let Some(bot) = pr.bot.as_mut() {
+            bot.reviewed = Some(pr.head.clone());
+            bot.reviewing = true;
+        }
+        app.pr_loaded(path, Ok(Some(pr)));
+        let shown = screen(&app, 100, 40);
+        assert!(
+            !shown.contains("newest push") && shown.contains("reviewing it again"),
+            "the Overview says what the tab says:\n{shown}"
+        );
+        press(&mut app, KeyCode::Char('2'));
+        let shown = screen(&app, 100, 40);
+        assert!(
+            shown.contains("os ubuntu-latest") && shown.contains("os windows-latest"),
+            "names use the room the row has:\n{shown}"
+        );
+        assert!(
+            !shown.contains("wit\n")
+                && !shown
+                    .lines()
+                    .any(|r| r.trim_start_matches(['│', ' ']).starts_with("h non-zero")),
+            "logs wrap at words:\n{shown}"
+        );
+        press(&mut app, KeyCode::Char('3'));
+        let shown = screen(&app, 100, 40);
+        assert!(
+            !shown
+                .lines()
+                .any(|r| r.trim_end_matches(['│', ' ']).ends_with('(')),
+            "a wrap falls at a space, not between styles:\n{shown}"
         );
     }
 }
