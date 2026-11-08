@@ -2758,13 +2758,17 @@ fn draw_pr_view(frame: &mut Frame, app: &App, popup: &PrPopup) {
     } else {
         Tab::Overview
     };
-    let keys = if pr.is_some() {
-        PR_KEYS[tab.index()]
-    } else {
-        &[("^R", "reload"), ("Esc", "back")]
+    let keys: Vec<(&str, &str)> = match pr {
+        // `z` only where there are nitpicks to show.
+        Some(pr) => PR_KEYS[tab.index()]
+            .iter()
+            .filter(|(key, _)| *key != "z" || pr_view::nitpick_count(pr) > 0)
+            .copied()
+            .collect(),
+        None => vec![("Esc", "back"), ("^R", "reload")],
     };
     frame.render_widget(
-        Paragraph::new(Line::from(fitting_keys(keys, key_row.width))).style(t.diff.header),
+        Paragraph::new(Line::from(fitting_keys(&keys, key_row.width))).style(t.diff.header),
         key_row,
     );
     if let Some(note) = note {
@@ -2791,18 +2795,24 @@ fn draw_pr_view(frame: &mut Frame, app: &App, popup: &PrPopup) {
             .and_then(|t| t.branch.as_deref())
             .unwrap_or("this branch");
         let lines = match answer {
-            None => vec![Line::raw(" reading the PR...")],
+            None => vec![Line::raw("reading the PR...")],
             Some(Err(why)) => vec![
-                Line::styled(format!(" {why}"), fg(t.danger)),
-                Line::styled(" ^R reads it again", fg(t.muted)),
+                Line::styled(why.clone(), fg(t.danger)),
+                Line::styled("^R reads it again", fg(t.muted)),
             ],
             Some(Ok(_)) => vec![
-                Line::raw(format!(" No pull request for {branch} yet.")),
+                Line::raw(format!("No pull request for {branch} yet.")),
                 Line::styled(
-                    " Close this and press s to start a ship run, which pushes the branch and opens one.",
+                    "Close this and press s to start a ship run, which pushes the branch and opens one.",
                     fg(t.muted),
                 ),
             ],
+        };
+        // Inset a column, so a wrapped note keeps its margin.
+        let content = Rect {
+            x: content.x + content.width.min(1),
+            width: content.width.saturating_sub(1),
+            ..content
         };
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), content);
         return;
@@ -3045,7 +3055,14 @@ fn pr_overview(pr: &PrView, width: usize) -> Vec<Line<'static>> {
     }
     for piece in issues::pieces(&pr.body, &palette()) {
         if let issues::Piece::Lines(body) = piece {
-            lines.extend(body);
+            for line in body {
+                let (style, hang) = (line.style, bullet_hang(&line));
+                lines.extend(
+                    wrap_spans(line.spans, width, hang)
+                        .into_iter()
+                        .map(|l| l.style(style)),
+                );
+            }
         }
     }
     lines
@@ -3068,8 +3085,8 @@ fn draw_pr_checks(frame: &mut Frame, pr: &PrView, selected: usize, area: Rect) {
         let time = check.seconds.map(duration).unwrap_or_default();
         let line = Line::from(vec![
             Span::styled(format!(" {mark} "), fg(color).add_modifier(Modifier::BOLD)),
-            Span::raw(format!("{:<28}", fit(&check.name, 27))),
-            Span::styled(format!("{:<20}", fit(&check.workflow, 19)), muted),
+            Span::raw(pad(&fit(&check.name, 27), 28)),
+            Span::styled(pad(&fit(&check.workflow, 19), 20), muted),
             Span::raw(format!("{time:>8}")),
         ]);
         rows.push(if i == selected {
@@ -3248,7 +3265,8 @@ fn markdown(text: &str, width: usize, indent: usize) -> Vec<Line<'static>> {
         };
         for line in lines {
             let style = line.style;
-            for row in wrap_spans(line.spans, width.saturating_sub(indent + 1), 0) {
+            let hang = bullet_hang(&line);
+            for row in wrap_spans(line.spans, width.saturating_sub(indent + 1), hang) {
                 let mut spans = vec![Span::raw(" ".repeat(indent))];
                 spans.extend(row.spans);
                 out.push(Line::from(spans).style(style));
@@ -3256,6 +3274,30 @@ fn markdown(text: &str, width: usize, indent: usize) -> Vec<Line<'static>> {
         }
     }
     out
+}
+
+/// How far a list item's wrapped rows go in, so they continue under its
+/// text rather than its bullet: `• `, `- ` or `12. `, after any indent.
+fn bullet_hang(line: &Line) -> usize {
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    let indent = text.chars().take_while(|c| *c == ' ').count();
+    let rest = &text[indent..];
+    let digits = rest.chars().take_while(char::is_ascii_digit).count();
+    let marker = if ["• ", "- ", "* ", "> "].iter().any(|b| rest.starts_with(b)) {
+        2
+    } else if digits > 0 && rest[digits..].starts_with(". ") {
+        digits + 2
+    } else {
+        0
+    };
+    if marker == 0 { 0 } else { indent + marker }
+}
+
+/// `text` padded with spaces to `width` columns as the terminal draws it,
+/// so a wide character such as an emoji keeps later columns in line.
+fn pad(text: &str, width: usize) -> String {
+    let room = width.saturating_sub(Line::raw(text).width());
+    format!("{text}{}", " ".repeat(room))
 }
 
 /// The first line of a comment as it reads, for a folded row.
@@ -5114,5 +5156,69 @@ mod pr_view_tests {
             row.contains("…/") && row.contains(":1613-1620") && row.contains('…'),
             "a long place keeps its file name and lines, and the title its ellipsis: {row}"
         );
+    }
+
+    #[test]
+    fn emoji_bullets_and_the_no_pr_note_keep_their_columns() {
+        let mut app = app();
+        let path = std::path::PathBuf::from("/pool/4/app");
+        while app.current().is_none_or(|t| t.path != path) {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Char('v'));
+        let mut pr = pr();
+        pr.checks[0].name = "\u{2705} Merge Gate".into();
+        pr.checks[1].name = "Analyze (actions)".into();
+        pr.body = "- einteger with a NaN or inf scalar: the scalar converts to 0, the edecimal \
+                   convention, and this was already true for every other operator we have."
+            .into();
+        app.pr_loaded(path.clone(), Ok(Some(pr)));
+        let shown = screen(&app, 100, 40);
+        let rows: Vec<&str> = shown.lines().collect();
+        let bullet = rows
+            .iter()
+            .position(|r| r.contains("einteger"))
+            .expect("the bullet");
+        // The screen has a cell a char, a wide one's filler cell included.
+        let text_column = |row: &str, word: &str| row.find(word).map(|b| row[..b].chars().count());
+        let start = text_column(rows[bullet], "einteger");
+        let next = rows[bullet + 1];
+        let continued = next.chars().nth(start.unwrap_or(0));
+        let before: String = next.chars().take(start.unwrap_or(0)).collect();
+        assert!(
+            continued.is_some_and(|c| c != ' ') && before.ends_with(' '),
+            "a wrapped bullet continues under its text: {}\n{next}",
+            rows[bullet]
+        );
+
+        press(&mut app, KeyCode::Char('2'));
+        let shown = screen(&app, 100, 40);
+        let time_column = |word: &str| {
+            let row = shown.lines().find(|r| r.contains(word))?;
+            text_column(row, word)
+        };
+        assert_eq!(
+            time_column("1m 12s"),
+            time_column("3m 40s"),
+            "an emoji in a name keeps the columns in line:\n{shown}"
+        );
+
+        app.pr_loaded(path, Ok(None));
+        let shown = screen(&app, 100, 40);
+        let left = shown
+            .lines()
+            .find_map(|r| r.find('┌').map(|b| Line::raw(&r[..b]).width()))
+            .unwrap();
+        for row in shown
+            .lines()
+            .filter(|r| r.contains("yet.") || r.contains("one."))
+        {
+            let after: Vec<char> = row.chars().skip(left + 1).take(1).collect();
+            assert_eq!(
+                after,
+                [' '],
+                "the note keeps its margin when it wraps: {row}"
+            );
+        }
     }
 }

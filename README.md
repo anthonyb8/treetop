@@ -640,7 +640,6 @@ A merged tree says so in the return dialog, and `/merged` filters the list to me
 When a tree that records its issue merges, treetop follows it up in the background: it marks the issue done where its source sets `finish = true`, then reads the issues it blocks, and names each one with nothing else blocking it and nobody working on it in the status line, `END-1 merged · END-2 ready`.
 Those show `ready` in the Issues screen's WORK column, where `p` picks one up.
 
-
 ## The PR view
 
 `v` opens the PR of the tree under the cursor in a popup over the pool, read afresh each time it opens, since review comments land without a push; the last read shows while the new one comes in.

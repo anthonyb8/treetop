@@ -582,14 +582,20 @@ fn pr_view(viewed: Viewed, threads: Vec<ThreadNode>) -> PrView {
             people.push(general(comment.who().to_string(), &comment.body));
         }
     }
-    let bot_check = checks
+    // A repository can have more than one check for CodeRabbit, such as a
+    // workflow that asks it to review; any still running means a review is
+    // coming.
+    let bot_checks: Vec<&CheckView> = checks
         .iter()
-        .find(|c| c.name.to_lowercase().contains("coderabbit"));
-    let bot = (reviewed.is_some() || !findings.is_empty() || bot_check.is_some()).then(|| {
+        .filter(|c| c.name.to_lowercase().contains("coderabbit"))
+        .collect();
+    let bot = (reviewed.is_some() || !findings.is_empty() || !bot_checks.is_empty()).then(|| {
         findings.sort_by_key(|f| (f.resolved, f.kind));
         BotReview {
             reviewed,
-            reviewing: bot_check.is_some_and(|c| c.outcome == ship::Outcome::Pending),
+            reviewing: bot_checks
+                .iter()
+                .any(|c| c.outcome == ship::Outcome::Pending),
             findings,
         }
     });
@@ -642,6 +648,7 @@ fn clean_log(log: &str) -> String {
                 [_, _, rest] => rest,
                 _ => line,
             };
+            let line = line.trim_start_matches('\u{feff}');
             let line = match line.split_once(' ') {
                 Some((stamp, rest)) if crate::pool::seconds(stamp).is_some() => rest,
                 _ => line,
@@ -923,6 +930,7 @@ mod tests {
                 {"name": "clippy", "status": "COMPLETED", "conclusion": "FAILURE", "workflowName": "CI",
                  "startedAt": "2026-11-08T10:00:00Z", "completedAt": "2026-11-08T10:01:12Z",
                  "detailsUrl": "https://github.com/o/r/actions/runs/991/job/5"},
+                {"name": "Request CodeRabbit Review", "status": "COMPLETED", "conclusion": "SUCCESS"},
                 {"name": "CodeRabbit", "status": "IN_PROGRESS"}
             ],
             "reviews": [
@@ -1039,10 +1047,11 @@ mod tests {
         let log = "guard\tReject triggers\t2026-11-08T22:32:19.8973361Z \u{1b}[36;1mruby check.rb\u{1b}[0m\n\
                    guard\tReject triggers\t2026-11-08T22:32:20.0000000Z ##[error]only workflow_dispatch is permitted\n\
                    guard\tReject triggers\t2026-11-08T22:32:21.0000000Z ^[[36;1mln -sf node^[[0m\n\
+                   gate\tRun gate\t\u{feff}2026-11-08T22:52:46.7315338Z ##[group]Run merge-gate.sh\n\
                    plain line";
         assert_eq!(
             clean_log(log),
-            "ruby check.rb\n##[error]only workflow_dispatch is permitted\nln -sf node\nplain line",
+            "ruby check.rb\n##[error]only workflow_dispatch is permitted\nln -sf node\n##[group]Run merge-gate.sh\nplain line",
             "no job, step or time before each line, and no colour codes"
         );
     }

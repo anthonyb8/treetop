@@ -449,6 +449,11 @@ fn item_start(line: &str) -> Option<(String, &str)> {
     let (lines, rest) = rest.split_once('`')?;
     let rest = rest.strip_prefix(':')?;
     let is_lines = !lines.is_empty() && lines.bytes().all(|b| b.is_ascii_digit() || b == b'-');
+    // `1148-1148` is one line.
+    let lines = match lines.split_once('-') {
+        Some((start, end)) if start == end => start,
+        _ => lines,
+    };
     is_lines.then(|| (lines.to_string(), rest.trim_start()))
 }
 
@@ -619,5 +624,14 @@ mod tests {
             found[0].body,
             "A fenced or inline `<script>` or `<iframe>` example fails validation."
         );
+    }
+
+    #[test]
+    fn a_one_line_item_names_its_line_once() {
+        let found = review(
+            "<details>\n<summary>Nitpick comments: 1</summary><blockquote>\n\n<details>\n<summary>src/a.hpp: 1</summary><blockquote>\n\n\
+             `1148-1148`: **Trivial** · **Style**\n\n**Name it.**\n\nIt reads better.\n\n<!-- cr-comment:v1:e -->\n",
+        );
+        assert_eq!(found[0].lines.as_deref(), Some("1148"));
     }
 }
