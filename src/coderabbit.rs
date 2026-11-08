@@ -261,7 +261,16 @@ fn take_fix(text: &str) -> (String, Vec<String>) {
             .find("```")
             .map_or(text.len(), |e| close + e + 3);
         let lines: Vec<String> = match lang {
-            "diff" => code.lines().map(str::to_string).collect(),
+            // A unified diff's own headers say nothing the place does not.
+            "diff" => code
+                .lines()
+                .filter(|l| {
+                    !["--- ", "+++ ", "@@", "diff --git", "index "]
+                        .iter()
+                        .any(|h| l.starts_with(h))
+                })
+                .map(str::to_string)
+                .collect(),
             "suggestion" => code.lines().map(|l| format!("+{l}")).collect(),
             _ => {
                 from = end;
@@ -300,6 +309,12 @@ fn plain(text: &str) -> Vec<String> {
         out.pop();
     }
     out
+}
+
+/// `text` with its HTML comments taken out, which bots such as CodeRabbit
+/// leave in a PR's description for themselves.
+pub fn without_comments(text: &str) -> String {
+    cut_all(text, "<!--", "-->")
 }
 
 fn without_pictures(text: &str) -> String {
@@ -531,5 +546,13 @@ mod tests {
             ],
             "an item's own Prompt for AI Agents heading stays inside it"
         );
+    }
+
+    #[test]
+    fn a_suggested_unified_diff_keeps_only_its_lines() {
+        let found = line_comment(
+            "**Tighten it.**\n\n```diff\n--- \"a/AGENTS.md\"\n+++ \"b/AGENTS.md\"\n@@ -57,7 +57,8 @@\n keep\n-old\n+new\n```",
+        );
+        assert_eq!(found[0].fix, [" keep", "-old", "+new"]);
     }
 }

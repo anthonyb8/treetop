@@ -603,7 +603,9 @@ fn pr_view(viewed: Viewed, threads: Vec<ThreadNode>) -> PrView {
         base: viewed.base_ref_name,
         branch: viewed.head_ref_name,
         head: viewed.head_ref_oid,
-        body: viewed.body,
+        body: coderabbit::without_comments(&viewed.body)
+            .trim()
+            .to_string(),
         additions: viewed.additions,
         deletions: viewed.deletions,
         files: viewed.changed_files,
@@ -629,6 +631,43 @@ fn general(author: String, body: &str) -> Thread {
         body: body.trim().to_string(),
         ..Thread::default()
     }
+}
+
+/// A failed job's log as a person reads it: `gh --log-failed` puts the job,
+/// the step and a timestamp before every line, and Actions colours some.
+fn clean_log(log: &str) -> String {
+    log.lines()
+        .map(|line| {
+            let line = match line.splitn(3, '\t').collect::<Vec<_>>()[..] {
+                [_, _, rest] => rest,
+                _ => line,
+            };
+            let line = match line.split_once(' ') {
+                Some((stamp, rest)) if crate::pool::seconds(stamp).is_some() => rest,
+                _ => line,
+            };
+            without_escapes(line)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `line` with its terminal colour codes (`ESC [ ... m`) taken out.
+fn without_escapes(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn view(args: &Value) -> Result<Value, Error> {
@@ -690,7 +729,7 @@ fn view(args: &Value) -> Result<Value, Error> {
         };
         if let Some(seen) = pr.checks.iter_mut().find(|c| c.name == check.name()) {
             seen.log = Some(match log {
-                Ok(log) => ship::tail(&log, LOG_LINES),
+                Ok(log) => ship::tail(&clean_log(&log), LOG_LINES),
                 Err(err) => format!("its log could not be read: {err}"),
             });
         }
@@ -875,6 +914,7 @@ mod tests {
     fn a_pr_reads_whole_for_its_popup() {
         let viewed: Viewed = serde_json::from_value(json!({
             "number": 37, "title": "Highlight syntax", "state": "OPEN", "author": {"login": "me"},
+            "body": "<!-- This is an auto-generated comment: release notes by coderabbit.ai --><!--\ncoderabbit-ai-generated:v1 -->Bumps the workspace.",
             "headRefOid": "head1", "commits": [{}, {}], "reviewDecision": "REVIEW_REQUIRED",
             "mergeStateStatus": "BLOCKED",
             "statusCheckRollup": [
@@ -911,6 +951,10 @@ mod tests {
         assert_eq!(
             (pr.commits, pr.review.as_str(), pr.merge.as_str()),
             (2, "required", "blocked")
+        );
+        assert_eq!(
+            pr.body, "Bumps the workspace.",
+            "HTML comments are not for reading"
         );
         assert_eq!(pr.checks[0].seconds, Some(72));
         assert_eq!(pr.checks[0].outcome, ship::Outcome::Failed);
@@ -986,5 +1030,17 @@ mod tests {
             "the hunk is the comment's own, ending at its original line"
         );
         assert_eq!(thread.replies[0].body, "Moved it.");
+    }
+
+    #[test]
+    fn a_failed_log_reads_as_its_lines_alone() {
+        let log = "guard\tReject triggers\t2026-11-08T22:32:19.8973361Z \u{1b}[36;1mruby check.rb\u{1b}[0m\n\
+                   guard\tReject triggers\t2026-11-08T22:32:20.0000000Z ##[error]only workflow_dispatch is permitted\n\
+                   plain line";
+        assert_eq!(
+            clean_log(log),
+            "ruby check.rb\n##[error]only workflow_dispatch is permitted\nplain line",
+            "no job, step or time before each line, and no colour codes"
+        );
     }
 }

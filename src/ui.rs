@@ -2709,11 +2709,16 @@ fn draw_pr_view(frame: &mut Frame, app: &App, popup: &PrPopup) {
     let mut title = vec![Span::styled(" pr ", t.badge)];
     match pr {
         Some(pr) => {
-            title.push(Span::styled(format!(" #{} {}", pr.number, pr.title), bold));
-            title.push(Span::styled(
-                format!("  {} → {}", pr.branch, pr.base),
-                fg(t.muted),
-            ));
+            // The title takes what the bar has left beside the badge and the
+            // tree, cut with an ellipsis; the branches follow where they fit.
+            let room = usize::from(popup::bar(screen).width).saturating_sub(16);
+            let named = fit(&format!(" #{} {}", pr.number, pr.title), room);
+            let left = room.saturating_sub(Line::raw(named.as_str()).width());
+            title.push(Span::styled(named, bold));
+            let branches = format!("  {} → {}", pr.branch, pr.base);
+            if Line::raw(branches.as_str()).width() <= left {
+                title.push(Span::styled(branches, fg(t.muted)));
+            }
         }
         None => title.push(Span::styled(
             format!(
@@ -2801,7 +2806,14 @@ fn draw_pr_view(frame: &mut Frame, app: &App, popup: &PrPopup) {
     let width = usize::from(content.width);
     match tab {
         Tab::Overview => {
-            let lines = pr_overview(pr, width);
+            // Inset a column, so a wrapped line keeps the indent its first
+            // row has rather than running into the border.
+            let content = Rect {
+                x: content.x + content.width.min(1),
+                width: content.width.saturating_sub(1),
+                ..content
+            };
+            let lines = pr_overview(pr, width.saturating_sub(1));
             let most = lines.len().saturating_sub(usize::from(content.height) / 2);
             let scroll = u16::try_from(popup.selected().min(most)).unwrap_or(u16::MAX);
             frame.render_widget(
@@ -2896,17 +2908,18 @@ fn pr_overview(pr: &PrView, width: usize) -> Vec<Line<'static>> {
     let t = theme();
     let muted = fg(t.muted);
     let mut lines = vec![
-        Line::styled(
-            format!(" {}", pr.title),
-            fg(t.title).add_modifier(Modifier::BOLD),
-        ),
+        Line::styled(pr.title.clone(), fg(t.title).add_modifier(Modifier::BOLD)),
         Line::from(vec![
             Span::styled(
                 format!(
-                    " {} wants to merge {} commit{} into {} from {} · ",
+                    "{} {} {} into {} from {} · ",
                     pr.author,
-                    pr.commits,
-                    if pr.commits == 1 { "" } else { "s" },
+                    match pr.state.as_str() {
+                        "MERGED" => "merged",
+                        "CLOSED" => "wanted to merge",
+                        _ => "wants to merge",
+                    },
+                    plural(usize::try_from(pr.commits).unwrap_or(usize::MAX), "commit"),
                     pr.base,
                     pr.branch
                 ),
@@ -2920,7 +2933,7 @@ fn pr_overview(pr: &PrView, width: usize) -> Vec<Line<'static>> {
         Line::raw(""),
     ];
     let row = |label: &str, parts: Vec<Span<'static>>| {
-        let mut spans = vec![Span::styled(format!(" {label:<12}"), muted)];
+        let mut spans = vec![Span::styled(format!("{label:<12}"), muted)];
         spans.extend(parts);
         Line::from(spans)
     };
@@ -3015,19 +3028,15 @@ fn pr_overview(pr: &PrView, width: usize) -> Vec<Line<'static>> {
     lines.push(row("Merge", vec![merge]));
     lines.push(Line::raw(""));
     lines.push(Line::styled(
-        format!(" ─ Description {}", "─".repeat(width.saturating_sub(16))),
+        format!("─ Description {}", "─".repeat(width.saturating_sub(15))),
         fg(t.border),
     ));
     if pr.body.trim().is_empty() {
-        lines.push(Line::styled(" No description.", muted));
+        lines.push(Line::styled("No description.", muted));
     }
     for piece in issues::pieces(&pr.body, &palette()) {
         if let issues::Piece::Lines(body) = piece {
-            lines.extend(body.into_iter().map(|line| {
-                let mut spans = vec![Span::raw(" ")];
-                spans.extend(line.spans);
-                Line::from(spans).style(line.style)
-            }));
+            lines.extend(body);
         }
     }
     lines
@@ -3083,11 +3092,13 @@ fn draw_pr_checks(frame: &mut Frame, pr: &PrView, selected: usize, area: Rect) {
                 fg(t.border),
             ));
             let log = log.unwrap_or("Its log could not be read, or it is not an Actions run.");
-            let all: Vec<&str> = log.lines().collect();
+            let room = usize::from(log_area.width).saturating_sub(2).max(1);
+            let all: Vec<String> = log.lines().flat_map(|l| wrap_chars(l, room)).collect();
             // Under its heading, above the line naming the keys.
             let fits = usize::from(log_area.height).saturating_sub(2).max(1);
             let from = all.len().saturating_sub(fits);
             for text in &all[from..] {
+                let text = text.as_str();
                 let style = if text.contains("error") || text.contains("Error") {
                     fg(t.danger)
                 } else {
@@ -3273,26 +3284,35 @@ fn pr_threads(pr: &PrView, selected: usize, width: usize) -> (Vec<Line<'static>>
         } else {
             format!(" on {place}")
         };
-        let header = Line::from(vec![
+        let mut header = vec![
             Span::styled(format!(" {mark} "), fg(color).add_modifier(Modifier::BOLD)),
             Span::styled(
                 thread.author.clone(),
                 Style::new().add_modifier(Modifier::BOLD),
             ),
             Span::styled(place, muted),
-        ]);
+        ];
+        // Folded, a resolved thread is its header and the start of what
+        // was said, on one row.
+        let is_folded = thread.resolved && !is_on;
+        if is_folded {
+            let first = thread.body.lines().next().unwrap_or_default();
+            let used: usize = header.iter().map(Span::width).sum();
+            header.push(Span::styled(
+                fit(
+                    &format!(" · resolved · {first}"),
+                    width.saturating_sub(used + 1),
+                ),
+                muted,
+            ));
+        }
+        let header = Line::from(header);
         lines.push(if is_on {
             full(header.style(t.cursor), width)
         } else {
             header
         });
-        if thread.resolved && !is_on {
-            let first = thread.body.lines().next().unwrap_or_default();
-            lines.push(Line::styled(
-                format!("   resolved · {}", fit(first, width.saturating_sub(16))),
-                muted,
-            ));
-        } else {
+        if !is_folded {
             lines.extend(code_lines(
                 &thread.code,
                 thread.path.as_deref(),
@@ -3387,6 +3407,15 @@ fn pr_findings(pr: &PrView, popup: &PrPopup, width: usize) -> (Vec<Line<'static>
             header
         });
         if is_on {
+            // The header cuts a long title; the selected one shows it whole.
+            if Line::raw(finding.title.as_str()).width() > room {
+                lines.extend(prose(
+                    &finding.title,
+                    width,
+                    "   ",
+                    Style::new().add_modifier(Modifier::BOLD),
+                ));
+            }
             lines.extend(prose(&finding.body, width, "   ", Style::new()));
             if !finding.fix.is_empty() {
                 lines.push(Line::styled("   Suggested change", muted));
@@ -3412,7 +3441,7 @@ fn pr_findings(pr: &PrView, popup: &PrPopup, width: usize) -> (Vec<Line<'static>
     if !popup.nitpicks && nitpicks > 0 {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            format!(" ▸ {nitpicks} nitpicks   z shows them"),
+            format!(" ▸ {}   z shows them", plural(nitpicks, "nitpick")),
             muted,
         ));
     }
@@ -4684,7 +4713,7 @@ mod pr_view_tests {
             "src/diff.rs:236-251",
             "Highlighting can stall a long diff",
             "Suggested change",
-            "1 nitpicks   z shows them",
+            "1 nitpick   z shows them",
         ] {
             assert!(shown.contains(seen), "{seen} on CodeRabbit:\n{shown}");
         }
@@ -4713,5 +4742,104 @@ mod pr_view_tests {
         assert!(shown.contains("gh is not signed in"), "{shown}");
         press(&mut app, KeyCode::Esc);
         assert!(!screen(&app, 200, 40).contains("gh is not signed in"));
+    }
+
+    #[test]
+    fn a_real_prs_text_fits_and_reads_at_100_columns() {
+        let mut app = app();
+        let path = std::path::PathBuf::from("/pool/4/app");
+        while app.current().is_none_or(|t| t.path != path) {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Char('v'));
+        let mut pr = pr();
+        pr.state = "MERGED".into();
+        pr.title =
+            "refactor(core): order restriction levels and rename the shown-handles op".into();
+        pr.body =
+            "Bumps the workspace to 0.8.0 and updates the examples, the Rust dependency snippets \
+                   and the docs that name the version, so nothing still points at the old one."
+                .into();
+        pr.checks[0].log = Some(
+            "ruby scripts/check-workflow-triggers.rb --strict --all-workflows-in-the-repository \
+             ##[error]only workflow_dispatch is permitted"
+                .into(),
+        );
+        pr.threads.push(Thread {
+            author: "jlin".into(),
+            path: Some("Cargo.toml".into()),
+            line: Some(16),
+            resolved: true,
+            body: "Does default-fancy pull in onig?".into(),
+            ..Thread::default()
+        });
+        if let Some(bot) = pr.bot.as_mut() {
+            bot.findings[0].title = "Require 0.2.3 in the standalone example docs".into();
+            bot.findings[0].path = Some("docs/crs.md".into());
+            bot.findings[0].lines = Some("70".into());
+        }
+        app.pr_loaded(path.clone(), Ok(Some(pr)));
+
+        let shown = screen(&app, 100, 40);
+        let rows: Vec<&str> = shown.lines().collect();
+        let header = rows
+            .iter()
+            .find(|r| r.contains(" pr "))
+            .expect("the popup's bar");
+        assert!(
+            header.contains('…'),
+            "a long title is cut with an ellipsis: {header}"
+        );
+        let left = rows
+            .iter()
+            .find_map(|r| r.find('┌').map(|b| r[..b].chars().count()))
+            .expect("the popup's corner");
+        for row in rows
+            .iter()
+            .filter(|r| r.contains("the docs") || r.contains("examples"))
+        {
+            let after: Vec<char> = row.chars().skip(left + 1).take(1).collect();
+            assert_eq!(after, [' '], "wrapped lines keep their indent: {row}");
+        }
+        assert!(shown.contains("me merged 3 commits into main"), "{shown}");
+
+        press(&mut app, KeyCode::Char('2'));
+        let shown = screen(&app, 100, 40);
+        assert!(
+            shown.contains("only workflow_dispatch is permitted"),
+            "a long log line wraps:\n{shown}"
+        );
+
+        press(&mut app, KeyCode::Char('3'));
+        let shown = screen(&app, 100, 40);
+        let folded: Vec<&str> = shown
+            .lines()
+            .filter(|r| r.contains("Cargo.toml:16"))
+            .collect();
+        assert!(
+            folded.len() == 1 && folded[0].contains("resolved"),
+            "a resolved thread folds to one row: {folded:?}"
+        );
+
+        press(&mut app, KeyCode::Char('4'));
+        let shown = screen(&app, 100, 40);
+        assert!(
+            shown.contains("Require 0.2.3 in the standalone example docs"),
+            "the selected finding's title shows whole:\n{shown}"
+        );
+        assert!(
+            shown.contains("1 nitpick ") && !shown.contains("1 nitpicks"),
+            "{shown}"
+        );
+
+        app.pr_loaded(
+            path,
+            Err(plugin::Error::new(plugin::Code::Auth, "run gh auth login")),
+        );
+        let shown = screen(&app, 100, 40);
+        assert!(
+            shown.contains("Run gh auth login.") && !shown.contains("then ^R"),
+            "^R is named once:\n{shown}"
+        );
     }
 }

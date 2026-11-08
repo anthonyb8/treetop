@@ -1327,7 +1327,7 @@ impl App {
     pub fn pr_loaded(&mut self, path: PathBuf, read: Result<Option<PrView>, plugin::Error>) {
         let read = read.map_err(|err| match err.code {
             plugin::Code::Auth => {
-                "gh is not signed in, so treetop cannot read this PR. Run gh auth login, then ^R."
+                "gh is not signed in, so treetop cannot read this PR. Run gh auth login."
                     .to_string()
             }
             _ => err.to_string(),
@@ -6187,8 +6187,7 @@ mod tests {
         assert_eq!(
             app.prs[&path].pr,
             Some(Err(
-                "gh is not signed in, so treetop cannot read this PR. Run gh auth login, then ^R."
-                    .into()
+                "gh is not signed in, so treetop cannot read this PR. Run gh auth login.".into()
             ))
         );
 
