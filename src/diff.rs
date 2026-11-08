@@ -4,6 +4,7 @@
 //! added lines that replace them, so the two columns line up row by row.
 
 use std::fs;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -13,10 +14,15 @@ use std::thread;
 use serde::Deserialize;
 
 use crate::pool;
+use crate::syntax::{self, Highlighter, Token};
 
 /// Untracked files beyond this many are left out; past it they are almost
 /// always generated output nobody meant to review.
 const MAX_UNTRACKED: usize = 200;
+
+/// Lines past this many are left plain: grammars parse a few thousand lines
+/// a second, and a diff this long is skimmed, not read line by line.
+const MAX_HIGHLIGHTED: usize = 20_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Change {
@@ -36,6 +42,9 @@ pub struct Side {
     /// The chars that differ from the line it is paired with, so the eye
     /// lands on what changed rather than on the whole line.
     pub emphasis: Option<(usize, usize)>,
+    /// What each run of the line is, as char ranges, so the diff colours it
+    /// as an editor would; empty for a file with no grammar.
+    pub tokens: Vec<(Range<usize>, Token)>,
 }
 
 fn is_word(c: char) -> bool {
@@ -296,6 +305,7 @@ pub fn parse(text: &str) -> Vec<FileDiff> {
                 text: clean(text),
                 is_change: true,
                 emphasis: None,
+                tokens: Vec::new(),
             });
             b.old_line += 1;
             b.file.deletions += 1;
@@ -305,6 +315,7 @@ pub fn parse(text: &str) -> Vec<FileDiff> {
                 text: clean(text),
                 is_change: true,
                 emphasis: None,
+                tokens: Vec::new(),
             });
             b.new_line += 1;
             b.file.additions += 1;
@@ -316,6 +327,7 @@ pub fn parse(text: &str) -> Vec<FileDiff> {
                     text: clean(text),
                     is_change: false,
                     emphasis: None,
+                    tokens: Vec::new(),
                 })
             };
             b.file
@@ -327,6 +339,36 @@ pub fn parse(text: &str) -> Vec<FileDiff> {
     }
     files.extend(current.map(Builder::finish));
     files
+}
+
+/// Tokens every line of the files that have a grammar, up to
+/// `MAX_HIGHLIGHTED` lines. Each hunk starts fresh on each side, since the
+/// lines between hunks are not in the diff to carry a comment or string
+/// across.
+pub fn highlight(diff: &mut BranchDiff) {
+    let mut budget = MAX_HIGHLIGHTED;
+    for file in &mut diff.files {
+        let Some(grammar) = syntax::find(&file.path) else {
+            continue;
+        };
+        let (mut old, mut new) = (Highlighter::new(grammar), Highlighter::new(grammar));
+        for row in &mut file.rows {
+            match row {
+                Row::Hunk(_) => (old, new) = (Highlighter::new(grammar), Highlighter::new(grammar)),
+                Row::Pair(left, right) => {
+                    if budget == 0 {
+                        return;
+                    }
+                    budget -= 1;
+                    for (side, highlighter) in [(left, &mut old), (right, &mut new)] {
+                        if let Some(side) = side {
+                            side.tokens = highlighter.line(&side.text);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// One row of the single scroll through every file.
@@ -368,7 +410,9 @@ pub fn layout(diff: BranchDiff) -> Layout {
 }
 
 /// Reads diffs one at a time on its own thread, in the order asked, each
-/// against the base it is asked with, else the pool's.
+/// against the base it is asked with, else the pool's. Each is sent plain as
+/// soon as it is read, then again once its code is coloured, so the popup
+/// never waits on the grammars.
 pub struct Loader {
     requests: Sender<(PathBuf, Option<String>)>,
     pub results: Receiver<(PathBuf, Result<Layout, String>)>,
@@ -380,8 +424,19 @@ impl Loader {
         let (results_tx, results) = mpsc::channel();
         thread::spawn(move || {
             for (path, own) in queue {
-                let diff = read(&path, own.as_deref().or(base.as_deref())).map(layout);
-                if results_tx.send((path, diff)).is_err() {
+                let diff = read(&path, own.as_deref().or(base.as_deref()));
+                if results_tx
+                    .send((path.clone(), diff.clone().map(layout)))
+                    .is_err()
+                {
+                    return;
+                }
+                let Ok(mut diff) = diff else { continue };
+                if diff.files.iter().all(|f| syntax::find(&f.path).is_none()) {
+                    continue;
+                }
+                highlight(&mut diff);
+                if results_tx.send((path, Ok(layout(diff)))).is_err() {
                     return;
                 }
             }
@@ -419,6 +474,7 @@ index 111..222 100644
             text: text.into(),
             is_change,
             emphasis: None,
+            tokens: Vec::new(),
         })
     }
 
@@ -528,6 +584,49 @@ Binary files a/logo.png and b/logo.png differ
             None,
             "nothing shared, the whole line is the change"
         );
+    }
+
+    #[test]
+    fn colours_each_hunk_afresh_and_leaves_files_with_no_grammar_plain() {
+        let text = "diff --git a/a.rs b/a.rs
+--- a/a.rs
++++ b/a.rs
+@@ -1,2 +1,2 @@
+ /* a comment left open
+-let old = 1;
++let new = 2;
+@@ -40,1 +40,1 @@
+ fn tail() {}
+diff --git a/notes.txt b/notes.txt
+--- a/notes.txt
++++ b/notes.txt
+@@ -1 +1 @@
+-fn old
++fn new
+";
+        let mut diff = BranchDiff {
+            base: "origin/main".into(),
+            files: parse(text),
+        };
+        highlight(&mut diff);
+        let first_token = |file: usize, row: usize| match &diff.files[file].rows[row] {
+            Row::Pair(left, right) => [left, right].map(|side| {
+                side.as_ref()
+                    .and_then(|side| side.tokens.first().map(|(_, token)| *token))
+            }),
+            Row::Hunk(_) => panic!("row {row} is a hunk"),
+        };
+        assert_eq!(
+            first_token(0, 2),
+            [Some(Token::Comment), Some(Token::Comment)],
+            "within a hunk, each side carries the comment left open"
+        );
+        assert_eq!(
+            first_token(0, 4),
+            [Some(Token::Keyword), Some(Token::Keyword)],
+            "a new hunk starts outside the comment"
+        );
+        assert_eq!(first_token(1, 1), [None, None], "plain text stays plain");
     }
 
     #[test]
