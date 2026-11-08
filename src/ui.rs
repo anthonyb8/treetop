@@ -22,6 +22,7 @@ use crate::app::{
 };
 use crate::assistant;
 use crate::chat::Chat;
+use crate::coderabbit;
 use crate::diff::{Change, FileDiff, Layout as DiffLayout, Row as DiffRow, Side, ViewRow};
 use crate::dispatch::{Prompt, Purpose, Target};
 use crate::guard;
@@ -30,8 +31,10 @@ use crate::phone::QUIET_ZONE;
 use crate::plugin::{Context, Spend, Usage};
 use crate::pool::{Tree, Work};
 use crate::popup;
+use crate::pr_view::{self, PrPopup, Tab};
 use crate::reports::{self, State};
-use crate::ship::Stage;
+use crate::ship::{Outcome as CheckOutcome, PrView, Stage};
+use crate::syntax;
 use crate::theme::theme;
 
 /// The bar's keys, most useful first: on a narrow bar the keys at the end
@@ -104,6 +107,7 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
         "Ship",
         &[
             ("s", "ship branch"),
+            ("v", "view PR"),
             ("O", "open PR"),
             ("f", "send CI failures"),
         ],
@@ -199,6 +203,7 @@ pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>, issues: Option<&i
     }
     if chat.is_some()
         || app.view.is_some()
+        || app.pr_popup.is_some()
         || app.prompt.is_some()
         || app.opening.is_some()
         || app.picker.is_some()
@@ -220,6 +225,8 @@ pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>, issues: Option<&i
         draw_opening(frame, app, opening);
     } else if let Some(view) = &app.view {
         draw_diff_view(frame, app, view);
+    } else if let Some(popup) = &app.pr_popup {
+        draw_pr_view(frame, app, popup);
     } else if let Some(prompt) = &app.prompt {
         draw_prompt(frame, stage(app, frame.area()), prompt);
     } else if let Some(picker) = &app.picker {
@@ -2653,6 +2660,765 @@ fn draw_diff_view(frame: &mut Frame, app: &App, view: &DiffView) {
     }
 }
 
+/// The keys of each PR tab, by `Tab::index`.
+const PR_KEYS: [&[(&str, &str)]; 4] = [
+    &[
+        ("1-4", "tab"),
+        ("j/k", "scroll"),
+        ("O", "GitHub"),
+        ("^R", "reload"),
+        ("Esc", "back"),
+    ],
+    &[
+        ("1-4", "tab"),
+        ("j/k", "check"),
+        ("f", "send failure to agent"),
+        ("Enter", "run on GitHub"),
+        ("^R", "reload"),
+        ("Esc", "back"),
+    ],
+    &[
+        ("1-4", "tab"),
+        ("j/k", "thread"),
+        ("f", "send to agent"),
+        ("O", "GitHub"),
+        ("^R", "reload"),
+        ("Esc", "back"),
+    ],
+    &[
+        ("1-4", "tab"),
+        ("j/k", "comment"),
+        ("f", "send to agent"),
+        ("F", "send all open"),
+        ("z", "nitpicks"),
+        ("^R", "reload"),
+        ("Esc", "back"),
+    ],
+];
+
+/// A tree's PR in its popup: a bar naming it, its tabs, the tab on show,
+/// the last thing said, and the tab's keys.
+fn draw_pr_view(frame: &mut Frame, app: &App, popup: &PrPopup) {
+    let t = theme();
+    let screen = stage(app, frame.area());
+    let tree = app.trees.iter().find(|tree| tree.path == popup.path);
+    let read = app.prs.get(&popup.path);
+    let answer = read.and_then(|r| r.pr.as_ref());
+    let pr = answer.and_then(|a| a.as_ref().ok()?.as_ref());
+    let bold = Style::new().add_modifier(Modifier::BOLD);
+    let mut title = vec![Span::styled(" pr ", t.badge)];
+    match pr {
+        Some(pr) => {
+            title.push(Span::styled(format!(" #{} {}", pr.number, pr.title), bold));
+            title.push(Span::styled(
+                format!("  {} → {}", pr.branch, pr.base),
+                fg(t.muted),
+            ));
+        }
+        None => title.push(Span::styled(
+            format!(
+                " {}",
+                tree.and_then(|t| t.branch.as_deref())
+                    .unwrap_or("(detached)")
+            ),
+            bold,
+        )),
+    }
+    if let Some(tree) = tree {
+        title.push(Span::styled(format!("   tree {} ", tree.name), fg(t.muted)));
+    }
+    let mut status = Vec::new();
+    if pr.is_some() && read.is_some_and(|r| r.is_reading) {
+        status.push(Span::styled("reading… ", fg(t.muted)));
+    }
+    if let Some(ship) = tree.and_then(|t| t.ship.as_ref()) {
+        status.push(Span::styled(
+            format!("{} ", ship.label),
+            stage_style(ship.stage),
+        ));
+    }
+    let body = bar_popup(frame, screen, title, status);
+    let note = app.message.as_deref();
+    let [tabs_row, content, note_row, key_row] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Fill(1),
+        Constraint::Length(u16::from(note.is_some())),
+        Constraint::Length(1),
+    ])
+    .areas(body);
+    let tab = if pr.is_some() {
+        popup.tab
+    } else {
+        Tab::Overview
+    };
+    let keys = if pr.is_some() {
+        PR_KEYS[tab.index()]
+    } else {
+        &[("^R", "reload"), ("Esc", "back")]
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(fitting_keys(keys, key_row.width))).style(t.diff.header),
+        key_row,
+    );
+    if let Some(note) = note {
+        let color = if note.starts_with("sent ") {
+            t.success
+        } else {
+            t.warning
+        };
+        frame.render_widget(
+            Paragraph::new(format!(" {note}")).style(fg(color)),
+            note_row,
+        );
+    }
+    frame.render_widget(Paragraph::new(pr_tabs(pr, tab)).style(t.header), tabs_row);
+    let content = Rect {
+        y: content.y + content.height.min(1),
+        height: content.height.saturating_sub(1),
+        ..content
+    };
+    let Some(pr) = pr else {
+        let branch = tree
+            .and_then(|t| t.branch.as_deref())
+            .unwrap_or("this branch");
+        let lines = match answer {
+            None => vec![Line::raw(" reading the PR...")],
+            Some(Err(why)) => vec![
+                Line::styled(format!(" {why}"), fg(t.danger)),
+                Line::styled(" ^R reads it again", fg(t.muted)),
+            ],
+            Some(Ok(_)) => vec![
+                Line::raw(format!(" No pull request for {branch} yet.")),
+                Line::styled(
+                    " s starts a ship run, which pushes the branch and opens one.",
+                    fg(t.muted),
+                ),
+            ],
+        };
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), content);
+        return;
+    };
+    let width = usize::from(content.width);
+    match tab {
+        Tab::Overview => {
+            let lines = pr_overview(pr, width);
+            let most = lines.len().saturating_sub(usize::from(content.height) / 2);
+            let scroll = u16::try_from(popup.selected().min(most)).unwrap_or(u16::MAX);
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .wrap(Wrap { trim: false })
+                    .scroll((scroll, 0)),
+                content,
+            );
+        }
+        Tab::Checks => draw_pr_checks(frame, pr, popup.selected(), content),
+        Tab::Comments => {
+            let (lines, at) = pr_threads(pr, popup.selected(), width);
+            draw_scrolled(frame, lines, at, content);
+        }
+        Tab::CodeRabbit => {
+            let (lines, at) = pr_findings(pr, popup, width);
+            draw_scrolled(frame, lines, at, content);
+        }
+    }
+}
+
+/// The tab row: each tab with what it holds, the one on show as a badge.
+fn pr_tabs(pr: Option<&PrView>, on: Tab) -> Line<'static> {
+    let t = theme();
+    let Some(pr) = pr else {
+        return Line::from(Span::styled(" 1 Overview ", t.badge));
+    };
+    let mut spans = Vec::new();
+    for (i, tab) in pr_view::tabs(pr).into_iter().enumerate() {
+        let (name, count, color) = match tab {
+            Tab::Overview => ("Overview", String::new(), t.text),
+            Tab::Checks => {
+                let failed = count_checks(pr, CheckOutcome::Failed);
+                let count = if failed > 0 {
+                    format!("✗{failed}")
+                } else {
+                    format!("{}", pr.checks.len())
+                };
+                ("Checks", count, if failed > 0 { t.danger } else { t.text })
+            }
+            Tab::Comments => {
+                let open = pr.threads.iter().filter(|t| !t.resolved).count();
+                ("Comments", open.to_string(), t.warning)
+            }
+            Tab::CodeRabbit => {
+                let reviewing = pr.bot.as_ref().is_some_and(|b| b.reviewing);
+                let open = pr_view::actionable(pr).len();
+                let count = if reviewing {
+                    "…".to_string()
+                } else {
+                    open.to_string()
+                };
+                ("CodeRabbit", count, t.info)
+            }
+        };
+        let style = if tab == on { t.badge } else { t.header };
+        spans.push(Span::styled(format!(" {} {name} ", i + 1), style));
+        if !count.is_empty() {
+            let count_style = if tab == on { style } else { style.fg(color) };
+            spans.push(Span::styled(format!("{count} "), count_style));
+        }
+        spans.push(Span::styled(" ", t.header));
+    }
+    Line::from(spans)
+}
+
+/// `1 issue`, `2 issues`.
+fn plural(count: usize, noun: &str) -> String {
+    if count == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
+}
+
+/// `line` padded with its own style to `width`, so a selection or a code
+/// line's colour runs to the popup's edge.
+fn full(line: Line<'static>, width: usize) -> Line<'static> {
+    let room = width.saturating_sub(line.width());
+    let mut line = line;
+    line.spans.push(Span::raw(" ".repeat(room)));
+    line
+}
+
+fn count_checks(pr: &PrView, outcome: CheckOutcome) -> usize {
+    pr.checks.iter().filter(|c| c.outcome == outcome).count()
+}
+
+/// The Overview: who wants to merge what, where its checks, review,
+/// CodeRabbit, threads and merge stand, then its description.
+fn pr_overview(pr: &PrView, width: usize) -> Vec<Line<'static>> {
+    let t = theme();
+    let muted = fg(t.muted);
+    let mut lines = vec![
+        Line::styled(
+            format!(" {}", pr.title),
+            fg(t.title).add_modifier(Modifier::BOLD),
+        ),
+        Line::from(vec![
+            Span::styled(
+                format!(
+                    " {} wants to merge {} commit{} into {} from {} · ",
+                    pr.author,
+                    pr.commits,
+                    if pr.commits == 1 { "" } else { "s" },
+                    pr.base,
+                    pr.branch
+                ),
+                muted,
+            ),
+            Span::styled(format!("+{}", pr.additions), fg(t.success)),
+            Span::raw(" "),
+            Span::styled(format!("-{}", pr.deletions), fg(t.danger)),
+            Span::styled(format!(" in {} files", pr.files), muted),
+        ]),
+        Line::raw(""),
+    ];
+    let row = |label: &str, parts: Vec<Span<'static>>| {
+        let mut spans = vec![Span::styled(format!(" {label:<12}"), muted)];
+        spans.extend(parts);
+        Line::from(spans)
+    };
+    let (failed, passed, running) = (
+        count_checks(pr, CheckOutcome::Failed),
+        count_checks(pr, CheckOutcome::Passed),
+        count_checks(pr, CheckOutcome::Pending),
+    );
+    let mut checks = Vec::new();
+    if failed > 0 {
+        let names: Vec<&str> = pr
+            .checks
+            .iter()
+            .filter(|c| c.outcome == CheckOutcome::Failed)
+            .map(|c| c.name.as_str())
+            .collect();
+        checks.push(Span::styled(
+            format!("✗ {failed} failed: {}   ", names.join(", ")),
+            fg(t.danger),
+        ));
+    }
+    if running > 0 {
+        checks.push(Span::styled(
+            format!("● {running} running   "),
+            fg(t.warning),
+        ));
+    }
+    if passed > 0 {
+        checks.push(Span::styled(format!("✓ {passed} passed"), fg(t.success)));
+    }
+    if checks.is_empty() {
+        checks.push(Span::styled("none", muted));
+    }
+    lines.push(row("Checks", checks));
+    let review = match pr.review.as_str() {
+        "" => Span::styled("none yet", muted),
+        "approved" => Span::styled("approved", fg(t.success)),
+        "changes requested" => Span::styled("changes requested", fg(t.danger)),
+        other => Span::styled(other.to_string(), fg(t.warning)),
+    };
+    lines.push(row("Review", vec![review]));
+    if let Some(bot) = &pr.bot {
+        let count = |kind| {
+            bot.findings
+                .iter()
+                .filter(|f| f.kind == kind && !f.resolved)
+                .count()
+        };
+        let mut parts = vec![
+            Span::styled(
+                plural(count(coderabbit::Kind::Issue), "issue"),
+                fg(t.danger),
+            ),
+            Span::raw(format!(
+                ", {}, {}",
+                plural(
+                    count(coderabbit::Kind::Suggestion) + count(coderabbit::Kind::Comment),
+                    "suggestion"
+                ),
+                plural(count(coderabbit::Kind::Nitpick), "nitpick")
+            )),
+        ];
+        if bot.reviewing {
+            parts.push(Span::styled("   reviewing the newest push", fg(t.warning)));
+        }
+        lines.push(row("CodeRabbit", parts));
+    }
+    let on_lines = pr.threads.iter().filter(|t| t.path.is_some());
+    let open = on_lines.clone().filter(|t| !t.resolved).count();
+    let resolved = on_lines.filter(|t| t.resolved).count();
+    lines.push(row(
+        "Threads",
+        vec![
+            Span::styled(
+                format!("{open} open"),
+                fg(if open > 0 { t.warning } else { t.text }),
+            ),
+            Span::raw(format!(", {resolved} resolved")),
+        ],
+    ));
+    let merge = match (pr.state.as_str(), pr.merge.as_str()) {
+        ("MERGED", _) => Span::styled("merged", fg(t.special)),
+        ("CLOSED", _) => Span::styled("closed", muted),
+        (_, "clean" | "has_hooks") => Span::styled("ready to merge", fg(t.success)),
+        (_, "blocked") => Span::styled("blocked", fg(t.danger)),
+        (_, "dirty") => Span::styled("conflicts with its base", fg(t.danger)),
+        (_, "behind") => Span::styled("behind its base", fg(t.warning)),
+        (_, "unstable") => Span::styled("checks failing", fg(t.warning)),
+        (_, "draft") => Span::styled("draft", muted),
+        _ => Span::styled("not known yet", muted),
+    };
+    lines.push(row("Merge", vec![merge]));
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        format!(" ─ Description {}", "─".repeat(width.saturating_sub(16))),
+        fg(t.border),
+    ));
+    if pr.body.trim().is_empty() {
+        lines.push(Line::styled(" No description.", muted));
+    }
+    for piece in issues::pieces(&pr.body, &palette()) {
+        if let issues::Piece::Lines(body) = piece {
+            lines.extend(body.into_iter().map(|line| {
+                let mut spans = vec![Span::raw(" ")];
+                spans.extend(line.spans);
+                Line::from(spans).style(line.style)
+            }));
+        }
+    }
+    lines
+}
+
+/// The checks, one a row, and below them the selected one's log's end.
+fn draw_pr_checks(frame: &mut Frame, pr: &PrView, selected: usize, area: Rect) {
+    let t = theme();
+    let muted = fg(t.muted);
+    if pr.checks.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::styled(" No checks on this PR.", muted)),
+            area,
+        );
+        return;
+    }
+    let mut rows: Vec<Line> = Vec::new();
+    for (i, check) in pr.checks.iter().enumerate() {
+        let (mark, color) = check_mark(check.outcome);
+        let time = check.seconds.map(duration).unwrap_or_default();
+        let line = Line::from(vec![
+            Span::styled(format!(" {mark} "), fg(color).add_modifier(Modifier::BOLD)),
+            Span::raw(format!("{:<28}", fit(&check.name, 27))),
+            Span::styled(format!("{:<20}", fit(&check.workflow, 19)), muted),
+            Span::raw(format!("{time:>8}")),
+        ]);
+        rows.push(if i == selected {
+            full(line.style(t.cursor), usize::from(area.width))
+        } else {
+            line
+        });
+    }
+    let list_height = u16::try_from(rows.len())
+        .unwrap_or(u16::MAX)
+        .min(area.height / 2)
+        .max(1);
+    let [list, _, log_area] = Layout::vertical([
+        Constraint::Length(list_height),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+    let skip = selected.saturating_sub(usize::from(list_height).saturating_sub(1));
+    frame.render_widget(Paragraph::new(rows.split_off(skip.min(rows.len()))), list);
+    let Some(check) = pr.checks.get(selected) else {
+        return;
+    };
+    let mut lines = Vec::new();
+    match (check.outcome, check.log.as_deref()) {
+        (CheckOutcome::Failed, log) => {
+            lines.push(Line::styled(
+                format!(" ─ {} · the end of its log ─", check.name),
+                fg(t.border),
+            ));
+            let log = log.unwrap_or("Its log could not be read, or it is not an Actions run.");
+            let all: Vec<&str> = log.lines().collect();
+            // Under its heading, above the line naming the keys.
+            let fits = usize::from(log_area.height).saturating_sub(2).max(1);
+            let from = all.len().saturating_sub(fits);
+            for text in &all[from..] {
+                let style = if text.contains("error") || text.contains("Error") {
+                    fg(t.danger)
+                } else {
+                    Style::new()
+                };
+                lines.push(Line::styled(format!(" {text}"), style));
+            }
+            lines.push(Line::styled(
+                " f sends this to the tree's agent · Enter opens the run on GitHub",
+                muted,
+            ));
+        }
+        (CheckOutcome::Pending, _) => {
+            lines.push(Line::styled(
+                format!(" {} is still running.", check.name),
+                fg(t.warning),
+            ));
+        }
+        (outcome, _) => {
+            let word = if outcome == CheckOutcome::Skipped {
+                "was skipped"
+            } else {
+                "passed"
+            };
+            let time = check
+                .seconds
+                .map(|s| format!(" in {}", duration(s)))
+                .unwrap_or_default();
+            lines.push(Line::styled(
+                format!(" {} {word}{time}.", check.name),
+                fg(t.success),
+            ));
+            lines.push(Line::styled(" Enter opens it on GitHub", muted));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), log_area);
+}
+
+fn check_mark(outcome: CheckOutcome) -> (&'static str, Color) {
+    let t = theme();
+    match outcome {
+        CheckOutcome::Passed => ("✓", t.success),
+        CheckOutcome::Failed => ("✗", t.danger),
+        CheckOutcome::Pending => ("●", t.warning),
+        CheckOutcome::Skipped => ("-", t.muted),
+    }
+}
+
+/// `1m 12s`, or `40s` under a minute.
+fn duration(seconds: u64) -> String {
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        _ => format!("{}m {:02}s", seconds / 60, seconds % 60),
+    }
+}
+
+/// `lines` scrolled so the selected item, from row `at.0` to `at.1`, is on
+/// screen.
+fn draw_scrolled(frame: &mut Frame, lines: Vec<Line<'static>>, at: (usize, usize), area: Rect) {
+    let height = usize::from(area.height);
+    let (start, end) = at;
+    let mut offset = end.saturating_sub(height);
+    if start < offset {
+        offset = start;
+    }
+    let shown: Vec<Line> = lines.into_iter().skip(offset).collect();
+    frame.render_widget(Paragraph::new(shown), area);
+}
+
+/// Prose wrapped to `width` at words, each row after `indent`.
+fn prose(text: &str, width: usize, indent: &str, style: Style) -> Vec<Line<'static>> {
+    let room = width.saturating_sub(indent.chars().count() + 1).max(10);
+    text.lines()
+        .flat_map(|line| {
+            if line.trim().is_empty() {
+                vec![String::new()]
+            } else {
+                word_wrap(line, room)
+            }
+        })
+        .map(|row| Line::styled(format!("{indent}{row}"), style))
+        .collect()
+}
+
+/// Code lines from a diff hunk or a suggested change, each starting `+`,
+/// `-` or a space, behind the diff's line colours and in its code colours.
+fn code_lines(
+    code: &[String],
+    path: Option<&str>,
+    last: Option<u64>,
+    indent: &str,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let t = theme();
+    let palette = &t.diff;
+    let grammar = path.and_then(syntax::find);
+    let mut highlighter = grammar.map(syntax::Highlighter::new);
+    let shown = code.iter().filter(|l| !l.starts_with('-')).count();
+    let mut number = last.map(|l| l + 1 - shown as u64);
+    code.iter()
+        .map(|line| {
+            let (sign, text) = line.split_at(line.len().min(1));
+            let bg = match sign {
+                "+" => Some(palette.added),
+                "-" => Some(palette.removed),
+                _ => None,
+            };
+            let label = match (sign, number) {
+                ("-", _) | (_, None) => "    ".to_string(),
+                (_, Some(n)) => {
+                    number = Some(n + 1);
+                    format!("{n:>4}")
+                }
+            };
+            let mut spans = vec![
+                Span::raw(indent.to_string()),
+                Span::styled(format!("{label} {sign} "), fg(palette.number)),
+            ];
+            let tokens = highlighter
+                .as_mut()
+                .map(|h| h.line(text))
+                .unwrap_or_default();
+            spans.extend(coloured(text, &tokens));
+            let line = Line::from(spans);
+            match bg {
+                Some(bg) => full(line.style(Style::new().bg(bg)), width),
+                None => line,
+            }
+        })
+        .collect()
+}
+
+/// `text` in its tokens' colours, where the theme colours code.
+fn coloured(text: &str, tokens: &[(std::ops::Range<usize>, syntax::Token)]) -> Vec<Span<'static>> {
+    let Some(syntax) = theme().diff.syntax.as_ref() else {
+        return vec![Span::raw(text.to_string())];
+    };
+    let chars: Vec<char> = text.chars().collect();
+    let mut spans = Vec::new();
+    let mut at = 0;
+    for (range, token) in tokens {
+        let (start, end) = (range.start.min(chars.len()), range.end.min(chars.len()));
+        if start > at {
+            spans.push(Span::raw(chars[at..start].iter().collect::<String>()));
+        }
+        if end > start {
+            spans.push(Span::styled(
+                chars[start..end].iter().collect::<String>(),
+                syntax.style(*token),
+            ));
+        }
+        at = at.max(end);
+    }
+    if at < chars.len() {
+        spans.push(Span::raw(chars[at..].iter().collect::<String>()));
+    }
+    spans
+}
+
+/// The Comments tab's lines, and the rows the selected thread takes.
+fn pr_threads(pr: &PrView, selected: usize, width: usize) -> (Vec<Line<'static>>, (usize, usize)) {
+    let t = theme();
+    let muted = fg(t.muted);
+    let mut lines = Vec::new();
+    let mut at = (0, 0);
+    if pr.threads.is_empty() {
+        lines.push(Line::styled(" No review comments yet.", muted));
+    }
+    for (i, thread) in pr.threads.iter().enumerate() {
+        let start = lines.len();
+        let is_on = i == selected;
+        let (mark, color) = if thread.resolved {
+            ("✓", t.success)
+        } else {
+            ("●", t.warning)
+        };
+        let place = pr_view::place(
+            thread.path.as_deref(),
+            thread.line.map(|l| l.to_string()).as_deref(),
+        );
+        let place = if place.is_empty() {
+            " commented".to_string()
+        } else {
+            format!(" on {place}")
+        };
+        let header = Line::from(vec![
+            Span::styled(format!(" {mark} "), fg(color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                thread.author.clone(),
+                Style::new().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(place, muted),
+        ]);
+        lines.push(if is_on {
+            full(header.style(t.cursor), width)
+        } else {
+            header
+        });
+        if thread.resolved && !is_on {
+            let first = thread.body.lines().next().unwrap_or_default();
+            lines.push(Line::styled(
+                format!("   resolved · {}", fit(first, width.saturating_sub(16))),
+                muted,
+            ));
+        } else {
+            lines.extend(code_lines(
+                &thread.code,
+                thread.path.as_deref(),
+                thread.code_line,
+                "   ",
+                width,
+            ));
+            lines.extend(prose(&thread.body, width, "   ", Style::new()));
+            for reply in &thread.replies {
+                lines.push(Line::from(vec![
+                    Span::styled("   ↳ ", muted),
+                    Span::styled(
+                        reply.author.clone(),
+                        Style::new().add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                lines.extend(prose(&reply.body, width, "     ", Style::new()));
+            }
+        }
+        if is_on {
+            at = (start, lines.len());
+        }
+        lines.push(Line::raw(""));
+    }
+    (lines, at)
+}
+
+/// The CodeRabbit tab's lines, and the rows the selected finding takes.
+fn pr_findings(pr: &PrView, popup: &PrPopup, width: usize) -> (Vec<Line<'static>>, (usize, usize)) {
+    let t = theme();
+    let muted = fg(t.muted);
+    let mut lines = Vec::new();
+    let mut at = (0, 0);
+    let Some(bot) = &pr.bot else {
+        return (lines, at);
+    };
+    let reviewed = bot.reviewed.as_deref().map(|sha| &sha[..sha.len().min(7)]);
+    let whose = match (reviewed, bot.reviewed.as_deref() == Some(pr.head.as_str())) {
+        (Some(sha), true) => format!(" coderabbitai reviewed {sha}, the head"),
+        (Some(sha), false) => format!(" coderabbitai reviewed {sha}, an earlier commit"),
+        (None, _) => " coderabbitai has not reviewed this PR yet".to_string(),
+    };
+    lines.push(Line::styled(whose, muted));
+    if bot.reviewing {
+        lines.push(Line::styled(
+            " CodeRabbit is reviewing the newest push; these are from before it.",
+            fg(t.warning),
+        ));
+    }
+    lines.push(Line::raw(""));
+    let findings = pr_view::findings(pr, popup.nitpicks);
+    if findings.is_empty() {
+        lines.push(Line::styled(" CodeRabbit has no comments to show.", muted));
+    }
+    for (i, finding) in findings.iter().enumerate() {
+        let start = lines.len();
+        let is_on = i == popup.selected();
+        let (tag, color) = match finding.kind {
+            coderabbit::Kind::Issue => ("issue", t.danger),
+            coderabbit::Kind::Suggestion => ("suggestion", t.info),
+            coderabbit::Kind::Nitpick => ("nitpick", t.muted),
+            coderabbit::Kind::Comment => ("comment", t.text),
+        };
+        let place = pr_view::place(finding.path.as_deref(), finding.lines.as_deref());
+        let mut header = vec![
+            Span::styled(
+                format!(" {}", if finding.resolved { "✓ " } else { "" }),
+                fg(t.success),
+            ),
+            Span::styled(format!("{tag:<11}"), fg(color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{:<9}", finding.severity.as_deref().unwrap_or("")),
+                muted,
+            ),
+            Span::styled(format!("{place}  "), fg(t.diff.path)),
+        ];
+        let room = width.saturating_sub(header.iter().map(Span::width).sum::<usize>() + 1);
+        header.push(Span::styled(
+            fit(&finding.title, room),
+            Style::new().add_modifier(Modifier::BOLD),
+        ));
+        if finding.resolved {
+            header = header
+                .into_iter()
+                .map(|s| s.patch_style(Style::new().add_modifier(Modifier::DIM)))
+                .collect();
+        }
+        let header = Line::from(header);
+        lines.push(if is_on {
+            full(header.style(t.cursor), width)
+        } else {
+            header
+        });
+        if is_on {
+            lines.extend(prose(&finding.body, width, "   ", Style::new()));
+            if !finding.fix.is_empty() {
+                lines.push(Line::styled("   Suggested change", muted));
+                lines.extend(code_lines(
+                    &finding.fix,
+                    finding.path.as_deref(),
+                    None,
+                    "   ",
+                    width,
+                ));
+            }
+            if finding.prompt.is_some() {
+                lines.push(Line::styled(
+                    "   f sends CodeRabbit's own prompt for agents",
+                    muted,
+                ));
+            }
+            at = (start, lines.len());
+            lines.push(Line::raw(""));
+        }
+    }
+    let nitpicks = pr_view::nitpick_count(pr);
+    if !popup.nitpicks && nitpicks > 0 {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            format!(" ▸ {nitpicks} nitpicks   z shows them"),
+            muted,
+        ));
+    }
+    (lines, at)
+}
+
 /// An agent's chat in a popup over treetop, under a bar naming its branch,
 /// tree and agent, with the keys out at the right of the same line. The
 /// branch comes from the latest listing, so it follows the agent if it
@@ -3768,5 +4534,184 @@ mod inbox_tests {
             );
         }
         assert!(screen(&app, 200, 20).iter().any(|l| l.contains("✉ INBOX")));
+    }
+}
+
+/// The PR popup as a user goes through it: `v`, each tab in turn, and what
+/// it says when there is no PR or it cannot read one (ANB-51).
+#[cfg(test)]
+mod pr_view_tests {
+    use super::*;
+    use crate::app::Outcome;
+    use crate::coderabbit::{Finding, Kind as Found};
+    use crate::inbox::tests::app;
+    use crate::plugin;
+    use crate::ship::{BotReview, CheckView, Outcome as Checked, PrView, Thread};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent};
+
+    fn screen(app: &App, width: u16, height: u16) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app, None, None)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn press(app: &mut App, code: KeyCode) -> Outcome {
+        app.handle_key(KeyEvent::from(code))
+    }
+
+    fn pr() -> PrView {
+        PrView {
+            number: 37,
+            title: "Highlight syntax in the diff".into(),
+            state: "OPEN".into(),
+            author: "me".into(),
+            base: "main".into(),
+            branch: "me/anb-41-inbox-rail".into(),
+            head: "abc1234".into(),
+            body: "Colours code in the diff.".into(),
+            commits: 3,
+            review: "required".into(),
+            merge: "blocked".into(),
+            checks: vec![
+                CheckView {
+                    name: "clippy".into(),
+                    outcome: Checked::Failed,
+                    workflow: "CI".into(),
+                    seconds: Some(72),
+                    log: Some("error: match can be simplified".into()),
+                    ..CheckView::default()
+                },
+                CheckView {
+                    name: "test".into(),
+                    outcome: Checked::Passed,
+                    seconds: Some(220),
+                    ..CheckView::default()
+                },
+            ],
+            threads: vec![Thread {
+                author: "jlin".into(),
+                path: Some("src/theme.rs".into()),
+                line: Some(111),
+                code: vec!["+        syntax: Some(SyntaxPalette {".into()],
+                code_line: Some(111),
+                body: "Should the ANSI theme get one too?".into(),
+                ..Thread::default()
+            }],
+            bot: Some(BotReview {
+                reviewed: Some("abc1234".into()),
+                findings: vec![
+                    Finding {
+                        kind: Found::Issue,
+                        severity: Some("Major".into()),
+                        path: Some("src/diff.rs".into()),
+                        lines: Some("236-251".into()),
+                        title: "Highlighting can stall a long diff".into(),
+                        body: "Cap it.".into(),
+                        fix: vec!["-let a = 1;".into(), "+let a = 2;".into()],
+                        ..Finding::default()
+                    },
+                    Finding {
+                        kind: Found::Nitpick,
+                        title: "Name the closure".into(),
+                        ..Finding::default()
+                    },
+                ],
+                ..BotReview::default()
+            }),
+            ..PrView::default()
+        }
+    }
+
+    #[test]
+    fn the_pr_popup_shows_each_tab_and_says_why_when_it_cannot() {
+        let mut app = app();
+        let path = std::path::PathBuf::from("/pool/4/app");
+        while app.current().is_none_or(|t| t.path != path) {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Char('v'));
+        let shown = screen(&app, 200, 40);
+        assert!(shown.contains("reading the PR..."), "{shown}");
+
+        app.pr_loaded(path.clone(), Ok(Some(pr())));
+        let shown = screen(&app, 200, 40);
+        for seen in [
+            "#37 Highlight syntax in the diff",
+            "1 Overview",
+            "2 Checks ✗1",
+            "4 CodeRabbit 1",
+            "✗ 1 failed: clippy",
+            "1 issue, 0 suggestions, 1 nitpick",
+            "Colours code in the diff.",
+        ] {
+            assert!(shown.contains(seen), "{seen} on the Overview:\n{shown}");
+        }
+
+        press(&mut app, KeyCode::Char('2'));
+        let shown = screen(&app, 200, 40);
+        for seen in [
+            "clippy",
+            "1m 12s",
+            "clippy · the end of its log",
+            "error: match can be simplified",
+        ] {
+            assert!(shown.contains(seen), "{seen} on Checks:\n{shown}");
+        }
+
+        press(&mut app, KeyCode::Char('3'));
+        let shown = screen(&app, 200, 40);
+        for seen in [
+            "jlin on src/theme.rs:111",
+            "111 +",
+            "Should the ANSI theme get one too?",
+        ] {
+            assert!(shown.contains(seen), "{seen} on Comments:\n{shown}");
+        }
+
+        press(&mut app, KeyCode::Char('4'));
+        let shown = screen(&app, 200, 40);
+        for seen in [
+            "coderabbitai reviewed abc1234, the head",
+            "src/diff.rs:236-251",
+            "Highlighting can stall a long diff",
+            "Suggested change",
+            "1 nitpicks   z shows them",
+        ] {
+            assert!(shown.contains(seen), "{seen} on CodeRabbit:\n{shown}");
+        }
+        assert!(
+            !shown.contains("Name the closure"),
+            "nitpicks fold:\n{shown}"
+        );
+        let narrow = screen(&app, 100, 40);
+        assert!(
+            narrow.contains("4 CodeRabbit"),
+            "the tabs fit at 100 columns:\n{narrow}"
+        );
+
+        app.pr_loaded(path.clone(), Ok(None));
+        let shown = screen(&app, 200, 40);
+        assert!(
+            shown.contains("No pull request for me/anb-41-inbox-rail yet.")
+                && shown.contains("s starts a ship run"),
+            "{shown}"
+        );
+        app.pr_loaded(
+            path,
+            Err(plugin::Error::new(plugin::Code::Auth, "run gh auth login")),
+        );
+        let shown = screen(&app, 200, 40);
+        assert!(shown.contains("gh is not signed in"), "{shown}");
+        press(&mut app, KeyCode::Esc);
+        assert!(!screen(&app, 200, 40).contains("gh is not signed in"));
     }
 }

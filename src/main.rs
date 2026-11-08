@@ -17,6 +17,7 @@ mod cache;
 mod chat;
 mod child;
 mod cli;
+mod coderabbit;
 mod config;
 mod diff;
 mod dispatch;
@@ -35,6 +36,7 @@ mod phone;
 mod plugin;
 mod pool;
 mod popup;
+mod pr_view;
 mod refresh;
 mod reports;
 mod scratch;
@@ -257,6 +259,9 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
     let away = inbox::spawn_reader(checkout.to_path_buf());
     app.base = diff::base(checkout);
     let diffs = diff::Loader::spawn(app.base.clone());
+    // Each PR the popup asks for is read on a thread of its own, since a
+    // read is a few `gh` calls and the popup stays live meanwhile.
+    let (prs_done, prs) = std::sync::mpsc::channel();
     // The Issues screen, made the first time it is shown.
     let mut issues: Option<issues::Screen> = None;
     let mut was_issues = false;
@@ -392,6 +397,18 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
         }
         if let Some((path, base)) = app.wanted_diff() {
             diffs.request(path, base);
+        }
+        while let Ok((path, pr)) = prs.try_recv() {
+            is_stale = true;
+            app.pr_loaded(path, pr);
+        }
+        if let Some((path, branch, plugin)) = app.wanted_pr() {
+            let done = prs_done.clone();
+            std::thread::spawn(move || {
+                let pr = ship::view(&plugin, &path, &branch);
+                let _ = done.send((path, pr));
+            });
+            is_stale = true;
         }
         if app.is_issues {
             match issues.as_mut() {
