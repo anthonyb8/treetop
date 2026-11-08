@@ -2707,7 +2707,8 @@ fn draw_pr_view(frame: &mut Frame, app: &App, popup: &PrPopup) {
     let pr = answer.and_then(|a| a.as_ref().ok()?.as_ref());
     let bold = Style::new().add_modifier(Modifier::BOLD);
     let mut status = Vec::new();
-    if pr.is_some() && read.is_some_and(|r| r.is_reading) {
+    // Over the last read, whatever it said; the first read says so below.
+    if answer.is_some() && read.is_some_and(|r| r.is_reading) {
         status.push(Span::styled("reading… ", fg(t.muted)));
     }
     if let Some(ship) = tree.and_then(|t| t.ship.as_ref()) {
@@ -3016,17 +3017,20 @@ fn pr_overview(pr: &PrView, width: usize) -> Vec<Line<'static>> {
         }
         lines.extend(row("CodeRabbit", parts));
     }
+    // What the Comments tab counts: the open threads and the comments on
+    // the whole PR, beside the resolved ones.
     let on_lines = pr.threads.iter().filter(|t| t.path.is_some());
     let open = on_lines.clone().filter(|t| !t.resolved).count();
     let resolved = on_lines.filter(|t| t.resolved).count();
+    let general = pr.threads.iter().filter(|t| t.path.is_none()).count();
     lines.extend(row(
-        "Threads",
+        "Comments",
         vec![
             Span::styled(
                 format!("{open} open"),
                 fg(if open > 0 { t.warning } else { t.text }),
             ),
-            Span::raw(format!(", {resolved} resolved")),
+            Span::raw(format!(", {resolved} resolved, {general} on the PR")),
         ],
     ));
     let merge = match (pr.state.as_str(), pr.merge.as_str()) {
@@ -3259,7 +3263,7 @@ fn wrap_spans(spans: Vec<Span<'static>>, width: usize, hang: usize) -> Vec<Line<
 /// browser would hide, wrapped after `indent` columns.
 fn markdown(text: &str, width: usize, indent: usize) -> Vec<Line<'static>> {
     let mut out = Vec::new();
-    for piece in issues::pieces(&coderabbit::readable(text), &palette()) {
+    for piece in issues::pieces(&tables_as_code(&coderabbit::readable(text)), &palette()) {
         let issues::Piece::Lines(lines) = piece else {
             continue;
         };
@@ -3274,6 +3278,25 @@ fn markdown(text: &str, width: usize, indent: usize) -> Vec<Line<'static>> {
         }
     }
     out
+}
+
+/// `text` with each Markdown table fenced as code, so its rows keep their
+/// lines and columns rather than running together as one paragraph.
+fn tables_as_code(text: &str) -> String {
+    let mut out = Vec::new();
+    let mut in_table = false;
+    for line in text.lines() {
+        let is_row = line.trim_start().starts_with('|');
+        if is_row != in_table {
+            out.push("```");
+            in_table = is_row;
+        }
+        out.push(line);
+    }
+    if in_table {
+        out.push("```");
+    }
+    out.join("\n")
 }
 
 /// How far a list item's wrapped rows go in, so they continue under its
@@ -3423,10 +3446,16 @@ fn pr_threads(pr: &PrView, selected: usize, width: usize) -> (Vec<Line<'static>>
         } else {
             ("●", t.warning)
         };
-        let place = pr_view::place(
-            thread.path.as_deref(),
-            thread.line.map(|l| l.to_string()).as_deref(),
-        );
+        // Its code is numbered from where the comment was written, so the
+        // header names that line, and where it is now when it has moved.
+        let shows_code = !thread.code.is_empty() && !(thread.resolved && !is_on);
+        let lines_text = match (thread.line, thread.code_line) {
+            (Some(now), Some(then)) if shows_code && now != then => {
+                Some(format!("{then} (now {now})"))
+            }
+            (now, _) => now.map(|l| l.to_string()),
+        };
+        let place = pr_view::place(thread.path.as_deref(), lines_text.as_deref());
         let place = if place.is_empty() {
             " commented".to_string()
         } else {
@@ -5220,5 +5249,54 @@ mod pr_view_tests {
                 "the note keeps its margin when it wraps: {row}"
             );
         }
+    }
+
+    #[test]
+    fn reloads_moved_threads_tables_and_counts_read_true() {
+        let mut app = app();
+        let path = std::path::PathBuf::from("/pool/4/app");
+        while app.current().is_none_or(|t| t.path != path) {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Char('v'));
+        app.pr_loaded(path.clone(), Ok(None));
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        let shown = screen(&app, 100, 40);
+        assert!(
+            shown.contains("reading"),
+            "^R on the no-PR note says it is reading:\n{shown}"
+        );
+
+        let mut pr = pr();
+        pr.threads[0].line = Some(3594);
+        pr.threads[0].code_line = Some(3509);
+        pr.threads.push(Thread {
+            author: "sourcery-ai".into(),
+            body: "| Change | Details |\n| ------ | ------- |\n| Route jobs | Replace the runner |"
+                .into(),
+            ..Thread::default()
+        });
+        app.pr_loaded(path, Ok(Some(pr)));
+        let shown = screen(&app, 100, 40);
+        assert!(
+            shown.contains("3 Comments 2") && shown.contains("1 open, 0 resolved, 1 on the PR"),
+            "the tab and the Overview count the same comments:\n{shown}"
+        );
+        press(&mut app, KeyCode::Char('3'));
+        let shown = screen(&app, 100, 40);
+        assert!(
+            shown.contains("on src/theme.rs:3509 (now 3594)"),
+            "the header names the line its code is numbered from:\n{shown}"
+        );
+        assert!(
+            !shown
+                .lines()
+                .any(|r| r.contains("Details") && r.contains("Route jobs")),
+            "a table keeps its rows:\n{shown}"
+        );
+        assert!(
+            shown.contains("| Route jobs | Replace the runner |"),
+            "{shown}"
+        );
     }
 }
