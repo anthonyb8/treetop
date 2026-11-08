@@ -167,10 +167,14 @@ fn finding(text: &str, default: Kind) -> Finding {
         while lines.next_if(String::is_empty).is_some() {}
     };
     skip_blanks(&mut lines);
-    if let Some(first) = lines.next_if(|l| is_rating(l)) {
-        found.severity = rating(&first, &mut found.kind);
+    // One rating line or more: the older `_Potential issue_ | _Major_`
+    // can come before `**Category** | **Major** | **Quick win**`.
+    while let Some(line) = lines.next_if(|l| is_rating(l)) {
+        if let Some(severity) = rating(&line, &mut found.kind) {
+            found.severity = Some(severity);
+        }
+        skip_blanks(&mut lines);
     }
-    skip_blanks(&mut lines);
     if let Some(title) = lines.next_if(|l| l.starts_with("**") && l.ends_with("**")) {
         found.title = title.trim_matches('*').trim().to_string();
     }
@@ -199,40 +203,41 @@ fn indicator(text: &str) -> Option<Kind> {
 /// The rating line that opens a finding: `**Minor** · **Correctness**` in
 /// the current format, `_⚠️ Potential issue_ | _🟠 Major_` in the old.
 fn is_rating(line: &str) -> bool {
-    (line.starts_with("**") && line.contains(" · "))
+    (line.starts_with("**") && (line.contains(" · ") || line.contains("** | **")))
         || (line.starts_with('_') && line.ends_with('_'))
 }
 
+/// How CodeRabbit rates a finding, worst first.
+const SEVERITIES: [&str; 5] = ["Critical", "Major", "Minor", "Trivial", "Info"];
+
 /// The severity a rating line gives, and the kind where an old-format line
-/// is the only thing that says it.
+/// is the only thing that says it. Its parts are split by ` · ` or `|`,
+/// each in `**` or `_`, often after an emoji.
 fn rating(line: &str, kind: &mut Kind) -> Option<String> {
-    if line.starts_with("**") {
-        return line
-            .split(" · ")
-            .next()
-            .map(|s| s.trim_matches('*').trim().to_string())
-            .filter(|s| !s.is_empty());
-    }
-    let parts: Vec<String> = line
-        .split('|')
+    let parts: Vec<&str> = line
+        .split(['|', '·'])
         .map(|p| {
             p.trim()
-                .trim_matches('_')
+                .trim_matches(['*', '_'])
                 .trim_start_matches(|c: char| !c.is_ascii_alphabetic())
-                .to_string()
+                .trim()
         })
+        .filter(|p| !p.is_empty())
         .collect();
     if *kind == Kind::Comment
         && let Some(first) = parts.first()
     {
-        *kind = match first.as_str() {
+        *kind = match *first {
             "Potential issue" => Kind::Issue,
             s if s.starts_with("Refactor") || s.starts_with("Verification") => Kind::Suggestion,
             s if s.starts_with("Nitpick") => Kind::Nitpick,
             _ => Kind::Comment,
         };
     }
-    parts.get(1).cloned().filter(|s| !s.is_empty())
+    parts
+        .iter()
+        .find(|p| SEVERITIES.contains(p))
+        .map(|p| p.to_string())
 }
 
 /// The text with its agent prompt taken out, and the prompt's code block.
@@ -311,6 +316,12 @@ fn plain(text: &str) -> Vec<String> {
     out
 }
 
+/// A comment's Markdown with the HTML a browser would hide or style taken
+/// out: folded sections, comments and tags, though not tags written as code.
+pub fn readable(text: &str) -> String {
+    without_tags(&without_details(text))
+}
+
 /// `text` with its HTML comments taken out, which bots such as CodeRabbit
 /// leave in a PR's description for themselves.
 pub fn without_comments(text: &str) -> String {
@@ -357,8 +368,28 @@ fn without_details(text: &str) -> String {
 /// HTML comments and tags taken out.
 fn without_tags(text: &str) -> String {
     let text = cut_all(text, "<!--", "-->");
+    text.lines()
+        .map(|line| {
+            // Between backticks a tag is code being talked about: kept.
+            line.split('`')
+                .enumerate()
+                .map(|(i, part)| {
+                    if i % 2 == 1 {
+                        part.to_string()
+                    } else {
+                        strip_tags(part)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("`")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn strip_tags(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut rest = text.as_str();
+    let mut rest = text;
     while let Some(open) = rest.find('<') {
         let tag = &rest[open + 1..];
         let is_tag = tag.starts_with(|c: char| c.is_ascii_alphabetic() || c == '/');
@@ -554,5 +585,39 @@ mod tests {
             "**Tighten it.**\n\n```diff\n--- \"a/AGENTS.md\"\n+++ \"b/AGENTS.md\"\n@@ -57,7 +57,8 @@\n keep\n-old\n+new\n```",
         );
         assert_eq!(found[0].fix, [" keep", "-old", "+new"]);
+    }
+
+    #[test]
+    fn reads_the_heading_with_its_category_severity_and_effort() {
+        let found = line_comment(
+            "_⚠️ Potential issue_ | _🟠 Major_\n\n**🗄️ Data Integrity & Integration** | **🟠 Major** | **⚡ Quick win**\n\n\
+             **Validate every snapshot before continuing with writes.**\n\nA bad snapshot is restored half way.",
+        );
+        let f = &found[0];
+        assert_eq!(
+            (
+                f.kind,
+                f.severity.as_deref(),
+                f.title.as_str(),
+                f.body.as_str()
+            ),
+            (
+                Kind::Issue,
+                Some("Major"),
+                "Validate every snapshot before continuing with writes.",
+                "A bad snapshot is restored half way."
+            )
+        );
+    }
+
+    #[test]
+    fn keeps_tags_written_as_code() {
+        let found = line_comment(
+            "**Escape it.**\n\nA fenced or inline `<script>` or `<iframe>` example fails <b>validation</b>.",
+        );
+        assert_eq!(
+            found[0].body,
+            "A fenced or inline `<script>` or `<iframe>` example fails validation."
+        );
     }
 }

@@ -42,6 +42,9 @@ pub struct PrPopup {
     pub selected: [usize; 4],
     /// CodeRabbit's nitpicks are listed, rather than folded into one row.
     pub nitpicks: bool,
+    /// Rows scrolled past the selected item's start, for one taller than
+    /// the popup; moving the selection starts it again at 0.
+    pub offset: usize,
 }
 
 impl PrPopup {
@@ -51,6 +54,7 @@ impl PrPopup {
             tab: Tab::Overview,
             selected: [0; 4],
             nitpicks: false,
+            offset: 0,
         }
     }
 

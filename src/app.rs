@@ -1373,6 +1373,13 @@ impl App {
         };
         let tabs = pr_view::tabs(&pr);
         let at = tabs.iter().position(|t| *t == popup.tab).unwrap_or(0);
+        // Anything but a scroll moves off the item, so starts it at its top.
+        if !matches!(
+            key.code,
+            KeyCode::Char('d' | 'u' | 'f' | 'F' | 'O') | KeyCode::Enter
+        ) {
+            popup.offset = 0;
+        }
         let index = popup.tab.index();
         let last = pr_view::last_row(&pr, popup.tab, popup.nitpicks);
         let step = |popup: &mut PrPopup, delta: isize| {
@@ -1391,6 +1398,10 @@ impl App {
             }
             KeyCode::Down | KeyCode::Char('j') => step(popup, 1),
             KeyCode::Up | KeyCode::Char('k') => step(popup, -1),
+            KeyCode::Char('d') if popup.tab == Tab::Overview => step(popup, SCROLL),
+            KeyCode::Char('u') if popup.tab == Tab::Overview => step(popup, -SCROLL),
+            KeyCode::Char('d') => popup.offset += SCROLL.unsigned_abs(),
+            KeyCode::Char('u') => popup.offset = popup.offset.saturating_sub(SCROLL.unsigned_abs()),
             KeyCode::Char('g') => popup.selected[index] = 0,
             KeyCode::Char('G') => step(popup, isize::MAX),
             KeyCode::Char('z') if popup.tab == Tab::CodeRabbit => {
@@ -3583,6 +3594,9 @@ impl App {
         Outcome::Continue
     }
 }
+
+/// Rows `d` and `u` scroll the PR popup by.
+const SCROLL: isize = 10;
 
 /// The selection kept on a row the PR has, after a read or a fold.
 fn clamp(popup: &mut PrPopup, pr: &PrView) {

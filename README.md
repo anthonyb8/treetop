@@ -644,11 +644,11 @@ Those show `ready` in the Issues screen's WORK column, where `p` picks one up.
 ## The PR view
 
 `v` opens the PR of the tree under the cursor in a popup over the pool, read afresh each time it opens, since review comments land without a push; the last read shows while the new one comes in.
-It has four tabs, which `1` to `4` switch, as do `h` and `l`.
+It has four tabs, which `1` to `4` switch, as do `h` and `l`; `j` and `k` move between items, and `d` and `u` scroll through one too long for the screen.
 
 - **Overview**: who wants to merge what, where its checks, review, CodeRabbit, open threads and merge stand, and its description.
 - **Checks**: each check with its workflow and how long it ran; a failed one shows the end of its log below, and Enter opens a check on GitHub.
-- **Comments**: each review thread with the lines of code it is on, coloured as the diff colours them, and each comment on the whole PR; a resolved thread folds to one line until it is selected.
+- **Comments**: each review thread with the lines of code it is on, coloured as the diff colours them, and each comment on the whole PR, its Markdown drawn as the description's is; a resolved thread folds to one line until it is selected.
 - **CodeRabbit**, on a repository CodeRabbit reviews: its comments as issues and suggestions, each with its severity, place and title, and the selected one with its text and suggested change. Its nitpicks fold into one line, which `z` opens.
 
 `f` sends the selected item to the tree's agents, as `m` sends a message: a failed check with its log, a thread with its code and replies, or a CodeRabbit comment as the prompt CodeRabbit writes for agents.

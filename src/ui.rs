@@ -2661,38 +2661,38 @@ fn draw_diff_view(frame: &mut Frame, app: &App, view: &DiffView) {
 }
 
 /// The keys of each PR tab, by `Tab::index`.
+// The tab row numbers the tabs, so the keys leave `1`-`4` out, and Esc
+// comes before what a narrow bar can drop.
 const PR_KEYS: [&[(&str, &str)]; 4] = [
     &[
-        ("1-4", "tab"),
         ("j/k", "scroll"),
         ("O", "GitHub"),
-        ("^R", "reload"),
         ("Esc", "back"),
+        ("^R", "reload"),
     ],
     &[
-        ("1-4", "tab"),
         ("j/k", "check"),
-        ("f", "send failure to agent"),
-        ("Enter", "run on GitHub"),
-        ("^R", "reload"),
+        ("f", "send to agent"),
+        ("Enter", "on GitHub"),
         ("Esc", "back"),
+        ("^R", "reload"),
     ],
     &[
-        ("1-4", "tab"),
         ("j/k", "thread"),
+        ("d/u", "scroll"),
         ("f", "send to agent"),
+        ("Esc", "back"),
         ("O", "GitHub"),
         ("^R", "reload"),
-        ("Esc", "back"),
     ],
     &[
-        ("1-4", "tab"),
-        ("j/k", "comment"),
-        ("f", "send to agent"),
-        ("F", "send all open"),
+        ("j/k", "move"),
+        ("d/u", "scroll"),
+        ("f", "send"),
+        ("F", "send all"),
         ("z", "nitpicks"),
-        ("^R", "reload"),
         ("Esc", "back"),
+        ("^R", "reload"),
     ],
 ];
 
@@ -2706,12 +2706,24 @@ fn draw_pr_view(frame: &mut Frame, app: &App, popup: &PrPopup) {
     let answer = read.and_then(|r| r.pr.as_ref());
     let pr = answer.and_then(|a| a.as_ref().ok()?.as_ref());
     let bold = Style::new().add_modifier(Modifier::BOLD);
+    let mut status = Vec::new();
+    if pr.is_some() && read.is_some_and(|r| r.is_reading) {
+        status.push(Span::styled("reading… ", fg(t.muted)));
+    }
+    if let Some(ship) = tree.and_then(|t| t.ship.as_ref()) {
+        status.push(Span::styled(
+            format!("{} ", ship.label),
+            stage_style(ship.stage),
+        ));
+    }
+    let status_width: usize = status.iter().map(Span::width).sum();
     let mut title = vec![Span::styled(" pr ", t.badge)];
     match pr {
         Some(pr) => {
-            // The title takes what the bar has left beside the badge and the
-            // tree, cut with an ellipsis; the branches follow where they fit.
-            let room = usize::from(popup::bar(screen).width).saturating_sub(16);
+            // The title takes what the bar has left beside the badge, the
+            // tree and the status, cut with an ellipsis; the branches follow
+            // where they fit.
+            let room = usize::from(popup::bar(screen).width).saturating_sub(17 + status_width);
             let named = fit(&format!(" #{} {}", pr.number, pr.title), room);
             let left = room.saturating_sub(Line::raw(named.as_str()).width());
             title.push(Span::styled(named, bold));
@@ -2731,16 +2743,6 @@ fn draw_pr_view(frame: &mut Frame, app: &App, popup: &PrPopup) {
     }
     if let Some(tree) = tree {
         title.push(Span::styled(format!("   tree {} ", tree.name), fg(t.muted)));
-    }
-    let mut status = Vec::new();
-    if pr.is_some() && read.is_some_and(|r| r.is_reading) {
-        status.push(Span::styled("reading… ", fg(t.muted)));
-    }
-    if let Some(ship) = tree.and_then(|t| t.ship.as_ref()) {
-        status.push(Span::styled(
-            format!("{} ", ship.label),
-            stage_style(ship.stage),
-        ));
     }
     let body = bar_popup(frame, screen, title, status);
     let note = app.message.as_deref();
@@ -2777,9 +2779,11 @@ fn draw_pr_view(frame: &mut Frame, app: &App, popup: &PrPopup) {
         );
     }
     frame.render_widget(Paragraph::new(pr_tabs(pr, tab)).style(t.header), tabs_row);
+    // A row under the tabs, and a column of margin at the right.
     let content = Rect {
         y: content.y + content.height.min(1),
         height: content.height.saturating_sub(1),
+        width: content.width.saturating_sub(1),
         ..content
     };
     let Some(pr) = pr else {
@@ -2795,7 +2799,7 @@ fn draw_pr_view(frame: &mut Frame, app: &App, popup: &PrPopup) {
             Some(Ok(_)) => vec![
                 Line::raw(format!(" No pull request for {branch} yet.")),
                 Line::styled(
-                    " s starts a ship run, which pushes the branch and opens one.",
+                    " Close this and press s to start a ship run, which pushes the branch and opens one.",
                     fg(t.muted),
                 ),
             ],
@@ -2826,11 +2830,11 @@ fn draw_pr_view(frame: &mut Frame, app: &App, popup: &PrPopup) {
         Tab::Checks => draw_pr_checks(frame, pr, popup.selected(), content),
         Tab::Comments => {
             let (lines, at) = pr_threads(pr, popup.selected(), width);
-            draw_scrolled(frame, lines, at, content);
+            draw_scrolled(frame, lines, at, popup.offset, content);
         }
         Tab::CodeRabbit => {
             let (lines, at) = pr_findings(pr, popup, width);
-            draw_scrolled(frame, lines, at, content);
+            draw_scrolled(frame, lines, at, popup.offset, content);
         }
     }
 }
@@ -2932,10 +2936,11 @@ fn pr_overview(pr: &PrView, width: usize) -> Vec<Line<'static>> {
         ]),
         Line::raw(""),
     ];
+    // A row wraps under its value, not under its label.
     let row = |label: &str, parts: Vec<Span<'static>>| {
         let mut spans = vec![Span::styled(format!("{label:<12}"), muted)];
         spans.extend(parts);
-        Line::from(spans)
+        wrap_spans(spans, width, 12)
     };
     let (failed, passed, running) = (
         count_checks(pr, CheckOutcome::Failed),
@@ -2967,14 +2972,14 @@ fn pr_overview(pr: &PrView, width: usize) -> Vec<Line<'static>> {
     if checks.is_empty() {
         checks.push(Span::styled("none", muted));
     }
-    lines.push(row("Checks", checks));
+    lines.extend(row("Checks", checks));
     let review = match pr.review.as_str() {
         "" => Span::styled("none yet", muted),
         "approved" => Span::styled("approved", fg(t.success)),
         "changes requested" => Span::styled("changes requested", fg(t.danger)),
         other => Span::styled(other.to_string(), fg(t.warning)),
     };
-    lines.push(row("Review", vec![review]));
+    lines.extend(row("Review", vec![review]));
     if let Some(bot) = &pr.bot {
         let count = |kind| {
             bot.findings
@@ -2999,12 +3004,12 @@ fn pr_overview(pr: &PrView, width: usize) -> Vec<Line<'static>> {
         if bot.reviewing {
             parts.push(Span::styled("   reviewing the newest push", fg(t.warning)));
         }
-        lines.push(row("CodeRabbit", parts));
+        lines.extend(row("CodeRabbit", parts));
     }
     let on_lines = pr.threads.iter().filter(|t| t.path.is_some());
     let open = on_lines.clone().filter(|t| !t.resolved).count();
     let resolved = on_lines.filter(|t| t.resolved).count();
-    lines.push(row(
+    lines.extend(row(
         "Threads",
         vec![
             Span::styled(
@@ -3025,7 +3030,7 @@ fn pr_overview(pr: &PrView, width: usize) -> Vec<Line<'static>> {
         (_, "draft") => Span::styled("draft", muted),
         _ => Span::styled("not known yet", muted),
     };
-    lines.push(row("Merge", vec![merge]));
+    lines.extend(row("Merge", vec![merge]));
     lines.push(Line::raw(""));
     lines.push(Line::styled(
         format!("─ Description {}", "─".repeat(width.saturating_sub(15))),
@@ -3155,17 +3160,95 @@ fn duration(seconds: u64) -> String {
     }
 }
 
-/// `lines` scrolled so the selected item, from row `at.0` to `at.1`, is on
-/// screen.
-fn draw_scrolled(frame: &mut Frame, lines: Vec<Line<'static>>, at: (usize, usize), area: Rect) {
+/// `lines` scrolled so the selected item, rows `at.0` to `at.1`, is on
+/// screen, then `extra` rows on. An item taller than the screen starts at
+/// its top, or at the tab's top where it is near it, so nothing above it is
+/// lost; `d` and `u` scroll through the rest.
+fn draw_scrolled(
+    frame: &mut Frame,
+    lines: Vec<Line<'static>>,
+    at: (usize, usize),
+    extra: usize,
+    area: Rect,
+) {
     let height = usize::from(area.height);
     let (start, end) = at;
-    let mut offset = end.saturating_sub(height);
-    if start < offset {
-        offset = start;
+    let mut base = end.saturating_sub(height);
+    if start < base {
+        base = if start < height / 2 { 0 } else { start };
     }
+    let offset = (base + extra).min(lines.len().saturating_sub(height).max(base));
     let shown: Vec<Line> = lines.into_iter().skip(offset).collect();
     frame.render_widget(Paragraph::new(shown), area);
+}
+
+/// `spans` broken into rows of at most `width` columns at spaces, or within
+/// a word longer than a row, each row after the first starting `hang`
+/// columns in; the spans keep their styles.
+fn wrap_spans(spans: Vec<Span<'static>>, width: usize, hang: usize) -> Vec<Line<'static>> {
+    let width = width.max(hang + 10);
+    let fits = |used: usize, word: &str| used + word.trim_end().chars().count() <= width;
+    let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let (mut used, mut is_empty) = (0, true);
+    for span in spans {
+        for word in span.content.split_inclusive(' ') {
+            let mut word = word.to_string();
+            if !is_empty && !fits(used, &word) {
+                rows.push(vec![Span::raw(" ".repeat(hang))]);
+                used = hang;
+            }
+            while !fits(used, &word) {
+                let room = width.saturating_sub(used).max(1);
+                let head: String = word.chars().take(room).collect();
+                word = word.chars().skip(room).collect();
+                if let Some(row) = rows.last_mut() {
+                    row.push(Span::styled(head, span.style));
+                }
+                rows.push(vec![Span::raw(" ".repeat(hang))]);
+                used = hang;
+            }
+            used += word.chars().count();
+            is_empty = false;
+            if let Some(row) = rows.last_mut() {
+                row.push(Span::styled(word, span.style));
+            }
+        }
+    }
+    rows.into_iter().map(Line::from).collect()
+}
+
+/// A comment's Markdown drawn as the description is, without the HTML a
+/// browser would hide, wrapped after `indent` columns.
+fn markdown(text: &str, width: usize, indent: usize) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    for piece in issues::pieces(&coderabbit::readable(text), &palette()) {
+        let issues::Piece::Lines(lines) = piece else {
+            continue;
+        };
+        for line in lines {
+            let style = line.style;
+            for row in wrap_spans(line.spans, width.saturating_sub(indent + 1), 0) {
+                let mut spans = vec![Span::raw(" ".repeat(indent))];
+                spans.extend(row.spans);
+                out.push(Line::from(spans).style(style));
+            }
+        }
+    }
+    out
+}
+
+/// The first line of a comment as it reads, for a folded row.
+fn first_line(text: &str) -> String {
+    markdown(text, usize::MAX / 2, 0)
+        .into_iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        })
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default()
 }
 
 /// Prose wrapped to `width` at words, each row after `indent`.
@@ -3199,7 +3282,7 @@ fn code_lines(
     let shown = code.iter().filter(|l| !l.starts_with('-')).count();
     let mut number = last.map(|l| l + 1 - shown as u64);
     code.iter()
-        .map(|line| {
+        .flat_map(|line| {
             let (sign, text) = line.split_at(line.len().min(1));
             let bg = match sign {
                 "+" => Some(palette.added),
@@ -3213,20 +3296,22 @@ fn code_lines(
                     format!("{n:>4}")
                 }
             };
-            let mut spans = vec![
-                Span::raw(indent.to_string()),
-                Span::styled(format!("{label} {sign} "), fg(palette.number)),
-            ];
+            let gutter = format!("{indent}{label} {sign} ");
+            let hang = gutter.chars().count();
+            let mut spans = vec![Span::styled(gutter, fg(palette.number))];
             let tokens = highlighter
                 .as_mut()
                 .map(|h| h.line(text))
                 .unwrap_or_default();
             spans.extend(coloured(text, &tokens));
-            let line = Line::from(spans);
-            match bg {
-                Some(bg) => full(line.style(Style::new().bg(bg)), width),
-                None => line,
-            }
+            // A long line wraps under its own code, behind its colour.
+            wrap_spans(spans, width.saturating_sub(1), hang)
+                .into_iter()
+                .map(|row| match bg {
+                    Some(bg) => full(row.style(Style::new().bg(bg)), width),
+                    None => row,
+                })
+                .collect::<Vec<_>>()
         })
         .collect()
 }
@@ -3296,7 +3381,7 @@ fn pr_threads(pr: &PrView, selected: usize, width: usize) -> (Vec<Line<'static>>
         // was said, on one row.
         let is_folded = thread.resolved && !is_on;
         if is_folded {
-            let first = thread.body.lines().next().unwrap_or_default();
+            let first = first_line(&thread.body);
             let used: usize = header.iter().map(Span::width).sum();
             header.push(Span::styled(
                 fit(
@@ -3320,7 +3405,7 @@ fn pr_threads(pr: &PrView, selected: usize, width: usize) -> (Vec<Line<'static>>
                 "   ",
                 width,
             ));
-            lines.extend(prose(&thread.body, width, "   ", Style::new()));
+            lines.extend(markdown(&thread.body, width, 3));
             for reply in &thread.replies {
                 lines.push(Line::from(vec![
                     Span::styled("   ↳ ", muted),
@@ -3329,7 +3414,7 @@ fn pr_threads(pr: &PrView, selected: usize, width: usize) -> (Vec<Line<'static>>
                         Style::new().add_modifier(Modifier::BOLD),
                     ),
                 ]));
-                lines.extend(prose(&reply.body, width, "     ", Style::new()));
+                lines.extend(markdown(&reply.body, width, 5));
             }
         }
         if is_on {
@@ -3379,7 +3464,7 @@ fn pr_findings(pr: &PrView, popup: &PrPopup, width: usize) -> (Vec<Line<'static>
         let place = pr_view::place(finding.path.as_deref(), finding.lines.as_deref());
         let mut header = vec![
             Span::styled(
-                format!(" {}", if finding.resolved { "✓ " } else { "" }),
+                format!(" {} ", if finding.resolved { "✓" } else { " " }),
                 fg(t.success),
             ),
             Span::styled(format!("{tag:<11}"), fg(color).add_modifier(Modifier::BOLD)),
@@ -3416,7 +3501,7 @@ fn pr_findings(pr: &PrView, popup: &PrPopup, width: usize) -> (Vec<Line<'static>
                     Style::new().add_modifier(Modifier::BOLD),
                 ));
             }
-            lines.extend(prose(&finding.body, width, "   ", Style::new()));
+            lines.extend(markdown(&finding.body, width, 3));
             if !finding.fix.is_empty() {
                 lines.push(Line::styled("   Suggested change", muted));
                 lines.extend(code_lines(
@@ -4576,7 +4661,7 @@ mod pr_view_tests {
     use crate::inbox::tests::app;
     use crate::plugin;
     use crate::ship::{BotReview, CheckView, Outcome as Checked, PrView, Thread};
-    use ratatui::crossterm::event::{KeyCode, KeyEvent};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn screen(app: &App, width: u16, height: u16) -> String {
         let mut terminal =
@@ -4731,7 +4816,7 @@ mod pr_view_tests {
         let shown = screen(&app, 200, 40);
         assert!(
             shown.contains("No pull request for me/anb-41-inbox-rail yet.")
-                && shown.contains("s starts a ship run"),
+                && shown.contains("Close this and press s to start a ship run"),
             "{shown}"
         );
         app.pr_loaded(
@@ -4840,6 +4925,133 @@ mod pr_view_tests {
         assert!(
             shown.contains("Run gh auth login.") && !shown.contains("then ^R"),
             "^R is named once:\n{shown}"
+        );
+    }
+
+    #[test]
+    fn long_and_marked_up_items_read_whole_at_100_columns() {
+        let mut app = app();
+        let path = std::path::PathBuf::from("/pool/4/app");
+        while app.current().is_none_or(|t| t.path != path) {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Char('v'));
+        let mut pr = pr();
+        pr.title =
+            "fix(registry-restore): continue restoring remaining keys when one snapshot fails"
+                .into();
+        pr.checks[1].outcome = Checked::Failed;
+        pr.checks[1].name = "CodeScene Code Health Review (issue-1066-a-very-long-branch)".into();
+        pr.threads[0].body = "\u{274c} New issue: [**Complex Method**](https://codescene.io/x) in <sub>x.rs</sub> <!-- hidden -->".into();
+        if let Some(bot) = pr.bot.as_mut() {
+            bot.reviewing = true;
+            let mut fix: Vec<String> = (0..60).map(|i| format!("+    step {i};")).collect();
+            fix.push("+    launch npm start -- --fullscreen --keep-the-window-open --and-a-flag END_OF_LINE".into());
+            fix.push("+the very last line".into());
+            bot.findings[0].fix = fix;
+            bot.findings.insert(
+                1,
+                Finding {
+                    kind: Found::Suggestion,
+                    severity: Some("Minor".into()),
+                    path: Some("src/b.rs".into()),
+                    title: "Already addressed".into(),
+                    resolved: true,
+                    ..Finding::default()
+                },
+            );
+        }
+        app.pr_loaded(path.clone(), Ok(Some(pr)));
+
+        let shown = screen(&app, 100, 40);
+        let rows: Vec<&str> = shown.lines().collect();
+        let corner = rows
+            .iter()
+            .position(|r| r.contains('┌'))
+            .expect("the popup");
+        let left = rows[corner]
+            .find('┌')
+            .map(|b| rows[corner][..b].chars().count())
+            .unwrap();
+        let right = left
+            + rows[corner]
+                .chars()
+                .skip(left)
+                .take_while(|c| *c != '┐')
+                .count();
+        let checks = rows
+            .iter()
+            .position(|r| r.contains("Checks      "))
+            .expect("the Checks row");
+        let value = |row: &str| row.chars().skip(left + 1).position(|c| c != ' ');
+        let first: String = rows[checks].chars().skip(left + 1).collect();
+        let column = first.find('✗').map(|b| first[..b].chars().count());
+        assert_eq!(
+            value(rows[checks + 1]),
+            column,
+            "a wrapped value starts under the value column: {}",
+            rows[checks + 1]
+        );
+        for row in &rows[corner + 1..corner + 30] {
+            let before: Vec<char> = row.chars().skip(right - 1).take(1).collect();
+            assert!(
+                before == [' '] || before == ['─'] || before == ['│'],
+                "a margin at the right: {row}"
+            );
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        let shown = screen(&app, 100, 40);
+        let bar = shown.lines().find(|r| r.contains(" pr ")).unwrap();
+        assert!(
+            bar.contains("reading…"),
+            "a reload shows beside a long title: {bar}"
+        );
+        app.pr_loaded(
+            path.clone(),
+            Ok(app.prs[&path].pr.clone().unwrap().unwrap()),
+        );
+
+        press(&mut app, KeyCode::Char('3'));
+        let shown = screen(&app, 100, 40);
+        assert!(
+            shown.contains("New issue: Complex Method") && shown.contains("in x.rs"),
+            "{shown}"
+        );
+        for raw in ["**", "<sub>", "<!--", "](https"] {
+            assert!(!shown.contains(raw), "{raw} is markup, not text:\n{shown}");
+        }
+
+        press(&mut app, KeyCode::Char('4'));
+        let shown = screen(&app, 100, 40);
+        assert!(
+            shown.contains("reviewing the newest push"),
+            "a tall first item hides nothing above it:\n{shown}"
+        );
+        assert!(shown.contains("Esc"), "the key bar keeps Esc:\n{shown}");
+        let tag = |shown: &str, word: &str| {
+            let row = shown.lines().find(|r| r.contains(word))?;
+            row.find(word).map(|b| row[..b].chars().count())
+        };
+        let open = tag(&shown, "issue ");
+        press(&mut app, KeyCode::Char('j'));
+        let resolved = tag(&screen(&app, 100, 40), "suggestion ");
+        press(&mut app, KeyCode::Char('k'));
+        assert!(
+            open.is_some() && open == resolved,
+            "resolved rows line up with open ones"
+        );
+        for _ in 0..12 {
+            press(&mut app, KeyCode::Char('d'));
+        }
+        let shown = screen(&app, 100, 40);
+        assert!(
+            shown.contains("the very last line"),
+            "d scrolls to a long item's end:\n{shown}"
+        );
+        assert!(
+            shown.contains("END_OF_LINE"),
+            "a long code line wraps:\n{shown}"
         );
     }
 }
