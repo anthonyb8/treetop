@@ -654,6 +654,8 @@ fn clean_log(log: &str) -> String {
 
 /// `line` with its terminal colour codes (`ESC [ ... m`) taken out.
 fn without_escapes(line: &str) -> String {
+    // gh writes the escape itself as the two characters `^[`.
+    let line = line.replace("^[", "\u{1b}");
     let mut out = String::with_capacity(line.len());
     let mut chars = line.chars();
     while let Some(c) = chars.next() {
@@ -1036,10 +1038,11 @@ mod tests {
     fn a_failed_log_reads_as_its_lines_alone() {
         let log = "guard\tReject triggers\t2026-11-08T22:32:19.8973361Z \u{1b}[36;1mruby check.rb\u{1b}[0m\n\
                    guard\tReject triggers\t2026-11-08T22:32:20.0000000Z ##[error]only workflow_dispatch is permitted\n\
+                   guard\tReject triggers\t2026-11-08T22:32:21.0000000Z ^[[36;1mln -sf node^[[0m\n\
                    plain line";
         assert_eq!(
             clean_log(log),
-            "ruby check.rb\n##[error]only workflow_dispatch is permitted\nplain line",
+            "ruby check.rb\n##[error]only workflow_dispatch is permitted\nln -sf node\nplain line",
             "no job, step or time before each line, and no colour codes"
         );
     }

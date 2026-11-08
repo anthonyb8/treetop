@@ -3026,7 +3026,11 @@ fn pr_overview(pr: &PrView, width: usize) -> Vec<Line<'static>> {
         (_, "blocked") => Span::styled("blocked", fg(t.danger)),
         (_, "dirty") => Span::styled("conflicts with its base", fg(t.danger)),
         (_, "behind") => Span::styled("behind its base", fg(t.warning)),
-        (_, "unstable") => Span::styled("checks failing", fg(t.warning)),
+        // GitHub calls a PR unstable while a check is running, as well as
+        // once one has failed.
+        (_, "unstable") if failed > 0 => Span::styled("checks failing", fg(t.warning)),
+        (_, "unstable") if running > 0 => Span::styled("waiting on checks", fg(t.warning)),
+        (_, "unstable") => Span::styled("unstable", fg(t.warning)),
         (_, "draft") => Span::styled("draft", muted),
         _ => Span::styled("not known yet", muted),
     };
@@ -3158,6 +3162,23 @@ fn duration(seconds: u64) -> String {
         0..60 => format!("{seconds}s"),
         _ => format!("{}m {:02}s", seconds / 60, seconds % 60),
     }
+}
+
+/// A place cut from its start to `width` columns, at a folder where it can,
+/// so its file name and lines stay: `…/navigation/Nav.kt:1613-1620`.
+fn tail_fit(place: &str, width: usize) -> String {
+    let chars: Vec<char> = place.chars().collect();
+    if chars.len() <= width {
+        return place.to_string();
+    }
+    let tail: String = chars[chars.len() - width.saturating_sub(1)..]
+        .iter()
+        .collect();
+    let tail = match tail.find('/') {
+        Some(at) if at + 1 < tail.len() => &tail[at..],
+        _ => tail.as_str(),
+    };
+    format!("…{tail}")
 }
 
 /// `lines` scrolled so the selected item, rows `at.0` to `at.1`, is on
@@ -3472,7 +3493,10 @@ fn pr_findings(pr: &PrView, popup: &PrPopup, width: usize) -> (Vec<Line<'static>
                 format!("{:<9}", finding.severity.as_deref().unwrap_or("")),
                 muted,
             ),
-            Span::styled(format!("{place}  "), fg(t.diff.path)),
+            Span::styled(
+                format!("{}  ", tail_fit(&place, width / 2)),
+                fg(t.diff.path),
+            ),
         ];
         let room = width.saturating_sub(header.iter().map(Span::width).sum::<usize>() + 1);
         header.push(Span::styled(
@@ -5052,6 +5076,43 @@ mod pr_view_tests {
         assert!(
             shown.contains("END_OF_LINE"),
             "a long code line wraps:\n{shown}"
+        );
+    }
+
+    #[test]
+    fn running_checks_and_long_places_read_right() {
+        let mut app = app();
+        let path = std::path::PathBuf::from("/pool/4/app");
+        while app.current().is_none_or(|t| t.path != path) {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Char('v'));
+        let mut pr = pr();
+        pr.merge = "unstable".into();
+        pr.checks[0].outcome = Checked::Pending;
+        pr.checks[0].log = None;
+        if let Some(bot) = pr.bot.as_mut() {
+            bot.findings[0].path =
+                Some("apps/android/app/src/main/java/app/switchboard/mobile/ui/navigation/SwitchboardNavigation.kt".into());
+            bot.findings[0].lines = Some("1613-1620".into());
+        }
+        app.pr_loaded(path, Ok(Some(pr)));
+        let shown = screen(&app, 100, 40);
+        assert!(
+            !shown.contains("checks failing") && shown.contains("waiting on checks"),
+            "a running check is not a failing one:\n{shown}"
+        );
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('4'));
+        press(&mut app, KeyCode::Char('j'));
+        let shown = screen(&app, 100, 40);
+        let row = shown
+            .lines()
+            .find(|r| r.contains("SwitchboardNavigation.kt"))
+            .expect("the finding's row");
+        assert!(
+            row.contains("…/") && row.contains(":1613-1620") && row.contains('…'),
+            "a long place keeps its file name and lines, and the title its ellipsis: {row}"
         );
     }
 }
