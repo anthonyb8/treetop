@@ -3057,12 +3057,12 @@ fn pr_overview(pr: &PrView, width: usize) -> Vec<Line<'static>> {
     if pr.body.trim().is_empty() {
         lines.push(Line::styled("No description.", muted));
     }
-    for piece in issues::pieces(&pr.body, &palette()) {
+    for piece in issues::pieces(&tables_as_code(&pr.body), &palette()) {
         if let issues::Piece::Lines(body) = piece {
             for line in body {
-                let (style, hang) = (line.style, bullet_hang(&line));
+                let (style, lead) = (line.style, continuation(&line));
                 lines.extend(
-                    wrap_spans(line.spans, width, hang)
+                    wrap_led(line.spans, width, lead)
                         .into_iter()
                         .map(|l| l.style(style)),
                 );
@@ -3228,6 +3228,17 @@ fn draw_scrolled(
 /// a word longer than a row, each row after the first starting `hang`
 /// columns in; the spans keep their styles.
 fn wrap_spans(spans: Vec<Span<'static>>, width: usize, hang: usize) -> Vec<Line<'static>> {
+    wrap_led(spans, width, vec![Span::raw(" ".repeat(hang))])
+}
+
+/// `spans` wrapped as `wrap_spans` does, each row after the first starting
+/// with `lead`, such as a quote's bar: the bar runs down the whole quote.
+fn wrap_led(
+    spans: Vec<Span<'static>>,
+    width: usize,
+    lead: Vec<Span<'static>>,
+) -> Vec<Line<'static>> {
+    let hang: usize = lead.iter().map(Span::width).sum();
     let width = width.max(hang + 10);
     let fits = |used: usize, word: &str| used + word.trim_end().chars().count() <= width;
     let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
@@ -3235,8 +3246,11 @@ fn wrap_spans(spans: Vec<Span<'static>>, width: usize, hang: usize) -> Vec<Line<
     for span in spans {
         for word in span.content.split_inclusive(' ') {
             let mut word = word.to_string();
-            if !is_empty && !fits(used, &word) {
-                rows.push(vec![Span::raw(" ".repeat(hang))]);
+            // A word longer than a whole row is cut where it stands rather
+            // than leaving the row before it, a bullet say, on its own.
+            let fits_a_row = word.trim_end().chars().count() <= width - hang;
+            if !is_empty && !fits(used, &word) && fits_a_row {
+                rows.push(lead.clone());
                 used = hang;
             }
             while !fits(used, &word) {
@@ -3246,7 +3260,7 @@ fn wrap_spans(spans: Vec<Span<'static>>, width: usize, hang: usize) -> Vec<Line<
                 if let Some(row) = rows.last_mut() {
                     row.push(Span::styled(head, span.style));
                 }
-                rows.push(vec![Span::raw(" ".repeat(hang))]);
+                rows.push(lead.clone());
                 used = hang;
             }
             used += word.chars().count();
@@ -3269,8 +3283,8 @@ fn markdown(text: &str, width: usize, indent: usize) -> Vec<Line<'static>> {
         };
         for line in lines {
             let style = line.style;
-            let hang = bullet_hang(&line);
-            for row in wrap_spans(line.spans, width.saturating_sub(indent + 1), hang) {
+            let lead = continuation(&line);
+            for row in wrap_led(line.spans, width.saturating_sub(indent + 1), lead) {
                 let mut spans = vec![Span::raw(" ".repeat(indent))];
                 spans.extend(row.spans);
                 out.push(Line::from(spans).style(style));
@@ -3299,21 +3313,33 @@ fn tables_as_code(text: &str) -> String {
     out.join("\n")
 }
 
-/// How far a list item's wrapped rows go in, so they continue under its
-/// text rather than its bullet: `• `, `- ` or `12. `, after any indent.
-fn bullet_hang(line: &Line) -> usize {
+/// What a line's wrapped rows start with, so they continue under its text:
+/// a quote's bars again, then spaces for any indent and a list item's
+/// bullet (`• `, `- ` or `12. `).
+fn continuation(line: &Line) -> Vec<Span<'static>> {
     let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-    let indent = text.chars().take_while(|c| *c == ' ').count();
-    let rest = &text[indent..];
+    let mut rest = text.as_str();
+    let mut bars = 0;
+    while let Some(after) = rest.strip_prefix("│ ") {
+        bars += 1;
+        rest = after;
+    }
+    let indent = rest.chars().take_while(|c| *c == ' ').count();
+    let rest = &rest[indent..];
     let digits = rest.chars().take_while(char::is_ascii_digit).count();
-    let marker = if ["• ", "- ", "* ", "> "].iter().any(|b| rest.starts_with(b)) {
+    let marker = if ["• ", "- ", "* "].iter().any(|b| rest.starts_with(b)) {
         2
     } else if digits > 0 && rest[digits..].starts_with(". ") {
         digits + 2
     } else {
         0
     };
-    if marker == 0 { 0 } else { indent + marker }
+    let mut lead = Vec::new();
+    if bars > 0 {
+        lead.push(Span::styled("│ ".repeat(bars), fg(theme().muted)));
+    }
+    lead.push(Span::raw(" ".repeat(indent + marker)));
+    lead
 }
 
 /// `text` padded with spaces to `width` columns as the terminal draws it,
@@ -3370,6 +3396,9 @@ fn code_lines(
     code.iter()
         .flat_map(|line| {
             let (sign, text) = line.split_at(line.len().min(1));
+            // As the diff draws a tab, so every row is as wide as it says.
+            let text = text.replace('\t', "    ");
+            let text = text.as_str();
             let bg = match sign {
                 "+" => Some(palette.added),
                 "-" => Some(palette.removed),
@@ -3534,10 +3563,12 @@ fn pr_findings(pr: &PrView, popup: &PrPopup, width: usize) -> (Vec<Line<'static>
     };
     lines.push(Line::styled(whose, muted));
     if bot.reviewing {
-        lines.push(Line::styled(
-            " CodeRabbit is reviewing the newest push; these are from before it.",
-            fg(t.warning),
-        ));
+        let note = if bot.reviewed.as_deref() == Some(pr.head.as_str()) {
+            " CodeRabbit is reviewing it again; these are from its last review."
+        } else {
+            " CodeRabbit is reviewing the newest push; these are from before it."
+        };
+        lines.push(Line::styled(note, fg(t.warning)));
     }
     lines.push(Line::raw(""));
     let findings = pr_view::findings(pr, popup.nitpicks);
@@ -5040,6 +5071,7 @@ mod pr_view_tests {
         pr.threads[0].body = "\u{274c} New issue: [**Complex Method**](https://codescene.io/x) in <sub>x.rs</sub> <!-- hidden -->".into();
         if let Some(bot) = pr.bot.as_mut() {
             bot.reviewing = true;
+            bot.reviewed = Some("old5678".into());
             let mut fix: Vec<String> = (0..60).map(|i| format!("+    step {i};")).collect();
             fix.push("+    launch npm start -- --fullscreen --keep-the-window-open --and-a-flag END_OF_LINE".into());
             fix.push("+the very last line".into());
@@ -5297,6 +5329,66 @@ mod pr_view_tests {
         assert!(
             shown.contains("| Route jobs | Replace the runner |"),
             "{shown}"
+        );
+    }
+
+    #[test]
+    fn tables_quotes_rereviews_and_tabs_draw_cleanly() {
+        let mut app = app();
+        let path = std::path::PathBuf::from("/pool/4/app");
+        while app.current().is_none_or(|t| t.path != path) {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Char('v'));
+        let mut pr = pr();
+        pr.body =
+            "| Condition | On master |\n| --- | --- |\n| radius timestamp | never true |".into();
+        pr.threads[0].body = "> - CI issue: smoke e2e tests (production) are red because three of them failed: \
+            extension-installation-smoke, onboarding-smoke and settings-smoke\n\
+            > - packages/renderer/src/lib/preferences/a-path-longer-than-any-row-in-the-popup-could-hold/rendering-task.spec.ts:92 issue"
+            .into();
+        pr.threads[0].code = vec!["+\tif (attr->name.txt) {".into()];
+        if let Some(bot) = pr.bot.as_mut() {
+            bot.reviewed = Some(pr.head.clone());
+            bot.reviewing = true;
+        }
+        app.pr_loaded(path, Ok(Some(pr)));
+        let shown = screen(&app, 100, 40);
+        assert!(
+            !shown
+                .lines()
+                .any(|r| r.contains("Condition") && r.contains("radius")),
+            "a table in the description keeps its rows:\n{shown}"
+        );
+
+        press(&mut app, KeyCode::Char('3'));
+        let shown = screen(&app, 100, 40);
+        let bars = |row: &str| row.matches('│').count();
+        let first = shown
+            .lines()
+            .find(|r| r.contains("CI issue"))
+            .expect("the quote");
+        for row in shown
+            .lines()
+            .filter(|r| r.contains("onboarding") || r.contains("settings-smoke"))
+        {
+            assert_eq!(
+                bars(row),
+                bars(first),
+                "a wrapped quote keeps its bar: {row}"
+            );
+        }
+        assert!(
+            !shown.lines().any(|r| r.replace(['│', ' '], "") == "•"),
+            "a bullet stays with its text:\n{shown}"
+        );
+        assert!(!shown.contains('\t'), "tabs are spaces:\n{shown}");
+
+        press(&mut app, KeyCode::Char('4'));
+        let shown = screen(&app, 100, 40);
+        assert!(
+            !shown.contains("newest push") && shown.contains("reviewing it again"),
+            "a re-review of the head is not a newer push:\n{shown}"
         );
     }
 }
