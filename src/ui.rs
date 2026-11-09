@@ -39,9 +39,10 @@ use crate::theme::theme;
 
 /// The bar's keys, most useful first: on a narrow bar the keys at the end
 /// are the ones left out, and `?` lists them all.
-const KEYS: [(&str, &str); 15] = [
+const KEYS: [(&str, &str); 16] = [
     ("Enter", "open"),
     ("^Q", "window"),
+    ("^P", "commands"),
     ("?", "help"),
     ("e", "inbox"),
     ("n", "new here"),
@@ -70,6 +71,7 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
             ("^Q", "window, table"),
             ("^\\", "two windows, one"),
             ("^F", "zoom table, windows"),
+            ("^P", "command palette"),
             ("\u{2190} \u{2192}", "chat, info tab"),
             ("n", "new agent here"),
             ("N", "agent in new tree"),
@@ -259,6 +261,7 @@ pub fn draw(
         || popup_opening.is_some()
         || app.picker.is_some()
         || app.port_menu.is_some()
+        || app.palette.is_some()
         || app.phone.is_some()
         || app.scratch_menu.is_some()
         || app.is_help
@@ -304,6 +307,91 @@ pub fn draw(
     } else if app.is_help {
         draw_help(frame, &HELP);
     }
+    // The palette opens over whatever is on screen, a chat's popup too.
+    if let Some(palette) = &app.palette {
+        draw_palette(frame, app, palette);
+    }
+}
+
+/// The rows of commands the palette shows at most.
+const PALETTE_ROWS: u16 = 14;
+
+/// The command palette: what has been typed, then the commands it narrows
+/// to, each with its key at the right, the one picked under the cursor.
+fn draw_palette(frame: &mut Frame, app: &App, palette: &crate::app::Palette) {
+    let t = theme();
+    let commands = app.commands();
+    let screen = frame.area();
+    let width = screen.width.saturating_sub(4).min(72);
+    let rows = u16::try_from(commands.len())
+        .unwrap_or(u16::MAX)
+        .clamp(1, PALETTE_ROWS);
+    let height = (rows + 4).min(screen.height);
+    // Its top holds still as it narrows: placed for the tallest it gets.
+    let tallest = (PALETTE_ROWS + 4).min(screen.height);
+    let area = Rect {
+        y: screen.y + screen.height.saturating_sub(tallest) / 4,
+        ..popup::centered(screen, width, height)
+    };
+    let keys = [("↑↓", "pick"), ("Enter", "run"), ("Esc", "close")];
+    let block = popup_block(Line::styled(
+        " Commands ",
+        fg(t.title).add_modifier(Modifier::BOLD),
+    ))
+    .title_bottom(Line::from(fitting_keys(&keys, width.saturating_sub(2))));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let [input, rule, list] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+    ])
+    .areas(inner);
+    // A query too long for the field shows its end, where the typing is,
+    // and the cursor stays after it, inside the box.
+    let room = usize::from(input.width.saturating_sub(3));
+    let mut shown = palette.query.as_str();
+    while Line::raw(shown).width() > room {
+        let mut chars = shown.chars();
+        chars.next();
+        shown = chars.as_str();
+    }
+    let typed = if palette.query.is_empty() {
+        Line::from(vec![
+            Span::raw("❯ "),
+            Span::styled("a command, a tree number or a branch", fg(t.muted)),
+        ])
+    } else {
+        Line::raw(format!("❯ {shown}"))
+    };
+    frame.render_widget(Paragraph::new(typed), input);
+    frame.set_cursor_position(Position::new(
+        input.x + 2 + u16::try_from(Line::raw(shown).width()).unwrap_or(0),
+        input.y,
+    ));
+    frame.render_widget(
+        Paragraph::new("─".repeat(usize::from(rule.width))).style(fg(t.border)),
+        rule,
+    );
+    if commands.is_empty() {
+        frame.render_widget(Paragraph::new(" nothing matches").style(fg(t.muted)), list);
+        return;
+    }
+    let rows: Vec<Row> = commands
+        .iter()
+        .map(|command| {
+            Row::new(vec![
+                Cell::from(format!(" {}", command.label)),
+                Cell::from(Line::styled(format!("{} ", command.key), fg(t.muted)).right_aligned()),
+            ])
+        })
+        .collect();
+    // The table scrolls so the command picked stays in view.
+    let table = Table::new(rows, [Constraint::Fill(1), Constraint::Length(6)])
+        .row_highlight_style(t.cursor);
+    let mut state = TableState::default().with_selected(Some(palette.selected));
+    frame.render_stateful_widget(table, list, &mut state);
 }
 
 /// The pool at a glance, for the right end of the bottom bar: counts,
@@ -1075,7 +1163,7 @@ fn footer_left(app: &App, width: u16) -> Line<'static> {
     let keys: Vec<(&str, &str)> = KEYS
         .iter()
         .copied()
-        .filter(|(key, _)| !(is_classic(app) && *key == "^Q"))
+        .filter(|(key, _)| !(is_classic(app) && matches!(*key, "^Q" | "^P")))
         .collect();
     let mut spans = fitting_keys(&keys, width.saturating_sub(used));
     spans.extend(narrowing);
@@ -7223,5 +7311,87 @@ mod window_tests {
         app.zoom = Some(Zoom::Table);
         let shown = lines(&drawn(&app, 200, 50)).join("\n");
         assert!(!shown.contains('◧') && !shown.contains('◨'), "{shown}");
+    }
+
+    #[test]
+    fn the_palette_shows_what_is_typed_and_the_commands_it_narrows_to() {
+        let mut app = on("4");
+        app.open_palette();
+        for c in "ret".chars() {
+            app.handle_key(ratatui::crossterm::event::KeyEvent::from(
+                ratatui::crossterm::event::KeyCode::Char(c),
+            ));
+        }
+        let buffer = drawn(&app, 200, 50);
+        let shown = lines(&buffer);
+        let typed = shown
+            .iter()
+            .position(|l| l.contains("❯ ret"))
+            .unwrap_or_else(|| panic!("{}", shown.join("\n")));
+        let first = typed + 2;
+        assert!(
+            shown[first].contains(" Return tree 4 to the pool"),
+            "{}",
+            shown[first]
+        );
+        // Its key at the right of the palette, before its border.
+        let row = &shown[first][shown[first].find("Return").unwrap()..];
+        assert!(
+            row.split('│').next().unwrap().trim_end().ends_with(" r"),
+            "{row}"
+        );
+        let at = shown[first].find("Return").unwrap();
+        let x = u16::try_from(shown[first][..at].chars().count()).unwrap();
+        assert_eq!(
+            buffer[(x, u16::try_from(first).unwrap())].bg,
+            theme().cursor.bg.unwrap_or_default(),
+            "the first is picked"
+        );
+    }
+
+    #[test]
+    fn a_long_query_keeps_its_end_and_the_cursor_inside_the_palette_which_holds_still() {
+        let mut app = on("4");
+        app.open_palette();
+        let top = |app: &App| {
+            lines(&drawn(app, 200, 50))
+                .iter()
+                .position(|l| l.contains("┌ Commands "))
+                .unwrap()
+        };
+        let empty = top(&app);
+        let typed = format!("{}{}", "a".repeat(93), "b".repeat(20));
+        for c in typed.chars() {
+            app.handle_key(ratatui::crossterm::event::KeyEvent::from(
+                ratatui::crossterm::event::KeyCode::Char(c),
+            ));
+        }
+        assert_eq!(top(&app), empty, "the palette holds still as it narrows");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(200, 50)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &app, None, None, None))
+            .unwrap();
+        let cursor = terminal.get_cursor_position().unwrap();
+        let shown = lines(terminal.backend().buffer());
+        let row = &shown[usize::from(cursor.y)];
+        let line: String = row.chars().collect();
+        let border = line
+            .char_indices()
+            .filter(|(_, c)| *c == '│')
+            .map(|(i, _)| line[..i].chars().count())
+            .collect::<Vec<_>>();
+        let right = *border
+            .iter()
+            .find(|&&x| x > usize::from(cursor.x))
+            .unwrap_or(&usize::MAX);
+        assert!(
+            usize::from(cursor.x) < right,
+            "cursor inside the box: {line}"
+        );
+        assert!(
+            line.contains("bbbb │"),
+            "the end of the query shows: {line}"
+        );
     }
 }

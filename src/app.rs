@@ -120,6 +120,107 @@ pub struct Picker {
     pub selected: usize,
 }
 
+/// The command palette Ctrl+P opens: what has been typed to narrow it,
+/// and the command picked.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Palette {
+    pub query: String,
+    pub selected: usize,
+}
+
+/// A command the palette offers: what it says it does, the key that does
+/// the same, and what running it presses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Command {
+    pub label: String,
+    pub key: String,
+    run: Run,
+}
+
+/// What running a command does: presses its key on the table, or puts the
+/// cursor on a tree and opens it, as Enter there does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Run {
+    Key(KeyEvent),
+    Open(String),
+}
+
+/// The commands on the tree under the cursor, `{}` its name, each with the
+/// key that does it.
+const TREE_COMMANDS: [(&str, char); 20] = [
+    ("Return tree {} to the pool", 'r'),
+    ("New agent in tree {}", 'n'),
+    ("Write to tree {}'s agent", 'm'),
+    ("Show the diff of tree {}", 'd'),
+    ("Show the PR of tree {}", 'v'),
+    ("Open tree {}'s PR on GitHub", 'O'),
+    ("Send tree {}'s failure to its agent", 'f'),
+    ("Start a ship run of tree {}", 's'),
+    ("Resume tree {}'s agent", 'R'),
+    ("Hand tree {}'s work to a new agent", 'h'),
+    ("Go to tree {} itself", 't'),
+    ("Rename the branch of tree {}", 'b'),
+    ("Park tree {}", 'z'),
+    ("Put tree {} on the Backburner", 'x'),
+    ("Mark tree {}", ' '),
+    ("Open tree {}'s port in the browser", 'o'),
+    ("Share tree {}'s port with the phone", 'p'),
+    ("Put tree {}'s port on the internet", 'P'),
+    ("Open tree {}'s issue", 'i'),
+    ("Choose the issue tree {} works on", 'I'),
+];
+
+/// The commands on the pool, each with the key that does it, `^` for one
+/// with Ctrl.
+const POOL_COMMANDS: [(&str, &str); 13] = [
+    ("New agent in a fresh tree", "N"),
+    ("Ask the assistant", ":"),
+    ("Open the assistant's chat", "a"),
+    ("Issues", "Tab"),
+    ("Switch workspace", "w"),
+    ("Scratch chats", "C"),
+    ("Filter the trees", "/"),
+    ("Open the inbox", "e"),
+    ("Hide or show the inbox", "E"),
+    ("Two windows, or one", "^\\"),
+    ("Zoom the table or the windows", "^F"),
+    ("Every key", "?"),
+    ("Quit", "q"),
+];
+
+/// The key event a command's key stands for.
+fn key_event(key: &str) -> KeyEvent {
+    match key {
+        "Tab" => KeyEvent::from(KeyCode::Tab),
+        _ => match key.strip_prefix('^').and_then(|rest| rest.chars().next()) {
+            Some(c) => KeyEvent::new(KeyCode::Char(c.to_ascii_lowercase()), KeyModifiers::CONTROL),
+            None => KeyEvent::from(KeyCode::Char(key.chars().next().unwrap_or(' '))),
+        },
+    }
+}
+
+/// How well `label` answers `query`: every word typed is in it, scored by
+/// where the first one falls, at its start, at a word's start, or within.
+/// None where a word is missing.
+fn rank(label: &str, query: &str) -> Option<u8> {
+    let label = label.to_lowercase();
+    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    let first = words.first()?;
+    if !words.iter().all(|word| label.contains(word.as_str())) {
+        return None;
+    }
+    Some(if label.starts_with(first.as_str()) {
+        0
+    } else if label
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|word| word.starts_with(first.as_str()))
+    {
+        1
+    } else {
+        2
+    })
+}
+
 /// The ports of a tree serving several, for `o` or `p` to choose from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortMenu {
@@ -560,6 +661,8 @@ pub struct App {
     pub other: Option<OtherWindow>,
     /// What Ctrl+F zoomed, while it is zoomed.
     pub zoom: Option<Zoom>,
+    /// The command palette, while Ctrl+P has it open.
+    pub palette: Option<Palette>,
     /// In a double, the side of the window the cursor drives, the one that
     /// last had the keys: 0 on the left, 1 on the right.
     pub side: usize,
@@ -1084,6 +1187,107 @@ impl App {
             (tree, WindowTab::Chat) => Self::chat_agent(tree)?.plugin.as_deref(),
             _ => None,
         }
+    }
+
+    /// Ctrl+P: opens the command palette.
+    pub fn open_palette(&mut self) {
+        self.palette = Some(Palette::default());
+    }
+
+    /// The commands the palette offers for what has been typed: the tree
+    /// under the cursor's first, then the pool's, then, once something is
+    /// typed, each tree to open; the best answers to it first.
+    pub fn commands(&self) -> Vec<Command> {
+        let query = self.palette.as_ref().map_or("", |p| p.query.as_str());
+        let mut all = Vec::new();
+        if let Some(tree) = self.current() {
+            for (label, key) in TREE_COMMANDS {
+                all.push(Command {
+                    label: label.replace("{}", &tree.name),
+                    key: if key == ' ' {
+                        "Space".to_string()
+                    } else {
+                        key.to_string()
+                    },
+                    run: Run::Key(KeyEvent::from(KeyCode::Char(key))),
+                });
+            }
+        }
+        for (label, key) in POOL_COMMANDS {
+            all.push(Command {
+                label: label.to_string(),
+                key: key.to_string(),
+                run: Run::Key(key_event(key)),
+            });
+        }
+        if !query.trim().is_empty() {
+            // Every tree, those a filter or a folded group keeps out of the
+            // list too: opening one brings it back into it.
+            for tree in self.trees.iter().filter(|t| !t.is_main) {
+                let branch = tree.branch.as_deref().unwrap_or("(detached)");
+                all.push(Command {
+                    label: format!("Open tree {} · {branch}", tree.name),
+                    key: String::new(),
+                    run: Run::Open(tree.name.clone()),
+                });
+            }
+            let mut ranked: Vec<(u8, Command)> = all
+                .into_iter()
+                .filter_map(|command| Some((rank(&command.label, query)?, command)))
+                .collect();
+            // A tree whose number is what was typed comes before any other.
+            let exact = |command: &Command| command.run == Run::Open(query.trim().to_string());
+            ranked.sort_by_key(|(score, command)| (!exact(command), *score));
+            return ranked.into_iter().map(|(_, command)| command).collect();
+        }
+        all
+    }
+
+    /// The keys while the palette is open: type to narrow it, Up and Down
+    /// to pick, Enter to run the command picked, Esc to close it.
+    fn handle_palette_key(&mut self, key: KeyEvent) -> Outcome {
+        let count = self.commands().len();
+        let Some(palette) = self.palette.as_mut() else {
+            return Outcome::Continue;
+        };
+        match key.code {
+            KeyCode::Esc => self.palette = None,
+            KeyCode::Down => palette.selected = (palette.selected + 1).min(count.saturating_sub(1)),
+            KeyCode::Up => palette.selected = palette.selected.saturating_sub(1),
+            KeyCode::Backspace => {
+                palette.query.pop();
+                palette.selected = 0;
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                palette.query.push(c);
+                palette.selected = 0;
+            }
+            KeyCode::Enter => {
+                let selected = palette.selected;
+                let picked = self.commands().into_iter().nth(selected);
+                self.palette = None;
+                if let Some(command) = picked {
+                    // A command runs as its key does on the table.
+                    self.is_window_focused = false;
+                    return match command.run {
+                        Run::Key(key) => self.handle_key(key),
+                        Run::Open(name) => {
+                            let path = self
+                                .trees
+                                .iter()
+                                .find(|t| t.name == name)
+                                .map(|t| t.path.clone());
+                            if let Some(path) = path {
+                                self.reveal(path);
+                            }
+                            self.handle_key(KeyEvent::from(KeyCode::Enter))
+                        }
+                    };
+                }
+            }
+            _ => {}
+        }
+        Outcome::Continue
     }
 
     /// Ctrl+F: zooms `what`, the table from the table and the windows from
@@ -1864,6 +2068,7 @@ impl App {
                 KeyCode::Char('r') => self.read_pr(path),
                 KeyCode::Char('q' | 'Q') => self.cycle_keys(),
                 KeyCode::Char('f' | 'F') => self.toggle_zoom(Zoom::Windows),
+                KeyCode::Char('p' | 'P') => self.open_palette(),
                 _ => {}
             }
             return Outcome::Continue;
@@ -2002,6 +2207,7 @@ impl App {
                 }
                 KeyCode::Char('q' | 'Q') => self.cycle_keys(),
                 KeyCode::Char('f' | 'F') => self.toggle_zoom(Zoom::Windows),
+                KeyCode::Char('p' | 'P') => self.open_palette(),
                 _ => {}
             }
             return Outcome::Continue;
@@ -3900,6 +4106,10 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Outcome {
+        // The palette opens over everything, a diff or a PR with the keys too.
+        if self.palette.is_some() {
+            return self.handle_palette_key(key);
+        }
         if self.view.is_some() && self.has_keys_on(WindowTab::Diff) {
             return self.handle_view_key(key);
         }
@@ -3966,6 +4176,20 @@ impl App {
                     // keys to, as before treetop had windows.
                     if is_free && self.zoom != Some(Zoom::Table) {
                         self.cycle_keys();
+                    }
+                    Outcome::Continue
+                }
+                // Ctrl+P: the command palette, once nothing else on screen
+                // waits on the keys, so no command lands in a dialog.
+                KeyCode::Char('p' | 'P') => {
+                    let is_free = self.reviews.is_empty()
+                        && self.pending.is_none()
+                        && self.shipping.is_none()
+                        && !self.is_help
+                        && !self.is_filtering
+                        && self.rail.is_none();
+                    if is_free {
+                        self.open_palette();
                     }
                     Outcome::Continue
                 }
@@ -7553,5 +7777,129 @@ mod tests {
         assert_eq!(app.zoom, Some(Zoom::Table));
         ctrl(&mut app, 'q');
         assert!(!app.is_window_focused, "the table keeps the keys");
+    }
+
+    fn type_into_palette(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    #[test]
+    fn the_palette_finds_a_command_by_its_words_and_runs_it_as_its_key_does() {
+        let mut app = with_chat(Status::Busy);
+        // From a chat with the keys, as from the table.
+        app.is_window_focused = true;
+        ctrl(&mut app, 'p');
+        assert!(app.palette.is_some());
+        type_into_palette(&mut app, "ret");
+        let first = app.commands().into_iter().next().unwrap();
+        assert_eq!(
+            (first.label.as_str(), first.key.as_str()),
+            ("Return tree 4 to the pool", "r")
+        );
+        press(&mut app, KeyCode::Enter);
+        assert!(app.palette.is_none());
+        assert!(app.pending.is_some(), "the return dialog, as r opens it");
+        assert!(!app.is_window_focused, "it ran on the table");
+        // A command that starts with the word typed comes before one that
+        // has it further in, wherever it sits in the list.
+        app.pending = None;
+        ctrl(&mut app, 'p');
+        type_into_palette(&mut app, "issue");
+        let first = app.commands().into_iter().next().unwrap();
+        assert_eq!(first.label, "Issues");
+    }
+
+    #[test]
+    fn a_tree_number_offers_to_open_that_tree() {
+        let mut app = with_chat(Status::Busy);
+        ctrl(&mut app, 'p');
+        type_into_palette(&mut app, "8");
+        let first = app.commands().into_iter().next().unwrap();
+        assert_eq!(first.label, "Open tree 8 · feature/end-2-b");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.current().map(|t| t.name.as_str()), Some("8"));
+        // Nothing typed, the pool's commands follow the tree's; Esc closes.
+        ctrl(&mut app, 'p');
+        let all = app.commands();
+        assert_eq!(all[0].label, "Return tree 8 to the pool");
+        assert!(
+            all.iter()
+                .any(|c| c.label == "New agent in a fresh tree" && c.key == "N")
+        );
+        assert!(
+            !all.iter().any(|c| c.label.contains(" · ")),
+            "trees to open only once typed"
+        );
+        type_into_palette(&mut app, "zzzz");
+        assert!(app.commands().is_empty());
+        press(&mut app, KeyCode::Esc);
+        assert!(app.palette.is_none());
+    }
+
+    #[test]
+    fn the_palette_takes_the_keys_over_a_diff_and_waits_out_a_dialog() {
+        // Opened from a diff with the keys, the palette takes what is typed.
+        let mut app = with_chat(Status::Busy);
+        press(&mut app, KeyCode::Char('d'));
+        assert!(app.has_keys_on(WindowTab::Diff));
+        ctrl(&mut app, 'p');
+        type_into_palette(&mut app, "ret");
+        assert_eq!(app.palette.as_ref().map(|p| p.query.as_str()), Some("ret"));
+        // Over a dialog it does not open, so no command lands in the dialog.
+        let mut app = with_chat(Status::Busy);
+        press(&mut app, KeyCode::Char('r'));
+        assert!(app.pending.is_some());
+        ctrl(&mut app, 'p');
+        assert!(app.palette.is_none());
+    }
+
+    #[test]
+    fn the_palette_offers_every_tree_and_an_exact_number_first() {
+        // A tree out of the list, behind a filter or in a folded group, is
+        // offered too; opening it brings it back so the cursor lands on it.
+        let mut app = with_chat(Status::Busy);
+        app.filter = "end-1".into();
+        select(&mut app, "4");
+        ctrl(&mut app, 'p');
+        type_into_palette(&mut app, "8");
+        assert!(app.commands()[0].label.starts_with("Open tree 8 · "));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.current().map(|t| t.name.as_str()), Some("8"));
+        assert!(app.filter.is_empty(), "the filter that hid it is cleared");
+        let free = app
+            .trees
+            .iter()
+            .find(|t| t.name == "7")
+            .and_then(|t| app.group_of(t))
+            .unwrap();
+        app.folded.insert(free.clone());
+        assert!(
+            !app.rows()
+                .iter()
+                .any(|r| matches!(r, ListRow::Tree(t) if t.name == "7"))
+        );
+        ctrl(&mut app, 'p');
+        type_into_palette(&mut app, "7");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.current().map(|t| t.name.as_str()), Some("7"));
+        assert!(!app.folded.contains(&free), "its group opened");
+        let mut trees = app.trees.clone();
+        trees.push(Tree {
+            name: "48".into(),
+            path: "/p/48/app".into(),
+            ..app.trees[0].clone()
+        });
+        app.set_trees(trees);
+        ctrl(&mut app, 'p');
+        type_into_palette(&mut app, "8");
+        let opens: Vec<String> = app
+            .commands()
+            .into_iter()
+            .filter(|c| c.label.contains(" · "))
+            .map(|c| c.label)
+            .collect();
+        assert!(opens[0].starts_with("Open tree 8 · "), "{opens:?}");
     }
 }

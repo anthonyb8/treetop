@@ -140,11 +140,13 @@ fn popup_size(term: &Term, app: &App) -> Result<(u16, u16)> {
 /// A chat takes the keys: one in a popup, or the window's while it has
 /// them on its chat or shell tab.
 fn chat_has_keys(chats: &Chats, app: &App) -> bool {
-    chats.open().is_some_and(|chat| {
-        ui::is_popup_chat(chat)
-            || app.has_keys_on(app::WindowTab::Chat)
-            || app.has_keys_on(app::WindowTab::Shell)
-    })
+    // The palette takes the keys over any chat while it is open.
+    app.palette.is_none()
+        && chats.open().is_some_and(|chat| {
+            ui::is_popup_chat(chat)
+                || app.has_keys_on(app::WindowTab::Chat)
+                || app.has_keys_on(app::WindowTab::Shell)
+        })
 }
 
 /// The chat open is the one the window's tab shows for its tree: its
@@ -875,7 +877,15 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                 &Event::Key(key) if key.kind != KeyEventKind::Release => {
                     // Ctrl+F zooms the windows from an agent's chat; a shell
                     // keeps it, as cursor-forward and page down.
-                    if chat::is_zoom(key) && !ui::is_popup_chat(open) && open.agent != app::SHELL {
+                    // From a tree's chat only: the assistant's and a scratch
+                    // chat's popups belong to no tree, and would cover a
+                    // command's dialog.
+                    if chat::is_palette(key) && !is_popup && open.agent != app::SHELL {
+                        app.open_palette();
+                    } else if chat::is_zoom(key)
+                        && !ui::is_popup_chat(open)
+                        && open.agent != app::SHELL
+                    {
                         app.toggle_zoom(app::Zoom::Windows);
                     } else if chat::is_exit(key) && !ui::is_popup_chat(open) {
                         app.cycle_keys();

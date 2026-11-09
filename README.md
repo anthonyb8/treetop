@@ -43,6 +43,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 |---|---|
 | Enter | give the keys to the chat of the agent in the tree under the cursor, in the window under the table, starting a cold one again, else go to the tree itself (see [Agent chats](#agent-chats) and [Entering a tree](#entering-a-tree)); on a group's heading, fold the group or open it again, and on the main checkout's, open the chat of its agent when it has one |
 | Ctrl+Q | give the keys to the chat in the window under the table, and from the chat back to the table; with two windows, move them round the table, the left window and the right one |
+| Ctrl+P | open the command palette: every action, the tree under the cursor's first, found by typing a few of its words, a tree number or a branch, and run with Enter |
 | Ctrl+F | zoom: on the table, the table over the whole screen; in a window, the windows, with the table folded to their trees' rows; again, back |
 | Ctrl+\\ | show two windows under the table, the tree under the cursor on the left and the next tree down on the right, or one again |
 | `←` `→` | step through the window's tabs: chat, diff, PR, run, shell and info |
@@ -415,6 +416,11 @@ Ctrl+\\ again goes back to one window, the one that last had the keys.
 A terminal too narrow for both shows the window the cursor drives alone, its title saying `1 of 2` or `2 of 2`, and Ctrl+Q still moves between them.
 The double is kept per workspace under `$XDG_STATE_HOME/treetop`, so treetop opens it again as it was left.
 Inside a chat, Ctrl+\\ still goes to the next agent's chat (see [Agent chats](#agent-chats)).
+
+**Ctrl+P** opens the command palette over whatever is on screen: every action treetop has, those on the tree under the cursor first and then the pool's, each with the key that does the same at its right.
+Typing narrows it to the commands with every word typed, those starting with the first word first; a tree number or a branch offers to open that tree, as Enter on it does, clearing a filter or opening a folded group that hid it.
+Up and Down pick a command, Enter runs it as its key does on the table, and Esc closes it.
+In a tree's agent chat treetop takes Ctrl+P for it, as it takes Ctrl+Q; a shell keeps it, as its history's previous line, and so do the assistant's and scratch chats.
 
 **Ctrl+F** zooms: on the table, to the screen treetop had before its windows, the table unboxed over the screen above the bar with the tree under the cursor in full in a pane under it, and the keys; in a window, the windows take it, the table folded to the rows of their trees where the terminal has room for them, and the inbox set aside.
 Ctrl+F again zooms back out.

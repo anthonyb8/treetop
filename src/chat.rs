@@ -949,6 +949,12 @@ pub fn is_zoom(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('f' | 'F'))
 }
 
+/// Ctrl+P, which opens the command palette from an agent's chat. A shell
+/// keeps it, as its history's previous line.
+pub fn is_palette(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('p' | 'P'))
+}
+
 /// Ctrl+Q, which leaves the chat. Claude Code binds no Ctrl+Q, and in raw
 /// mode it is no flow control, so the chat never needs it; Ctrl+], which
 /// Claude Code uses, passes through.
