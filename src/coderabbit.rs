@@ -82,16 +82,11 @@ pub fn review(body: &str) -> Vec<Finding> {
     let mut section: Option<Kind> = None;
     let mut path: Option<String> = None;
     let mut item: Option<(String, String)> = None;
-    let mut close = |item: &mut Option<(String, String)>, path: &Option<String>, kind: Kind| {
-        if let Some((lines, text)) = item.take() {
-            let mut found = finding(&text, kind);
-            found.path.clone_from(path);
-            found.lines = Some(lines);
-            if !found.title.is_empty() || !found.body.is_empty() {
-                findings.push(found);
-            }
-        }
-    };
+    // A section's text outside any item it could read, and how many
+    // findings there were when it opened: one that yields none comes
+    // through whole rather than going missing.
+    let mut loose = String::new();
+    let mut opened_at = 0;
     for line in body.lines() {
         let trimmed = line.trim();
         // A heading opens a section or a file; any other `<summary>`, such as
@@ -109,25 +104,87 @@ pub fn review(body: &str) -> Vec<Finding> {
                 (section.is_some() && file != summary).then_some((section, Some(file)))
             }
         });
-        if let Some(opened) = heading {
-            close(&mut item, &path, section.unwrap_or_default());
-            (section, path) = opened;
+        if let Some((next, file)) = heading {
+            close(&mut findings, &mut item, &path, section.unwrap_or_default());
+            if let Some(file) = &file {
+                loose.push_str(&format!("\n\n**{file}**\n\n"));
+            } else {
+                unread(&mut findings, section, &mut loose, opened_at);
+                opened_at = findings.len();
+            }
+            (section, path) = (next, file);
             continue;
         }
         let Some(kind) = section else { continue };
         if let Some((lines, rest)) = item_start(trimmed) {
-            close(&mut item, &path, kind);
+            close(&mut findings, &mut item, &path, kind);
             item = Some((lines, rest.to_string()));
         } else if let Some((_, text)) = item.as_mut() {
             text.push('\n');
             text.push_str(line);
             if trimmed.starts_with(COMMENT_END) {
-                close(&mut item, &path, kind);
+                close(&mut findings, &mut item, &path, kind);
             }
+        } else {
+            loose.push('\n');
+            loose.push_str(line);
         }
     }
-    close(&mut item, &path, section.unwrap_or_default());
+    close(&mut findings, &mut item, &path, section.unwrap_or_default());
+    unread(&mut findings, section, &mut loose, opened_at);
     findings
+}
+
+/// The item being read, as a finding on `path`.
+fn close(
+    findings: &mut Vec<Finding>,
+    item: &mut Option<(String, String)>,
+    path: &Option<String>,
+    kind: Kind,
+) {
+    if let Some((lines, text)) = item.take() {
+        let mut found = finding(&text, kind);
+        found.path.clone_from(path);
+        found.lines = Some(lines);
+        if !found.title.is_empty() || !found.body.is_empty() {
+            findings.push(found);
+        }
+    }
+}
+
+/// A section that yielded no findings, as one with all its text, so a shape
+/// this cannot split still shows, and `f` sends it whole.
+fn unread(
+    findings: &mut Vec<Finding>,
+    section: Option<Kind>,
+    loose: &mut String,
+    opened_at: usize,
+) {
+    let text = std::mem::take(loose);
+    let Some(kind) = section else { return };
+    // Its tags out but not its folded sections, which it all sits inside.
+    let mut lines: Vec<&str> = Vec::new();
+    let stripped = without_tags(&text);
+    for line in stripped.lines().map(str::trim) {
+        if !(line.is_empty() && lines.last().is_none_or(|l| l.is_empty())) {
+            lines.push(line);
+        }
+    }
+    let body = lines.join("\n").trim().to_string();
+    if findings.len() > opened_at || body.is_empty() {
+        return;
+    }
+    let what = if kind == Kind::Nitpick {
+        "Nitpicks"
+    } else {
+        "Comments"
+    };
+    findings.push(Finding {
+        kind,
+        title: format!("{what} CodeRabbit wrote in a shape treetop cannot split"),
+        body,
+        ..Finding::default()
+    });
 }
 
 /// The comment cut at each `cr-comment` marker; one chunk when it has none.
@@ -714,6 +771,25 @@ mod tests {
         assert_eq!(
             f.prompt.as_deref(),
             Some("In operator.go wait for the old pod.")
+        );
+    }
+
+    #[test]
+    fn nitpicks_in_a_shape_it_cannot_split_come_through_as_one() {
+        let found = review(
+            "<details>\n<summary>🧹 Nitpick comments (2)</summary><blockquote>\n\n<details>\n<summary>src/b.rs (2)</summary><blockquote>\n\n\
+             Lines 3 to 4: **Name the closure.** It reads better named.\n\nLine 9: **Drop the clone.** It is not needed.\n\n\
+             </blockquote></details>\n\n</blockquote></details>",
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        let f = &found[0];
+        assert_eq!(f.kind, Kind::Nitpick);
+        assert!(
+            f.body.contains("src/b.rs")
+                && f.body.contains("Name the closure")
+                && f.body.contains("Drop the clone"),
+            "the whole section, under its files: {}",
+            f.body
         );
     }
 }
