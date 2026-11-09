@@ -2017,7 +2017,7 @@ impl App {
     }
 
     /// Gives the window under the table the keys in Insert, so what is
-    /// typed goes to its chat: Enter on a tree, the inbox, or a click.
+    /// typed goes to its chat: a click in it.
     pub fn insert_in_window(&mut self) {
         self.is_window_focused = true;
         self.is_inserting = true;
