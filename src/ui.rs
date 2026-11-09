@@ -217,7 +217,13 @@ pub fn draw(
                 } else {
                     " Trees "
                 };
-                let block = window_block(!app.is_window_focused && app.rail.is_none()).title(title);
+                // Marked only while nothing else takes the keys: a window,
+                // the inbox, a compose box or the palette.
+                let has_keys = !app.is_window_focused
+                    && app.rail.is_none()
+                    && app.prompt.is_none()
+                    && app.palette.is_none();
+                let block = window_block(has_keys).title(title);
                 let body = block.inner(inbox.list);
                 frame.render_widget(block, inbox.list);
                 draw_table(frame, app, body, fold);
@@ -7393,5 +7399,22 @@ mod window_tests {
             line.contains("bbbb │"),
             "the end of the query shows: {line}"
         );
+    }
+
+    #[test]
+    fn the_table_is_not_marked_while_a_form_or_the_palette_has_the_keys() {
+        let mut app = on("4");
+        let table = |app: &App| {
+            let buffer = drawn(app, 200, 50);
+            buffer[(0, 0)].fg
+        };
+        assert_eq!(table(&app), theme().title, "the table has the keys");
+        app.handle_key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Char('N'),
+        ));
+        assert_eq!(table(&app), theme().border, "the form has them");
+        app.prompt = None;
+        app.open_palette();
+        assert_eq!(table(&app), theme().border, "the palette has them");
     }
 }
