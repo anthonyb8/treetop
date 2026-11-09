@@ -87,6 +87,9 @@ const CHAT_TICK: Duration = Duration::from_millis(16);
 /// How long the cursor rests on a tree before the window under the table
 /// opens its chat, so moving down the list starts no chat on the way.
 const WINDOW_REST: Duration = Duration::from_millis(300);
+/// How long before the second window of a double tries again to start a
+/// chat that would not start.
+const OTHER_RETRY: Duration = Duration::from_secs(5);
 /// How often the screen is drawn when nothing has changed, for the listing's
 /// age in the summary.
 const REDRAW: Duration = Duration::from_secs(1);
@@ -366,6 +369,8 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
     // its chat, diff or PR opens once the cursor has rested there for
     // WINDOW_REST.
     let mut window_wants: (Option<(PathBuf, app::WindowTab)>, Instant) = (None, Instant::now());
+    // The second window's chat last started behind the screen, and when.
+    let mut other_tried: (Option<Vec<String>>, Instant) = (None, Instant::now());
     // A scratch chat starting, and those being deleted, off this thread.
     let mut starting_scratch: Option<mpsc::Receiver<Result<scratch::Scratch, String>>> = None;
     let mut removing_scratch: Vec<mpsc::Receiver<Result<String, String>>> = Vec::new();
@@ -721,6 +726,10 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             let here = app.window_tree().map(|t| (t.path.clone(), app.shown_tab()));
             if here != window_wants.0 {
                 window_wants = (here, Instant::now());
+                // A double is kept as the cursor leaves it, for a restart.
+                if app.other.is_some() {
+                    app.save_layout();
+                }
             }
             let is_rested = app.is_window_focused || window_wants.1.elapsed() >= WINDOW_REST;
             let wanted = app.window_chat();
@@ -744,6 +753,24 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             }
             if is_rested {
                 app.sync_window();
+            }
+            // The second window of a double shows its chat or shell live,
+            // run behind the one with the keys; one that will not start is
+            // tried again every OTHER_RETRY rather than on every pass.
+            if let Some((command, agent, tree)) = app.other_chat()
+                && chats.running(&command).is_none()
+                && (other_tried.0.as_ref() != Some(&command)
+                    || other_tried.1.elapsed() >= OTHER_RETRY)
+            {
+                let size = chat_size(term, app)?;
+                let hints = app.other_plugin().and_then(plugin::screen_of);
+                if chats
+                    .run_behind(&command, size, (agent, tree), hints)
+                    .is_ok()
+                {
+                    is_stale = true;
+                }
+                other_tried = (Some(command), Instant::now());
             }
         }
         let pumped = chats.pump();
@@ -773,26 +800,8 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             }
             is_stale = true;
         }
-        if is_stale || drawn_at.elapsed() >= REDRAW {
-            let size = term.size()?;
-            app.window_rows = ui::window_chat_area(app, Rect::new(0, 0, size.width, size.height))
-                .map_or(0, |area| area.height);
-            term.draw(|frame| ui::draw(frame, app, chats.open(), issues.as_ref()))?;
-            is_stale = false;
-            drawn_at = Instant::now();
-        }
-        if !event::poll(if chat_has_keys(&chats, app) {
-            CHAT_TICK
-        } else {
-            TICK
-        })? {
-            continue;
-        }
-        // A key or a resize: either way the screen is drawn again.
-        is_stale = true;
-        let event = event::read()?;
-        // A resize, or the inbox shown or hidden, changes the room a chat
-        // has beside it.
+        // A resize, the inbox shown or hidden, or the windows split or
+        // joined, changes the room a chat has, before it is drawn there.
         let sizes = (chat_size(term, app)?, popup_size(term, app)?);
         if chat_sized != Some(sizes) {
             let ((rows, cols), (popup_rows, popup_cols)) = sizes;
@@ -807,6 +816,27 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             }
             chat_sized = Some(sizes);
         }
+        if is_stale || drawn_at.elapsed() >= REDRAW {
+            let size = term.size()?;
+            app.window_rows = ui::window_chat_area(app, Rect::new(0, 0, size.width, size.height))
+                .map_or(0, |area| area.height);
+            let other = app
+                .other_chat()
+                .and_then(|(command, ..)| chats.running(&command));
+            term.draw(|frame| ui::draw(frame, app, chats.open(), other, issues.as_ref()))?;
+            is_stale = false;
+            drawn_at = Instant::now();
+        }
+        if !event::poll(if chat_has_keys(&chats, app) {
+            CHAT_TICK
+        } else {
+            TICK
+        })? {
+            continue;
+        }
+        // A key or a resize: either way the screen is drawn again.
+        is_stale = true;
+        let event = event::read()?;
         // Over the window's chat while the table has the keys, the wheel
         // scrolls it and a click gives it the keys.
         if let &Event::Mouse(mouse) = &event
@@ -843,7 +873,10 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             match &event {
                 &Event::Key(key) if key.kind != KeyEventKind::Release => {
                     if chat::is_exit(key) && !ui::is_popup_chat(open) {
-                        leave_window(app)?;
+                        app.cycle_keys();
+                        if !app.is_window_focused {
+                            leave_window(app)?;
+                        }
                     } else if chat::is_exit(key) {
                         let (agent, tree) = (open.agent.clone(), open.tree.clone());
                         chats.hide();
@@ -1114,6 +1147,9 @@ fn show(
         app.scratch_root = scratch::root();
         if let Some(file) = state::asked_file(&checkout) {
             app.keep_asked_in(file);
+        }
+        if let Some(file) = state::layout_file(&checkout) {
+            app.keep_layout_in(file);
         }
         if let Some(file) = inbox::file() {
             app.keep_inbox_in(file);

@@ -68,6 +68,7 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
         &[
             ("Enter", "open, fold heading"),
             ("^Q", "window, table"),
+            ("^\\", "two windows, one"),
             ("\u{2190} \u{2192}", "chat, info tab"),
             ("n", "new agent here"),
             ("N", "agent in new tree"),
@@ -180,7 +181,13 @@ pub fn palette() -> issues::Palette {
 
 /// Draws the screen: the trees, or the Issues screen when it is shown,
 /// with whatever is open over it.
-pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>, issues: Option<&issues::Screen>) {
+pub fn draw(
+    frame: &mut Frame,
+    app: &App,
+    chat: Option<&Chat>,
+    other_chat: Option<&Chat>,
+    issues: Option<&issues::Screen>,
+) {
     // The theme's text colour is the base for every cell; widgets below only
     // add accents, so nothing falls back to a theme's dim default.
     frame.render_widget(Block::new().style(fg(theme().text)), frame.area());
@@ -198,12 +205,16 @@ pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>, issues: Option<&i
             draw_table(frame, app, body);
             if let Some(area) = windows.window {
                 let screen = frame.area();
-                draw_window(
-                    frame,
-                    app,
-                    area,
-                    chat.filter(|c| !floats(app, is_popup_chat(c), screen)),
-                );
+                let (cursor_area, other_area) = pane_areas(app, area);
+                let shown = chat.filter(|c| !floats(app, is_popup_chat(c), screen));
+                let pane = Pane {
+                    is_alone: other_area.is_none() && app.other_window().is_some(),
+                    ..cursor_pane(app)
+                };
+                draw_window(frame, app, cursor_area, &pane, shown);
+                if let (Some(area), Some(pane)) = (other_area, other_pane(app)) {
+                    draw_window(frame, app, area, &pane, other_chat);
+                }
             }
             draw_footer(frame, app, footer);
             if let Some(area) = inbox.strip {
@@ -604,9 +615,10 @@ fn row(app: &App, tree: &Tree) -> Row<'static> {
         Some(b) => Cell::from(b.clone()),
         None => Cell::from("(detached)").style(fg(t.muted)),
     };
+    let name = Line::from(vec![Span::raw(tree.name.clone()), window_marks(app, tree)]);
     let mut cells = vec![
         Cell::from(mark),
-        Cell::from(tree.name.clone()),
+        Cell::from(name),
         status_cell(app, tree),
         Cell::from(
             tree.sidecar
@@ -687,6 +699,25 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_stateful_widget(table, area, &mut state);
 }
 
+/// In a double, the marks of the windows showing `tree`, left then right,
+/// for its row or, for the main checkout, its heading; a tree in both
+/// carries both.
+fn window_marks(app: &App, tree: &Tree) -> Span<'static> {
+    let marks: String = app
+        .other_window()
+        .map(|(other, _)| {
+            let here = app.window_tree().is_some_and(|t| t.path == tree.path);
+            let there = other.path == tree.path;
+            let on = |side: usize| if side == app.side { here } else { there };
+            (0..2)
+                .filter(|&side| on(side))
+                .map(|side| SIDES[side])
+                .collect()
+        })
+        .unwrap_or_default();
+    Span::styled(marks, fg(theme().title))
+}
+
 /// A group's heading: folded or open, which group, and how many trees it
 /// holds. A base's names its branch in the BRANCH column, wide enough for
 /// any name, and the main checkout's branch carries the checkout itself,
@@ -734,8 +765,10 @@ fn heading_row(
             vec![Span::styled(format!("{count} set aside"), fg(t.muted))],
         ),
     };
-    if main.is_some() {
+    if let Some(main) = main {
         name.push(Span::styled("  · main checkout", fg(t.muted)));
+        name.push(Span::raw(" "));
+        name.push(window_marks(app, main));
     }
     let waits = if is_folded && waiting > 0 {
         Cell::from(format!("● {waiting} waiting on you"))
@@ -1162,13 +1195,87 @@ fn window_areas(area: Rect) -> [Rect; 2] {
 /// sizing its terminal and placing its mouse events.
 pub fn window_chat_area(app: &App, screen: Rect) -> Option<Rect> {
     let [main, _] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(screen);
-    windows(app, main).window.map(|area| window_areas(area)[1])
+    let window = windows(app, main).window?;
+    Some(window_areas(pane_areas(app, window).0)[1])
+}
+
+/// The two windows' marks, left and right, in their titles and on their
+/// trees' rows.
+const SIDES: [&str; 2] = ["◧", "◨"];
+
+/// The narrowest window area two windows share side by side; below it a
+/// double shows the window the cursor drives alone.
+const DOUBLE_FROM: u16 = 140;
+
+/// Where the window the cursor drives goes in `window`, and the second
+/// window of a double beside it: halves on its side, or the whole for the
+/// cursor's window alone.
+fn pane_areas(app: &App, window: Rect) -> (Rect, Option<Rect>) {
+    if app.other_window().is_none() || window.width < DOUBLE_FROM {
+        return (window, None);
+    }
+    // Equal halves, an odd column left blank at the right, so one chat size
+    // fits either window.
+    let half = window.width / 2;
+    let halves: [Rect; 2] = [
+        Rect {
+            width: half,
+            ..window
+        },
+        Rect {
+            x: window.x + half,
+            width: half,
+            ..window
+        },
+    ];
+    (halves[app.side], Some(halves[1 - app.side]))
+}
+
+/// What a window draws: the tree it shows and its tabs, whether it has the
+/// keys, its mark in a double, and whether the cursor drives it.
+struct Pane<'a> {
+    tree: Option<&'a Tree>,
+    tab: WindowTab,
+    tabs: Vec<WindowTab>,
+    has_keys: bool,
+    side: Option<usize>,
+    is_cursor: bool,
+    /// One of a double shown alone, the terminal too narrow for both.
+    is_alone: bool,
+}
+
+/// The window the cursor drives.
+fn cursor_pane(app: &App) -> Pane<'_> {
+    let is_double = app.other_window().is_some();
+    Pane {
+        tree: app.window_tree(),
+        tab: app.shown_tab(),
+        tabs: app.window_tabs(),
+        has_keys: app.is_window_focused,
+        side: is_double.then_some(app.side),
+        is_cursor: true,
+        is_alone: false,
+    }
+}
+
+/// The second window of a double, keeping its tree while the cursor
+/// drives the other.
+fn other_pane(app: &App) -> Option<Pane<'_>> {
+    let (tree, tab) = app.other_window()?;
+    Some(Pane {
+        tree: Some(tree),
+        tab,
+        tabs: app.tabs_of(tree),
+        has_keys: false,
+        side: Some(1 - app.side),
+        is_cursor: false,
+        is_alone: false,
+    })
 }
 
 /// A tab's name in the window's bar, with what the PR column or the run
 /// says of it where there is something.
-fn tab_label(app: &App, tab: WindowTab) -> String {
-    let tree = app.window_tree();
+fn tab_label(app: &App, tree: Option<&Tree>, tab: WindowTab) -> String {
     match tab {
         WindowTab::Chat => "chat".into(),
         WindowTab::Diff => "diff".into(),
@@ -1187,16 +1294,15 @@ fn tab_label(app: &App, tab: WindowTab) -> String {
 
 /// The window's tabs, the one shown picked out, each with the columns it
 /// takes in the bar, the same for drawing them as for a click.
-fn tab_spans(app: &App) -> Vec<(WindowTab, Span<'static>)> {
+fn tab_spans(app: &App, pane: &Pane) -> Vec<(WindowTab, Span<'static>)> {
     let t = theme();
-    let shown = app.shown_tab();
-    app.window_tabs()
-        .into_iter()
-        .map(|tab| {
-            let style = if tab == shown { t.header } else { t.bar };
+    pane.tabs
+        .iter()
+        .map(|&tab| {
+            let style = if tab == pane.tab { t.header } else { t.bar };
             (
                 tab,
-                Span::styled(format!(" {} ", tab_label(app, tab)), style),
+                Span::styled(format!(" {} ", tab_label(app, pane.tree, tab)), style),
             )
         })
         .collect()
@@ -1276,18 +1382,28 @@ fn context_note(agent: Option<&Agent>) -> Vec<Span<'static>> {
 /// border, its tabs in a bar on the first row, and under them its agent's
 /// chat, live, or its info. `chat` is the chat open in the window, which
 /// shows only while it is the window agent's.
-fn draw_window(frame: &mut Frame, app: &App, area: Rect, chat: Option<&Chat>) {
+fn draw_window(frame: &mut Frame, app: &App, area: Rect, pane: &Pane, chat: Option<&Chat>) {
     let t = theme();
-    let tree = app.window_tree();
+    let tree = pane.tree;
+    let mark = pane
+        .side
+        .map(|side| format!("{} ", SIDES[side]))
+        .unwrap_or_default();
+    // Alone on a terminal too narrow for both, a window says it has a twin.
+    let alone = if pane.is_alone {
+        format!("{} of 2 · ", pane.side.unwrap_or(0) + 1)
+    } else {
+        String::new()
+    };
     let title = tree.map(|tree| {
         let branch = tree.branch.as_deref().unwrap_or("(detached)");
         if tree.is_main {
-            format!(" main checkout · {branch} ")
+            format!(" {mark}{alone}main checkout · {branch} ")
         } else {
-            format!(" Tree {} · {branch} ", tree.name)
+            format!(" {mark}{alone}Tree {} · {branch} ", tree.name)
         }
     });
-    let block = window_block(app.is_window_focused).title(title.unwrap_or_default());
+    let block = window_block(pane.has_keys).title(title.unwrap_or_default());
     frame.render_widget(block, area);
     let [bar, body] = window_areas(area);
     let Some(tree) = tree else {
@@ -1300,19 +1416,22 @@ fn draw_window(frame: &mut Frame, app: &App, area: Rect, chat: Option<&Chat>) {
         frame.render_widget(Paragraph::new(text).style(fg(t.muted)), body);
         return;
     };
-    let agent = app.window_agent();
-    let tabs: Vec<Span> = tab_spans(app).into_iter().map(|(_, span)| span).collect();
+    let agent = App::chat_agent(tree);
+    let tabs: Vec<Span> = tab_spans(app, pane)
+        .into_iter()
+        .map(|(_, span)| span)
+        .collect();
     frame.render_widget(Paragraph::new(Line::from(tabs)).style(t.bar), bar);
     let note = Line::from(context_note(agent)).right_aligned();
     if note.width() + 14 <= usize::from(bar.width) {
         frame.render_widget(Paragraph::new(note), bar);
     }
-    let shown_tab = app.shown_tab();
+    let shown_tab = pane.tab;
     if shown_tab == WindowTab::Shell {
         match chat.filter(|c| c.tree == tree.name && c.agent == crate::app::SHELL) {
             Some(chat) if chat.is_ready() => {
                 let cursor = draw_screen(chat.screen(), frame.buffer_mut(), body);
-                if let Some(cursor) = cursor.filter(|_| app.is_window_focused) {
+                if let Some(cursor) = cursor.filter(|_| pane.has_keys) {
                     frame.set_cursor_position(cursor);
                 }
             }
@@ -1321,7 +1440,7 @@ fn draw_window(frame: &mut Frame, app: &App, area: Rect, chat: Option<&Chat>) {
         return;
     }
     if matches!(shown_tab, WindowTab::Diff | WindowTab::Pr) {
-        draw_review_tab(frame, app, tree, body);
+        draw_review_tab(frame, app, tree, shown_tab, pane.is_cursor, body);
         return;
     }
     if shown_tab == WindowTab::Chat
@@ -1332,7 +1451,7 @@ fn draw_window(frame: &mut Frame, app: &App, area: Rect, chat: Option<&Chat>) {
             Some(chat) if !chat.is_ready() => draw_note(frame, body, &opening_note(&chat.agent)),
             Some(chat) => {
                 let cursor = draw_screen(chat.screen(), frame.buffer_mut(), body);
-                if let Some(cursor) = cursor.filter(|_| app.is_window_focused) {
+                if let Some(cursor) = cursor.filter(|_| pane.has_keys) {
                     frame.set_cursor_position(cursor);
                 }
             }
@@ -1356,16 +1475,50 @@ fn draw_window(frame: &mut Frame, app: &App, area: Rect, chat: Option<&Chat>) {
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
 }
 
-/// The diff or the PR of `tree`, as its tab shows it, in `area`.
-fn draw_review_tab(frame: &mut Frame, app: &App, tree: &Tree, area: Rect) {
-    if app.shown_tab() == WindowTab::Diff {
-        match app.view.as_ref().filter(|v| v.path == tree.path) {
+/// The diff or the PR of `tree`, as `tab` shows it, in `area`: where the
+/// cursor drives the window, as scrolled; in the other window of a double,
+/// from its top, as last read.
+fn draw_review_tab(
+    frame: &mut Frame,
+    app: &App,
+    tree: &Tree,
+    tab: WindowTab,
+    is_cursor: bool,
+    area: Rect,
+) {
+    if tab == WindowTab::Diff {
+        let view = app
+            .view
+            .as_ref()
+            .filter(|v| is_cursor && v.path == tree.path);
+        match view {
             Some(view) => draw_diff_view(frame, app, view, area),
+            None if !is_cursor && app.diffs.contains_key(&tree.path) => {
+                let still = DiffView {
+                    path: tree.path.clone(),
+                    scroll: 0,
+                    hscroll: 0,
+                };
+                draw_diff_view(frame, app, &still, area);
+            }
+            None if !is_cursor => {
+                draw_note(frame, area, "the diff reads once this window has the keys")
+            }
             None => draw_note(frame, area, "reading the diff..."),
         }
     } else {
-        match app.pr_popup.as_ref().filter(|p| p.path == tree.path) {
+        let popup = app
+            .pr_popup
+            .as_ref()
+            .filter(|p| is_cursor && p.path == tree.path);
+        match popup {
             Some(popup) => draw_pr_view(frame, app, popup, area),
+            None if !is_cursor && app.prs.contains_key(&tree.path) => {
+                draw_pr_view(frame, app, &PrPopup::new(tree.path.clone()), area);
+            }
+            None if !is_cursor => {
+                draw_note(frame, area, "the PR reads once this window has the keys")
+            }
             None => draw_note(frame, area, "reading the PR..."),
         }
     }
@@ -1385,7 +1538,7 @@ fn draw_floating_tab(frame: &mut Frame, app: &App) {
         .title(format!(" Tree {} ", tree.name));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    draw_review_tab(frame, app, tree, inner);
+    draw_review_tab(frame, app, tree, app.shown_tab(), true, inner);
 }
 
 /// Where the list and the inbox go in `main`, the screen above the bar.
@@ -1477,10 +1630,16 @@ pub fn click(
     let at = Position::new(mouse.column, mouse.row);
     // A tab in the window's bar shows that tab.
     if let Some(window) = windows.window {
-        let [bar, _] = window_areas(window);
+        let (cursor_area, other_area) = pane_areas(app, window);
+        // A click on the other window of a double gives it the keys.
+        if other_area.is_some_and(|area| area.contains(at)) {
+            app.focus_side(1 - app.side);
+            return Some(Outcome::Continue);
+        }
+        let [bar, _] = window_areas(cursor_area);
         if bar.contains(at) {
             let mut x = bar.x;
-            for (tab, span) in tab_spans(app) {
+            for (tab, span) in tab_spans(app, &cursor_pane(app)) {
                 let width = u16::try_from(span.width()).unwrap_or(u16::MAX);
                 if (x..x.saturating_add(width)).contains(&at.x) {
                     app.tab = tab;
@@ -4979,7 +5138,9 @@ mod sidebar_tests {
     fn screen(app: &App, width: u16, height: u16) -> Vec<String> {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| draw(frame, app, None, None)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, app, None, None, None))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         (0..height)
             .map(|y| {
@@ -5035,7 +5196,9 @@ mod inbox_tests {
     fn screen(app: &App, width: u16, height: u16) -> Vec<String> {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| draw(frame, app, None, None)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, app, None, None, None))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         (0..height)
             .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
@@ -5100,7 +5263,7 @@ mod inbox_tests {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(200, 50)).unwrap();
         terminal
-            .draw(|frame| draw(frame, &app, None, None))
+            .draw(|frame| draw(frame, &app, None, None, None))
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let lines = screen(&app, 200, 50);
@@ -5180,7 +5343,7 @@ mod inbox_tests {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(200, 30)).unwrap();
         terminal
-            .draw(|frame| draw(frame, &app, None, None))
+            .draw(|frame| draw(frame, &app, None, None, None))
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let lines = screen(&app, 200, 30);
@@ -5232,7 +5395,9 @@ mod inbox_tests {
     fn cells(app: &App, width: u16, height: u16) -> ratatui::buffer::Buffer {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| draw(frame, app, None, None)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, app, None, None, None))
+            .unwrap();
         terminal.backend().buffer().clone()
     }
 
@@ -5290,7 +5455,9 @@ mod pr_view_tests {
     fn screen(app: &App, width: u16, height: u16) -> String {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| draw(frame, app, None, None)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, app, None, None, None))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         (0..height)
             .map(|y| {
@@ -6213,7 +6380,9 @@ mod window_tests {
     fn drawn(app: &App, width: u16, height: u16) -> Buffer {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| draw(frame, app, None, None)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, app, None, None, None))
+            .unwrap();
         terminal.backend().buffer().clone()
     }
 
@@ -6457,5 +6626,97 @@ mod window_tests {
             shown.contains("reading the PR..."),
             "the PR is seen:\n{shown}"
         );
+    }
+
+    #[test]
+    fn a_double_shows_two_windows_marked_and_one_at_a_time_when_narrow() {
+        let mut app = on("4");
+        app.handle_key(ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char('\\'),
+            ratatui::crossterm::event::KeyModifiers::CONTROL,
+        ));
+        let cursor = app.window_tree().unwrap().name.clone();
+        let shown = lines(&drawn(&app, 200, 50));
+        let titles = shown
+            .iter()
+            .find(|l| l.starts_with("┌ ◧ Tree 4 "))
+            .unwrap_or_else(|| panic!("{}", shown.join("\n")));
+        assert!(
+            titles.contains(&format!("┌ ◨ Tree {cursor} ")),
+            "both side by side: {titles}"
+        );
+        let row = |name: &str| {
+            shown
+                .iter()
+                .find(|l| l.starts_with(&format!("│  {name}")))
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert!(row("4◧").contains("leased"), "{}", shown.join("\n"));
+        // A tree shown in both windows carries both marks.
+        app.select_tree("4");
+        let shown = lines(&drawn(&app, 200, 50));
+        assert!(
+            shown.iter().any(|l| l.starts_with("│  4◧◨")),
+            "{}",
+            shown.join("\n")
+        );
+        app.select_tree(&cursor);
+        assert!(row(&format!("{cursor}◨")).contains("leased"));
+        // The other window's diff reads once it has the keys, and says so.
+        if let Some(other) = app.other.as_mut() {
+            other.tab = WindowTab::Diff;
+        }
+        let shown = lines(&drawn(&app, 200, 50)).join("\n");
+        assert!(
+            shown.contains("the diff reads once this window has the keys"),
+            "{shown}"
+        );
+        // Too narrow for both, the window the cursor drives shows alone.
+        let shown = lines(&drawn(&app, 120, 50)).join("\n");
+        assert!(
+            shown.contains(&format!("┌ ◨ 2 of 2 · Tree {cursor} ")),
+            "{shown}"
+        );
+        assert!(!shown.contains("┌ ◧"), "{shown}");
+    }
+
+    #[test]
+    fn the_main_checkouts_heading_carries_its_windows_mark() {
+        let mut app = on("4");
+        let mut main = crate::pool::main_tree(std::path::Path::new("/pool/main"));
+        main.branch = Some("main".into());
+        app.base = Some("main".into());
+        app.trees.insert(0, main);
+        app.selected = 0;
+        assert!(
+            app.main_under_cursor().is_some(),
+            "the cursor is on its heading"
+        );
+        app.handle_key(ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char('\\'),
+            ratatui::crossterm::event::KeyModifiers::CONTROL,
+        ));
+        let shown = lines(&drawn(&app, 200, 50));
+        let heading = shown
+            .iter()
+            .find(|l| l.contains("main checkout") && l.starts_with("│▾"))
+            .unwrap_or_else(|| panic!("{}", shown.join("\n")));
+        assert!(heading.contains('◧'), "{heading}");
+    }
+
+    #[test]
+    fn the_two_windows_are_the_same_width_so_one_chat_size_fits_both() {
+        let mut app = on("4");
+        app.handle_key(ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char('\\'),
+            ratatui::crossterm::event::KeyModifiers::CONTROL,
+        ));
+        for width in [200, 201] {
+            let (cursor, other) = pane_areas(&app, Rect::new(0, 0, width, 30));
+            let other = other.unwrap();
+            assert_eq!(cursor.width, other.width, "at {width} columns");
+            assert!(cursor.right().max(other.right()) <= width);
+        }
     }
 }

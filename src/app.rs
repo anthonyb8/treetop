@@ -257,7 +257,7 @@ pub struct LogEntry {
 
 /// What the window under the table shows of its tree, in the order its
 /// tab bar has them.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WindowTab {
     /// Its agent's chat, live.
     #[default]
@@ -277,6 +277,24 @@ pub enum WindowTab {
 
 /// What a shell in the window under the table names as its agent.
 pub const SHELL: &str = "shell";
+
+/// The second window of a double: the tree it keeps showing, and its tab,
+/// while the cursor drives the other. Kept per workspace, so a restart
+/// opens the double as it was left.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OtherWindow {
+    pub path: PathBuf,
+    pub tab: WindowTab,
+}
+
+/// A double as it is kept between runs: the second window, the window the
+/// cursor drove and the side it was on.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct KeptLayout {
+    other: Option<OtherWindow>,
+    cursor: Option<OtherWindow>,
+    side: usize,
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
@@ -523,6 +541,16 @@ pub struct App {
     /// Rows inside the window under the table, under its tab bar, as last
     /// drawn: what a page of its diff scrolls by.
     pub window_rows: u16,
+    /// The second window, in a double; None shows one window.
+    pub other: Option<OtherWindow>,
+    /// In a double, the side of the window the cursor drives, the one that
+    /// last had the keys: 0 on the left, 1 on the right.
+    pub side: usize,
+    /// Where the double is kept. None keeps it in memory only.
+    layout_file: Option<PathBuf>,
+    /// The window the cursor drove when the double was kept, put back once
+    /// its tree is listed.
+    returning: Option<OtherWindow>,
     /// The tree whose agent opens once this workspace's agents are read:
     /// an inbox entry chosen from another workspace.
     pub arriving: Option<(PathBuf, crate::inbox::Kind)>,
@@ -948,20 +976,30 @@ impl App {
     /// The agent the window shows the chat of: the tree's leading agent
     /// that offers one, as Enter opens it.
     pub fn window_agent(&self) -> Option<&Agent> {
-        Self::agents_of(self.window_tree()?)
+        Self::chat_agent(self.window_tree()?)
+    }
+
+    /// The agent a window on `tree` shows the chat of.
+    pub fn chat_agent(tree: &Tree) -> Option<&Agent> {
+        Self::agents_of(tree)
             .into_iter()
             .find(|agent| agent.attach.is_some())
     }
 
-    /// The tabs the window has for its tree: the chat where an agent offers
-    /// one, the diff and PR of a held tree, the run while keel has one
-    /// holding it, a shell in a held tree, and its info.
+    /// The tabs the window has for its tree.
     pub fn window_tabs(&self) -> Vec<WindowTab> {
-        let Some(tree) = self.window_tree() else {
-            return vec![WindowTab::Info];
-        };
+        match self.window_tree() {
+            Some(tree) => self.tabs_of(tree),
+            None => vec![WindowTab::Info],
+        }
+    }
+
+    /// The tabs a window on `tree` has: the chat where an agent offers one,
+    /// the diff and PR of a held tree, the run while keel has one holding
+    /// it, a shell in a held tree, and its info.
+    pub fn tabs_of(&self, tree: &Tree) -> Vec<WindowTab> {
         let mut tabs = Vec::new();
-        if self.window_agent().is_some() {
+        if Self::chat_agent(tree).is_some() {
             tabs.push(WindowTab::Chat);
         }
         // The main checkout's heading stands for it, and `d` and `v` work
@@ -990,6 +1028,185 @@ impl App {
         }
     }
 
+    /// The second window of a double, its tree and the tab it shows; None
+    /// while there is no double, or its tree has left the pool.
+    pub fn other_window(&self) -> Option<(&Tree, WindowTab)> {
+        let other = self.other.as_ref()?;
+        let tree = self.trees.iter().find(|t| t.path == other.path)?;
+        let tab = if self.tabs_of(tree).contains(&other.tab) {
+            other.tab
+        } else {
+            WindowTab::Info
+        };
+        Some((tree, tab))
+    }
+
+    /// The terminal the second window shows, kept running behind the one
+    /// with the keys: as `window_chat` has it for the cursor's window.
+    pub fn other_chat(&self) -> Option<(Vec<String>, String, String)> {
+        let (tree, tab) = self.other_window()?;
+        Self::terminal_of(tree, tab)
+    }
+
+    /// The plugin whose screen hints the second window's terminal is read
+    /// by, as `window_plugin` has it.
+    pub fn other_plugin(&self) -> Option<&str> {
+        match self.other_window()? {
+            (tree, WindowTab::Chat) => Self::chat_agent(tree)?.plugin.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Ctrl+\: two windows, the one the cursor drives on the right and the
+    /// tree it was on kept on the left, with the cursor moved to the next
+    /// tree down; or back to one, keeping the window that had the keys.
+    pub fn toggle_double(&mut self) {
+        // A double whose other tree has left the pool counts as none, so
+        // this opens a new one rather than only forgetting it.
+        let was_double = self.other_window().is_some();
+        self.other = None;
+        self.side = 0;
+        if was_double {
+            // Alone, a window keeps the keys only where it takes typing,
+            // as Ctrl+Q gives them to one window.
+            if !matches!(
+                self.shown_tab(),
+                WindowTab::Chat | WindowTab::Shell | WindowTab::Diff | WindowTab::Pr
+            ) {
+                self.is_window_focused = false;
+            }
+            self.save_layout();
+            return;
+        }
+        let Some(tree) = self.window_tree() else {
+            return;
+        };
+        let (path, tab) = (tree.path.clone(), self.tab);
+        let rows = self.rows();
+        let next = (self.selected + 1..rows.len())
+            .chain((0..self.selected).rev())
+            .find(|&at| matches!(rows[at], ListRow::Tree(_)));
+        let Some(at) = next else {
+            self.message = Some("one tree in the list: nothing to put beside it".into());
+            self.save_layout();
+            return;
+        };
+        self.other = Some(OtherWindow { path, tab });
+        self.side = 1;
+        self.selected = at;
+        self.save_layout();
+    }
+
+    /// The window on `side` takes the keys: where the cursor drives the
+    /// other one, the two change places, so the cursor drives this one and
+    /// the tree it was on stays in the other.
+    pub fn focus_side(&mut self, side: usize) {
+        if side != self.side
+            && let Some(other) = self.other.clone()
+            && let Some(name) = self
+                .trees
+                .iter()
+                .find(|t| t.path == other.path)
+                .map(|t| t.name.clone())
+            && let Some(here) = self.window_tree().map(|t| t.path.clone())
+        {
+            let tab = self.tab;
+            self.select_tree(&name);
+            // A filter or a folded group hides its tree from the cursor:
+            // the windows stay as they are rather than both show this one.
+            if self.window_tree().is_none_or(|t| t.path != other.path) {
+                self.message = Some(format!(
+                    "tree {name} is out of the list; clear the filter or open its group to give it the keys"
+                ));
+                return;
+            }
+            self.other = Some(OtherWindow { path: here, tab });
+            self.tab = other.tab;
+            self.side = side;
+            self.save_layout();
+        }
+        self.is_window_focused = true;
+        self.sync_window();
+    }
+
+    /// Ctrl+Q: with one window, gives it the keys where it has something to
+    /// take them, else gives them back to the table; with two, moves them
+    /// on round the table, the left window and the right one.
+    pub fn cycle_keys(&mut self) {
+        if self.other_window().is_some() {
+            match (self.is_window_focused, self.side) {
+                (false, _) => self.focus_side(0),
+                (true, 0) => self.focus_side(1),
+                (true, _) => self.is_window_focused = false,
+            }
+            return;
+        }
+        if self.is_window_focused {
+            self.is_window_focused = false;
+            return;
+        }
+        let can_take = match self.shown_tab() {
+            WindowTab::Chat | WindowTab::Shell => self.window_chat().is_some(),
+            WindowTab::Diff | WindowTab::Pr => true,
+            WindowTab::Run | WindowTab::Info => false,
+        };
+        if can_take {
+            self.is_window_focused = true;
+            self.sync_window();
+        }
+    }
+
+    /// Keeps the double in `file`, opening it as that file left it.
+    pub fn keep_layout_in(&mut self, file: PathBuf) {
+        let layout = crate::state::read::<KeptLayout>(&file);
+        self.other = layout.other;
+        self.side = layout.side;
+        self.returning = layout.cursor.filter(|_| self.other.is_some());
+        self.layout_file = Some(file);
+    }
+
+    /// Keeps the double as it stands: both windows' trees and tabs, so a
+    /// restart opens it as it was left. main calls it as the cursor moves.
+    pub fn save_layout(&self) {
+        let Some(file) = &self.layout_file else {
+            return;
+        };
+        let cursor = self
+            .other
+            .as_ref()
+            .and(self.window_tree())
+            .map(|tree| OtherWindow {
+                path: tree.path.clone(),
+                tab: self.tab,
+            });
+        let layout = KeptLayout {
+            other: self.other.clone(),
+            cursor,
+            side: self.side,
+        };
+        crate::state::write(file, &layout);
+    }
+
+    /// Puts the cursor back where a double was left, once its tree is
+    /// listed and the agents read have sorted the list, which moves rows
+    /// under the cursor until then.
+    fn return_cursor(&mut self) {
+        let Some(cursor) = self.returning.clone().filter(|_| self.is_agents_read) else {
+            return;
+        };
+        let Some(name) = self
+            .trees
+            .iter()
+            .find(|t| t.path == cursor.path)
+            .map(|t| t.name.clone())
+        else {
+            return;
+        };
+        self.select_tree(&name);
+        self.tab = cursor.tab;
+        self.returning = None;
+    }
+
     /// A shell left running in tree `name` stays while the tree is held,
     /// and ends once it is returned or destroyed.
     pub fn keeps_shell(&self, name: &str) -> bool {
@@ -1015,10 +1232,15 @@ impl App {
     /// runs, or a shell in the tree. A cold agent is left closed, since
     /// attaching to it would start it again; Enter does that on purpose.
     pub fn window_chat(&self) -> Option<(Vec<String>, String, String)> {
-        let tree = self.window_tree()?;
-        match self.shown_tab() {
+        Self::terminal_of(self.window_tree()?, self.shown_tab())
+    }
+
+    /// The terminal a window on `tree` shows on `tab`, as `window_chat`
+    /// has it.
+    fn terminal_of(tree: &Tree, tab: WindowTab) -> Option<(Vec<String>, String, String)> {
+        match tab {
             WindowTab::Chat => {
-                let agent = self.window_agent()?;
+                let agent = Self::chat_agent(tree)?;
                 if agent.status == Some(Status::Cold) {
                     return None;
                 }
@@ -1163,6 +1385,7 @@ impl App {
         }
         self.is_agents_read = true;
         self.reselect(cursor);
+        self.return_cursor();
     }
 
     /// Keeps the cursor on the same tree, keeps each surviving tree's probed
@@ -1201,6 +1424,7 @@ impl App {
             None => self.selected.min(last),
         };
         self.is_cursor_placed |= has_tree;
+        self.return_cursor();
     }
 
     pub fn job_started(&mut self, job: &Job) {
@@ -1450,6 +1674,29 @@ impl App {
         });
     }
 
+    /// The keys a window takes with nothing open in it to type into: Esc
+    /// or q gives them back to the table, and the arrows step through its
+    /// tabs.
+    fn handle_window_key(&mut self, key: KeyEvent) -> Outcome {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.is_window_focused = false,
+            KeyCode::Left | KeyCode::Right => self.step_tab(key.code == KeyCode::Right),
+            _ => {}
+        }
+        Outcome::Continue
+    }
+
+    /// Steps the window to its next tab, or its last.
+    fn step_tab(&mut self, is_next: bool) {
+        let tabs = self.window_tabs();
+        let at = tabs
+            .iter()
+            .position(|t| *t == self.shown_tab())
+            .unwrap_or(0);
+        let step = if is_next { 1 } else { tabs.len() - 1 };
+        self.tab = tabs[(at + step) % tabs.len()];
+    }
+
     /// Shows `tab` in the window under the table with the keys, where the
     /// tree under the cursor has it.
     fn show_tab(&mut self, tab: WindowTab) {
@@ -1536,7 +1783,7 @@ impl App {
             match key.code {
                 KeyCode::Char('c') => return Outcome::Quit,
                 KeyCode::Char('r') => self.read_pr(path),
-                KeyCode::Char('q' | 'Q') => self.is_window_focused = false,
+                KeyCode::Char('q' | 'Q') => self.cycle_keys(),
                 _ => {}
             }
             return Outcome::Continue;
@@ -1673,7 +1920,7 @@ impl App {
                 KeyCode::Char('r') => {
                     self.diffs.remove(&path);
                 }
-                KeyCode::Char('q' | 'Q') => self.is_window_focused = false,
+                KeyCode::Char('q' | 'Q') => self.cycle_keys(),
                 _ => {}
             }
             return Outcome::Continue;
@@ -3587,8 +3834,9 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return match key.code {
                 KeyCode::Char('c') => Outcome::Quit,
-                // Ctrl+Q gives the window under the table the keys, for its
-                // chat to take, once nothing else on screen waits on them.
+                // Ctrl+Q moves the keys on to the window under the table,
+                // or round the two of a double, once nothing else on screen
+                // waits on them.
                 KeyCode::Char('q' | 'Q') => {
                     let is_free = self.reviews.is_empty()
                         && self.pending.is_none()
@@ -3596,15 +3844,15 @@ impl App {
                         && !self.is_help
                         && !self.is_filtering
                         && self.rail.is_none();
-                    let can_take = match self.shown_tab() {
-                        WindowTab::Chat | WindowTab::Shell => self.window_chat().is_some(),
-                        WindowTab::Diff | WindowTab::Pr => true,
-                        WindowTab::Run | WindowTab::Info => false,
-                    };
-                    if is_free && can_take {
-                        self.is_window_focused = true;
-                        self.sync_window();
+                    if is_free {
+                        self.cycle_keys();
                     }
+                    Outcome::Continue
+                }
+                // Ctrl+\: two windows under the table, or one again.
+                // Without the terminal's extended keys it comes as Ctrl+4.
+                KeyCode::Char('\\' | '4') => {
+                    self.toggle_double();
                     Outcome::Continue
                 }
                 _ => Outcome::Continue,
@@ -3613,6 +3861,12 @@ impl App {
         if self.is_help {
             self.is_help = false;
             return Outcome::Continue;
+        }
+        // A window with the keys but nothing to type into, its info or run,
+        // or a chat not open yet, keeps them from the table, so typing meant
+        // for it never runs a table command.
+        if self.is_window_focused {
+            return self.handle_window_key(key);
         }
         if let Some(review) = self.reviews.front_mut() {
             match key.code {
@@ -3699,17 +3953,7 @@ impl App {
             return Outcome::Workspaces;
         }
         if matches!(key.code, KeyCode::Left | KeyCode::Right) {
-            let tabs = self.window_tabs();
-            let at = tabs
-                .iter()
-                .position(|t| *t == self.shown_tab())
-                .unwrap_or(0);
-            let step = if key.code == KeyCode::Right {
-                1
-            } else {
-                tabs.len() - 1
-            };
-            self.tab = tabs[(at + step) % tabs.len()];
+            self.step_tab(key.code == KeyCode::Right);
             return Outcome::Continue;
         }
         if key.code == KeyCode::Char('C') {
@@ -6867,5 +7111,168 @@ mod tests {
         assert!(app.keeps_shell("4"));
         assert!(!app.keeps_shell("7"), "a returned tree's shell ends");
         assert!(!app.keeps_shell("12"), "so does a destroyed one's");
+    }
+
+    fn ctrl(app: &mut App, c: char) {
+        app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+    }
+
+    fn cursor_on(app: &App) -> String {
+        app.window_tree()
+            .map(|t| t.name.clone())
+            .unwrap_or_default()
+    }
+
+    fn other_on(app: &App) -> Option<String> {
+        app.other_window().map(|(t, _)| t.name.clone())
+    }
+
+    #[test]
+    fn ctrl_backslash_puts_the_next_tree_beside_this_one_and_the_cursor_drives_it() {
+        let mut app = with_chat(Status::Busy);
+        ctrl(&mut app, '\\');
+        assert_eq!(
+            other_on(&app).as_deref(),
+            Some("4"),
+            "tree 4 stays on the left"
+        );
+        assert_eq!((cursor_on(&app).as_str(), app.side), ("8", 1));
+        // Moving the cursor to tree 7, past the available group's heading,
+        // changes only the window it drives.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(cursor_on(&app), "7");
+        assert_eq!(other_on(&app).as_deref(), Some("4"));
+        // Without the terminal's extended keys, Ctrl+\ comes as Ctrl+4.
+        ctrl(&mut app, '4');
+        assert_eq!(other_on(&app), None, "one window again");
+    }
+
+    #[test]
+    fn ctrl_q_moves_the_keys_round_the_table_and_both_windows() {
+        let mut app = with_chat(Status::Busy);
+        ctrl(&mut app, '\\');
+        ctrl(&mut app, 'q');
+        assert!(app.is_window_focused);
+        assert_eq!(app.side, 0, "the left window has the keys");
+        assert_eq!(cursor_on(&app), "4", "and the cursor drives it");
+        assert_eq!(other_on(&app).as_deref(), Some("8"));
+        ctrl(&mut app, 'q');
+        assert_eq!((app.side, cursor_on(&app).as_str()), (1, "8"));
+        assert!(app.is_window_focused);
+        ctrl(&mut app, 'q');
+        assert!(!app.is_window_focused, "back to the table");
+        // Back to one window, the one that last had the keys stays.
+        ctrl(&mut app, 'q');
+        ctrl(&mut app, '\\');
+        assert_eq!((cursor_on(&app).as_str(), other_on(&app)), ("4", None));
+    }
+
+    #[test]
+    fn a_double_opens_again_as_it_was_left() {
+        let file = std::env::temp_dir().join(format!("treetop-layout-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let mut app = with_chat(Status::Busy);
+        app.keep_layout_in(file.clone());
+        ctrl(&mut app, '\\');
+        assert_eq!(cursor_on(&app), "8");
+        app.save_layout();
+        // At start the pool is listed before its agents are read, and the
+        // agents then sort it: the cursor goes back to its tree after both.
+        let mut again = App::new(None);
+        again.keep_layout_in(file.clone());
+        let trees = app.trees.clone();
+        again.set_trees(trees);
+        let mut busy = attachable("fixer");
+        busy.status = Some(Status::Waiting);
+        again.apply_agents(&HashMap::from([(PathBuf::from("/p/8/app"), vec![busy])]));
+        assert_eq!(other_on(&again).as_deref(), Some("4"));
+        assert_eq!(cursor_on(&again), "8", "both windows as they were left");
+        assert_eq!(again.side, 1);
+        ctrl(&mut again, '\\');
+        let mut single = with_chat(Status::Busy);
+        single.keep_layout_in(file.clone());
+        assert_eq!(other_on(&single), None, "one window, as it was left");
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn a_double_keeps_its_trees_when_one_is_hidden_and_starts_afresh_once_one_is_gone() {
+        // Hidden by a filter, the other window's tree keeps its place, and
+        // the keys stay where they were.
+        let mut app = with_chat(Status::Busy);
+        ctrl(&mut app, '\\');
+        app.filter = "end-2".into();
+        app.reselect(Some("/p/8/app".into()));
+        ctrl(&mut app, 'q');
+        assert_eq!(other_on(&app).as_deref(), Some("4"));
+        assert_eq!(cursor_on(&app), "8");
+        assert!(!app.is_window_focused);
+        assert!(app.message.as_deref().unwrap_or("").contains("tree 4"));
+        // Its tree gone from the pool, Ctrl+\ opens a new double at once.
+        let mut app = with_chat(Status::Busy);
+        ctrl(&mut app, '\\');
+        app.trees.retain(|t| t.name != "4");
+        select(&mut app, "8");
+        ctrl(&mut app, '\\');
+        assert_eq!(other_on(&app).as_deref(), Some("8"));
+    }
+
+    #[test]
+    fn ctrl_backslash_with_one_tree_listed_says_so_and_keeps_one_window() {
+        let mut app = with_chat(Status::Busy);
+        app.trees.retain(|t| t.name == "4");
+        select(&mut app, "4");
+        ctrl(&mut app, '\\');
+        assert_eq!(other_on(&app), None);
+        assert!(app.message.is_some());
+    }
+
+    #[test]
+    fn a_window_with_no_typing_to_take_keeps_the_keys_from_the_table() {
+        // Tree 7 is free: its window has its info, which takes no typing.
+        let mut app = with_chat(Status::Busy);
+        ctrl(&mut app, '\\');
+        select(&mut app, "7");
+        ctrl(&mut app, 'q');
+        ctrl(&mut app, 'q');
+        assert!(app.is_window_focused);
+        assert_eq!(cursor_on(&app), "7");
+        for key in [KeyCode::Up, KeyCode::Char('n'), KeyCode::Enter] {
+            assert_eq!(press(&mut app, key), Outcome::Continue);
+        }
+        assert_eq!(cursor_on(&app), "7", "the table did not move");
+        assert!(app.prompt.is_none(), "n started nothing");
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.is_window_focused, "Esc gives the keys back");
+    }
+
+    #[test]
+    fn back_to_one_window_the_keys_stay_only_where_there_is_typing_to_take() {
+        let mut app = with_chat(Status::Busy);
+        ctrl(&mut app, '\\');
+        select(&mut app, "7");
+        ctrl(&mut app, 'q');
+        ctrl(&mut app, 'q');
+        assert!(app.is_window_focused, "tree 7's info window has the keys");
+        ctrl(&mut app, '\\');
+        assert!(
+            !app.is_window_focused,
+            "alone, an info window gives them back"
+        );
+    }
+
+    #[test]
+    fn going_round_the_windows_keeps_the_tab_each_was_picked_on() {
+        let mut app = with_chat(Status::Busy);
+        ctrl(&mut app, '\\');
+        app.tab = WindowTab::Shell;
+        select(&mut app, "7");
+        assert_eq!(app.shown_tab(), WindowTab::Info, "a free tree has no shell");
+        for _ in 0..3 {
+            ctrl(&mut app, 'q');
+        }
+        select(&mut app, "8");
+        assert_eq!(app.shown_tab(), WindowTab::Shell, "the shell tab was kept");
     }
 }

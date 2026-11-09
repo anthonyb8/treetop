@@ -23,6 +23,12 @@ pub fn asked_file(checkout: &Path) -> Option<PathBuf> {
     Some(dir()?.join(format!("asked-{}.json", crate::cache::key(checkout))))
 }
 
+/// The file the double of the workspace checked out at `checkout` is kept
+/// in: the second window's tree and tab, or none for one window.
+pub fn layout_file(checkout: &Path) -> Option<PathBuf> {
+    Some(dir()?.join(format!("layout-{}.json", crate::cache::key(checkout))))
+}
+
 /// What `file` holds, else the empty value: the seen asks, or the inbox's
 /// marks.
 pub fn read<T: serde::de::DeserializeOwned + Default>(file: &Path) -> T {

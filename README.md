@@ -42,7 +42,8 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | Key | Does |
 |---|---|
 | Enter | give the keys to the chat of the agent in the tree under the cursor, in the window under the table, starting a cold one again, else go to the tree itself (see [Agent chats](#agent-chats) and [Entering a tree](#entering-a-tree)); on a group's heading, fold the group or open it again, and on the main checkout's, open the chat of its agent when it has one |
-| Ctrl+Q | give the keys to the chat in the window under the table, and from the chat back to the table |
+| Ctrl+Q | give the keys to the chat in the window under the table, and from the chat back to the table; with two windows, move them round the table, the left window and the right one |
+| Ctrl+\\ | show two windows under the table, the tree under the cursor on the left and the next tree down on the right, or one again |
 | `←` `→` | step through the window's tabs: chat, diff, PR, run, shell and info |
 | `t` | go to the tree itself, even when its agent has a chat: its tmux pane or a window in it, else a shell there (see [Entering a tree](#entering-a-tree)) |
 | `n` | start a new agent in the tree under the cursor: a free one is leased for it, on a branch named for the task, and a held one keeps its branch; on the main checkout's heading, start one in the main checkout, for work that needs no tree |
@@ -404,6 +405,15 @@ The window under the table names the tree and its branch in its border, and has 
 - **run**: the steps of the keel run that holds the tree, the one under way picked out, while an active or paused run holds it (see [keel runs](#keel-runs)).
 - **shell**: a shell in a held tree, live, in `$SHELL`, run in a terminal of treetop's own as a chat is; Ctrl+Q gives it the keys, and it keeps running behind the screen as a chat does.
 - **info**: the tree in full (see [The info tab](#the-info-tab)).
+
+**Ctrl+\\** on the table puts two windows side by side under it: the tree the cursor was on stays in the left one, marked ◧, and the cursor moves to the next tree down, in the right one, marked ◨; each window's tree carries its mark in the table.
+The cursor drives the window that last had the keys, so moving it changes only that one, and the other keeps its tree and tab, its chat or shell running live behind.
+Ctrl+Q moves the keys round the table, the left window and the right one; giving a window the keys puts the cursor on its tree.
+A window given the keys with nothing in it to type into, its info or run, keeps them from the table: Esc or `q` gives them back, and `←` and `→` step through its tabs.
+Ctrl+\\ again goes back to one window, the one that last had the keys.
+A terminal too narrow for both shows the window the cursor drives alone, its title saying `1 of 2` or `2 of 2`, and Ctrl+Q still moves between them.
+The double is kept per workspace under `$XDG_STATE_HOME/treetop`, so treetop opens it again as it was left.
+Inside a chat, Ctrl+\\ still goes to the next agent's chat (see [Agent chats](#agent-chats)).
 
 Moving the cursor keeps the tab, so the diff tab shows each tree's diff in turn and the PR tab each tree's PR, once the cursor rests on it; a PR read before shows as it was last read, and `v` reads it afresh.
 A tab the tree under the cursor has not got shows its info instead.

@@ -648,6 +648,33 @@ impl Chats {
         Ok(())
     }
 
+    /// The chat running `command`, on screen or behind it.
+    pub fn running(&self, command: &[String]) -> Option<&Chat> {
+        self.open
+            .iter()
+            .chain(&self.background)
+            .find(|c| c.command == command)
+    }
+
+    /// Starts the chat running `command` behind the screen, where none runs
+    /// yet, so the second window of a double shows it live.
+    pub fn run_behind(
+        &mut self,
+        command: &[String],
+        (rows, cols): (u16, u16),
+        (agent, tree): (String, String),
+        hints: Option<Screen>,
+    ) -> Result<()> {
+        if self.running(command).is_some() {
+            return Ok(());
+        }
+        let mut chat = Chat::open(command, rows, cols, agent, tree)?;
+        chat.hints = hints;
+        self.background.push(chat);
+        self.trim();
+        Ok(())
+    }
+
     /// Leaves the open chat running behind treetop, ending the oldest left
     /// one beyond KEPT.
     pub fn hide(&mut self) {
