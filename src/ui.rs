@@ -3123,15 +3123,23 @@ fn draw_pr_checks(frame: &mut Frame, pr: &PrView, selected: usize, area: Rect) {
     let Some(check) = pr.checks.get(selected) else {
         return;
     };
+    let room = usize::from(log_area.width).saturating_sub(2).max(1);
+    // A line of the detail wrapped at words, so a long name keeps its end.
+    let said = |text: &str, style: Style| -> Vec<Line<'static>> {
+        word_wrap(text, room)
+            .into_iter()
+            .map(|row| Line::styled(format!(" {row}"), style))
+            .collect()
+    };
     let mut lines = Vec::new();
     match (check.outcome, check.log.as_deref()) {
         (CheckOutcome::Failed, log) => {
-            lines.push(Line::styled(
-                format!(" ─ {} · the end of its log ─", check.name),
+            lines.extend(said(
+                &format!("─ {} · the end of its log ─", check.name),
                 fg(t.border),
             ));
+            let heading = lines.len();
             let log = log.unwrap_or("Its log could not be read, or it is not an Actions run.");
-            let room = usize::from(log_area.width).saturating_sub(2).max(1);
             // Wrapped at words, each row keeping the indent its line had.
             let all: Vec<String> = log
                 .lines()
@@ -3148,7 +3156,9 @@ fn draw_pr_checks(frame: &mut Frame, pr: &PrView, selected: usize, area: Rect) {
                 })
                 .collect();
             // Under its heading, above the line naming the keys.
-            let fits = usize::from(log_area.height).saturating_sub(2).max(1);
+            let fits = usize::from(log_area.height)
+                .saturating_sub(heading + 1)
+                .max(1);
             let from = all.len().saturating_sub(fits);
             for text in &all[from..] {
                 let text = text.as_str();
@@ -3165,8 +3175,8 @@ fn draw_pr_checks(frame: &mut Frame, pr: &PrView, selected: usize, area: Rect) {
             ));
         }
         (CheckOutcome::Pending, _) => {
-            lines.push(Line::styled(
-                format!(" {} is still running.", check.name),
+            lines.extend(said(
+                &format!("{} is still running.", check.name),
                 fg(t.warning),
             ));
         }
@@ -3180,8 +3190,8 @@ fn draw_pr_checks(frame: &mut Frame, pr: &PrView, selected: usize, area: Rect) {
                 .seconds
                 .map(|s| format!(" in {}", duration(s)))
                 .unwrap_or_default();
-            lines.push(Line::styled(
-                format!(" {} {word}{time}.", check.name),
+            lines.extend(said(
+                &format!("{} {word}{time}.", check.name),
                 fg(t.success),
             ));
             lines.push(Line::styled(" Enter opens it on GitHub", muted));
@@ -5671,5 +5681,36 @@ mod pr_view_tests {
         for said in ["has not reviewed", "from before it", "no comments to show"] {
             assert!(!shown.contains(said), "{said} contradicts it:\n{shown}");
         }
+    }
+
+    #[test]
+    fn a_long_check_name_leaves_its_detail_whole() {
+        let mut app = app();
+        let path = std::path::PathBuf::from("/pool/4/app");
+        while app.current().is_none_or(|t| t.path != path) {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Char('v'));
+        let mut pr = pr();
+        pr.checks[0].name =
+            "Code standards on changed lines (ruff, function length, nesting) (non-required)"
+                .into();
+        pr.checks[1].name =
+            "W3 reference goldens re-recorded with the replaced libraries (PRD-262) (non-required)"
+                .into();
+        pr.checks[1].outcome = Checked::Skipped;
+        app.pr_loaded(path, Ok(Some(pr)));
+        press(&mut app, KeyCode::Char('2'));
+        let shown = screen(&app, 100, 40);
+        assert!(
+            shown.contains("the end of its log"),
+            "the heading keeps its end:\n{shown}"
+        );
+        press(&mut app, KeyCode::Char('j'));
+        let shown = screen(&app, 100, 40);
+        assert!(
+            shown.contains("was skipped in 3m 40s."),
+            "the detail line wraps whole:\n{shown}"
+        );
     }
 }

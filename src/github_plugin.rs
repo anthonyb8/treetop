@@ -718,6 +718,22 @@ fn log_targets(checks: &[Check]) -> Vec<&Check> {
     failed
 }
 
+/// What a failed check's log read says: its tail, why it is empty, or why
+/// it could not be read.
+fn log_text(check: &Check, log: Result<String, Error>) -> String {
+    match log {
+        Ok(log) if log.trim().is_empty() => {
+            if check.conclusion.as_deref() == Some("CANCELLED") {
+                "It was cancelled before it wrote a log.".to_string()
+            } else {
+                "Its log is empty.".to_string()
+            }
+        }
+        Ok(log) => ship::tail(&clean_log(&log), LOG_LINES),
+        Err(err) => format!("its log could not be read: {err}"),
+    }
+}
+
 fn view(args: &Value) -> Result<Value, Error> {
     let dir = args
         .get("dir")
@@ -769,15 +785,24 @@ fn view(args: &Value) -> Result<Value, Error> {
     let mut pr = pr_view(viewed, threads);
     for check in failing {
         let log = match (check.job_id(), check.run_id()) {
-            (Some(job), _) => gh(dir, &["run", "view", "--job", job, "--log-failed"]),
+            (Some(job), _) => match gh(dir, &["run", "view", "--job", job, "--log-failed"]) {
+                // gh waits for the whole run; the job's own log is there once
+                // the job is done, while others in its run still go.
+                Err(err) if err.message.contains("still in progress") => {
+                    let path = format!("repos/{{owner}}/{{repo}}/actions/jobs/{job}/logs");
+                    // Its colour codes come through raw; `clean_log` takes them out.
+                    gh(dir, &["api", "--allow-escape-sequences", &path])
+                }
+                read => read,
+            },
             (None, Some(run)) => gh(dir, &["run", "view", run, "--log-failed"]),
             (None, None) => continue,
         };
-        if let Some(seen) = pr.checks.iter_mut().find(|c| c.name == check.name()) {
-            seen.log = Some(match log {
-                Ok(log) => ship::tail(&clean_log(&log), LOG_LINES),
-                Err(err) => format!("its log could not be read: {err}"),
-            });
+        let text = log_text(&check, log);
+        if let Some(seen) = pr.checks.iter_mut().find(|c| {
+            c.name == check.name() && c.workflow == check.workflow_name.clone().unwrap_or_default()
+        }) {
+            seen.log = Some(text);
         }
     }
     Ok(json!({ "pr": pr }))
@@ -1129,5 +1154,23 @@ mod tests {
             ["test (3.12)", "lint"],
             "a real failure is read before a cancelled one"
         );
+    }
+
+    #[test]
+    fn an_empty_log_says_why_it_is_empty() {
+        let cancelled: Check = serde_json::from_value(
+            json!({"name": "sanitize", "status": "COMPLETED", "conclusion": "CANCELLED"}),
+        )
+        .unwrap();
+        assert_eq!(
+            log_text(&cancelled, Ok(String::new())),
+            "It was cancelled before it wrote a log."
+        );
+        let failed: Check = serde_json::from_value(
+            json!({"name": "test", "status": "COMPLETED", "conclusion": "FAILURE"}),
+        )
+        .unwrap();
+        assert_eq!(log_text(&failed, Ok("  \n".into())), "Its log is empty.");
+        assert_eq!(log_text(&failed, Ok("a\tb\tboom".into())), "boom");
     }
 }
