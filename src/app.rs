@@ -2001,11 +2001,19 @@ impl App {
     }
 
     /// The window with the keys is in Insert, on a chat or shell: every key
-    /// but treetop's few Ctrl keys goes to it.
+    /// but treetop's few Ctrl keys goes to it. A chat floating where its
+    /// window cannot show has no Normal to show, so it is always in Insert.
     pub fn is_inserting(&self) -> bool {
-        self.is_inserting
+        (self.is_inserting || self.chat_floats())
             && self.is_window_focused
             && matches!(self.shown_tab(), WindowTab::Chat | WindowTab::Shell)
+    }
+
+    /// The window cannot show as last drawn, over the Issues screen or on a
+    /// terminal too short for it, so a tree's chat with the keys floats in
+    /// a popup instead.
+    pub fn chat_floats(&self) -> bool {
+        self.is_issues || self.window_rows == 0
     }
 
     /// Gives the window under the table the keys in Insert, so what is
@@ -7542,6 +7550,21 @@ mod tests {
         assert!(!app.is_window_focused);
         app.handle_key(ctrl_q);
         assert!(app.is_window_focused && !app.is_inserting());
+    }
+
+    #[test]
+    fn a_chat_floating_where_its_window_cannot_show_takes_the_keys_from_ctrl_q() {
+        let ctrl_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
+        let mut app = with_chat(Status::Idle);
+        app.window_rows = 20;
+        app.handle_key(ctrl_q);
+        assert!(!app.is_inserting(), "drawn in the window: Normal");
+        // Too short for the window, the chat floats with no mode to show.
+        app.window_rows = 0;
+        assert!(app.is_inserting(), "floating: every key to the chat");
+        app.window_rows = 20;
+        app.is_issues = true;
+        assert!(app.is_inserting(), "over the Issues screen too");
     }
 
     #[test]

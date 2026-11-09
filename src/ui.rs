@@ -1199,10 +1199,19 @@ fn footer_left(app: &App, width: u16) -> Line<'static> {
 fn bar_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     let tab = app.shown_tab();
     if app.is_inserting() {
+        // Floating, Ctrl+Q leaves the chat for the table, as it always has.
+        let back = if app.chat_floats() { "back" } else { "normal" };
         return INSERT_KEYS
             .iter()
             .copied()
             .filter(|(key, _)| !(tab == WindowTab::Shell && matches!(*key, "^F" | "^P")))
+            .map(|(key, label)| {
+                if key == "^Q" {
+                    (key, back)
+                } else {
+                    (key, label)
+                }
+            })
             .collect();
     }
     if app.is_window_focused {
@@ -1217,6 +1226,10 @@ fn bar_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             .iter()
             .copied()
             .filter(|(key, _)| is_terminal || *key != "i")
+            // The run and the info have nothing to scroll.
+            .filter(|(key, _)| {
+                !matches!(tab, WindowTab::Run | WindowTab::Info) || !matches!(*key, "j k" | "d u")
+            })
             .map(|(key, label)| if key == "^Q" { (key, on) } else { (key, label) })
             .collect();
     }
@@ -6906,6 +6919,10 @@ mod window_tests {
     fn the_window_with_the_keys_says_its_mode_in_its_bottom_corner_and_the_bar_its_keys() {
         let mut app = on("4");
         app.tab = WindowTab::Chat;
+        // The main loop records the window's rows before each draw.
+        app.window_rows = window_chat_area(&app, Rect::new(0, 0, 200, 50))
+            .unwrap()
+            .height;
         let bottom = |app: &App| {
             let shown = lines(&drawn(app, 200, 50));
             (shown[48].clone(), shown[49].clone())
@@ -6928,11 +6945,18 @@ mod window_tests {
         app.tab = WindowTab::Info;
         let (corner, bar) = bottom(&app);
         assert!(corner.starts_with("└ NORMAL  ─"), "{corner}");
-        assert!(bar.starts_with(" ←→  tabs "), "{bar}");
+        assert!(bar.starts_with(" ←→  tabs  ^Q  "), "{bar}");
         // A shell keeps Ctrl+F and Ctrl+P, so its Insert bar leaves them out.
         app.tab = WindowTab::Shell;
         let (_, bar) = bottom(&app);
         assert!(bar.starts_with(" ^Q  normal  ^\\  next agent   "), "{bar}");
+        // Floating on a terminal too short for the window, a chat is always
+        // in Insert, and Ctrl+Q leaves it for the table.
+        app.tab = WindowTab::Chat;
+        app.is_inserting = false;
+        app.window_rows = 0;
+        let short = lines(&drawn(&app, 200, 12));
+        assert!(short[11].starts_with(" ^Q  back  "), "{}", short[11]);
     }
 
     #[test]
