@@ -42,7 +42,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | Key | Does |
 |---|---|
 | Enter | give the keys to the chat of the agent in the tree under the cursor, in the window under the table, in Normal, where Enter again starts Insert, starting a cold one again, else go to the tree itself (see [Agent chats](#agent-chats) and [Entering a tree](#entering-a-tree)); on a group's heading, fold the group or open it again, and on the main checkout's, open the chat of its agent when it has one |
-| Ctrl+Q | give the keys to the window under the table, in Normal; from Insert, drop to Normal; from Normal, give them back to the table; with two windows, move them round the table, the left window and the right one (see [Normal and Insert](#normal-and-insert)) |
+| Ctrl+Q | (or F13 to F24, such as a Caps Lock remapped to F19) give the keys to the window under the table, in Normal; from Insert, drop to Normal; from Normal, give them back to the table; with two windows, move them round the table, the left window and the right one (see [Normal and Insert](#normal-and-insert)) |
 | Ctrl+P | open the command palette: every action, the tree under the cursor's first, found by typing a few of its words, a tree number or a branch, and run with Enter |
 | Ctrl+F | zoom: on the table, the table over the whole screen; in a window, the windows, with the table folded to their trees' rows; again, back |
 | Ctrl+\\ | show two windows under the table, the tree under the cursor on the left and the next tree down on the right, or one again |
@@ -477,7 +477,8 @@ A window with the keys is in one of two modes, as in vim, and says which in the 
 Esc, `q` or Ctrl+Q gives the keys back to the table; with two windows, Ctrl+Q moves them on to the other one first.
 
 **Insert** gives every key to the chat or shell, Esc too, which interrupts Claude Code.
-**Ctrl+Q** drops back to Normal, and so do F13 to F24, so a Caps Lock remapped to one of them, such as F19 (with keyd on Linux or Karabiner-Elements on a Mac, on the machine whose keyboard you type on, over SSH too) leaves Insert in one key while Esc still interrupts Claude Code.
+**Ctrl+Q** drops back to Normal.
+F13 to F24 are Ctrl+Q everywhere in treetop, so a Caps Lock remapped to one of them, such as F19 (with keyd on Linux or Karabiner-Elements on a Mac, on the machine whose keyboard you type on, over SSH too), does all Ctrl+Q does in one key, while Esc still interrupts Claude Code.
 Ctrl+\\, Ctrl+F and Ctrl+P keep working as before, and a shell keeps Ctrl+F and Ctrl+P for itself.
 
 Ctrl+Q from the table, Enter on a tree and an agent opened from the inbox land in Normal, so nothing typed reaches an agent by accident; a second Enter starts Insert, and a click in the chat lands in Insert, ready to type.
