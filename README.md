@@ -459,7 +459,7 @@ An agent running in a tmux pane, such as an interactive `claude`, belongs to tha
 
 treetop is where agents are sent out, and the assistant is who keeps track of them for you.
 
-`n` opens the compose box in the middle of the screen for a new agent in the tree under the cursor: a free tree is leased for it with `treehouse lease`, and one already held is started in as it is.
+`n` opens the compose box in the window under the table, the one the cursor drives, for a new agent in the tree under the cursor: a free tree is leased for it with `treehouse lease`, and one already held is started in as it is.
 `N` opens it for a new agent in a fresh tree from the pool instead, leased with `treehouse get --lease` when the job runs, so two quick dispatches never share one.
 `:` opens it to the assistant, about the tree under the cursor (see below).
 
@@ -557,6 +557,9 @@ The agent is `claude --bg --name <the task's first words> -- <task>`, which Clau
 An empty task starts the agent idle and opens its chat as soon as it shows up, so its first message is typed there.
 
 A start runs as steps, each with its own timeout: lease the tree (`treehouse get --lease --branch`), check it is a clean worktree, name the branch, write `treetop.json`, start the agent, and wait for `claude agents` to list it, since `claude --bg` exits as soon as the session is queued.
+The window the box was written in follows the start as it runs: each step ticked as it ends, one it did not need marked as such, and the one under way, then its chat, once the agent runs and its tree is listed, with the keys; the row of a fresh tree reads `starting...` in the table meanwhile.
+A step that fails is marked in the window with why, until Esc; Esc while it runs hides it, and the start carries on, its chat left for Enter.
+The window holds no keys while a start runs, so a second start can follow the first at once; in a double, the other window keeps its tree.
 When a step fails, the ones before it are undone in reverse: the agent stopped, the record removed, the branch deleted and the tree returned. The row shows "failed" and the status line which step failed and why.
 The start's log ends with how long each step took, such as `took 1.4s: lease 0.0s branch 0.0s record 0.0s agent 1.4s attach 0.0s`, so a slow start says which step was slow.
 Up to four actions run at once, each on its own tree, so a slow one never holds up the rest.

@@ -229,10 +229,17 @@ pub fn draw(
     let floating_tab = !app.is_issues
         && floats(app, false, frame.area())
         && (app.has_keys_on(WindowTab::Diff) || app.has_keys_on(WindowTab::Pr));
+    let form = window_form(app, frame.area());
+    // A chat on its way floats in a popup unless the window shows it; a
+    // window start gives way to any other prompt opened over it.
+    let popup_opening = app.opening.as_ref().filter(|o| {
+        form.is_none()
+            && (o.key.is_none() || app.prompt.is_none() && !has_window(app, frame.area()))
+    });
     if popup_chat.is_some()
         || floating_tab
-        || app.prompt.is_some()
-        || app.opening.is_some()
+        || app.prompt.is_some() && form.is_none()
+        || popup_opening.is_some()
         || app.picker.is_some()
         || app.port_menu.is_some()
         || app.phone.is_some()
@@ -250,10 +257,17 @@ pub fn draw(
         draw_chat(frame, app, chat);
     } else if floating_tab {
         draw_floating_tab(frame, app);
-    } else if let Some(opening) = &app.opening {
+    } else if let Some(opening) = popup_opening {
         draw_opening(frame, app, opening);
     } else if let Some(prompt) = &app.prompt {
-        draw_prompt(frame, stage(app, frame.area()), prompt);
+        draw_prompt(
+            frame,
+            form.map_or_else(
+                || stage(app, frame.area()),
+                |area| Block::bordered().inner(area),
+            ),
+            prompt,
+        );
     } else if let Some(picker) = &app.picker {
         draw_picker(frame, app, picker);
     } else if let Some(menu) = &app.port_menu {
@@ -1231,6 +1245,104 @@ fn pane_areas(app: &App, window: Rect) -> (Rect, Option<Rect>) {
     (halves[app.side], Some(halves[1 - app.side]))
 }
 
+/// Where a new agent's compose box and its start go: the window the cursor
+/// drives, while one is on screen. None draws them in a popup, as before:
+/// the assistant's, a scratch chat's, and over the Issues screen.
+fn window_form(app: &App, screen: Rect) -> Option<Rect> {
+    if app.is_issues {
+        return None;
+    }
+    let [main, _] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(screen);
+    let (cursor, other) = pane_areas(app, windows(app, main).window?);
+    if app.prompt.as_ref().is_some_and(Prompt::starts_agent) {
+        return Some(cursor);
+    }
+    // A start stays in the window it was asked from, wherever the keys
+    // have gone since; on a terminal too narrow for both it shows only
+    // while that window is the one on screen.
+    let start = app.window_start().filter(|_| app.prompt.is_none())?;
+    match start.side.filter(|_| app.other_window().is_some()) {
+        Some(side) if side != app.side => other,
+        _ => Some(cursor),
+    }
+}
+
+/// The window under the table is on screen, for a tree's start to show in
+/// rather than a popup.
+fn has_window(app: &App, screen: Rect) -> bool {
+    !app.is_issues && window_chat_area(app, screen).is_some()
+}
+
+/// The steps a start goes through, in order: the name its log gives each,
+/// and what the window says for it.
+const START_STEPS: [(&str, &str); 6] = [
+    ("lease", "lease a tree"),
+    ("check", "check it is a clean worktree"),
+    ("branch", "name its branch"),
+    ("record", "write treetop.json"),
+    ("agent", "start the agent"),
+    ("attach", "find its chat"),
+];
+
+/// A start under way in the window: each step ticked as it ends, a step
+/// it went past marked skipped, the one under way, or the one it failed
+/// at with why.
+fn start_lines(app: &App, opening: &Opening, key: &std::path::Path) -> Vec<Line<'static>> {
+    let t = theme();
+    let done = app.steps.get(key).map(Vec::as_slice).unwrap_or_default();
+    let last = START_STEPS
+        .iter()
+        .rposition(|(step, _)| done.contains(step));
+    let mut lines = vec![
+        Line::styled(
+            format!("Starting {}", opening.agent),
+            Style::new().add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+    ];
+    let mut is_next = true;
+    for (at, (step, label)) in START_STEPS.iter().enumerate() {
+        // A start in a tree already held leases, branches and records
+        // nothing.
+        if !opening.leases && !matches!(*step, "agent" | "attach") {
+            continue;
+        }
+        let (glyph, style, note) = if done.contains(step) {
+            ("✓", fg(t.success), String::new())
+        } else if last.is_some_and(|last| at < last) {
+            ("-", fg(t.muted), "  not needed here".to_string())
+        } else if is_next {
+            is_next = false;
+            match &opening.failed {
+                Some(why) => ("✗", fg(t.danger), format!("  {why}")),
+                None => (
+                    "◌",
+                    fg(t.warning).add_modifier(Modifier::BOLD),
+                    String::new(),
+                ),
+            }
+        } else {
+            ("·", fg(t.muted), String::new())
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{glyph} "), style),
+            Span::styled(*label, style),
+            Span::styled(note, fg(t.danger)),
+        ]));
+    }
+    if is_next && opening.failed.is_none() {
+        lines.push(Line::styled("◌ waiting for its chat", fg(t.warning)));
+    }
+    lines.push(Line::raw(""));
+    let keys = if opening.failed.is_some() {
+        "Esc closes this"
+    } else {
+        "Esc hides this; the start carries on"
+    };
+    lines.push(Line::styled(keys, fg(t.muted)));
+    lines
+}
+
 /// What a window draws: the tree it shows and its tabs, whether it has the
 /// keys, its mark in a double, and whether the cursor drives it.
 struct Pane<'a> {
@@ -1384,6 +1496,26 @@ fn context_note(agent: Option<&Agent>) -> Vec<Span<'static>> {
 /// shows only while it is the window agent's.
 fn draw_window(frame: &mut Frame, app: &App, area: Rect, pane: &Pane, chat: Option<&Chat>) {
     let t = theme();
+    // The cursor's window gives way to a new agent's compose box, drawn
+    // over it, and then to its start until its chat opens.
+    if window_form(app, frame.area()) == Some(area) {
+        let mark = pane
+            .side
+            .map(|side| format!("{} ", SIDES[side]))
+            .unwrap_or_default();
+        let block = window_block(true).title(format!(" {mark}New agent "));
+        let body = Block::new()
+            .padding(Padding::horizontal(1))
+            .inner(block.inner(area));
+        frame.render_widget(block, area);
+        if app.prompt.is_none()
+            && let Some(opening) = app.window_start()
+            && let Some(key) = opening.key.as_deref()
+        {
+            frame.render_widget(Paragraph::new(start_lines(app, opening, key)), body);
+        }
+        return;
+    }
     let tree = pane.tree;
     let mark = pane
         .side
@@ -6718,5 +6850,148 @@ mod window_tests {
             assert_eq!(cursor.width, other.width, "at {width} columns");
             assert!(cursor.right().max(other.right()) <= width);
         }
+    }
+
+    #[test]
+    fn a_new_agents_form_and_its_start_take_the_window_the_cursor_drives() {
+        let mut app = on("4");
+        app.handle_key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Char('N'),
+        ));
+        let shown = lines(&drawn(&app, 200, 50));
+        let window = shown
+            .iter()
+            .position(|l| l.starts_with("┌ New agent "))
+            .unwrap_or_else(|| panic!("{}", shown.join("\n")));
+        let table_ends = shown.iter().position(|l| l.starts_with('└')).unwrap();
+        assert!(window > table_ends, "under the table, not over it");
+        assert!(
+            shown[window..]
+                .iter()
+                .any(|l| l.contains("New agent in a fresh tree")),
+            "{}",
+            shown.join("\n")
+        );
+        // Once sent, the window lists its steps as they end.
+        app.prompt = None;
+        let key = std::path::PathBuf::from("(new tree 1)");
+        app.opening = Some(Opening {
+            agent: "fix login".into(),
+            tree: "new".into(),
+            key: Some(key.clone()),
+            failed: None,
+            leases: true,
+            side: None,
+        });
+        app.job_step(key.clone(), "lease");
+        app.job_step(key.clone(), "branch");
+        let shown = lines(&drawn(&app, 200, 50)).join("\n");
+        for seen in [
+            "Starting fix login",
+            "✓ lease a tree",
+            "- check it is a clean worktree  not needed here",
+            "✓ name its branch",
+            "◌ write treetop.json",
+            "· start the agent",
+            "Esc hides this; the start carries on",
+        ] {
+            assert!(shown.contains(seen), "{seen}:\n{shown}");
+        }
+        if let Some(opening) = app.opening.as_mut() {
+            opening.failed = Some("record: disk full".into());
+        }
+        let shown = lines(&drawn(&app, 200, 50)).join("\n");
+        assert!(
+            shown.contains("✗ write treetop.json  record: disk full"),
+            "{shown}"
+        );
+        assert!(shown.contains("Esc closes this"), "{shown}");
+        // In a tree already held nothing is leased, branched or recorded,
+        // so only the agent's own steps are listed.
+        app.opening = Some(Opening {
+            agent: "add tests".into(),
+            tree: "4".into(),
+            key: Some("/pool/4/app".into()),
+            failed: None,
+            leases: false,
+            side: None,
+        });
+        let shown = lines(&drawn(&app, 200, 50)).join("\n");
+        assert!(shown.contains("◌ start the agent"), "{shown}");
+        assert!(!shown.contains("lease a tree"), "{shown}");
+    }
+
+    #[test]
+    fn a_prompt_opened_over_a_start_is_drawn_and_a_double_keeps_its_other_tree() {
+        let mut app = on("4");
+        app.handle_key(ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char('\\'),
+            ratatui::crossterm::event::KeyModifiers::CONTROL,
+        ));
+        app.handle_key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Char('N'),
+        ));
+        let shown = lines(&drawn(&app, 200, 50));
+        let titles = shown
+            .iter()
+            .find(|l| l.contains("New agent"))
+            .unwrap_or_else(|| panic!("{}", shown.join("\n")));
+        assert!(
+            titles.contains("┌ ◧ Tree 4 "),
+            "the other window keeps its tree: {titles}"
+        );
+        app.prompt = None;
+        app.opening = Some(Opening {
+            agent: "fix login".into(),
+            tree: "new".into(),
+            key: Some("(new tree 1)".into()),
+            failed: None,
+            leases: true,
+            side: None,
+        });
+        app.handle_key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Char(':'),
+        ));
+        assert!(app.prompt.is_some());
+        let shown = lines(&drawn(&app, 200, 50)).join("\n");
+        assert!(shown.contains("Ask the assistant"), "{shown}");
+    }
+
+    #[test]
+    fn a_start_stays_in_the_window_it_was_asked_from_and_the_form_in_its_borders() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let ctrl = |app: &mut App, c: char| {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+        };
+        let mut app = on("4");
+        ctrl(&mut app, '\\');
+        app.handle_key(KeyEvent::from(KeyCode::Char('N')));
+        app.handle_key(KeyEvent::from(KeyCode::Char('x')));
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.window_start().is_some());
+        let started_on = app.side;
+        // The keys go round to the other window and back; the start stays.
+        for _ in 0..2 {
+            ctrl(&mut app, 'q');
+            let shown = lines(&drawn(&app, 200, 50));
+            let titles = shown
+                .iter()
+                .find(|l| l.contains("New agent"))
+                .unwrap_or_else(|| panic!("{}", shown.join("\n")));
+            let mark = SIDES[started_on];
+            assert!(titles.contains(&format!("┌ {mark} New agent ")), "{titles}");
+        }
+        // Esc reaches the window with the keys, not the start.
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.window_start().is_some(), "the start is still shown");
+        // On a short terminal the form keeps inside its window's border.
+        let mut app = on("4");
+        app.handle_key(KeyEvent::from(KeyCode::Char('N')));
+        let shown = lines(&drawn(&app, 80, 20));
+        assert!(
+            shown.iter().any(|l| l.starts_with("┌ New agent ")),
+            "{}",
+            shown.join("\n")
+        );
     }
 }

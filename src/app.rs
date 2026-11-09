@@ -440,9 +440,16 @@ pub struct App {
     /// prints the id `claude attach` takes, so there is no waiting for the
     /// agent to be seen in its tree.
     started_chat: Option<Outcome>,
-    /// A chat on its way: its popup stands in from the moment the box is
-    /// sent until the chat itself opens in the same frame.
+    /// A chat on its way: its popup, or the window under the table for a
+    /// tree's agent, stands in from the moment the box is sent until the
+    /// chat itself opens in the same place.
     pub opening: Option<Opening>,
+    /// The steps each start has finished so far, by its row, as the worker
+    /// says them.
+    pub steps: HashMap<PathBuf, Vec<&'static str>>,
+    /// Since when a started agent's chat has waited for its new tree to be
+    /// listed.
+    started_at: Option<Instant>,
     /// The main checkout of the pool on screen, the workspace.
     pub checkout: PathBuf,
     /// The workspace picker, while it is open.
@@ -566,6 +573,18 @@ pub struct Opening {
     pub agent: String,
     /// The tree's name, `new` until a new tree is leased.
     pub tree: String,
+    /// The row of the start a tree's agent comes from, whose steps the
+    /// window under the table shows as they end; None for the assistant's
+    /// and a scratch chat, which open in a popup.
+    pub key: Option<PathBuf>,
+    /// Why its start failed, shown in the window until Esc.
+    pub failed: Option<String>,
+    /// Its start leases a tree, a fresh one or a free one, so it goes
+    /// through every step; one in a tree already held only starts the agent.
+    pub leases: bool,
+    /// In a double, the side of the window it was asked from, which it
+    /// stays in wherever the keys go; None with one window.
+    pub side: Option<usize>,
 }
 
 /// A tree an agent was just started in, and the agents already there, so
@@ -1427,6 +1446,25 @@ impl App {
         self.return_cursor();
     }
 
+    /// The chat on its way is `job`'s: its window's start, or, for a popup
+    /// with no row, the start that opened it; never a scratch chat's.
+    fn owns_opening(&self, job: &Job) -> bool {
+        self.opening.as_ref().is_some_and(|o| match &o.key {
+            Some(key) => *key == job.key,
+            None => o.tree != SCRATCH,
+        })
+    }
+
+    /// A start on row `key` finished `step`.
+    pub fn job_step(&mut self, key: PathBuf, step: &'static str) {
+        self.steps.entry(key).or_default().push(step);
+    }
+
+    /// The start shown in the window under the table, while there is one.
+    pub fn window_start(&self) -> Option<&Opening> {
+        self.opening.as_ref().filter(|o| o.key.is_some())
+    }
+
     pub fn job_started(&mut self, job: &Job) {
         self.jobs
             .insert(job.key.clone(), JobState::Running(job.kind));
@@ -1469,7 +1507,16 @@ impl App {
         let is_assistant = job.launch.as_ref().is_some_and(|l| l.is_assistant);
         if !is_ok {
             if job.kind == Kind::Start {
-                self.opening = None;
+                // A start shown in the window stays there, saying which
+                // step failed and why, until Esc.
+                // Another start's window, or a chat on its way for
+                // something else, is left as it is.
+                if self.owns_opening(&job) {
+                    match self.opening.as_mut().filter(|o| o.key.is_some()) {
+                        Some(opening) => opening.failed = Some(last_line(&output).to_string()),
+                        None => self.opening = None,
+                    }
+                }
             }
             self.jobs.insert(path, JobState::Failed(job.kind));
             self.message = Some(format!(
@@ -1478,7 +1525,13 @@ impl App {
                 job.tree.name,
                 last_line(&output)
             ));
-        } else if job.kind == Kind::Start && task.is_some() {
+        } else if job.kind == Kind::Start
+            && task.is_some()
+            && self
+                .opening
+                .as_ref()
+                .is_none_or(|o| o.key.as_ref() != Some(&job.key))
+        {
             self.jobs
                 .insert(path.clone(), JobState::Done(job.kind, Instant::now()));
             self.message = Some(if is_assistant {
@@ -1502,7 +1555,14 @@ impl App {
                 .find(|t| t.path == path)
                 .map(|t| t.agents.iter().map(|a| a.pid).collect())
                 .unwrap_or_default();
-            match (self.opening.as_mut(), job.attach.clone()) {
+            if self.window_start().is_some() {
+                self.message = Some(format!(
+                    "agent started in tree {}; its chat opens here",
+                    job.tree.name
+                ));
+            }
+            let owns = self.owns_opening(&job);
+            match (self.opening.as_mut().filter(|_| owns), job.attach.clone()) {
                 (None, _) => {
                     self.message = Some(if is_assistant {
                         "the assistant started; a opens its chat".to_string()
@@ -2045,9 +2105,21 @@ impl App {
     /// id to attach to, else once it has shown up in its tree with a chat to
     /// open. Gives up after AWAIT_CHAT, saying so.
     pub fn ready_chat(&mut self) -> Option<Outcome> {
+        // A tree's chat opens in the window under the table, on its tree, so
+        // a new tree's waits until the pool lists it, as long as AWAIT_CHAT.
+        if let Some(Outcome::Chat { tree, .. }) = &self.started_chat
+            && self.window_start().is_some()
+            && !self.trees.iter().any(|t| &t.name == tree)
+        {
+            let since = *self.started_at.get_or_insert_with(Instant::now);
+            if since.elapsed() < AWAIT_CHAT {
+                return None;
+            }
+        }
         if let Some(chat) = self.started_chat.take() {
             self.opening = None;
             self.awaiting_chat = None;
+            self.started_at = None;
             return Some(chat);
         }
         let awaiting = self.awaiting_chat.as_ref()?;
@@ -3410,12 +3482,26 @@ impl App {
             return Outcome::Continue;
         }
         // A pick's task comes from its ticket when the job runs, so it is
-        // never an idle start.
-        if launch.task.trim().is_empty() && launch.ticket.is_none() {
+        // never an idle start. A start from the compose box shows in the
+        // window under the table, its steps as they end, and its chat opens
+        // there once it runs; the assistant's opens only when idle, as it
+        // answers in the background.
+        let is_idle = launch.task.trim().is_empty();
+        if launch.ticket.is_none() && (is_idle || !launch.is_assistant) {
             self.opening = Some(Opening {
-                agent: launch.name.clone().unwrap_or_else(|| "new agent".into()),
+                agent: launch
+                    .name
+                    .clone()
+                    .or_else(|| crate::dispatch::session_name(&launch.task))
+                    .unwrap_or_else(|| "new agent".into()),
                 tree: tree.name.clone(),
+                key: (!launch.is_assistant).then(|| tree.path.clone()),
+                failed: None,
+                leases: launch.is_new_tree || !tree.is_held(),
+                side: self.other_window().is_some().then_some(self.side),
             });
+            self.steps.remove(&tree.path);
+            self.started_at = None;
         }
         let job = Job {
             launch: Some(launch),
@@ -3814,7 +3900,18 @@ impl App {
         if self.scratch_menu.is_some() {
             return self.handle_scratch_key(key);
         }
-        if let Some(opening) = self.opening.clone() {
+        // A start shown in the window under the table holds no keys: Esc
+        // hides it, and the start carries on; the rest work as ever, so a
+        // second start can follow the first at once.
+        // Esc hides it from the table; a window with the keys takes its own.
+        if self.window_start().is_some() && key.code == KeyCode::Esc && !self.is_window_focused {
+            self.opening = None;
+            self.awaiting_chat = None;
+            self.started_chat = None;
+            self.started_at = None;
+            return Outcome::Continue;
+        }
+        if let Some(opening) = self.opening.clone().filter(|o| o.key.is_none()) {
             let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             if is_ctrl && key.code == KeyCode::Char('c') {
                 return Outcome::Quit;
@@ -5666,6 +5763,60 @@ mod tests {
     }
 
     #[test]
+    fn a_start_shows_in_the_window_and_its_chat_opens_once_its_tree_is_listed() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('N'));
+        type_in(&mut app, "fix login");
+        let mut job = queued(press(&mut app, KeyCode::Enter)).remove(0);
+        assert_eq!(
+            app.window_start().and_then(|o| o.key.clone()),
+            Some(job.key.clone())
+        );
+        job.tree.path = PathBuf::from("/p/12/app");
+        job.tree.name = "12".into();
+        job.attach = Some(vec!["claude".into(), "attach".into(), "new1".into()]);
+        app.job_finished(job.clone(), true, String::new());
+        // Its tree is not listed yet, so the window has nowhere to show it.
+        assert_eq!(app.ready_chat(), None);
+        let mut trees = app.trees.clone();
+        trees.push(Tree {
+            name: "12".into(),
+            path: "/p/12/app".into(),
+            ..app.trees[0].clone()
+        });
+        app.set_trees(trees);
+        assert!(matches!(
+            app.ready_chat(),
+            Some(Outcome::Chat { tree, .. }) if tree == "12"
+        ));
+        assert!(app.window_start().is_none());
+    }
+
+    #[test]
+    fn a_failed_start_stays_in_the_window_until_esc_and_esc_hides_one_under_way() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('N'));
+        type_in(&mut app, "fix login");
+        let job = queued(press(&mut app, KeyCode::Enter)).remove(0);
+        app.job_finished(job, false, "lease: no tree is free".into());
+        assert_eq!(
+            app.window_start().and_then(|o| o.failed.clone()).as_deref(),
+            Some("lease: no tree is free")
+        );
+        press(&mut app, KeyCode::Esc);
+        assert!(app.opening.is_none());
+        // Esc while it runs hides it, and the start carries on unopened.
+        press(&mut app, KeyCode::Char('N'));
+        type_in(&mut app, "fix login");
+        let mut job = queued(press(&mut app, KeyCode::Enter)).remove(0);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.opening.is_none());
+        job.attach = Some(vec!["claude".into(), "attach".into(), "new2".into()]);
+        app.job_finished(job, true, String::new());
+        assert_eq!(app.ready_chat(), None, "a hidden start opens no chat");
+    }
+
+    #[test]
     fn esc_closes_the_bar_and_queues_nothing() {
         let mut app = app();
         press(&mut app, KeyCode::Char('N'));
@@ -7274,5 +7425,39 @@ mod tests {
         }
         select(&mut app, "8");
         assert_eq!(app.shown_tab(), WindowTab::Shell, "the shell tab was kept");
+    }
+
+    #[test]
+    fn each_start_minds_its_own_window_and_esc_forgets_the_wait() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('N'));
+        type_in(&mut app, "one");
+        let one = queued(press(&mut app, KeyCode::Enter)).remove(0);
+        press(&mut app, KeyCode::Char('N'));
+        type_in(&mut app, "two");
+        let mut two = queued(press(&mut app, KeyCode::Enter)).remove(0);
+        // The first start failing leaves the second's window be.
+        app.job_finished(one, false, "lease: no tree is free".into());
+        let shown = app.window_start().cloned().unwrap();
+        assert_eq!((shown.agent.as_str(), shown.failed), ("two", None));
+        two.attach = Some(vec!["claude".into(), "attach".into(), "two".into()]);
+        two.tree.name = "8".into();
+        two.tree.path = "/p/8/app".into();
+        app.job_finished(two, true, String::new());
+        assert!(matches!(
+            app.ready_chat(),
+            Some(Outcome::Chat { agent, tree, .. }) if agent == "two" && tree == "8"
+        ));
+        // A start whose tree is not listed yet waits for it; Esc forgets
+        // that wait, so the next start waits afresh.
+        press(&mut app, KeyCode::Char('N'));
+        type_in(&mut app, "three");
+        let mut three = queued(press(&mut app, KeyCode::Enter)).remove(0);
+        three.attach = Some(vec!["claude".into(), "attach".into(), "three".into()]);
+        three.tree.name = "12".into();
+        app.job_finished(three, true, String::new());
+        assert_eq!(app.ready_chat(), None);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.started_at, None);
     }
 }

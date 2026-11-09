@@ -447,6 +447,7 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             is_stale = true;
             match event {
                 jobs::Event::Started(job) => app.job_started(&job),
+                jobs::Event::Step { key, step } => app.job_step(key, step),
                 jobs::Event::Finished { job, is_ok, output } => {
                     let is_preview = job.kind == Kind::Preview;
                     if job.kind == Kind::Ship {
@@ -1008,6 +1009,10 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                 app.opening = Some(Opening {
                     agent: "a scratch chat".into(),
                     tree: app::SCRATCH.into(),
+                    key: None,
+                    failed: None,
+                    leases: false,
+                    side: None,
                 });
                 let (done, result) = mpsc::channel();
                 std::thread::spawn(move || {
