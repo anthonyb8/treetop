@@ -18,7 +18,7 @@ use ratatui::widgets::{
 use crate::agents::{Agent, Status};
 use crate::app::{
     App, DiffView, Group, Item, JobState, ListRow, LogEntry, Opening, Outcome, Pending, Phone,
-    Picker, PortMenu, Reach, Review, SCRATCH, ScratchMenu, Shipping, WindowTab,
+    Picker, PortMenu, Reach, Review, SCRATCH, ScratchMenu, Shipping, WindowTab, Zoom,
 };
 use crate::assistant;
 use crate::chat::Chat;
@@ -69,6 +69,7 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
             ("Enter", "open, fold heading"),
             ("^Q", "window, table"),
             ("^\\", "two windows, one"),
+            ("^F", "zoom table, windows"),
             ("\u{2190} \u{2192}", "chat, info tab"),
             ("n", "new agent here"),
             ("N", "agent in new tree"),
@@ -197,12 +198,28 @@ pub fn draw(
             let [main, footer] =
                 Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
             let windows = windows(app, main);
-            let inbox = inbox_layout(app, windows.top);
-            // The table has the keys unless the window or the inbox does.
-            let block = window_block(!app.is_window_focused && app.rail.is_none()).title(" Trees ");
-            let body = block.inner(inbox.list);
-            frame.render_widget(block, inbox.list);
-            draw_table(frame, app, body);
+            let inbox = inbox_layout(app, &windows);
+            if is_classic(app) {
+                // Zoomed, the table is the screen treetop had before its
+                // windows: unboxed, the detail pane under it.
+                let [body, detail] =
+                    Layout::vertical([Constraint::Fill(1), Constraint::Length(DETAIL_HEIGHT)])
+                        .areas(inbox.list);
+                draw_table(frame, app, body, false);
+                draw_detail(frame, app, detail);
+            } else {
+                let fold = folds(app, main);
+                // The table has the keys unless the window or the inbox does.
+                let title = if fold {
+                    " Trees · ^F shows them all "
+                } else {
+                    " Trees "
+                };
+                let block = window_block(!app.is_window_focused && app.rail.is_none()).title(title);
+                let body = block.inner(inbox.list);
+                frame.render_widget(block, inbox.list);
+                draw_table(frame, app, body, fold);
+            }
             if let Some(area) = windows.window {
                 let screen = frame.area();
                 let (cursor_area, other_area) = pane_areas(app, area);
@@ -658,7 +675,7 @@ fn row(app: &App, tree: &Tree) -> Row<'static> {
     })
 }
 
-fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_table(frame: &mut Frame, app: &App, area: Rect, fold: bool) {
     let t = theme();
     let mut titles = vec!["", "#", "STATUS", "TICKET", "BRANCH", "AGENT"];
     if !app.runs.is_empty() {
@@ -674,8 +691,12 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
     // further down the table.
     let mut rows: Vec<Row> = Vec::new();
     let mut selected = 0;
+    let kept = fold.then(|| zoomed_rows(app));
     for (at, list_row) in app.rows().into_iter().enumerate() {
-        if matches!(list_row, ListRow::Heading { .. }) && at > 0 {
+        if kept.as_ref().is_some_and(|kept| !kept.contains(&at)) {
+            continue;
+        }
+        if matches!(list_row, ListRow::Heading { .. }) && at > 0 && kept.is_none() {
             rows.push(Row::new(Vec::<Cell>::new()));
         }
         if at == app.selected {
@@ -717,8 +738,10 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
 /// for its row or, for the main checkout, its heading; a tree in both
 /// carries both.
 fn window_marks(app: &App, tree: &Tree) -> Span<'static> {
+    // Zoomed to the table no window shows, so no tree is marked.
     let marks: String = app
         .other_window()
+        .filter(|_| !is_classic(app))
         .map(|(other, _)| {
             let here = app.window_tree().is_some_and(|t| t.path == tree.path);
             let there = other.path == tree.path;
@@ -1047,7 +1070,14 @@ fn footer_left(app: &App, width: u16) -> Line<'static> {
         ));
     }
     let used = u16::try_from(narrowing.iter().map(Span::width).sum::<usize>()).unwrap_or(width);
-    let mut spans = fitting_keys(&KEYS, width.saturating_sub(used));
+    // Zoomed to the table there is no window for Ctrl+Q to give the keys
+    // to, and the bar is the one treetop had before its windows.
+    let keys: Vec<(&str, &str)> = KEYS
+        .iter()
+        .copied()
+        .filter(|(key, _)| !(is_classic(app) && *key == "^Q"))
+        .collect();
+    let mut spans = fitting_keys(&keys, width.saturating_sub(used));
     spans.extend(narrowing);
     Line::from(spans)
 }
@@ -1128,12 +1158,40 @@ struct Windows {
     top: Rect,
     /// The window under them, showing the tree under the cursor.
     window: Option<Rect>,
+    /// Zoomed to the windows, the table folds to their trees' rows.
+    folded: bool,
 }
 
 /// The table's window is as tall as its rows, or the inbox's entries
 /// beside it where there are more, between TABLE_MIN and TABLE_SHARE of
 /// `main`; the window under it takes the rest.
 fn windows(app: &App, main: Rect) -> Windows {
+    match app.zoom {
+        // The table over the whole screen, as treetop was before windows.
+        Some(Zoom::Table) => {
+            return Windows {
+                top: main,
+                window: None,
+                folded: false,
+            };
+        }
+        // The windows, under the rows of their trees and the header.
+        Some(Zoom::Windows) => {
+            let height = u16::try_from(zoomed_rows(app).len())
+                .unwrap_or(u16::MAX)
+                .saturating_add(3);
+            if folds(app, main) {
+                let [top, window] =
+                    Layout::vertical([Constraint::Length(height), Constraint::Fill(1)]).areas(main);
+                return Windows {
+                    top,
+                    window: Some(window),
+                    folded: true,
+                };
+            }
+        }
+        None => {}
+    }
     let rows = app.rows();
     // Each heading after the first has a blank line above it.
     let blanks = rows
@@ -1159,6 +1217,7 @@ fn windows(app: &App, main: Rect) -> Windows {
         return Windows {
             top: main,
             window: None,
+            folded: false,
         };
     }
     let [top, window] =
@@ -1166,7 +1225,54 @@ fn windows(app: &App, main: Rect) -> Windows {
     Windows {
         top,
         window: Some(window),
+        folded: false,
     }
+}
+
+/// Zoomed to the table: the screen treetop had before its windows.
+fn is_classic(app: &App) -> bool {
+    app.zoom == Some(Zoom::Table)
+}
+
+/// Rows the detail pane takes under the table zoomed, borders included.
+const DETAIL_HEIGHT: u16 = 12;
+
+/// The tree under the cursor in full, or the main checkout on its heading,
+/// in the pane under the table zoomed, as the info tab has it.
+fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
+    let block = Block::bordered().border_style(fg(theme().border));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let lines = match app.window_tree() {
+        Some(tree) => detail_text(app, tree, inner),
+        None if app.is_loaded => vec![Line::raw("no trees match")],
+        None => Vec::new(),
+    };
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+/// Zoomed to the windows with room for them, the table folds to their
+/// trees' rows; too short for that, it stays whole.
+fn folds(app: &App, main: Rect) -> bool {
+    let height = u16::try_from(zoomed_rows(app).len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(3);
+    app.zoom == Some(Zoom::Windows) && main.height >= height + WINDOW_MIN
+}
+
+/// The rows of the list the table keeps, zoomed to the windows: the row
+/// under the cursor, and the second window's tree in a double.
+fn zoomed_rows(app: &App) -> Vec<usize> {
+    let other = app.other_window().map(|(tree, _)| tree.path.clone());
+    app.rows()
+        .iter()
+        .enumerate()
+        .filter(|(at, row)| {
+            *at == app.selected
+                || matches!(row, ListRow::Tree(t) if Some(&t.path) == other.as_ref())
+        })
+        .map(|(at, _)| at)
+        .collect()
 }
 
 /// A window's border: the title colour on the one that has the keys, as
@@ -1682,9 +1788,13 @@ struct InboxLayout {
     strip: Option<Rect>,
 }
 
-fn inbox_layout(app: &App, main: Rect) -> InboxLayout {
+fn inbox_layout(app: &App, windows: &Windows) -> InboxLayout {
+    let main = windows.top;
+    // Zoomed to the windows, the table's few rows leave no room for it
+    // beside them, so it is set aside as if hidden.
+    let is_hidden = app.inbox.is_hidden || windows.folded;
     let is_wide = main.width >= INBOX_FULL_FROM;
-    let beside = match (app.inbox.is_hidden, is_wide) {
+    let beside = match (is_hidden, is_wide) {
         (true, _) => 0,
         (false, true) => INBOX_WIDTH,
         (false, false) => STRIP_WIDTH,
@@ -1726,7 +1836,7 @@ pub fn stage(app: &App, screen: Rect) -> Rect {
     }
     let [main, _] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(screen);
     Rect {
-        width: inbox_layout(app, windows(app, main).top).list.width,
+        width: inbox_layout(app, &windows(app, main)).list.width,
         ..screen
     }
 }
@@ -1737,7 +1847,7 @@ pub fn is_on_inbox(app: &App, screen: Rect, mouse: ratatui::crossterm::event::Mo
         return false;
     }
     let [main, _] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(screen);
-    let layout = inbox_layout(app, windows(app, main).top);
+    let layout = inbox_layout(app, &windows(app, main));
     let at = Position::new(mouse.column, mouse.row);
     layout
         .rail
@@ -1758,7 +1868,7 @@ pub fn click(
     }
     let [main, _] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(screen);
     let windows = windows(app, main);
-    let layout = inbox_layout(app, windows.top);
+    let layout = inbox_layout(app, &windows);
     let at = Position::new(mouse.column, mouse.row);
     // A tab in the window's bar shows that tab.
     if let Some(window) = windows.window {
@@ -1806,6 +1916,26 @@ fn inbox_areas(app: &App, area: Rect) -> [Rect; 3] {
     .areas(inbox_block(app).inner(area))
 }
 
+/// The inbox's border without its padding: a rule at its left zoomed to
+/// the table, as before the windows, else a box.
+fn inbox_rule(app: &App) -> Block<'static> {
+    if is_classic(app) {
+        Block::new().borders(Borders::LEFT)
+    } else {
+        Block::bordered()
+    }
+}
+
+/// Where the inbox's heading bar runs: across its rule too zoomed to the
+/// table, as before the windows, else inside its box.
+fn heading_area(app: &App, area: Rect) -> Rect {
+    if is_classic(app) {
+        area
+    } else {
+        Block::bordered().inner(area)
+    }
+}
+
 fn inbox_block(app: &App) -> Block<'static> {
     let t = theme();
     let border = if app.rail.is_some() {
@@ -1813,7 +1943,7 @@ fn inbox_block(app: &App) -> Block<'static> {
     } else {
         t.border
     };
-    Block::bordered()
+    inbox_rule(app)
         .border_style(fg(border))
         .padding(Padding::horizontal(1))
 }
@@ -1942,7 +2072,7 @@ fn draw_inbox(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         Span::raw("")
     };
-    heading_bar(frame, Block::bordered().inner(area));
+    heading_bar(frame, heading_area(app, area));
     let mut heading = Line::from(vec![inbox_icon(waiting), Span::styled(" INBOX", t.header)]);
     let pad = usize::from(title.width).saturating_sub(heading.width() + count.width());
     heading.spans.extend([Span::raw(" ".repeat(pad)), count]);
@@ -2014,10 +2144,10 @@ fn inbox_icon(waiting: usize) -> Span<'static> {
 /// done, for a terminal too narrow for it in full.
 fn draw_inbox_strip(frame: &mut Frame, app: &App, area: Rect) {
     let t = theme();
-    let block = Block::bordered().border_style(fg(t.border));
+    let block = inbox_rule(app).border_style(fg(t.border));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    heading_bar(frame, inner);
+    heading_bar(frame, heading_area(app, area));
     let unseen: Vec<Kind> = inbox::shown(app)
         .into_iter()
         .filter(|(_, seen)| !seen)
@@ -6993,5 +7123,105 @@ mod window_tests {
             "{}",
             shown.join("\n")
         );
+    }
+
+    #[test]
+    fn zoomed_to_the_windows_the_table_keeps_their_rows() {
+        let mut app = on("4");
+        // Zoomed to the windows, the table keeps only the window's tree.
+        app.zoom = Some(Zoom::Windows);
+        let shown = lines(&drawn(&app, 200, 50));
+        assert!(
+            shown[0].starts_with("┌ Trees · ^F shows them all "),
+            "{}",
+            shown[0]
+        );
+        assert!(
+            shown[2].contains("me/anb-41-inbox-rail"),
+            "{}",
+            shown.join("\n")
+        );
+        assert!(shown[3].starts_with('└'), "one row: {}", shown.join("\n"));
+        assert!(
+            shown[4].starts_with("┌ Tree 4 "),
+            "the window takes the rest"
+        );
+        assert!(
+            !shown.iter().any(|l| l.contains("INBOX")),
+            "no inbox beside it"
+        );
+        // Given the keys, the inbox set aside opens over the table.
+        app.rail = Some(0);
+        let shown = lines(&drawn(&app, 200, 50));
+        assert!(
+            shown.iter().any(|l| l.contains("INBOX")),
+            "{}",
+            shown.join("\n")
+        );
+        app.rail = None;
+        // In a double, both windows' trees, however far apart in the list.
+        app.other = Some(crate::app::OtherWindow {
+            path: "/pool/9/app".into(),
+            tab: WindowTab::Info,
+        });
+        app.side = 0;
+        let shown = lines(&drawn(&app, 200, 50));
+        assert!(
+            shown[2].contains("me/anb-41-inbox-rail"),
+            "{}",
+            shown.join("\n")
+        );
+        assert!(shown[3].contains("me/port-menu"), "{}", shown.join("\n"));
+        assert!(shown[4].starts_with('└'), "{}", shown.join("\n"));
+    }
+
+    #[test]
+    fn zoomed_the_table_is_the_screen_treetop_had_before_its_windows() {
+        let mut app = on("4");
+        app.zoom = Some(Zoom::Table);
+        let shown = lines(&drawn(&app, 200, 50));
+        // The table's header on the first row, unboxed, as it always was.
+        assert!(shown[0].starts_with("  #    STATUS"), "{}", shown[0]);
+        // The detail pane boxed under it, its last 12 rows above the bar.
+        assert!(shown[37].starts_with('┌'), "{}", shown.join("\n"));
+        assert!(shown[38].starts_with("│/pool/4/app"), "{}", shown[38]);
+        assert!(shown[48].starts_with('└'));
+        // The inbox beside it with its one left border, its heading on the
+        // table's header row.
+        let inbox_at = 200 - usize::from(INBOX_WIDTH);
+        let border: String = shown[5].chars().skip(inbox_at).take(1).collect();
+        assert_eq!(border, "│", "{}", shown[5]);
+        assert!(
+            shown[0]
+                .chars()
+                .skip(inbox_at)
+                .collect::<String>()
+                .contains("INBOX")
+        );
+        // Its key bar too, with no window for Ctrl+Q to give the keys to.
+        assert!(!shown[49].contains("^Q"), "{}", shown[49]);
+        assert!(
+            shown[49].starts_with(" Enter  open  ?  help "),
+            "{}",
+            shown[49]
+        );
+        // Zoomed to the windows on a terminal too short for them, nothing is
+        // folded away and the inbox stays beside the table.
+        app.zoom = Some(Zoom::Windows);
+        let shown = lines(&drawn(&app, 200, 8)).join("\n");
+        assert!(!shown.contains("^F shows them all"), "{shown}");
+        assert!(shown.contains("INBOX"), "{shown}");
+    }
+
+    #[test]
+    fn zoomed_to_the_table_its_rows_carry_no_window_marks() {
+        let mut app = on("4");
+        app.handle_key(ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char('\\'),
+            ratatui::crossterm::event::KeyModifiers::CONTROL,
+        ));
+        app.zoom = Some(Zoom::Table);
+        let shown = lines(&drawn(&app, 200, 50)).join("\n");
+        assert!(!shown.contains('◧') && !shown.contains('◨'), "{shown}");
     }
 }

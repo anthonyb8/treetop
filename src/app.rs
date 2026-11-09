@@ -275,6 +275,14 @@ pub enum WindowTab {
     Info,
 }
 
+/// What Ctrl+F zooms: the table over the whole screen, as treetop was
+/// before the windows, or the windows, the table folded to their trees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Zoom {
+    Table,
+    Windows,
+}
+
 /// What a shell in the window under the table names as its agent.
 pub const SHELL: &str = "shell";
 
@@ -550,6 +558,8 @@ pub struct App {
     pub window_rows: u16,
     /// The second window, in a double; None shows one window.
     pub other: Option<OtherWindow>,
+    /// What Ctrl+F zoomed, while it is zoomed.
+    pub zoom: Option<Zoom>,
     /// In a double, the side of the window the cursor drives, the one that
     /// last had the keys: 0 on the left, 1 on the right.
     pub side: usize,
@@ -1074,6 +1084,15 @@ impl App {
             (tree, WindowTab::Chat) => Self::chat_agent(tree)?.plugin.as_deref(),
             _ => None,
         }
+    }
+
+    /// Ctrl+F: zooms `what`, the table from the table and the windows from
+    /// a window with the keys, or zooms back out.
+    pub fn toggle_zoom(&mut self, what: Zoom) {
+        self.zoom = match self.zoom {
+            Some(_) => None,
+            None => Some(what),
+        };
     }
 
     /// Ctrl+\: two windows, the one the cursor drives on the right and the
@@ -1844,6 +1863,7 @@ impl App {
                 KeyCode::Char('c') => return Outcome::Quit,
                 KeyCode::Char('r') => self.read_pr(path),
                 KeyCode::Char('q' | 'Q') => self.cycle_keys(),
+                KeyCode::Char('f' | 'F') => self.toggle_zoom(Zoom::Windows),
                 _ => {}
             }
             return Outcome::Continue;
@@ -1981,6 +2001,7 @@ impl App {
                     self.diffs.remove(&path);
                 }
                 KeyCode::Char('q' | 'Q') => self.cycle_keys(),
+                KeyCode::Char('f' | 'F') => self.toggle_zoom(Zoom::Windows),
                 _ => {}
             }
             return Outcome::Continue;
@@ -3941,9 +3962,21 @@ impl App {
                         && !self.is_help
                         && !self.is_filtering
                         && self.rail.is_none();
-                    if is_free {
+                    // Zoomed to the table there is no window to give the
+                    // keys to, as before treetop had windows.
+                    if is_free && self.zoom != Some(Zoom::Table) {
                         self.cycle_keys();
                     }
+                    Outcome::Continue
+                }
+                // Ctrl+F: the table, or the window with the keys, zoomed.
+                KeyCode::Char('f' | 'F') => {
+                    let what = if self.is_window_focused {
+                        Zoom::Windows
+                    } else {
+                        Zoom::Table
+                    };
+                    self.toggle_zoom(what);
                     Outcome::Continue
                 }
                 // Ctrl+\: two windows under the table, or one again.
@@ -4082,7 +4115,14 @@ impl App {
             }
             KeyCode::Char('i') => self.show_issue(),
             KeyCode::Char('I') => self.choose_issue(),
-            KeyCode::Char('e') => self.rail = Some(0),
+            KeyCode::Char('e') => {
+                // Zoomed to the windows, the inbox has no room beside the
+                // table: it zooms back out to show itself.
+                if self.zoom == Some(Zoom::Windows) {
+                    self.zoom = None;
+                }
+                self.rail = Some(0);
+            }
             KeyCode::Char('E') => self.toggle_inbox(),
             KeyCode::Char('m') => self.open_message(),
             KeyCode::Char('q') => return self.quit(),
@@ -7459,5 +7499,59 @@ mod tests {
         assert_eq!(app.ready_chat(), None);
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.started_at, None);
+    }
+
+    #[test]
+    fn ctrl_f_zooms_the_table_from_the_table_and_the_windows_from_a_window() {
+        let mut app = with_chat(Status::Busy);
+        ctrl(&mut app, 'f');
+        assert_eq!(app.zoom, Some(Zoom::Table));
+        ctrl(&mut app, 'f');
+        assert_eq!(app.zoom, None, "again zooms back out");
+        // From a diff with the keys, the windows.
+        press(&mut app, KeyCode::Char('d'));
+        assert!(app.is_window_focused);
+        ctrl(&mut app, 'f');
+        assert_eq!(app.zoom, Some(Zoom::Windows));
+        assert!(app.is_window_focused, "the diff keeps the keys");
+        ctrl(&mut app, 'f');
+        assert_eq!(app.zoom, None);
+        // From the PR with the keys, the windows too.
+        app.tab = WindowTab::Pr;
+        app.sync_window();
+        assert!(app.has_keys_on(WindowTab::Pr));
+        ctrl(&mut app, 'f');
+        assert_eq!(app.zoom, Some(Zoom::Windows));
+        ctrl(&mut app, 'f');
+        assert_eq!(app.zoom, None);
+        // From a window with nothing to type into, the windows too.
+        press(&mut app, KeyCode::Esc);
+        ctrl(&mut app, '\\');
+        select(&mut app, "7");
+        ctrl(&mut app, 'q');
+        ctrl(&mut app, 'q');
+        assert!(app.is_window_focused);
+        assert_eq!(app.shown_tab(), WindowTab::Info);
+        ctrl(&mut app, 'f');
+        assert_eq!(app.zoom, Some(Zoom::Windows));
+    }
+
+    #[test]
+    fn e_zoomed_to_the_windows_zooms_out_to_show_the_inbox() {
+        let mut app = with_chat(Status::Busy);
+        app.zoom = Some(Zoom::Windows);
+        press(&mut app, KeyCode::Char('e'));
+        assert_eq!(app.rail, Some(0), "the inbox has the keys");
+        assert_eq!(app.zoom, None, "and room to show itself");
+    }
+
+    #[test]
+    fn zoomed_to_the_table_ctrl_q_gives_no_hidden_window_the_keys() {
+        let mut app = with_chat(Status::Busy);
+        ctrl(&mut app, '\\');
+        ctrl(&mut app, 'f');
+        assert_eq!(app.zoom, Some(Zoom::Table));
+        ctrl(&mut app, 'q');
+        assert!(!app.is_window_focused, "the table keeps the keys");
     }
 }

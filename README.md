@@ -43,6 +43,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 |---|---|
 | Enter | give the keys to the chat of the agent in the tree under the cursor, in the window under the table, starting a cold one again, else go to the tree itself (see [Agent chats](#agent-chats) and [Entering a tree](#entering-a-tree)); on a group's heading, fold the group or open it again, and on the main checkout's, open the chat of its agent when it has one |
 | Ctrl+Q | give the keys to the chat in the window under the table, and from the chat back to the table; with two windows, move them round the table, the left window and the right one |
+| Ctrl+F | zoom: on the table, the table over the whole screen; in a window, the windows, with the table folded to their trees' rows; again, back |
 | Ctrl+\\ | show two windows under the table, the tree under the cursor on the left and the next tree down on the right, or one again |
 | `←` `→` | step through the window's tabs: chat, diff, PR, run, shell and info |
 | `t` | go to the tree itself, even when its agent has a chat: its tmux pane or a window in it, else a shell there (see [Entering a tree](#entering-a-tree)) |
@@ -414,6 +415,10 @@ Ctrl+\\ again goes back to one window, the one that last had the keys.
 A terminal too narrow for both shows the window the cursor drives alone, its title saying `1 of 2` or `2 of 2`, and Ctrl+Q still moves between them.
 The double is kept per workspace under `$XDG_STATE_HOME/treetop`, so treetop opens it again as it was left.
 Inside a chat, Ctrl+\\ still goes to the next agent's chat (see [Agent chats](#agent-chats)).
+
+**Ctrl+F** zooms: on the table, to the screen treetop had before its windows, the table unboxed over the screen above the bar with the tree under the cursor in full in a pane under it, and the keys; in a window, the windows take it, the table folded to the rows of their trees where the terminal has room for them, and the inbox set aside.
+Ctrl+F again zooms back out.
+In an agent's chat treetop takes Ctrl+F for this, as it takes Ctrl+Q; a shell keeps it, as cursor-forward and as page down in vim and less.
 
 Moving the cursor keeps the tab, so the diff tab shows each tree's diff in turn and the PR tab each tree's PR, once the cursor rests on it; a PR read before shows as it was last read, and `v` reads it afresh.
 A tab the tree under the cursor has not got shows its info instead.

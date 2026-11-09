@@ -873,7 +873,11 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             let mut is_inbox_click = false;
             match &event {
                 &Event::Key(key) if key.kind != KeyEventKind::Release => {
-                    if chat::is_exit(key) && !ui::is_popup_chat(open) {
+                    // Ctrl+F zooms the windows from an agent's chat; a shell
+                    // keeps it, as cursor-forward and page down.
+                    if chat::is_zoom(key) && !ui::is_popup_chat(open) && open.agent != app::SHELL {
+                        app.toggle_zoom(app::Zoom::Windows);
+                    } else if chat::is_exit(key) && !ui::is_popup_chat(open) {
                         app.cycle_keys();
                         if !app.is_window_focused {
                             leave_window(app)?;

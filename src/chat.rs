@@ -943,6 +943,12 @@ pub fn is_next(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('\\' | '4'))
 }
 
+/// Ctrl+F, which zooms the windows from an agent's chat. A shell keeps it,
+/// as cursor-forward and as vim's and less's page down.
+pub fn is_zoom(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('f' | 'F'))
+}
+
 /// Ctrl+Q, which leaves the chat. Claude Code binds no Ctrl+Q, and in raw
 /// mode it is no flow control, so the chat never needs it; Ctrl+], which
 /// Claude Code uses, passes through.

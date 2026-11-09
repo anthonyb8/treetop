@@ -1798,8 +1798,8 @@ pub(crate) mod tests {
     }
 
     /// Each step a start ends reaches the screen as it ends, for the
-    /// start's row, before the start finishes: a held tree's start says
-    /// its lease, branch and record, then fails at its agent.
+    /// start's row, before the start finishes: a held tree's start, which
+    /// leases, branches and records nothing, says only its agent's start.
     #[test]
     fn a_starts_steps_are_said_for_its_row_as_they_end() {
         let root = config_root("steps");
