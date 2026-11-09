@@ -73,7 +73,7 @@ use ratatui::crossterm::terminal::{
 use ratatui::layout::{Position, Rect};
 
 use crate::app::{App, Choice, Opening, Outcome};
-use crate::chat::Chats;
+use crate::chat::{Chat, Chats};
 use crate::dispatch::Recipient;
 use crate::jobs::{Kind, Worker};
 use crate::keeper::Keeper;
@@ -134,11 +134,27 @@ fn popup_size(term: &Term, app: &App) -> Result<(u16, u16)> {
     Ok(popup::terminal_size(stage.height, stage.width))
 }
 
-/// A chat takes the keys: one in a popup, or the window's while it has them.
+/// A chat takes the keys: one in a popup, or the window's while it has
+/// them on its chat or shell tab.
 fn chat_has_keys(chats: &Chats, app: &App) -> bool {
-    chats
-        .open()
-        .is_some_and(|chat| ui::is_popup_chat(chat) || app.is_window_focused)
+    chats.open().is_some_and(|chat| {
+        ui::is_popup_chat(chat)
+            || app.has_keys_on(app::WindowTab::Chat)
+            || app.has_keys_on(app::WindowTab::Shell)
+    })
+}
+
+/// The chat open is the one the window's tab shows for its tree: its
+/// agent's on the chat tab, whichever agent, and its shell on the shell tab.
+fn is_window_chat(chat: &Chat, app: &App) -> bool {
+    let is_here = app.window_tree().map(|t| t.name.as_str()) == Some(chat.tree.as_str());
+    let is_shell = chat.agent == app::SHELL;
+    is_here
+        && match app.shown_tab() {
+            app::WindowTab::Chat => !is_shell,
+            app::WindowTab::Shell => is_shell,
+            _ => false,
+        }
 }
 
 /// Opens an agent's chat with the keys: a tree's in the window under the
@@ -199,10 +215,7 @@ fn show_in_window(
     (command, agent, tree): (Vec<String>, String, String),
 ) -> Result<()> {
     let size = chat_size(term, app)?;
-    let hints = app
-        .window_agent()
-        .and_then(|a| a.plugin.as_deref())
-        .and_then(plugin::screen_of);
+    let hints = app.window_plugin().and_then(plugin::screen_of);
     // A chat that cannot open says so in the window, as an opening note
     // that stays; the next cursor move tries another.
     let _ = chats.show(&command, size, agent, tree, hints);
@@ -349,9 +362,10 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
     // The sizes the chats' terminals were last given: the window's, and the
     // popup's for the one open in a popup.
     let mut chat_sized: Option<((u16, u16), (u16, u16))> = None;
-    // The chat the window under the table wants, and since when: it opens
-    // once the cursor has rested on its tree for WINDOW_REST.
-    let mut window_wants: (Option<Vec<String>>, Instant) = (None, Instant::now());
+    // The tree and tab the window under the table shows, and since when:
+    // its chat, diff or PR opens once the cursor has rested there for
+    // WINDOW_REST.
+    let mut window_wants: (Option<(PathBuf, app::WindowTab)>, Instant) = (None, Instant::now());
     // A scratch chat starting, and those being deleted, off this thread.
     let mut starting_scratch: Option<mpsc::Receiver<Result<scratch::Scratch, String>>> = None;
     let mut removing_scratch: Vec<mpsc::Receiver<Result<String, String>>> = Vec::new();
@@ -415,7 +429,11 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                         .flatten()
                         .filter_map(|a| a.attach.as_ref())
                         .collect();
-                    chats.retain(|command| live.iter().any(|c| c.as_slice() == command));
+                    // A shell is no agent's, so it stays while its tree does.
+                    chats.retain(|chat| {
+                        live.iter().any(|c| c.as_slice() == chat.command())
+                            || chat.agent == app::SHELL && app.keeps_shell(&chat.tree)
+                    });
                     keeper.keep(app.kept());
                 }
             }
@@ -700,29 +718,32 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
         // whichever of its agents it is and however the listing has it, so
         // one Enter just started is not closed while it comes up.
         if !chats.open().is_some_and(ui::is_popup_chat) {
-            let wanted = app.window_chat();
-            let shown = chats.open().map(|c| c.command().to_vec());
-            let is_shown_here = chats.open().is_some_and(|c| {
-                app.window_tree().map(|t| t.name.as_str()) == Some(c.tree.as_str())
-            });
-            let wanted_command = wanted.as_ref().map(|(command, ..)| command.clone());
-            if wanted_command != window_wants.0 {
-                window_wants = (wanted_command.clone(), Instant::now());
+            let here = app.window_tree().map(|t| (t.path.clone(), app.shown_tab()));
+            if here != window_wants.0 {
+                window_wants = (here, Instant::now());
             }
-            if app.is_window_focused && wanted.is_none() && !is_shown_here {
+            let is_rested = app.is_window_focused || window_wants.1.elapsed() >= WINDOW_REST;
+            let wanted = app.window_chat();
+            let is_shown_here = chats.open().is_some_and(|c| is_window_chat(c, app));
+            let is_terminal_tab = matches!(
+                app.shown_tab(),
+                app::WindowTab::Chat | app::WindowTab::Shell
+            );
+            if app.is_window_focused && is_terminal_tab && wanted.is_none() && !is_shown_here {
                 leave_window(app)?;
             }
-            if wanted_command != shown && !is_shown_here {
-                if shown.is_some() {
+            if !is_shown_here {
+                if chats.open().is_some() {
                     chats.hide();
                     is_stale = true;
                 }
-                if let Some(wanted) = wanted
-                    && (app.is_window_focused || window_wants.1.elapsed() >= WINDOW_REST)
-                {
+                if let Some(wanted) = wanted.filter(|_| is_rested) {
                     show_in_window(term, app, &mut chats, wanted)?;
                     is_stale = true;
                 }
+            }
+            if is_rested {
+                app.sync_window();
             }
         }
         let pumped = chats.pump();
@@ -753,7 +774,9 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             is_stale = true;
         }
         if is_stale || drawn_at.elapsed() >= REDRAW {
-            app.screen_height = term.size()?.height;
+            let size = term.size()?;
+            app.window_rows = ui::window_chat_area(app, Rect::new(0, 0, size.width, size.height))
+                .map_or(0, |area| area.height);
             term.draw(|frame| ui::draw(frame, app, chats.open(), issues.as_ref()))?;
             is_stale = false;
             drawn_at = Instant::now();

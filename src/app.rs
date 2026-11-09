@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::Rect;
 
 use crate::agents::{Agent, Status};
 use crate::assistant;
@@ -256,16 +255,28 @@ pub struct LogEntry {
     pub output: String,
 }
 
-/// What the window under the table shows of its tree.
+/// What the window under the table shows of its tree, in the order its
+/// tab bar has them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum WindowTab {
     /// Its agent's chat, live.
     #[default]
     Chat,
+    /// Its diff against its base, as `d` shows it.
+    Diff,
+    /// Its PR: checks, review threads and CodeRabbit, as `v` shows it.
+    Pr,
+    /// The steps of the keel run that holds it.
+    Run,
+    /// A shell in it, live.
+    Shell,
     /// Where it is, its agents, ports and processes, and what its agent
     /// last said: the detail the pane under the list used to hold.
     Info,
 }
+
+/// What a shell in the window under the table names as its agent.
+pub const SHELL: &str = "shell";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
@@ -383,8 +394,6 @@ pub struct App {
     /// latest of the tree under the cursor.
     pub log: Vec<LogEntry>,
     pub view: Option<DiffView>,
-    /// The terminal's height, for paging the diff popup.
-    pub screen_height: u16,
     pub diffs: HashMap<PathBuf, LoadedDiff>,
     /// Diffs asked for and not yet loaded, with the counts they were asked at.
     diff_requests: HashMap<PathBuf, Option<Work>>,
@@ -511,6 +520,9 @@ pub struct App {
     /// The window under the table has the keys: its chat takes them, and
     /// Ctrl+Q gives them back to the table.
     pub is_window_focused: bool,
+    /// Rows inside the window under the table, under its tab bar, as last
+    /// drawn: what a page of its diff scrolls by.
+    pub window_rows: u16,
     /// The tree whose agent opens once this workspace's agents are read:
     /// an inbox entry chosen from another workspace.
     pub arriving: Option<(PathBuf, crate::inbox::Kind)>,
@@ -941,20 +953,110 @@ impl App {
             .find(|agent| agent.attach.is_some())
     }
 
-    /// The chat the window shows on its chat tab, as the chat command, its
-    /// agent and its tree: the window agent's while it runs. A cold one is
-    /// left closed, since attaching to it would start it again; Enter does
-    /// that on purpose.
+    /// The tabs the window has for its tree: the chat where an agent offers
+    /// one, the diff and PR of a held tree, the run while keel has one
+    /// holding it, a shell in a held tree, and its info.
+    pub fn window_tabs(&self) -> Vec<WindowTab> {
+        let Some(tree) = self.window_tree() else {
+            return vec![WindowTab::Info];
+        };
+        let mut tabs = Vec::new();
+        if self.window_agent().is_some() {
+            tabs.push(WindowTab::Chat);
+        }
+        // The main checkout's heading stands for it, and `d` and `v` work
+        // only on a tree's own row.
+        if tree.is_held() && !tree.is_main {
+            tabs.extend([WindowTab::Diff, WindowTab::Pr]);
+        }
+        if crate::keel::holding(&self.runs, &tree.path).is_some() {
+            tabs.push(WindowTab::Run);
+        }
+        // A shell is kept running only while its tree is held.
+        if self.keeps_shell(&tree.name) {
+            tabs.push(WindowTab::Shell);
+        }
+        tabs.push(WindowTab::Info);
+        tabs
+    }
+
+    /// The tab the window shows: the one picked where its tree has it,
+    /// else its info.
+    pub fn shown_tab(&self) -> WindowTab {
+        if self.window_tabs().contains(&self.tab) {
+            self.tab
+        } else {
+            WindowTab::Info
+        }
+    }
+
+    /// A shell left running in tree `name` stays while the tree is held,
+    /// and ends once it is returned or destroyed.
+    pub fn keeps_shell(&self, name: &str) -> bool {
+        self.trees.iter().any(|t| t.name == name && t.is_held())
+    }
+
+    /// The plugin whose screen hints the window's terminal is read by: the
+    /// window agent's on the chat tab, and none for a shell.
+    pub fn window_plugin(&self) -> Option<&str> {
+        match self.shown_tab() {
+            WindowTab::Chat => self.window_agent()?.plugin.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// The window has the keys on `tab`.
+    pub fn has_keys_on(&self, tab: WindowTab) -> bool {
+        self.is_window_focused && self.shown_tab() == tab
+    }
+
+    /// The terminal the window shows on its chat or shell tab, as its
+    /// command, its agent and its tree: the window agent's chat while it
+    /// runs, or a shell in the tree. A cold agent is left closed, since
+    /// attaching to it would start it again; Enter does that on purpose.
     pub fn window_chat(&self) -> Option<(Vec<String>, String, String)> {
-        if self.tab != WindowTab::Chat {
-            return None;
-        }
         let tree = self.window_tree()?;
-        let agent = self.window_agent()?;
-        if agent.status == Some(Status::Cold) {
-            return None;
+        match self.shown_tab() {
+            WindowTab::Chat => {
+                let agent = self.window_agent()?;
+                if agent.status == Some(Status::Cold) {
+                    return None;
+                }
+                Some((agent.attach.clone()?, agent.name.clone(), tree.name.clone()))
+            }
+            WindowTab::Shell => {
+                let dir = tree.path.display().to_string().replace('\'', "'\\''");
+                let command = format!("cd '{dir}' && exec \"${{SHELL:-sh}}\"");
+                Some((
+                    vec!["sh".into(), "-c".into(), command],
+                    SHELL.into(),
+                    tree.name.clone(),
+                ))
+            }
+            _ => None,
         }
-        Some((agent.attach.clone()?, agent.name.clone(), tree.name.clone()))
+    }
+
+    /// Opens what the window's tab shows for the tree under the cursor, once
+    /// the cursor has rested there: its diff, or its PR as last read, read
+    /// now where it never has been. `v` reads it afresh.
+    pub fn sync_window(&mut self) {
+        let Some(tree) = self.window_tree() else {
+            return;
+        };
+        let path = tree.path.clone();
+        match self.shown_tab() {
+            WindowTab::Diff if self.view.as_ref().is_none_or(|v| v.path != path) => {
+                self.open_diff();
+            }
+            WindowTab::Pr if self.pr_popup.as_ref().is_none_or(|p| p.path != path) => {
+                self.pr_popup = Some(PrPopup::new(path.clone()));
+                if !self.prs.contains_key(&path) {
+                    self.read_pr(path);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Moves the cursor to tree `name`, so the window shows the chat opened
@@ -1348,6 +1450,15 @@ impl App {
         });
     }
 
+    /// Shows `tab` in the window under the table with the keys, where the
+    /// tree under the cursor has it.
+    fn show_tab(&mut self, tab: WindowTab) {
+        if self.window_tabs().contains(&tab) {
+            self.tab = tab;
+            self.is_window_focused = true;
+        }
+    }
+
     /// Opens the PR popup on the tree under the cursor, reading its PR
     /// afresh: comments and reviews land without a push, so the last read
     /// shows only until this one comes in.
@@ -1425,12 +1536,14 @@ impl App {
             match key.code {
                 KeyCode::Char('c') => return Outcome::Quit,
                 KeyCode::Char('r') => self.read_pr(path),
+                KeyCode::Char('q' | 'Q') => self.is_window_focused = false,
                 _ => {}
             }
             return Outcome::Continue;
         }
+        // Esc gives the keys back to the table; the PR stays in its tab.
         if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
-            self.pr_popup = None;
+            self.is_window_focused = false;
             return Outcome::Continue;
         }
         let pr = self.prs.get(&path).and_then(|r| r.pr.clone()?.ok()?);
@@ -1560,22 +1673,23 @@ impl App {
                 KeyCode::Char('r') => {
                     self.diffs.remove(&path);
                 }
+                KeyCode::Char('q' | 'Q') => self.is_window_focused = false,
                 _ => {}
             }
             return Outcome::Continue;
         }
+        // Esc gives the keys back to the table; the diff stays in its tab.
         if matches!(key.code, KeyCode::Esc | KeyCode::Tab | KeyCode::Char('q')) {
-            self.view = None;
+            self.is_window_focused = false;
             return Outcome::Continue;
         }
         let (len, starts) = match self.diffs.get(&path).map(|d| &d.layout) {
             Some(Ok(layout)) => (layout.rows.len(), layout.file_starts.clone()),
             _ => (0, Vec::new()),
         };
-        // The popup under its bar, less the file header pinned at its top
-        // and the key bar at its bottom.
-        let body = crate::popup::body(Rect::new(0, 0, 80, self.screen_height)).height;
-        let page = isize::try_from(body.saturating_sub(2)).map_or(1, |p| p.max(1));
+        // The window under its title bar, less the file header pinned at
+        // its top and the key bar at its bottom.
+        let page = isize::try_from(self.window_rows.saturating_sub(3)).map_or(1, |p| p.max(1));
         let Some(view) = self.view.as_mut() else {
             return Outcome::Continue;
         };
@@ -1750,8 +1864,8 @@ impl App {
     /// Nothing else is on screen or being typed: the list alone, where an
     /// ask's chat may open without taking over something under way.
     fn is_free(&self) -> bool {
-        self.view.is_none()
-            && self.pr_popup.is_none()
+        !self.has_keys_on(WindowTab::Diff)
+            && !self.has_keys_on(WindowTab::Pr)
             && self.prompt.is_none()
             && self.picker.is_none()
             && self.port_menu.is_none()
@@ -1853,8 +1967,8 @@ impl App {
     pub fn wants_mouse(&self) -> bool {
         (!self.inbox.is_hidden || self.rail.is_some())
             && !self.is_issues
-            && self.view.is_none()
-            && self.pr_popup.is_none()
+            && !self.has_keys_on(WindowTab::Diff)
+            && !self.has_keys_on(WindowTab::Pr)
             && self.prompt.is_none()
             && self.picker.is_none()
             && self.port_menu.is_none()
@@ -3432,10 +3546,10 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Outcome {
-        if self.view.is_some() {
+        if self.view.is_some() && self.has_keys_on(WindowTab::Diff) {
             return self.handle_view_key(key);
         }
-        if self.pr_popup.is_some() {
+        if self.pr_popup.is_some() && self.has_keys_on(WindowTab::Pr) {
             return self.handle_pr_key(key);
         }
         if self.prompt.is_some() {
@@ -3482,8 +3596,14 @@ impl App {
                         && !self.is_help
                         && !self.is_filtering
                         && self.rail.is_none();
-                    if is_free && self.window_chat().is_some() {
+                    let can_take = match self.shown_tab() {
+                        WindowTab::Chat | WindowTab::Shell => self.window_chat().is_some(),
+                        WindowTab::Diff | WindowTab::Pr => true,
+                        WindowTab::Run | WindowTab::Info => false,
+                    };
+                    if is_free && can_take {
                         self.is_window_focused = true;
+                        self.sync_window();
                     }
                     Outcome::Continue
                 }
@@ -3579,10 +3699,17 @@ impl App {
             return Outcome::Workspaces;
         }
         if matches!(key.code, KeyCode::Left | KeyCode::Right) {
-            self.tab = match self.tab {
-                WindowTab::Chat => WindowTab::Info,
-                WindowTab::Info => WindowTab::Chat,
+            let tabs = self.window_tabs();
+            let at = tabs
+                .iter()
+                .position(|t| *t == self.shown_tab())
+                .unwrap_or(0);
+            let step = if key.code == KeyCode::Right {
+                1
+            } else {
+                tabs.len() - 1
             };
+            self.tab = tabs[(at + step) % tabs.len()];
             return Outcome::Continue;
         }
         if key.code == KeyCode::Char('C') {
@@ -3663,8 +3790,14 @@ impl App {
             KeyCode::Char('a') => return self.converse(String::new()),
             KeyCode::Char('n') => self.open_start(),
             KeyCode::Char('N') => self.open_dispatch(),
-            KeyCode::Char('d') => self.open_diff(),
-            KeyCode::Char('v') => self.open_pr_view(),
+            KeyCode::Char('d') => {
+                self.open_diff();
+                self.show_tab(WindowTab::Diff);
+            }
+            KeyCode::Char('v') => {
+                self.open_pr_view();
+                self.show_tab(WindowTab::Pr);
+            }
             KeyCode::Char('b') => self.open_rename(),
             KeyCode::Char('r') => {
                 // Destroy is asked inside the return dialog, so it takes
@@ -4215,8 +4348,10 @@ mod tests {
         assert_eq!(app.wanted_diff(), None, "in flight");
         app.diff_loaded(PathBuf::from("/p/4/app"), two_files());
         assert_eq!(app.wanted_diff(), None, "loaded");
+        // Esc gives the keys back to the table; the diff stays in its tab.
         press(&mut app, KeyCode::Esc);
-        assert!(app.view.is_none());
+        assert!(!app.is_window_focused);
+        assert!(app.view.is_some());
         with_work(&mut app, 2);
         press(&mut app, KeyCode::Char('d'));
         assert_eq!(
@@ -4766,7 +4901,7 @@ mod tests {
     #[test]
     fn the_view_scrolls_jumps_between_files_and_stays_in_bounds() {
         let mut app = app();
-        app.screen_height = 10;
+        app.window_rows = 6;
         press(&mut app, KeyCode::Char('d'));
         app.wanted_diff();
         app.diff_loaded(PathBuf::from("/p/4/app"), two_files());
@@ -4781,14 +4916,17 @@ mod tests {
         assert_eq!(
             scroll(&app),
             3,
-            "a page is the popup's inside less its bar, the pinned header and the key bar"
+            "a page is the window's inside less the diff's bar, its pinned header and its key bar"
         );
         press(&mut app, KeyCode::Char('G'));
         assert_eq!(scroll(&app), 14);
         press(&mut app, KeyCode::Char('j'));
         assert_eq!(scroll(&app), 14, "never past the last row");
         press(&mut app, KeyCode::Char('q'));
-        assert!(app.view.is_none(), "q closes the view, not treetop");
+        assert!(
+            !app.is_window_focused && !app.is_quitting && app.view.is_some(),
+            "q gives the table the keys, and leaves treetop and the diff open"
+        );
     }
 
     fn agent(name: &str) -> Agent {
@@ -6384,8 +6522,16 @@ mod tests {
             2,
             "z lists the nitpick"
         );
+        // Esc gives the keys back to the table; the PR stays in its tab.
         press(&mut app, KeyCode::Esc);
-        assert!(app.pr_popup.is_none());
+        assert!(!app.is_window_focused);
+        assert!(app.pr_popup.is_some());
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(
+            app.pr_popup.as_ref().unwrap().selected(),
+            2,
+            "keys go to the table now, not the PR"
+        );
     }
 
     #[test]
@@ -6547,11 +6693,12 @@ mod tests {
         // Attaching to a cold agent starts it again, so the window leaves it
         // to Enter.
         assert_eq!(with_chat(Status::Cold).window_chat(), None);
+        // Left from the chat wraps round to the info tab, which opens no chat.
         let mut on_info = with_chat(Status::Busy);
-        press(&mut on_info, KeyCode::Right);
+        press(&mut on_info, KeyCode::Left);
         assert_eq!(on_info.tab, WindowTab::Info);
         assert_eq!(on_info.window_chat(), None, "the info tab opens no chat");
-        press(&mut on_info, KeyCode::Left);
+        press(&mut on_info, KeyCode::Right);
         assert_eq!(on_info.tab, WindowTab::Chat);
     }
 
@@ -6583,5 +6730,142 @@ mod tests {
         assert_eq!(app.window_tree().map(|t| t.name.clone()), Some(main));
         app.select_tree("4");
         assert_eq!(app.window_tree().map(|t| t.name.as_str()), Some("4"));
+    }
+
+    /// A keel run of three steps holding the tree at `path`, on its second.
+    fn run_in(path: &str) -> crate::keel::Run {
+        let step = |title: &str, state: &str| crate::keel::Step {
+            title: title.into(),
+            state: state.into(),
+        };
+        crate::keel::Run {
+            tree: path.into(),
+            playbook: "issue".into(),
+            goal: "fix the login".into(),
+            state: "active".into(),
+            steps: vec![
+                step("Audit it", "done"),
+                step("Build it", "doing"),
+                step("Verify it", "pending"),
+            ],
+            current: Some(2),
+            attention: 0,
+            stale: false,
+        }
+    }
+
+    #[test]
+    fn each_tree_has_the_tabs_it_can_show_and_the_keys_step_through_them() {
+        use WindowTab::*;
+        let mut app = with_chat(Status::Busy);
+        assert_eq!(app.window_tabs(), [Chat, Diff, Pr, Shell, Info]);
+        app.runs.insert("/p/4/app".into(), run_in("/p/4/app"));
+        assert_eq!(app.window_tabs(), [Chat, Diff, Pr, Run, Shell, Info]);
+        for wanted in [Diff, Pr, Run, Shell, Info, Chat] {
+            press(&mut app, KeyCode::Right);
+            assert_eq!(app.shown_tab(), wanted);
+        }
+        // A free tree has nothing to diff, no PR and no agent, and no shell
+        // to keep running in it: `t` opens one there.
+        select(&mut app, "7");
+        assert_eq!(app.window_tabs(), [Info]);
+        app.tab = Diff;
+        assert_eq!(app.shown_tab(), Info, "a tab it has not got shows its info");
+    }
+
+    #[test]
+    fn the_shell_tab_opens_a_shell_in_the_tree() {
+        // A quote in the tree's path must not break out of the command.
+        let dir = std::env::temp_dir().join(format!("treetop-shell-{}/it's", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // As pwd names it, where the temp dir is behind a symlink.
+        let dir = dir.canonicalize().unwrap();
+        let mut app = app();
+        select(&mut app, "8");
+        app.trees.iter_mut().find(|t| t.name == "8").unwrap().path = dir.clone();
+        app.tab = WindowTab::Shell;
+        let (command, agent, tree) = app.window_chat().unwrap();
+        assert_eq!((agent.as_str(), tree.as_str()), (SHELL, "8"));
+        // The user's $SHELL is run in the tree: pwd stands in for it.
+        let ran = std::process::Command::new(&command[0])
+            .args(&command[1..])
+            .env("SHELL", "pwd")
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+        assert_eq!(
+            String::from_utf8_lossy(&ran.stdout).trim(),
+            dir.display().to_string(),
+            "{command:?}"
+        );
+    }
+
+    #[test]
+    fn the_diff_and_pr_tabs_follow_the_cursor_and_a_pr_read_once_is_not_read_again() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('d'));
+        assert!(app.is_window_focused, "d gives the diff the keys");
+        press(&mut app, KeyCode::Esc);
+        select(&mut app, "8");
+        app.sync_window();
+        assert_eq!(
+            app.view.as_ref().map(|v| v.path.clone()),
+            Some("/p/8/app".into())
+        );
+        app.tab = WindowTab::Pr;
+        app.sync_window();
+        assert_eq!(
+            app.pr_wanted,
+            Some("/p/8/app".into()),
+            "read the first time"
+        );
+        app.pr_wanted = None;
+        select(&mut app, "4");
+        app.sync_window();
+        assert_eq!(app.pr_wanted, Some("/p/4/app".into()));
+        app.pr_wanted = None;
+        select(&mut app, "8");
+        app.sync_window();
+        assert_eq!(
+            app.pr_popup.as_ref().map(|p| p.path.clone()),
+            Some("/p/8/app".into())
+        );
+        assert_eq!(app.pr_wanted, None, "tree 8's PR was read already");
+    }
+
+    #[test]
+    fn the_main_checkout_and_a_finished_run_get_no_tab_they_cannot_fill() {
+        use WindowTab::*;
+        // The heading stands for the main checkout, which has no PR and no
+        // diff of a branch of its own, so d and v leave it alone.
+        let app = app_on_main_heading();
+        assert_eq!(app.window_tabs(), [Shell, Info]);
+        let mut app = with_chat(Status::Busy);
+        let mut done = run_in("/p/4/app");
+        done.state = "done".into();
+        app.runs.insert("/p/4/app".into(), done);
+        assert!(
+            !app.window_tabs().contains(&Run),
+            "a done run holds nothing"
+        );
+    }
+
+    #[test]
+    fn only_the_chat_tab_reads_its_screen_by_the_agents_plugin() {
+        let mut app = with_chat(Status::Busy);
+        let tree = app.trees.iter_mut().find(|t| t.name == "4").unwrap();
+        tree.agents[0].plugin = Some("claude".into());
+        assert_eq!(app.window_plugin(), Some("claude"));
+        // A shell is no agent's chat: what it prints is its own.
+        app.tab = WindowTab::Shell;
+        assert_eq!(app.window_plugin(), None);
+    }
+
+    #[test]
+    fn a_shell_left_running_is_kept_while_its_tree_is_held() {
+        let app = app();
+        assert!(app.keeps_shell("4"));
+        assert!(!app.keeps_shell("7"), "a returned tree's shell ends");
+        assert!(!app.keeps_shell("12"), "so does a destroyed one's");
     }
 }

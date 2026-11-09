@@ -43,7 +43,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 |---|---|
 | Enter | give the keys to the chat of the agent in the tree under the cursor, in the window under the table, starting a cold one again, else go to the tree itself (see [Agent chats](#agent-chats) and [Entering a tree](#entering-a-tree)); on a group's heading, fold the group or open it again, and on the main checkout's, open the chat of its agent when it has one |
 | Ctrl+Q | give the keys to the chat in the window under the table, and from the chat back to the table |
-| `←` `→` | show the window's chat tab or its info tab |
+| `←` `→` | step through the window's tabs: chat, diff, PR, run, shell and info |
 | `t` | go to the tree itself, even when its agent has a chat: its tmux pane or a window in it, else a shell there (see [Entering a tree](#entering-a-tree)) |
 | `n` | start a new agent in the tree under the cursor: a free one is leased for it, on a branch named for the task, and a held one keeps its branch; on the main checkout's heading, start one in the main checkout, for work that needs no tree |
 | `N` | start a new agent in a fresh tree, on a branch named for the task (see [New agents](#new-agents)) |
@@ -52,7 +52,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | `E` | hide the inbox, giving the list its width back, or show it again |
 | `:` | ask the assistant about the tree under the cursor, or write `@17 ...` for that tree's agent (see [The assistant](#the-assistant)) |
 | `a` | open the assistant's chat, where it answers, starting it if there is none |
-| `d` | open the side-by-side diff of the tree under the cursor in a popup |
+| `d` | show the side-by-side diff of the tree under the cursor in the window's diff tab, with the keys |
 | `r` | return the marked trees, or the one under the cursor, to the pool; its dialog names each tree's branch, its uncommitted and unpushed counts, the pid of every live process a return would stop and any [keel run](#keel-runs) that holds it, and `D` in it destroys them from disk instead, after reviewing treehouse's preview of each |
 | Space | mark or unmark the tree under the cursor |
 | `x` | put the tree under the cursor on the Backburner, or bring it back, with the cursor following it; `X` folds or opens Backburner |
@@ -62,7 +62,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | `p` | share the port the tree serves with your phone and show its address as a QR code to scan with the phone's camera; it runs `tether share <port>`, or the `share` the config names (see [Config](#config)); pressed again on a port already shared, it takes the share down; a tree serving several offers the same menu as `o` |
 | `P` | put the port the tree serves on the internet, for anyone with the link, and copy that link to the clipboard; it runs `tether share --public <port>`, or the `publish` the config names; pressed again on a port already public, it takes it off the internet, as `x` in its popup does, with `tether unshare <port>`, or the `unpublish` the config names; a tree serving several offers the same menu as `o` |
 | `Q` | show a shared port's QR code and address again, without sharing anything: treetop reads them back from `tether shares`, so a port shared before it started shows too; on a port that is not shared it says which key shares it |
-| `v` | open the tree's PR in a popup: its checks, review threads and CodeRabbit's comments (see [The PR view](#the-pr-view)) |
+| `v` | show the tree's PR in the window's PR tab, with the keys: its checks, review threads and CodeRabbit's comments (see [The PR view](#the-pr-view)) |
 | `O` | open the tree's PR the same way (see [After the agent](#after-the-agent)) |
 | `f` | send what failed on the tree's PR, a check's log or a review's requested changes, to its agent |
 | `R` | resume the tree's stopped or failed agent in the tree, with its conversation and the flags it was started with, rather than a fresh dispatch that loses them |
@@ -122,7 +122,7 @@ On opening, treetop draws the last listing it saved under `$XDG_CACHE_HOME/treet
 
 ## The diff
 
-`d` opens the tree under the cursor in a side-by-side diff, in a popup over the pool, the way a pull request shows it: everything its branch changes against its base, the branch it was cut from (see [New agents](#new-agents)) or else the pool's (`base_branch` in `treehouse.toml`, else `origin/HEAD`), measured from their merge base, plus uncommitted and untracked files.
+`d` shows the tree under the cursor in a side-by-side diff, in the window's diff tab with the keys, the way a pull request shows it: everything its branch changes against its base, the branch it was cut from (see [New agents](#new-agents)) or else the pool's (`base_branch` in `treehouse.toml`, else `origin/HEAD`), measured from their merge base, plus uncommitted and untracked files.
 Removed lines sit on the left and the added lines that replace them on the right, row by row, with line numbers on both sides; within a changed line, the words that differ are highlighted.
 Every file runs in one scroll, each under a header with its path and its additions and deletions, and the header of the file you are reading stays pinned to the top.
 Code is coloured as an editor colours it, by the grammars [bat](https://github.com/sharkdp/bat) ships, for every language they cover, such as Rust, TypeScript, Svelte, TOML and Markdown; a file with none, such as plain text, stays one colour.
@@ -140,7 +140,7 @@ In a terminal without true colour, code stays one colour, since 16 colours canno
 | `h` `l` | sideways, for lines wider than their half |
 | `g` `G` | the top or the end |
 | `Ctrl-R` | read the diff again |
-| Esc, `Tab`, `q` | back to the pool |
+| Esc, `Tab`, `q`, Ctrl+Q | give the keys back to the table; the diff stays in its tab |
 
 The diff is read in the background and holds still while it is open; reopening it after the tree's counts have moved reads it again.
 Only the rows on screen are drawn, so a diff of fifty thousand lines scrolls as fast as a short one.
@@ -396,10 +396,19 @@ The Trees screen is two windows over the bottom bar: the table, with the inbox b
 The table's window is as tall as its rows, or the inbox's entries where there are more, up to just under half the screen; the window under it takes the rest.
 The window that has the keys has its border in the title colour, as Neovim marks the window the cursor is in.
 
-The window under the table names the tree and its branch in its border, and has two tabs in a bar on its first row: **chat**, the agent's chat, live, and **info**, the tree in full (see [The info tab](#the-info-tab)); `←` and `→` switch between them, and a click on one shows it.
+The window under the table names the tree and its branch in its border, and has its tabs in a bar on its first row; `←` and `→` step through them, and a click on one shows it:
+
+- **chat**: the agent's chat, live, where an agent offers one.
+- **diff**: the tree's diff, as `d` shows it (see [The diff](#the-diff)), on a held tree; the main checkout's heading has no diff or PR tab, as `d` and `v` do nothing there.
+- **PR**: the tree's PR, as `v` shows it (see [The PR view](#the-pr-view)), on a held tree, named with what the PR column says of it.
+- **run**: the steps of the keel run that holds the tree, the one under way picked out, while an active or paused run holds it (see [keel runs](#keel-runs)).
+- **shell**: a shell in a held tree, live, in `$SHELL`, run in a terminal of treetop's own as a chat is; Ctrl+Q gives it the keys, and it keeps running behind the screen as a chat does.
+- **info**: the tree in full (see [The info tab](#the-info-tab)).
+
+Moving the cursor keeps the tab, so the diff tab shows each tree's diff in turn and the PR tab each tree's PR, once the cursor rests on it; a PR read before shows as it was last read, and `v` reads it afresh.
+A tab the tree under the cursor has not got shows its info instead.
 At the right of the bar, how full the agent's context is and what its session has spent.
 Once the cursor has rested on a tree for a moment, the chat tab shows its agent's chat, so moving down the list opens no chat on the way; a tree whose agent is not running says Enter starts it again, since opening it would.
-A tree with no agent to chat with shows its info on either tab.
 
 Enter, or Ctrl+Q, gives the chat the keys, and a click in it does too; **Ctrl+Q** in the chat gives them back to the table, with the chat still running on screen, and so does a click outside it.
 An agent's question counts as seen once its chat has had the keys, not when it only showed in the window.
@@ -657,7 +666,7 @@ Those show `ready` in the Issues screen's WORK column, where `p` picks one up.
 
 ## The PR view
 
-`v` opens the PR of the tree under the cursor in a popup over the pool, read afresh each time it opens, since review comments land without a push; the last read shows while the new one comes in.
+`v` shows the PR of the tree under the cursor in the window's PR tab with the keys, read afresh each time, since review comments land without a push; the last read shows while the new one comes in.
 It has four tabs, which `1` to `4` switch, as do `h` and `l`; `j` and `k` move between items, and `d` and `u` scroll through one too long for the screen.
 
 - **Overview**: who wants to merge what, where its checks, review, CodeRabbit, open threads and merge stand, and its description.
@@ -667,7 +676,7 @@ It has four tabs, which `1` to `4` switch, as do `h` and `l`; `j` and `k` move b
 
 `f` sends the selected item to the tree's agents, as `m` sends a message: a failed check with its log, a thread with its code and replies, or a CodeRabbit comment as the prompt CodeRabbit writes for agents.
 `F` on the CodeRabbit tab sends every open comment but the nitpicks at once.
-`O` opens the PR in the browser, `^R` reads it again, and Esc or `q` closes it.
+`O` opens the PR in the browser, `^R` reads it again, and Esc, `q` or Ctrl+Q gives the keys back to the table, the PR staying in its tab.
 
 It reads through the repository's first ship plugin that answers `view`: GitHub's reads `gh pr view`, the PR's review threads over GraphQL, and the failed checks' logs, with your own `gh` login, and still only reads.
 CodeRabbit's comments are read from the markers it leaves in them; one it writes in a shape treetop does not know shows as a plain comment rather than going missing.

@@ -569,8 +569,13 @@ impl Drop for Chat {
             return;
         };
         if let Ok(group) = libc::pid_t::try_from(child.id()) {
+            // The hangup a closed terminal sends first, which ends an
+            // interactive shell that ignores SIGTERM, then SIGTERM.
             // SAFETY: the child leads its own session and process group.
-            unsafe { libc::kill(-group, libc::SIGTERM) };
+            unsafe {
+                libc::kill(-group, libc::SIGHUP);
+                libc::kill(-group, libc::SIGTERM);
+            }
         }
         thread::spawn(move || child.wait());
     }
@@ -798,9 +803,9 @@ impl Chats {
 
     /// Ends the background chats whose agent is gone, except one still
     /// delivering a message: attaching to a stopped agent starts it again.
-    pub fn retain(&mut self, is_live: impl Fn(&[String]) -> bool) {
+    pub fn retain(&mut self, is_live: impl Fn(&Chat) -> bool) {
         self.background
-            .retain(|c| !c.outbox.is_empty() || is_live(&c.command));
+            .retain(|c| !c.outbox.is_empty() || is_live(c));
     }
 
     /// Resizes every chat, so one opened later is already the right size.
@@ -1106,6 +1111,37 @@ mod tests {
                 return text;
             }
             assert!(started.elapsed() < Duration::from_secs(15), "{text}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn ending_a_chat_ends_a_program_that_ignores_sigterm_as_a_shell_does() {
+        // An interactive shell ignores SIGTERM, as this one is made to, and
+        // ends on the hangup a closed terminal sends.
+        let command = [
+            "sh".to_string(),
+            "-c".to_string(),
+            "trap '' TERM; echo started $$; while :; do sleep 1; done".to_string(),
+        ];
+        let mut chats = Chats::default();
+        chats
+            .show(&command, (24, 80), "shell".into(), "tree".into(), None)
+            .unwrap();
+        let text = shown(&mut chats, "started");
+        let pid: libc::pid_t = text
+            .split_whitespace()
+            .nth(1)
+            .and_then(|p| p.parse().ok())
+            .unwrap();
+        drop(chats);
+        let started = Instant::now();
+        // SAFETY: signal 0 only asks whether the process is there.
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{pid} still runs"
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
     }
