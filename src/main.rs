@@ -200,13 +200,11 @@ fn open_chat(
     match chats.show(command, size, agent, tree, hints) {
         // The mouse is captured while a chat has the keys, so the wheel
         // scrolls it; on the list, the terminal keeps the mouse to itself.
-        // A tree's chat opens in Insert, ready to type to.
+        // A tree's chat opens in Normal, so a second Enter starts Insert
+        // and nothing typed reaches the agent by accident.
         Ok(()) => {
-            if is_popup {
-                app.is_window_focused = false;
-            } else {
-                app.insert_in_window();
-            }
+            app.is_window_focused = !is_popup;
+            app.is_inserting = false;
             execute!(io::stdout(), EnableMouseCapture)?;
         }
         Err(err) => app.message = Some(format!("{err:#}")),
