@@ -427,7 +427,18 @@ fn plain(text: &str) -> Vec<String> {
 /// A comment's Markdown with the HTML a browser would hide or style taken
 /// out: folded sections, comments and tags, though not tags written as code.
 pub fn readable(text: &str) -> String {
-    without_tags(&without_details(text))
+    let shown = without_tags(&without_details(text));
+    if !shown.trim().is_empty() {
+        return shown;
+    }
+    // All of it folded: GitHub still shows each section's summary line.
+    text.split("<summary>")
+        .skip(1)
+        .filter_map(|rest| rest.split_once("</summary>"))
+        .map(|(inside, _)| without_tags(inside).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 /// `text` with its HTML comments taken out, which bots such as CodeRabbit
@@ -888,5 +899,13 @@ mod tests {
             "the label stays, after the text: {}",
             f.body
         );
+    }
+
+    #[test]
+    fn a_comment_all_folded_still_shows_its_summary() {
+        let text = readable(
+            "<details><summary>Codex Review Summary: ❌ Failed</summary>\n\n| Check | Result |\n|---|---|\n| lint | fail |\n</details>",
+        );
+        assert!(text.contains("Codex Review Summary: ❌ Failed"), "{text}");
     }
 }

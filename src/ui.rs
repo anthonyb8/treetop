@@ -3050,9 +3050,19 @@ fn pr_overview(pr: &PrView, width: usize) -> Vec<Line<'static>> {
             Span::raw(format!(", {resolved} resolved, {general} on the PR")),
         ],
     ));
+    if let Some(why) = &pr.threads_error {
+        lines.extend(row(
+            "",
+            vec![Span::styled(
+                format!("review threads could not be read: {why}"),
+                fg(t.danger),
+            )],
+        ));
+    }
     let merge = match (pr.state.as_str(), pr.merge.as_str()) {
         ("MERGED", _) => Span::styled("merged", fg(t.special)),
         ("CLOSED", _) => Span::styled("closed", muted),
+        _ if pr.draft => Span::styled("a draft, not ready for review", fg(t.warning)),
         (_, "clean" | "has_hooks") => Span::styled("ready to merge", fg(t.success)),
         (_, "blocked") => Span::styled("blocked", fg(t.danger)),
         (_, "dirty") => Span::styled("conflicts with its base", fg(t.danger)),
@@ -3583,7 +3593,13 @@ fn pr_threads(pr: &PrView, selected: usize, width: usize) -> (Vec<Line<'static>>
     let muted = fg(t.muted);
     let mut lines = Vec::new();
     let mut at = (0, 0);
-    if pr.threads.is_empty() {
+    if let Some(why) = &pr.threads_error {
+        lines.push(Line::styled(
+            format!(" review threads could not be read: {why}"),
+            fg(t.danger),
+        ));
+        lines.push(Line::raw(""));
+    } else if pr.threads.is_empty() {
         lines.push(Line::styled(" No review comments yet.", muted));
     }
     for (i, thread) in pr.threads.iter().enumerate() {
@@ -5785,6 +5801,32 @@ mod pr_view_tests {
         let shown = screen(&app, 200, 40);
         assert!(
             shown.contains("Validation (affected) was cancelled."),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn a_draft_and_an_unread_thread_list_say_so() {
+        let mut app = app();
+        let path = std::path::PathBuf::from("/pool/4/app");
+        while app.current().is_none_or(|t| t.path != path) {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Char('v'));
+        let mut pr = pr();
+        pr.draft = true;
+        pr.threads_error = Some("HTTP 502".into());
+        app.pr_loaded(path, Ok(Some(pr)));
+        let shown = screen(&app, 200, 40);
+        assert!(shown.contains("a draft, not ready for review"), "{shown}");
+        assert!(
+            shown.contains("review threads could not be read: HTTP 502"),
+            "a failed read is not an empty one:\n{shown}"
+        );
+        press(&mut app, KeyCode::Char('3'));
+        let shown = screen(&app, 200, 40);
+        assert!(
+            shown.contains("review threads could not be read: HTTP 502"),
             "{shown}"
         );
     }

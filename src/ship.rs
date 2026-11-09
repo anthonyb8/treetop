@@ -128,6 +128,9 @@ pub struct PrView {
     pub threads: Vec<Thread>,
     /// CodeRabbit's review, where it reviews the repository.
     pub bot: Option<BotReview>,
+    /// Why the review threads could not be read, so none is not taken for
+    /// an empty list.
+    pub threads_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

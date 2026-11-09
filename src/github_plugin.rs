@@ -535,7 +535,10 @@ fn pr_view(viewed: Viewed, threads: Vec<ThreadNode>) -> PrView {
         let line = node.line.or(node.original_line);
         if coderabbit::is_coderabbit(first.who()) {
             let lines = match (node.start_line, line) {
-                (Some(start), Some(end)) if start != end => Some(format!("{start}-{end}")),
+                // GitHub can give the start after the end; a range reads up.
+                (Some(start), Some(end)) if start != end => {
+                    Some(format!("{}-{}", start.min(end), start.max(end)))
+                }
                 (_, end) => end.map(|l| l.to_string()),
             };
             for mut finding in coderabbit::line_comment(&first.body) {
@@ -636,6 +639,7 @@ fn pr_view(viewed: Viewed, threads: Vec<ThreadNode>) -> PrView {
         checks,
         threads: people,
         bot,
+        threads_error: None,
     }
 }
 
@@ -759,7 +763,7 @@ fn view(args: &Value) -> Result<Value, Error> {
             .cloned()
             .collect();
     let number = format!("number={}", viewed.number);
-    let threads: Vec<ThreadNode> = gh(
+    let threads: Result<Vec<ThreadNode>, Error> = gh(
         dir,
         &[
             "api",
@@ -774,14 +778,23 @@ fn view(args: &Value) -> Result<Value, Error> {
             &format!("query={THREADS}"),
         ],
     )
-    .ok()
-    .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-    .and_then(|v| {
-        let nodes = v.pointer("/data/repository/pullRequest/reviewThreads/nodes")?;
-        serde_json::from_value(nodes.clone()).ok()
-    })
-    .unwrap_or_default();
+    .and_then(|text| {
+        let read: Value = serde_json::from_str(&text)
+            .map_err(|err| failed(format!("unreadable threads: {err}")))?;
+        let nodes = read
+            .pointer("/data/repository/pullRequest/reviewThreads/nodes")
+            .ok_or_else(|| failed("no review threads in GitHub's answer"))?;
+        serde_json::from_value(nodes.clone())
+            .map_err(|err| failed(format!("unreadable threads: {err}")))
+    });
+    // The rest of the PR still shows when its threads cannot be read, with
+    // why, so none is not taken for an empty list.
+    let (threads, threads_error) = match threads {
+        Ok(threads) => (threads, None),
+        Err(err) => (Vec::new(), Some(err.message)),
+    };
     let mut pr = pr_view(viewed, threads);
+    pr.threads_error = threads_error;
     for check in failing {
         let log = match (check.job_id(), check.run_id()) {
             (Some(job), _) => match gh(dir, &["run", "view", "--job", job, "--log-failed"]) {
@@ -1173,5 +1186,19 @@ mod tests {
         .unwrap();
         assert_eq!(log_text(&failed, Ok("  \n".into())), "Its log is empty.");
         assert_eq!(log_text(&failed, Ok("a\tb\tboom".into())), "boom");
+    }
+
+    #[test]
+    fn a_backwards_range_reads_forwards() {
+        let threads: Vec<ThreadNode> = serde_json::from_value(json!([
+            {"isResolved": false, "path": "src/Container.ts", "line": 1567, "startLine": 1577,
+             "comments": {"nodes": [{"author": {"login": "coderabbitai"}, "body": RABBIT_LINE}]}}
+        ]))
+        .unwrap();
+        let pr = pr_view(Viewed::default(), threads);
+        let lines = pr
+            .bot
+            .and_then(|b| b.findings.first().and_then(|f| f.lines.clone()));
+        assert_eq!(lines.as_deref(), Some("1567-1577"));
     }
 }
