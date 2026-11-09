@@ -68,11 +68,12 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
         "Agents",
         &[
             ("Enter", "open, fold heading"),
-            ("^Q", "window, table"),
+            ("^Q", "window, Normal, table"),
+            ("i Enter", "Insert in window"),
             ("^\\", "two windows, one"),
             ("^F", "zoom table, windows"),
             ("^P", "command palette"),
-            ("\u{2190} \u{2192}", "chat, info tab"),
+            ("\u{2190} \u{2192}", "window tabs"),
             ("n", "new agent here"),
             ("N", "agent in new tree"),
             ("m", "message agents"),
@@ -143,6 +144,29 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
 /// to right, so the columns come out about as tall as each other. Where
 /// four do not fit, neighbours share a column: two, else one.
 const HELP_COLUMNS: [usize; 4] = [1, 2, 2, 2];
+
+/// The bar's keys while a window has them in Normal, most useful first.
+/// `i` is left out on a tab with nothing to type into, and Ctrl+Q's label
+/// says where it sends the keys.
+const NORMAL_KEYS: [(&str, &str); 7] = [
+    ("i", "insert"),
+    ("\u{2190}\u{2192}", "tabs"),
+    ("j k", "line"),
+    ("d u", "half page"),
+    ("^Q", "table"),
+    ("^F", "zoom"),
+    ("^P", "commands"),
+];
+
+/// The bar's keys while a window's chat or shell has them in Insert: the
+/// Ctrl keys treetop keeps, since every other key goes to the chat.
+/// A shell keeps Ctrl+F and Ctrl+P, so they are left out there.
+const INSERT_KEYS: [(&str, &str); 4] = [
+    ("^Q", "normal"),
+    ("^\\", "next agent"),
+    ("^F", "zoom"),
+    ("^P", "commands"),
+];
 
 /// Most useful first, as with `KEYS`; Esc stays early so the way out is
 /// never the key a narrow bar drops.
@@ -1164,16 +1188,44 @@ fn footer_left(app: &App, width: u16) -> Line<'static> {
         ));
     }
     let used = u16::try_from(narrowing.iter().map(Span::width).sum::<usize>()).unwrap_or(width);
-    // Zoomed to the table there is no window for Ctrl+Q to give the keys
-    // to, and the bar is the one treetop had before its windows.
-    let keys: Vec<(&str, &str)> = KEYS
-        .iter()
-        .copied()
-        .filter(|(key, _)| !(is_classic(app) && matches!(*key, "^Q" | "^P")))
-        .collect();
+    let keys = bar_keys(app);
     let mut spans = fitting_keys(&keys, width.saturating_sub(used));
     spans.extend(narrowing);
     Line::from(spans)
+}
+
+/// The keys the bar lists: the mode's while a window has the keys, else the
+/// table's.
+fn bar_keys(app: &App) -> Vec<(&'static str, &'static str)> {
+    let tab = app.shown_tab();
+    if app.is_inserting() {
+        return INSERT_KEYS
+            .iter()
+            .copied()
+            .filter(|(key, _)| !(tab == WindowTab::Shell && matches!(*key, "^F" | "^P")))
+            .collect();
+    }
+    if app.is_window_focused {
+        let is_terminal = matches!(tab, WindowTab::Chat | WindowTab::Shell);
+        // With two windows, Ctrl+Q from the first moves on to the second.
+        let on = if app.other_window().is_some() && app.side == 0 {
+            "other window"
+        } else {
+            "table"
+        };
+        return NORMAL_KEYS
+            .iter()
+            .copied()
+            .filter(|(key, _)| is_terminal || *key != "i")
+            .map(|(key, label)| if key == "^Q" { (key, on) } else { (key, label) })
+            .collect();
+    }
+    // Zoomed to the table there is no window for Ctrl+Q to give the keys
+    // to, and the bar is the one treetop had before its windows.
+    KEYS.iter()
+        .copied()
+        .filter(|(key, _)| !(is_classic(app) && matches!(*key, "^Q" | "^P")))
+        .collect()
 }
 
 /// The bottom bar: keys or a message on the left, the summary on the right.
@@ -1544,12 +1596,15 @@ fn start_lines(app: &App, opening: &Opening, key: &std::path::Path) -> Vec<Line<
 }
 
 /// What a window draws: the tree it shows and its tabs, whether it has the
-/// keys, its mark in a double, and whether the cursor drives it.
+/// keys and in which mode, its mark in a double, and whether the cursor
+/// drives it.
 struct Pane<'a> {
     tree: Option<&'a Tree>,
     tab: WindowTab,
     tabs: Vec<WindowTab>,
     has_keys: bool,
+    /// In Insert: its chat or shell takes every key.
+    is_inserting: bool,
     side: Option<usize>,
     is_cursor: bool,
     /// One of a double shown alone, the terminal too narrow for both.
@@ -1564,6 +1619,7 @@ fn cursor_pane(app: &App) -> Pane<'_> {
         tab: app.shown_tab(),
         tabs: app.window_tabs(),
         has_keys: app.is_window_focused,
+        is_inserting: app.is_inserting(),
         side: is_double.then_some(app.side),
         is_cursor: true,
         is_alone: false,
@@ -1579,10 +1635,33 @@ fn other_pane(app: &App) -> Option<Pane<'_>> {
         tab,
         tabs: app.tabs_of(tree),
         has_keys: false,
+        is_inserting: false,
         side: Some(1 - app.side),
         is_cursor: false,
         is_alone: false,
     })
+}
+
+/// The mode in the bottom-left corner of the window with the keys, as
+/// nvim's status line shows it, with the key that leaves it: NORMAL, or
+/// INSERT on a chat or shell typing to it. None on a window without the keys.
+fn mode_line(pane: &Pane) -> Option<Line<'static>> {
+    let t = theme();
+    if !pane.has_keys {
+        return None;
+    }
+    let is_terminal = matches!(pane.tab, WindowTab::Chat | WindowTab::Shell);
+    let (mode, style, hint) = if pane.is_inserting {
+        (" INSERT ", t.badge.bg(t.info), " ^Q normal ")
+    } else if is_terminal {
+        (" NORMAL ", t.badge, " i insert ")
+    } else {
+        (" NORMAL ", t.badge, " ")
+    };
+    Some(Line::from(vec![
+        Span::styled(mode, style),
+        Span::styled(hint, fg(t.muted)),
+    ]))
 }
 
 /// A tab's name in the window's bar, with what the PR column or the run
@@ -1735,7 +1814,10 @@ fn draw_window(frame: &mut Frame, app: &App, area: Rect, pane: &Pane, chat: Opti
             format!(" {mark}{alone}Tree {} · {branch} ", tree.name)
         }
     });
-    let block = window_block(pane.has_keys).title(title.unwrap_or_default());
+    let mut block = window_block(pane.has_keys).title(title.unwrap_or_default());
+    if let Some(mode) = mode_line(pane) {
+        block = block.title_bottom(mode);
+    }
     frame.render_widget(block, area);
     let [bar, body] = window_areas(area);
     let Some(tree) = tree else {
@@ -1763,7 +1845,7 @@ fn draw_window(frame: &mut Frame, app: &App, area: Rect, pane: &Pane, chat: Opti
         match chat.filter(|c| c.tree == tree.name && c.agent == crate::app::SHELL) {
             Some(chat) if chat.is_ready() => {
                 let cursor = draw_screen(chat.screen(), frame.buffer_mut(), body);
-                if let Some(cursor) = cursor.filter(|_| pane.has_keys) {
+                if let Some(cursor) = cursor.filter(|_| pane.is_inserting) {
                     frame.set_cursor_position(cursor);
                 }
             }
@@ -1783,7 +1865,7 @@ fn draw_window(frame: &mut Frame, app: &App, area: Rect, pane: &Pane, chat: Opti
             Some(chat) if !chat.is_ready() => draw_note(frame, body, &opening_note(&chat.agent)),
             Some(chat) => {
                 let cursor = draw_screen(chat.screen(), frame.buffer_mut(), body);
-                if let Some(cursor) = cursor.filter(|_| pane.has_keys) {
+                if let Some(cursor) = cursor.filter(|_| pane.is_inserting) {
                     frame.set_cursor_position(cursor);
                 }
             }
@@ -6818,6 +6900,39 @@ mod window_tests {
         app.rail = Some(0);
         assert_eq!(corner(&app, "┌ Trees "), theme().border);
         assert_eq!(corner(&app, "┌ Tree 4 "), theme().border);
+    }
+
+    #[test]
+    fn the_window_with_the_keys_says_its_mode_in_its_bottom_corner_and_the_bar_its_keys() {
+        let mut app = on("4");
+        app.tab = WindowTab::Chat;
+        let bottom = |app: &App| {
+            let shown = lines(&drawn(app, 200, 50));
+            (shown[48].clone(), shown[49].clone())
+        };
+        let (corner, bar) = bottom(&app);
+        assert!(
+            !corner.contains("NORMAL") && !corner.contains("INSERT"),
+            "{corner}"
+        );
+        assert!(bar.starts_with(" Enter  open "), "{bar}");
+        app.is_window_focused = true;
+        let (corner, bar) = bottom(&app);
+        assert!(corner.starts_with("└ NORMAL  i insert ─"), "{corner}");
+        assert!(bar.starts_with(" i  insert  ←→  tabs "), "{bar}");
+        app.is_inserting = true;
+        let (corner, bar) = bottom(&app);
+        assert!(corner.starts_with("└ INSERT  ^Q normal ─"), "{corner}");
+        assert!(bar.starts_with(" ^Q  normal  ^\\  next agent "), "{bar}");
+        // The info has nothing to type into: Normal, without `i`.
+        app.tab = WindowTab::Info;
+        let (corner, bar) = bottom(&app);
+        assert!(corner.starts_with("└ NORMAL  ─"), "{corner}");
+        assert!(bar.starts_with(" ←→  tabs "), "{bar}");
+        // A shell keeps Ctrl+F and Ctrl+P, so its Insert bar leaves them out.
+        app.tab = WindowTab::Shell;
+        let (_, bar) = bottom(&app);
+        assert!(bar.starts_with(" ^Q  normal  ^\\  next agent   "), "{bar}");
     }
 
     #[test]

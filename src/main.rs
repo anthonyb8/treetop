@@ -142,11 +142,9 @@ fn popup_size(term: &Term, app: &App) -> Result<(u16, u16)> {
 fn chat_has_keys(chats: &Chats, app: &App) -> bool {
     // The palette takes the keys over any chat while it is open.
     app.palette.is_none()
-        && chats.open().is_some_and(|chat| {
-            ui::is_popup_chat(chat)
-                || app.has_keys_on(app::WindowTab::Chat)
-                || app.has_keys_on(app::WindowTab::Shell)
-        })
+        && chats
+            .open()
+            .is_some_and(|chat| ui::is_popup_chat(chat) || app.is_inserting())
 }
 
 /// The chat open is the one the window's tab shows for its tree: its
@@ -202,8 +200,13 @@ fn open_chat(
     match chats.show(command, size, agent, tree, hints) {
         // The mouse is captured while a chat has the keys, so the wheel
         // scrolls it; on the list, the terminal keeps the mouse to itself.
+        // A tree's chat opens in Insert, ready to type to.
         Ok(()) => {
-            app.is_window_focused = !is_popup;
+            if is_popup {
+                app.is_window_focused = false;
+            } else {
+                app.insert_in_window();
+            }
             execute!(io::stdout(), EnableMouseCapture)?;
         }
         Err(err) => app.message = Some(format!("{err:#}")),
@@ -706,7 +709,13 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
         // An agent asking you something gets its chat opened once nothing
         // else is on screen, the next as the last one closes.
         match chats.open() {
-            Some(open) if chat_has_keys(&chats, app) => app.saw_chat(open.command()),
+            // A chat read in Normal counts as seen, as one typed to does.
+            Some(open)
+                if chat_has_keys(&chats, app)
+                    || app.is_window_focused && is_window_chat(open, app) =>
+            {
+                app.saw_chat(open.command())
+            }
             _ => {
                 if let Some(Outcome::Chat {
                     command,
@@ -793,9 +802,7 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             app.handoff_unsent(agent, tree);
         }
         if let Some((agent, _)) = &pumped.kept {
-            app.message = Some(format!(
-                "kept in {agent}'s chat; Ctrl+Q goes back to the list"
-            ));
+            app.message = Some(format!("kept in {agent}'s chat; Ctrl+Q leaves it"));
         }
         if let Some((agent, tree)) = pumped.ended {
             if app.is_window_focused || ui::is_popup(&agent, &tree) {
@@ -855,7 +862,7 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                         open.send_mouse(mouse, area);
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
-                        app.is_window_focused = true;
+                        app.insert_in_window();
                         execute!(io::stdout(), EnableMouseCapture)?;
                     }
                     _ => {}
@@ -887,7 +894,13 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                         && open.agent != app::SHELL
                     {
                         app.toggle_zoom(app::Zoom::Windows);
+                    } else if chat::is_exit(key) && !is_popup {
+                        // Ctrl+Q drops Insert to Normal, the window keeping
+                        // the keys and the mouse, for the wheel and a click.
+                        app.is_inserting = false;
                     } else if chat::is_exit(key) && !ui::is_popup_chat(open) {
+                        // A tree's chat floating over the Issues screen or a
+                        // short terminal has no Normal to drop to on screen.
                         app.cycle_keys();
                         if !app.is_window_focused {
                             leave_window(app)?;
@@ -956,7 +969,19 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                 continue;
             }
             let size = term.size()?;
-            match ui::click(app, Rect::new(0, 0, size.width, size.height), mouse) {
+            let screen = Rect::new(0, 0, size.width, size.height);
+            let is_wheel = matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            );
+            if is_wheel
+                && ui::window_chat_area(app, screen)
+                    .is_some_and(|a| a.contains(Position::new(mouse.column, mouse.row)))
+            {
+                app.wheel_window(mouse.kind == MouseEventKind::ScrollDown);
+                continue;
+            }
+            match ui::click(app, screen, mouse) {
                 Some(outcome) => outcome,
                 None => continue,
             }
@@ -1062,6 +1087,15 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                 agent,
                 tree,
             } => open_chat(term, app, &mut chats, &command, agent, tree)?,
+            Outcome::ScrollChat(lines) => {
+                let size = term.size()?;
+                let area = ui::window_chat_area(app, Rect::new(0, 0, size.width, size.height));
+                if let Some(area) = area
+                    && let Some(open) = chats.open_mut().filter(|c| is_window_chat(c, app))
+                {
+                    open.scroll(lines, area);
+                }
+            }
             Outcome::Record { path, record } => {
                 if let Err(err) = sidecar::write(&path, &record) {
                     app.message = Some(format!("could not record it: {err}"));

@@ -440,6 +440,34 @@ impl Chat {
         }
     }
 
+    /// Scrolls the chat drawn in `area` by `lines`, down when positive, as
+    /// the wheel over it would one line a step.
+    pub fn scroll(&mut self, lines: isize, area: Rect) {
+        let kind = if lines > 0 {
+            MouseEventKind::ScrollDown
+        } else {
+            MouseEventKind::ScrollUp
+        };
+        let wheel = MouseEvent {
+            kind,
+            column: area.x,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let screen = self.screen();
+        let bytes = encode_mouse_by(
+            wheel,
+            area,
+            screen.mouse_protocol_mode(),
+            screen.mouse_protocol_encoding(),
+            screen.application_cursor(),
+            lines.unsigned_abs(),
+        );
+        if let Some(bytes) = bytes {
+            self.write(&bytes);
+        }
+    }
+
     /// Pastes `text`, wrapped in bracketed-paste markers when the chat asked
     /// for them, so it arrives as one paste rather than as typed keys.
     pub fn paste(&mut self, text: &str) {
@@ -861,6 +889,19 @@ fn encode_mouse(
     encoding: MouseProtocolEncoding,
     application_cursor: bool,
 ) -> Option<Vec<u8>> {
+    encode_mouse_by(event, area, mode, encoding, application_cursor, WHEEL_LINES)
+}
+
+/// As `encode_mouse`, a wheel step sent `lines` times rather than
+/// `WHEEL_LINES`, so Normal's `j` moves the chat one line.
+fn encode_mouse_by(
+    event: MouseEvent,
+    area: Rect,
+    mode: MouseProtocolMode,
+    encoding: MouseProtocolEncoding,
+    application_cursor: bool,
+    lines: usize,
+) -> Option<Vec<u8>> {
     if !area.contains(Position::new(event.column, event.row)) {
         return None;
     }
@@ -872,7 +913,7 @@ fn encode_mouse(
             _ => return None,
         };
         let bytes = encode(KeyEvent::new(arrow, KeyModifiers::NONE), application_cursor);
-        return Some(bytes.repeat(WHEEL_LINES));
+        return Some(bytes.repeat(lines));
     }
     let button_code = |button: MouseButton| match button {
         MouseButton::Left => 0,
@@ -930,11 +971,7 @@ fn encode_mouse(
             bytes
         }
     };
-    Some(if is_wheel {
-        bytes.repeat(WHEEL_LINES)
-    } else {
-        bytes
-    })
+    Some(if is_wheel { bytes.repeat(lines) } else { bytes })
 }
 
 /// Ctrl+\\, which goes to the next agent's chat. Without the terminal's
@@ -1429,6 +1466,26 @@ mod tests {
             legacy(MouseEventKind::Up(MouseButton::Left), default).unwrap(),
             [0x1b, b'[', b'M', 35, 37, 38]
         );
+    }
+
+    #[test]
+    fn scrolling_by_lines_sends_one_wheel_step_a_line() {
+        let down = mouse(MouseEventKind::ScrollDown, 0, 1);
+        let by = |lines, mode| {
+            encode_mouse_by(
+                down,
+                BELOW_A_BAR,
+                mode,
+                MouseProtocolEncoding::Sgr,
+                false,
+                lines,
+            )
+            .unwrap()
+        };
+        let any = MouseProtocolMode::AnyMotion;
+        assert_eq!(by(1, any), b"\x1b[<65;1;1M", "j: one line");
+        assert_eq!(by(2, any), b"\x1b[<65;1;1M".repeat(2));
+        assert_eq!(by(1, MouseProtocolMode::None), b"\x1b[B", "as one arrow");
     }
 
     #[test]

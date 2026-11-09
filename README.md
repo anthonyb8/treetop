@@ -41,12 +41,12 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 
 | Key | Does |
 |---|---|
-| Enter | give the keys to the chat of the agent in the tree under the cursor, in the window under the table, starting a cold one again, else go to the tree itself (see [Agent chats](#agent-chats) and [Entering a tree](#entering-a-tree)); on a group's heading, fold the group or open it again, and on the main checkout's, open the chat of its agent when it has one |
-| Ctrl+Q | give the keys to the chat in the window under the table, and from the chat back to the table; with two windows, move them round the table, the left window and the right one |
+| Enter | give the keys to the chat of the agent in the tree under the cursor, in the window under the table, in Insert, starting a cold one again, else go to the tree itself (see [Agent chats](#agent-chats) and [Entering a tree](#entering-a-tree)); on a group's heading, fold the group or open it again, and on the main checkout's, open the chat of its agent when it has one |
+| Ctrl+Q | give the keys to the window under the table, in Normal; from Insert, drop to Normal; from Normal, give them back to the table; with two windows, move them round the table, the left window and the right one (see [Normal and Insert](#normal-and-insert)) |
 | Ctrl+P | open the command palette: every action, the tree under the cursor's first, found by typing a few of its words, a tree number or a branch, and run with Enter |
 | Ctrl+F | zoom: on the table, the table over the whole screen; in a window, the windows, with the table folded to their trees' rows; again, back |
 | Ctrl+\\ | show two windows under the table, the tree under the cursor on the left and the next tree down on the right, or one again |
-| `←` `→` | step through the window's tabs: chat, diff, PR, run, shell and info |
+| `←` `→` | step through the window's tabs: chat, diff, PR, run, shell and info, from the table or from the window in Normal |
 | `t` | go to the tree itself, even when its agent has a chat: its tmux pane or a window in it, else a shell there (see [Entering a tree](#entering-a-tree)) |
 | `n` | start a new agent in the tree under the cursor: a free one is leased for it, on a branch named for the task, and a held one keeps its branch; on the main checkout's heading, start one in the main checkout, for work that needs no tree |
 | `N` | start a new agent in a fresh tree, on a branch named for the task (see [New agents](#new-agents)) |
@@ -140,7 +140,7 @@ In a terminal without true colour, code stays one colour, since 16 colours canno
 | Space, `b` | a page |
 | `d` `u` | half a page |
 | `n` `p` | the next or previous file |
-| `h` `l` | sideways, for lines wider than their half |
+| `h` `l` | sideways, for lines wider than their half; `←` and `→` step the window's tabs |
 | `g` `G` | the top or the end |
 | `Ctrl-R` | read the diff again |
 | Esc, `Tab`, `q`, Ctrl+Q | give the keys back to the table; the diff stays in its tab |
@@ -431,7 +431,7 @@ A tab the tree under the cursor has not got shows its info instead.
 At the right of the bar, how full the agent's context is and what its session has spent.
 Once the cursor has rested on a tree for a moment, the chat tab shows its agent's chat, so moving down the list opens no chat on the way; a tree whose agent is not running says Enter starts it again, since opening it would.
 
-Enter, or Ctrl+Q, gives the chat the keys, and a click in it does too; **Ctrl+Q** in the chat gives them back to the table, with the chat still running on screen, and so does a click outside it.
+Enter gives the chat the keys in Insert, ready to type to, and a click in it does too; Ctrl+Q gives the window the keys in Normal (see [Normal and Insert](#normal-and-insert)), and a click outside it gives them back to the table, with the chat still running on screen.
 An agent's question counts as seen once its chat has had the keys, not when it only showed in the window.
 The chat's terminal is the size of the inside of the window, under its tab bar, and follows it when the terminal is resized or the inbox is shown or hidden.
 
@@ -445,7 +445,7 @@ Below it, Usage shows how much of your plan is used, a bar for each limit, such 
 Claude Code's limits are asked of Anthropic as `/usage` asks, with Claude Code's login from `~/.claude/.credentials.json`, once a minute and every five minutes while that fails.
 treetop only reads the login: an expired one is left for Claude Code to renew, since renewing it here would sign Claude Code out, and until then the sidebar shows the reading Claude Code last kept in `~/.claude.json`, with its age.
 At the bottom is the chat's tree: its git state and PR as the list's columns show them, then under Ports each port it serves with the process listening on it, then under PR its link and what its plugin says of it, such as its checks and review.
-**Ctrl+Q** always gives the keys back, whatever the chat is doing: from a popup, back to the list as you left it.
+**Ctrl+Q** always takes the keys back, whatever the chat is doing: from a popup, back to the list as you left it, and from a tree's chat in Insert, to Normal.
 **Ctrl+\\** goes straight to the next agent's chat, down the list as filtered, skipping trees with none and wrapping at the end; the cursor follows, so Ctrl+Q lands on the tree you were last in.
 Neither key is a Claude Code default.
 The agent's session keeps running after you leave.
@@ -465,6 +465,25 @@ A chat only ever shows the agent it was opened on: `←` on an empty prompt, whi
 
 An agent with an `attach` command in its `agent.json` opens the same way.
 An agent running in a tmux pane, such as an interactive `claude`, belongs to that pane and cannot be opened elsewhere: Enter goes to the tree instead, which inside tmux switches to its pane.
+
+### Normal and Insert
+
+A window with the keys is in one of two modes, as in vim, and says which in the bottom-left corner of its border, as Neovim's status line does: `NORMAL` in grey, or `INSERT` in blue, with the key that leaves it beside it.
+
+**Normal** gives the keys to treetop.
+`←` and `→` step through the window's tabs, from a chat as from any other.
+`j` and `k` scroll a line and `d` and `u` half a page, on the chat's history as on the diff and the PR, whose other keys work as ever.
+`i` or Enter on a chat or shell starts Insert.
+Esc, `q` or Ctrl+Q gives the keys back to the table; with two windows, Ctrl+Q moves them on to the other one first.
+
+**Insert** gives every key to the chat or shell, Esc too, which interrupts Claude Code.
+**Ctrl+Q** drops back to Normal.
+Ctrl+\\, Ctrl+F and Ctrl+P keep working as before, and a shell keeps Ctrl+F and Ctrl+P for itself.
+
+Ctrl+Q from the table lands in Normal, so nothing typed reaches an agent by accident; Enter on a tree, an agent opened from the inbox and a click in the chat land in Insert, ready to type.
+The diff, PR, run and info tabs have nothing to type into, so they are only ever in Normal.
+The bar at the bottom lists the mode's keys while a window has them.
+The mouse wheel over a window scrolls what it shows, from the table while the inbox is beside it and from Normal on a chat or shell; on a diff or PR with the keys, the terminal keeps the mouse, so text selects there as ever.
 
 ## The assistant and dispatch
 
@@ -597,7 +616,7 @@ The old conversation is kept: `claude attach <id>`, with the id the info tab's l
 A start that fails leaves the old agent working, as it was.
 Only a tree treetop leased can hand off, since its `treetop.json` is what moves the tree to the new agent, and only a running background agent can be asked; a stopped one is started again with `R` first.
 With `TREETOP_NEW_AGENT` set, a handoff is refused before it starts anything, since treetop cannot name a custom command's agent in the tree.
-In an agent's chat, from 75% of its context the sidebar says so: Ctrl+Q, then `h`.
+In an agent's chat, from 75% of its context the sidebar says so: Ctrl+Q until the table has the keys, then `h`.
 
 ### What agents say
 
@@ -612,8 +631,8 @@ The assistant's own reports are left off its row, since it speaks through its ch
 ### Asks open their chat
 
 An agent that asks you something, a question or a permission prompt, gets its chat opened for you with the keys, in the window under the table, so you answer it there in full.
-It waits until you are free on the list: never over a chat, the compose box, a filter, the diff, a dialog or the Issues screen.
-Giving the keys back with Ctrl+Q opens the next ask, so once you are done with other work they come to you one after another until none is left.
+It waits until you are free on the list: never over a chat, one read in Normal too, the compose box, a filter, the diff, a dialog or the Issues screen.
+Giving the keys back to the table, with Ctrl+Q from Normal, opens the next ask, so once you are done with other work they come to you one after another until none is left.
 Each ask opens once: one you have seen, opened for you or asked while its chat was open, stays shut until that agent asks something new, and its row keeps its `●` for Enter.
 A finished agent never opens, nor does a busy one whose last report still asks, nor one with no chat here, such as `claude` in a tmux pane.
 A filter that hides the asking tree is cleared, so the cursor lands on it.
