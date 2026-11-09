@@ -3132,7 +3132,21 @@ fn draw_pr_checks(frame: &mut Frame, pr: &PrView, selected: usize, area: Rect) {
             ));
             let log = log.unwrap_or("Its log could not be read, or it is not an Actions run.");
             let room = usize::from(log_area.width).saturating_sub(2).max(1);
-            let all: Vec<String> = log.lines().flat_map(|l| word_wrap(l, room)).collect();
+            // Wrapped at words, each row keeping the indent its line had.
+            let all: Vec<String> = log
+                .lines()
+                .flat_map(|l| {
+                    let indent = l.len() - l.trim_start().len();
+                    let (pad, text) = l.split_at(indent);
+                    let rows = word_wrap(text, room.saturating_sub(indent).max(10));
+                    let rows = if rows.is_empty() {
+                        vec![String::new()]
+                    } else {
+                        rows
+                    };
+                    rows.into_iter().map(move |row| format!("{pad}{row}"))
+                })
+                .collect();
             // Under its heading, above the line naming the keys.
             let fits = usize::from(log_area.height).saturating_sub(2).max(1);
             let from = all.len().saturating_sub(fits);
@@ -3307,7 +3321,8 @@ fn wrap_led(
 /// browser would hide, wrapped after `indent` columns.
 fn markdown(text: &str, width: usize, indent: usize) -> Vec<Line<'static>> {
     let mut out = Vec::new();
-    for piece in issues::pieces(&tables_as_code(&coderabbit::readable(text)), &palette()) {
+    let text = with_marks(&tables_as_code(&coderabbit::readable(text)));
+    for piece in issues::pieces(&text, &palette()) {
         let issues::Piece::Lines(lines) = piece else {
             continue;
         };
@@ -3332,15 +3347,52 @@ fn tables_as_code(text: &str) -> String {
     for line in text.lines() {
         let is_row = line.trim_start().starts_with('|');
         if is_row != in_table {
-            out.push("```");
+            out.push("```".to_string());
             in_table = is_row;
         }
-        out.push(line);
+        out.push(if is_row {
+            as_words(line)
+        } else {
+            line.to_string()
+        });
     }
     if in_table {
-        out.push("```");
+        out.push("```".to_string());
     }
     out.join("\n")
+}
+
+/// A table row's links and pictures as their words, since a code block
+/// shows Markdown as it is written.
+fn as_words(line: &str) -> String {
+    let mut out = String::new();
+    let mut rest = line;
+    while let Some(open) = rest.find('[') {
+        let close = rest[open..].find("](").map(|c| open + c);
+        let end = close.and_then(|c| rest[c..].find(')').map(|e| c + e));
+        let (Some(close), Some(end)) = (close, end) else {
+            break;
+        };
+        out.push_str(rest[..open].trim_end_matches('!'));
+        out.push_str(&rest[open + 1..close]);
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// GitHub's shortcodes for the marks bots use, as the marks.
+fn with_marks(text: &str) -> String {
+    [
+        (":x:", "❌"),
+        (":warning:", "⚠️"),
+        (":white_check_mark:", "✅"),
+        (":heavy_check_mark:", "✔️"),
+    ]
+    .iter()
+    .fold(text.to_string(), |text, (code, mark)| {
+        text.replace(code, mark)
+    })
 }
 
 /// What a line's wrapped rows start with, so they continue under its text:
@@ -3636,7 +3688,7 @@ fn pr_findings(pr: &PrView, popup: &PrPopup, width: usize) -> (Vec<Line<'static>
         ];
         let room = width.saturating_sub(header.iter().map(Span::width).sum::<usize>() + 1);
         header.push(Span::styled(
-            fit(&finding.title, room),
+            fit(&finding.title.replace('`', ""), room),
             Style::new().add_modifier(Modifier::BOLD),
         ));
         if finding.resolved {
@@ -3655,7 +3707,7 @@ fn pr_findings(pr: &PrView, popup: &PrPopup, width: usize) -> (Vec<Line<'static>
             // The header cuts a long title; the selected one shows it whole.
             if Line::raw(finding.title.as_str()).width() > room {
                 lines.extend(prose(
-                    &finding.title,
+                    &finding.title.replace('`', ""),
                     width,
                     "   ",
                     Style::new().add_modifier(Modifier::BOLD),
@@ -5504,6 +5556,47 @@ mod pr_view_tests {
         assert!(
             row.contains("primitives.tsx:194") && row.contains("resolved"),
             "a long place keeps its file and line, and the fold its note: {row}"
+        );
+    }
+
+    #[test]
+    fn logs_keep_indents_and_tables_read_as_text() {
+        let mut app = app();
+        let path = std::path::PathBuf::from("/pool/4/app");
+        while app.current().is_none_or(|t| t.path != path) {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Char('v'));
+        let mut pr = pr();
+        pr.checks[0].log =
+            Some("{\n   \"schemaVersion\": 2,\n     \"package\": \"bulma\"\n}".into());
+        pr.threads[0].body =
+            "| [Files with missing lines](https://app.codecov.io/gh/o/r/pull/1) | Patch % |\n\
+            |---|---|\n| [operator.go](https://app.codecov.io/x) :x: | 50% |"
+                .into();
+        if let Some(bot) = pr.bot.as_mut() {
+            bot.findings[0].title = "Update the description for `WorkflowStatus.Suspended`".into();
+        }
+        app.pr_loaded(path, Ok(Some(pr)));
+        press(&mut app, KeyCode::Char('2'));
+        let shown = screen(&app, 100, 40);
+        assert!(
+            shown.contains("   \"schemaVersion\": 2,"),
+            "a log keeps its indent:\n{shown}"
+        );
+        press(&mut app, KeyCode::Char('3'));
+        let shown = screen(&app, 100, 40);
+        assert!(
+            shown.contains("| Files with missing lines | Patch % |")
+                && shown.contains("operator.go ❌"),
+            "a table reads as text, links as their words and :x: as its mark:\n{shown}"
+        );
+        assert!(!shown.contains("](https"), "{shown}");
+        press(&mut app, KeyCode::Char('4'));
+        let shown = screen(&app, 100, 40);
+        assert!(
+            shown.contains("WorkflowStatus.Suspended") && !shown.contains("`WorkflowStatus"),
+            "a title's code shows without its backticks:\n{shown}"
         );
     }
 }

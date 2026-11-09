@@ -516,6 +516,14 @@ fn pr_view(viewed: Viewed, threads: Vec<ThreadNode>) -> PrView {
         .flatten()
         .map(Check::view)
         .collect();
+    let mut checks = checks;
+    // What needs you first: failed, then running, then the rest.
+    checks.sort_by_key(|c| match c.outcome {
+        ship::Outcome::Failed => 0,
+        ship::Outcome::Pending => 1,
+        ship::Outcome::Passed => 2,
+        ship::Outcome::Skipped => 3,
+    });
     let mut people = Vec::new();
     let mut findings: Vec<Finding> = Vec::new();
     for node in threads {
@@ -687,7 +695,9 @@ fn latest_checks(rollup: Vec<Check>) -> Vec<Check> {
     let started = |c: &Check| c.started_at.as_deref().and_then(crate::pool::seconds);
     let mut latest: Vec<Check> = Vec::new();
     for check in rollup {
-        match latest.iter_mut().find(|seen| seen.name() == check.name()) {
+        let same =
+            |seen: &Check| seen.name() == check.name() && seen.workflow_name == check.workflow_name;
+        match latest.iter_mut().find(|seen| same(seen)) {
             Some(seen) if started(&check) >= started(seen) => *seen = check,
             Some(_) => {}
             None => latest.push(check),
@@ -954,6 +964,7 @@ mod tests {
             "headRefOid": "head1", "commits": [{}, {}], "reviewDecision": "REVIEW_REQUIRED",
             "mergeStateStatus": "BLOCKED",
             "statusCheckRollup": [
+                {"name": "fmt", "status": "COMPLETED", "conclusion": "SUCCESS", "workflowName": "CI"},
                 {"name": "clippy", "status": "COMPLETED", "conclusion": "FAILURE", "workflowName": "CI",
                  "startedAt": "2026-11-08T10:00:00Z", "completedAt": "2026-11-08T10:01:12Z",
                  "detailsUrl": "https://github.com/o/r/actions/runs/991/job/5"},
@@ -1094,7 +1105,9 @@ mod tests {
             {"name": "lint", "status": "COMPLETED", "conclusion": "CANCELLED",
              "startedAt": "2026-11-08T10:01:00Z", "detailsUrl": "https://github.com/o/r/actions/runs/1/job/12"},
             {"name": "changes", "status": "COMPLETED", "conclusion": "SUCCESS",
-             "startedAt": "2026-11-08T10:04:00Z", "detailsUrl": "https://github.com/o/r/actions/runs/2/job/22"}
+             "startedAt": "2026-11-08T10:04:00Z", "detailsUrl": "https://github.com/o/r/actions/runs/2/job/22"},
+            {"name": "gate", "workflowName": "AI Triage", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "gate", "workflowName": "Security Scan", "status": "COMPLETED", "conclusion": "SUCCESS"}
         ]))
         .unwrap();
         let latest = latest_checks(rollup);
@@ -1104,9 +1117,11 @@ mod tests {
             [
                 ("changes", Outcome::Passed),
                 ("test (3.12)", Outcome::Failed),
-                ("lint", Outcome::Failed)
+                ("lint", Outcome::Failed),
+                ("gate", Outcome::Passed),
+                ("gate", Outcome::Passed),
             ],
-            "a check run again counts as its latest run"
+            "a check run again counts as its latest run, and one in another workflow is another check"
         );
         let read: Vec<&str> = log_targets(&latest).iter().map(|c| c.name()).collect();
         assert_eq!(

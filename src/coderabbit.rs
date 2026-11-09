@@ -182,10 +182,19 @@ fn finding(text: &str, default: Kind) -> Finding {
         labels.push(line.replace("**", ""));
         skip_blanks(&mut lines);
     }
-    if let Some(title) = lines.next_if(|l| l.starts_with("**") && l.ends_with("**")) {
-        found.title = title.trim_matches('*').trim().to_string();
+    // The title is a bold line, or a bold start the text runs on from.
+    let mut lead = None;
+    if let Some(title) = lines.next_if(|l| l.starts_with("**")) {
+        match title[2..].find("**") {
+            Some(end) if !title.ends_with("**") || end + 4 < title.len() => {
+                found.title = title[2..2 + end].trim().to_string();
+                lead = Some(title[2 + end + 2..].trim().to_string());
+            }
+            _ => found.title = title.trim_matches('*').trim().to_string(),
+        }
     }
-    found.body = lines.collect::<Vec<_>>().join("\n").trim().to_string();
+    let rest: Vec<String> = lead.into_iter().chain(lines).collect();
+    found.body = rest.join("\n").trim().to_string();
     if !labels.is_empty() {
         found.body = format!("{}\n\n{}", found.body, labels.join("\n"))
             .trim()
@@ -255,7 +264,7 @@ fn rating(line: &str, kind: &mut Kind) -> Option<String> {
 /// The text with its agent prompt taken out, and the prompt's code block.
 fn take_prompt(text: &str) -> (String, Option<String>) {
     let (Some(start), Some(end)) = (text.find(PROMPT_START), text.find(PROMPT_END)) else {
-        return (text.to_string(), None);
+        return take_prompt_section(text);
     };
     if end < start {
         return (text.to_string(), None);
@@ -264,6 +273,21 @@ fn take_prompt(text: &str) -> (String, Option<String>) {
     let prompt = fenced(inside).map(|(_, code)| code.trim().to_string());
     let rest = format!("{}{}", &text[..start], &text[end + PROMPT_END.len()..]);
     (rest, prompt)
+}
+
+/// The prompt from a folded "Prompt for AI Agents" section, where the
+/// comment has no `ai-agent-prompt` markers round it, and the text without
+/// that section.
+fn take_prompt_section(text: &str) -> (String, Option<String>) {
+    let Some(summary) = text.find("Prompt for AI Agents") else {
+        return (text.to_string(), None);
+    };
+    let start = text[..summary].rfind("<details").unwrap_or(summary);
+    let end = text[summary..]
+        .find("</details>")
+        .map_or(text.len(), |e| summary + e + "</details>".len());
+    let prompt = fenced(&text[summary..end]).map(|(_, code)| code.trim().to_string());
+    (format!("{}{}", &text[..start], &text[end..]), prompt)
 }
 
 /// The text with its first ```diff or ```suggestion block taken out, and
@@ -668,6 +692,28 @@ mod tests {
             f.body.contains("Reachability: External"),
             "the labels stay, after the text: {}",
             f.body
+        );
+    }
+
+    #[test]
+    fn reads_a_title_run_into_its_text_and_a_prompt_without_markers() {
+        let found = line_comment(
+            "_🩺 Stability & Availability_ | _🟠 Major_ | _🏗️ Heavy lift_\n\n\
+             **Wait for termination before submitting the replacement.** `ReplaceConcurrent` submits it at once.\n\n\
+             <details>\n<summary>🤖 Prompt for AI Agents</summary>\n\n```\nIn operator.go wait for the old pod.\n```\n\n</details>",
+        );
+        let f = &found[0];
+        assert_eq!(
+            (f.severity.as_deref(), f.title.as_str(), f.body.as_str()),
+            (
+                Some("Major"),
+                "Wait for termination before submitting the replacement.",
+                "`ReplaceConcurrent` submits it at once."
+            )
+        );
+        assert_eq!(
+            f.prompt.as_deref(),
+            Some("In operator.go wait for the old pod.")
         );
     }
 }
