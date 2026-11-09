@@ -3518,7 +3518,10 @@ fn pr_threads(pr: &PrView, selected: usize, width: usize) -> (Vec<Line<'static>>
         let place = if place.is_empty() {
             " commented".to_string()
         } else {
-            format!(" on {place}")
+            // What the row has after its mark, author and, folded, its note.
+            let note = if thread.resolved && !is_on { 12 } else { 0 };
+            let room = width.saturating_sub(thread.author.chars().count() + 8 + note);
+            format!(" on {}", tail_fit(&place, room.min(width / 2)))
         };
         let mut header = vec![
             Span::styled(format!(" {mark} "), fg(color).add_modifier(Modifier::BOLD)),
@@ -3532,15 +3535,16 @@ fn pr_threads(pr: &PrView, selected: usize, width: usize) -> (Vec<Line<'static>>
         // was said, on one row.
         let is_folded = thread.resolved && !is_on;
         if is_folded {
+            // "resolved" stays whole; the start of what was said gives way.
             let first = first_line(&thread.body);
-            let used: usize = header.iter().map(Span::width).sum();
-            header.push(Span::styled(
-                fit(
-                    &format!(" · resolved · {first}"),
-                    width.saturating_sub(used + 1),
-                ),
-                muted,
-            ));
+            let used: usize = header.iter().map(Span::width).sum::<usize>() + 11;
+            header.push(Span::styled(" · resolved", muted));
+            if used + 4 < width {
+                header.push(Span::styled(
+                    fit(&format!(" · {first}"), width.saturating_sub(used + 1)),
+                    muted,
+                ));
+            }
         }
         let header = Line::from(header);
         lines.push(if is_on {
@@ -5467,6 +5471,39 @@ mod pr_view_tests {
                 .lines()
                 .any(|r| r.trim_end_matches(['│', ' ']).ends_with('(')),
             "a wrap falls at a space, not between styles:\n{shown}"
+        );
+    }
+
+    #[test]
+    fn a_long_thread_place_keeps_its_file_and_line() {
+        let mut app = app();
+        let path = std::path::PathBuf::from("/pool/4/app");
+        while app.current().is_none_or(|t| t.path != path) {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Char('v'));
+        let mut pr = pr();
+        pr.threads[0].author = "copilot-pull-request-reviewer".into();
+        pr.threads[0].path = Some("src/features/repository/insights/primitives.tsx".into());
+        pr.threads[0].line = Some(194);
+        pr.threads[0].code_line = Some(194);
+        pr.threads[0].resolved = true;
+        pr.threads.push(Thread {
+            author: "jlin".into(),
+            body: "Thanks.".into(),
+            ..Thread::default()
+        });
+        app.pr_loaded(path, Ok(Some(pr)));
+        press(&mut app, KeyCode::Char('3'));
+        press(&mut app, KeyCode::Char('j'));
+        let shown = screen(&app, 100, 40);
+        let row = shown
+            .lines()
+            .find(|r| r.contains("copilot"))
+            .expect("the thread");
+        assert!(
+            row.contains("primitives.tsx:194") && row.contains("resolved"),
+            "a long place keeps its file and line, and the fold its note: {row}"
         );
     }
 }

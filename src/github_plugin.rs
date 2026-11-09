@@ -653,7 +653,8 @@ fn clean_log(log: &str) -> String {
                 Some((stamp, rest)) if crate::pool::seconds(stamp).is_some() => rest,
                 _ => line,
             };
-            without_escapes(line)
+            // A log lines its columns up with tabs, which a row drops.
+            without_escapes(line).replace('\t', "    ")
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -679,6 +680,34 @@ fn without_escapes(line: &str) -> String {
     out
 }
 
+/// Each check once, as its latest run: GitHub lists every run of a check
+/// on the head, so a workflow run again lists the one it superseded,
+/// cancelled, beside the new one.
+fn latest_checks(rollup: Vec<Check>) -> Vec<Check> {
+    let started = |c: &Check| c.started_at.as_deref().and_then(crate::pool::seconds);
+    let mut latest: Vec<Check> = Vec::new();
+    for check in rollup {
+        match latest.iter_mut().find(|seen| seen.name() == check.name()) {
+            Some(seen) if started(&check) >= started(seen) => *seen = check,
+            Some(_) => {}
+            None => latest.push(check),
+        }
+    }
+    latest
+}
+
+/// The failed checks whose logs `view` reads: ones that failed before ones
+/// that were cancelled, which say little, up to `VIEW_LOGS`.
+fn log_targets(checks: &[Check]) -> Vec<&Check> {
+    let mut failed: Vec<&Check> = checks
+        .iter()
+        .filter(|c| c.outcome() == Outcome::Failed)
+        .collect();
+    failed.sort_by_key(|c| c.conclusion.as_deref() == Some("CANCELLED"));
+    failed.truncate(VIEW_LOGS);
+    failed
+}
+
 fn view(args: &Value) -> Result<Value, Error> {
     let dir = args
         .get("dir")
@@ -696,16 +725,14 @@ fn view(args: &Value) -> Result<Value, Error> {
         }
         Err(err) => return Err(err),
     };
-    let viewed: Viewed =
+    let mut viewed: Viewed =
         serde_json::from_str(&viewed).map_err(|err| failed(format!("unreadable PR: {err}")))?;
-    let failing: Vec<Check> = viewed
-        .status_check_rollup
-        .iter()
-        .flatten()
-        .filter(|c| c.outcome() == Outcome::Failed)
-        .take(VIEW_LOGS)
-        .cloned()
-        .collect();
+    viewed.status_check_rollup = viewed.status_check_rollup.map(latest_checks);
+    let failing: Vec<Check> =
+        log_targets(viewed.status_check_rollup.as_deref().unwrap_or_default())
+            .into_iter()
+            .cloned()
+            .collect();
     let number = format!("number={}", viewed.number);
     let threads: Vec<ThreadNode> = gh(
         dir,
@@ -1048,11 +1075,44 @@ mod tests {
                    guard\tReject triggers\t2026-11-08T22:32:20.0000000Z ##[error]only workflow_dispatch is permitted\n\
                    guard\tReject triggers\t2026-11-08T22:32:21.0000000Z ^[[36;1mln -sf node^[[0m\n\
                    gate\tRun gate\t\u{feff}2026-11-08T22:52:46.7315338Z ##[group]Run merge-gate.sh\n\
+                   test\tRun tests\t2026-11-08T22:52:47.0000000Z FAIL\tgithub.com/caddyserver/caddy\t0.003s\n\
                    plain line";
         assert_eq!(
             clean_log(log),
-            "ruby check.rb\n##[error]only workflow_dispatch is permitted\nln -sf node\n##[group]Run merge-gate.sh\nplain line",
+            "ruby check.rb\n##[error]only workflow_dispatch is permitted\nln -sf node\n##[group]Run merge-gate.sh\nFAIL    github.com/caddyserver/caddy    0.003s\nplain line",
             "no job, step or time before each line, and no colour codes"
+        );
+    }
+
+    #[test]
+    fn a_rerun_check_counts_once_and_real_failures_are_read_first() {
+        let rollup: Vec<Check> = serde_json::from_value(json!([
+            {"name": "changes", "status": "COMPLETED", "conclusion": "CANCELLED",
+             "startedAt": "2026-11-08T10:00:00Z", "detailsUrl": "https://github.com/o/r/actions/runs/1/job/11"},
+            {"name": "test (3.12)", "status": "COMPLETED", "conclusion": "FAILURE",
+             "startedAt": "2026-11-08T10:05:00Z", "detailsUrl": "https://github.com/o/r/actions/runs/2/job/21"},
+            {"name": "lint", "status": "COMPLETED", "conclusion": "CANCELLED",
+             "startedAt": "2026-11-08T10:01:00Z", "detailsUrl": "https://github.com/o/r/actions/runs/1/job/12"},
+            {"name": "changes", "status": "COMPLETED", "conclusion": "SUCCESS",
+             "startedAt": "2026-11-08T10:04:00Z", "detailsUrl": "https://github.com/o/r/actions/runs/2/job/22"}
+        ]))
+        .unwrap();
+        let latest = latest_checks(rollup);
+        let names: Vec<(&str, Outcome)> = latest.iter().map(|c| (c.name(), c.outcome())).collect();
+        assert_eq!(
+            names,
+            [
+                ("changes", Outcome::Passed),
+                ("test (3.12)", Outcome::Failed),
+                ("lint", Outcome::Failed)
+            ],
+            "a check run again counts as its latest run"
+        );
+        let read: Vec<&str> = log_targets(&latest).iter().map(|c| c.name()).collect();
+        assert_eq!(
+            read,
+            ["test (3.12)", "lint"],
+            "a real failure is read before a cancelled one"
         );
     }
 }
