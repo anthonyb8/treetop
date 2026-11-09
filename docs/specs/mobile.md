@@ -156,7 +156,8 @@ What makes it feel like an app, and each is part of the issue that adds the scre
 - A new reply is laid out whole, so nothing reflows, and its words fade up in a rhythm taken from their length and punctuation, with what came after it held back until it is done.
 - A chat holds its place: scrolled to the end it follows new messages, scrolled up it stays put and shows a "new messages" pill; a tool call you opened stays open, and what you are typing is kept.
 - The pool's cards move into their new order when a tree's state changes, rather than the list jumping.
-- The service worker keeps the app shell, so it opens instantly and shows the last pool it saw, marked as stale, while the server is out of reach.
+- The app shows the last pool it saw, marked as stale, while the server is out of reach.
+  The service worker keeps no copy of the app (ANB-52): a stored copy once left a phone on a blank screen after an update, so every open loads the page from the server.
 
 ### Developing on the phone
 

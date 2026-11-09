@@ -13,6 +13,55 @@
     <link rel="icon" href="/icons/icon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="/icons/icon-180.png" />
     <title>treetop</title>
+    <script>
+      // An app that has not started 8 seconds after the page loads gets one
+      // fresh try: whatever an older treetop stored is cleared and the page
+      // reloads. Once that has been tried, it says so instead of leaving a
+      // blank screen. Plain script, because the app's own may be what failed.
+      setTimeout(function () {
+        var tried = "treetop:restarted";
+        var app = document.getElementById("app");
+        if (app && app.childElementCount > 0) {
+          try {
+            sessionStorage.removeItem(tried);
+          } catch (e) {}
+          return;
+        }
+        var hasTried = true;
+        try {
+          hasTried = sessionStorage.getItem(tried) !== null;
+          if (!hasTried) sessionStorage.setItem(tried, "1");
+        } catch (e) {
+          // Without storage a reload could not know it was the second, so it
+          // is not risked.
+        }
+        if (!hasTried) {
+          var cleared = "caches" in window
+            ? caches.keys().then(function (keys) {
+                return Promise.all(keys.map(function (key) { return caches.delete(key); }));
+              })
+            : Promise.resolve();
+          cleared.catch(function () {}).then(function () { location.reload(); });
+          return;
+        }
+        var notice = document.createElement("div");
+        notice.id = "not-started";
+        notice.setAttribute("role", "alert");
+        notice.style.cssText =
+          "padding:calc(env(safe-area-inset-top, 0px) + 24px) 16px 24px;font:16px/1.5 system-ui,sans-serif;color:#d4be98";
+        notice.innerHTML =
+          "<p style='margin:0 0 8px;font-size:18px;font-weight:700;color:#ddc7a1'>treetop did not start</p>" +
+          "<p style='margin:0 0 16px'>Close it and open it again. If this shows again, delete treetop from the home screen and add it back from Safari.</p>" +
+          "<button type='button' style='font:inherit;color:#ddc7a1;background:#3c3836;border:1px solid #5a524c;border-radius:8px;padding:10px 16px'>Try again</button>";
+        notice.querySelector("button").addEventListener("click", function () {
+          try {
+            sessionStorage.removeItem(tried);
+          } catch (e) {}
+          location.reload();
+        });
+        document.body.insertBefore(notice, app);
+      }, 8000);
+    </script>
   </head>
   <body>
     <div id="app"></div>

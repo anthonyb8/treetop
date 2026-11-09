@@ -1,6 +1,6 @@
 // What the app keeps on the phone between opens: the workspace chosen and
-// the last pool seen, so it opens instantly and still shows something while
-// the server is out of reach. Storage can be missing or full, as in a
+// the last pool seen, so it shows a pool at once and still shows something
+// when the server drops out of reach. Storage can be missing or full, as in a
 // private tab, so every call is allowed to fail.
 
 const PREFIX = "treetop:";
