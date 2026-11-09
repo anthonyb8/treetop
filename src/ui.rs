@@ -3651,13 +3651,22 @@ fn pr_findings(pr: &PrView, popup: &PrPopup, width: usize) -> (Vec<Line<'static>
         return (lines, at);
     };
     let reviewed = bot.reviewed.as_deref().map(|sha| &sha[..sha.len().min(7)]);
-    let whose = match (reviewed, bot.reviewed.as_deref() == Some(pr.head.as_str())) {
-        (Some(sha), true) => format!(" coderabbitai reviewed {sha}, the head"),
-        (Some(sha), false) => format!(" coderabbitai reviewed {sha}, an earlier commit"),
-        (None, _) => " coderabbitai has not reviewed this PR yet".to_string(),
-    };
-    lines.push(Line::styled(whose, muted));
-    if bot.reviewing {
+    let first = bot.reviewing && reviewed.is_none();
+    if first {
+        // Nothing yet to show or to say it is from before.
+        lines.push(Line::styled(
+            " CodeRabbit is reviewing this PR for the first time.",
+            fg(t.warning),
+        ));
+    } else {
+        let whose = match (reviewed, bot.reviewed.as_deref() == Some(pr.head.as_str())) {
+            (Some(sha), true) => format!(" coderabbitai reviewed {sha}, the head"),
+            (Some(sha), false) => format!(" coderabbitai reviewed {sha}, an earlier commit"),
+            (None, _) => " coderabbitai has not reviewed this PR yet".to_string(),
+        };
+        lines.push(Line::styled(whose, muted));
+    }
+    if bot.reviewing && !first {
         let note = if bot.reviewed.as_deref() == Some(pr.head.as_str()) {
             " CodeRabbit is reviewing it again; these are from its last review."
         } else {
@@ -3667,7 +3676,7 @@ fn pr_findings(pr: &PrView, popup: &PrPopup, width: usize) -> (Vec<Line<'static>
     }
     lines.push(Line::raw(""));
     let findings = pr_view::findings(pr, popup.nitpicks);
-    if findings.is_empty() {
+    if findings.is_empty() && !first {
         lines.push(Line::styled(" CodeRabbit has no comments to show.", muted));
     }
     for (i, finding) in findings.iter().enumerate() {
@@ -5636,6 +5645,31 @@ mod pr_view_tests {
         ] {
             let squeezed: String = words.split_whitespace().collect();
             assert!(text.contains(&squeezed), "{words} is drawn whole:\n{shown}");
+        }
+    }
+
+    #[test]
+    fn a_first_review_under_way_says_so_once() {
+        let mut app = app();
+        let path = std::path::PathBuf::from("/pool/4/app");
+        while app.current().is_none_or(|t| t.path != path) {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Char('v'));
+        let mut pr = pr();
+        pr.bot = Some(BotReview {
+            reviewing: true,
+            ..BotReview::default()
+        });
+        app.pr_loaded(path, Ok(Some(pr)));
+        press(&mut app, KeyCode::Char('4'));
+        let shown = screen(&app, 100, 40);
+        assert!(
+            shown.contains("CodeRabbit is reviewing this PR for the first time."),
+            "{shown}"
+        );
+        for said in ["has not reviewed", "from before it", "no comments to show"] {
+            assert!(!shown.contains(said), "{said} contradicts it:\n{shown}");
         }
     }
 }

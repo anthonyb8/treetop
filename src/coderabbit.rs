@@ -97,8 +97,12 @@ pub fn review(body: &str) -> Vec<Finding> {
                 Some((Some(Kind::Nitpick), None))
             } else if lower.contains("outside diff range") {
                 Some((Some(Kind::Issue), None))
-            } else if lower.contains("comments") || lower.starts_with("prompt to fix") {
+            } else if lower.starts_with("prompt to fix") {
                 Some((None, None))
+            } else if lower.contains("comments") {
+                // Any other set of comments, such as "Additional comments",
+                // reads as plain comments rather than going missing.
+                Some((Some(Kind::Comment), None))
             } else {
                 let file = file_of(&summary);
                 (section.is_some() && file != summary).then_some((section, Some(file)))
@@ -790,6 +794,23 @@ mod tests {
                 && f.body.contains("Drop the clone"),
             "the whole section, under its files: {}",
             f.body
+        );
+    }
+
+    #[test]
+    fn reads_additional_comments_as_comments() {
+        let found = review(
+            "<details>\n<summary>Additional comments: 1</summary><blockquote>\n\n<details>\n<summary>db/schema.sql: 1</summary><blockquote>\n\n\
+             `19-47`: **Trivial** · **Performance & Scalability** · **Low value**\n\n**Add index coverage for the composite FK child columns.**\n\n\
+             Lookups scan the table.\n\n<!-- cr-comment:v1:f -->\n\n</blockquote></details>\n\n</blockquote></details>",
+        );
+        let read: Vec<(Kind, Option<&str>, Option<&str>)> = found
+            .iter()
+            .map(|f| (f.kind, f.path.as_deref(), f.lines.as_deref()))
+            .collect();
+        assert_eq!(
+            read,
+            [(Kind::Comment, Some("db/schema.sql"), Some("19-47"))]
         );
     }
 }
