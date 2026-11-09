@@ -243,16 +243,27 @@ fn finding(text: &str, default: Kind) -> Finding {
         labels.push(line.replace("**", ""));
         skip_blanks(&mut lines);
     }
-    // The title is a bold line, or a bold start the text runs on from.
+    // The title is a bold line, or a bold start the text runs on from; a
+    // bold line followed by another, such as `**Unverified finding**`, is a
+    // label, and the next one the title.
     let mut lead = None;
-    if let Some(title) = lines.next_if(|l| l.starts_with("**")) {
-        match title[2..].find("**") {
-            Some(end) if !title.ends_with("**") || end + 4 < title.len() => {
-                found.title = title[2..2 + end].trim().to_string();
-                lead = Some(title[2 + end + 2..].trim().to_string());
+    while let Some(title) = lines.next_if(|l| l.starts_with("**")) {
+        match bold_end(&title) {
+            Some(end) if end + 2 < title.len() => {
+                found.title = title[2..end].trim().to_string();
+                lead = Some(title[end + 2..].trim().to_string());
             }
             _ => found.title = title.trim_matches('*').trim().to_string(),
         }
+        skip_blanks(&mut lines);
+        let another = lead.is_none()
+            && lines
+                .peek()
+                .is_some_and(|l| l.starts_with("**") && l.ends_with("**"));
+        if !another {
+            break;
+        }
+        labels.push(std::mem::take(&mut found.title));
     }
     let rest: Vec<String> = lead.into_iter().chain(lines).collect();
     found.body = rest.join("\n").trim().to_string();
@@ -537,7 +548,36 @@ fn file_of(summary: &str) -> String {
                 .rsplit_once(" (")
                 .filter(|(_, n)| n.trim_end_matches(')').parse::<u32>().is_ok())
         });
-    cut.map_or(summary, |(path, _)| path).to_string()
+    let path = cut.map_or(summary, |(path, _)| path);
+    // Some headings name the lines too: `docs/a.md-50-50`.
+    let mut parts = path.rsplitn(3, '-');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(end), Some(start), Some(file))
+            if [end, start]
+                .iter()
+                .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) =>
+        {
+            file.to_string()
+        }
+        _ => path.to_string(),
+    }
+}
+
+/// Where a bold run that opens a line ends: the `**` after its start that is
+/// not inside a code span, as in `**Add `crates/core/**` to it.**`.
+fn bold_end(line: &str) -> Option<usize> {
+    let mut in_code = false;
+    let bytes = line.as_bytes();
+    let mut at = 2;
+    while at + 1 < bytes.len() {
+        match bytes[at] {
+            b'`' => in_code = !in_code,
+            b'*' if !in_code && bytes[at + 1] == b'*' => return Some(at),
+            _ => {}
+        }
+        at += 1;
+    }
+    None
 }
 
 /// A review's item opening with its lines: `` `183-188`: **Trivial** ``.
@@ -811,6 +851,42 @@ mod tests {
         assert_eq!(
             read,
             [(Kind::Comment, Some("db/schema.sql"), Some("19-47"))]
+        );
+    }
+
+    #[test]
+    fn a_title_with_stars_in_its_code_stays_whole() {
+        let found = line_comment(
+            "**Add `crates/core/**` to the rollout PR path filter.**\n\nThe filter misses it.",
+        );
+        assert_eq!(
+            found[0].title,
+            "Add `crates/core/**` to the rollout PR path filter."
+        );
+        assert_eq!(found[0].body, "The filter misses it.");
+    }
+
+    #[test]
+    fn reads_an_unverified_finding_under_a_heading_with_its_lines() {
+        let found = review(
+            "<details>\n<summary>Additional comments: 1</summary><blockquote>\n\n\
+             <details>\n<summary>docs/adr/0001-collection-branch-transfer.md-50-50: 1</summary><blockquote>\n\n\
+             `50`: **Major** · **Correctness**\n\n**Unverified finding**\n\n**Name the branch the transfer reads.**\n\n\
+             It reads the wrong one.\n\n<!-- cr-comment:v1:g -->\n\n</blockquote></details>\n\n</blockquote></details>",
+        );
+        let f = &found[0];
+        assert_eq!(
+            (f.path.as_deref(), f.lines.as_deref(), f.title.as_str()),
+            (
+                Some("docs/adr/0001-collection-branch-transfer.md"),
+                Some("50"),
+                "Name the branch the transfer reads."
+            )
+        );
+        assert!(
+            f.body.contains("Unverified finding"),
+            "the label stays, after the text: {}",
+            f.body
         );
     }
 }

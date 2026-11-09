@@ -2943,7 +2943,13 @@ fn pr_overview(pr: &PrView, width: usize) -> Vec<Line<'static>> {
             Span::styled(format!("+{}", pr.additions), fg(t.success)),
             Span::raw(" "),
             Span::styled(format!("-{}", pr.deletions), fg(t.danger)),
-            Span::styled(format!(" in {} files", pr.files), muted),
+            Span::styled(
+                format!(
+                    " in {}",
+                    plural(usize::try_from(pr.files).unwrap_or(usize::MAX), "file")
+                ),
+                muted,
+            ),
         ]),
         Line::raw(""),
     ];
@@ -5711,6 +5717,24 @@ mod pr_view_tests {
         assert!(
             shown.contains("was skipped in 3m 40s."),
             "the detail line wraps whole:\n{shown}"
+        );
+    }
+
+    #[test]
+    fn one_file_is_one_file() {
+        let mut app = app();
+        let path = std::path::PathBuf::from("/pool/4/app");
+        while app.current().is_none_or(|t| t.path != path) {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Char('v'));
+        let mut pr = pr();
+        pr.files = 1;
+        app.pr_loaded(path, Ok(Some(pr)));
+        let shown = screen(&app, 200, 40);
+        assert!(
+            shown.contains("in 1 file") && !shown.contains("1 files"),
+            "{shown}"
         );
     }
 }
