@@ -2984,7 +2984,11 @@ fn pr_overview(pr: &PrView, width: usize) -> Vec<Line<'static>> {
         ));
     }
     if passed > 0 {
-        checks.push(Span::styled(format!("✓ {passed} passed"), fg(t.success)));
+        checks.push(Span::styled(format!("✓ {passed} passed   "), fg(t.success)));
+    }
+    let cancelled = count_checks(pr, CheckOutcome::Cancelled);
+    if cancelled > 0 {
+        checks.push(Span::styled(format!("⊘ {cancelled} cancelled"), muted));
     }
     if checks.is_empty() {
         checks.push(Span::styled("none", muted));
@@ -3011,13 +3015,15 @@ fn pr_overview(pr: &PrView, width: usize) -> Vec<Line<'static>> {
             ),
             Span::raw(format!(
                 ", {}, {}",
-                plural(
-                    count(coderabbit::Kind::Suggestion) + count(coderabbit::Kind::Comment),
-                    "suggestion"
-                ),
+                plural(count(coderabbit::Kind::Suggestion), "suggestion"),
                 plural(count(coderabbit::Kind::Nitpick), "nitpick")
             )),
         ];
+        // Named as the tab names them; comments only where there are some.
+        let comments = count(coderabbit::Kind::Comment);
+        if comments > 0 {
+            parts.push(Span::raw(format!(", {}", plural(comments, "comment"))));
+        }
         if bot.reviewing {
             let note = if bot.reviewed.as_deref() == Some(pr.head.as_str()) {
                 "   reviewing it again"
@@ -3145,7 +3151,11 @@ fn draw_pr_checks(frame: &mut Frame, pr: &PrView, selected: usize, area: Rect) {
                 fg(t.border),
             ));
             let heading = lines.len();
-            let log = log.unwrap_or("Its log could not be read, or it is not an Actions run.");
+            let unread = format!(
+                "treetop reads the logs of the first {} failed checks; Enter opens this one on GitHub.",
+                crate::ship::VIEW_LOGS
+            );
+            let log = log.unwrap_or(&unread);
             // Wrapped at words, each row keeping the indent its line had.
             let all: Vec<String> = log
                 .lines()
@@ -3187,13 +3197,14 @@ fn draw_pr_checks(frame: &mut Frame, pr: &PrView, selected: usize, area: Rect) {
             ));
         }
         (outcome, _) => {
-            let word = if outcome == CheckOutcome::Skipped {
-                "was skipped"
-            } else {
-                "passed"
+            let word = match outcome {
+                CheckOutcome::Skipped => "was skipped",
+                CheckOutcome::Cancelled => "was cancelled",
+                _ => "passed",
             };
             let time = check
                 .seconds
+                .filter(|_| outcome != CheckOutcome::Cancelled)
                 .map(|s| format!(" in {}", duration(s)))
                 .unwrap_or_default();
             lines.extend(said(
@@ -3213,6 +3224,7 @@ fn check_mark(outcome: CheckOutcome) -> (&'static str, Color) {
         CheckOutcome::Failed => ("✗", t.danger),
         CheckOutcome::Pending => ("●", t.warning),
         CheckOutcome::Skipped => ("-", t.muted),
+        CheckOutcome::Cancelled => ("⊘", t.muted),
     }
 }
 
@@ -5734,6 +5746,45 @@ mod pr_view_tests {
         let shown = screen(&app, 200, 40);
         assert!(
             shown.contains("in 1 file") && !shown.contains("1 files"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn cancelled_checks_and_unread_logs_say_what_they_are() {
+        let mut app = app();
+        let path = std::path::PathBuf::from("/pool/4/app");
+        while app.current().is_none_or(|t| t.path != path) {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Char('v'));
+        let mut pr = pr();
+        pr.checks[0].log = None;
+        pr.checks[1].outcome = Checked::Cancelled;
+        pr.checks[1].name = "Validation (affected)".into();
+        if let Some(bot) = pr.bot.as_mut() {
+            bot.findings[0].kind = Found::Comment;
+        }
+        app.pr_loaded(path, Ok(Some(pr)));
+        let shown = screen(&app, 200, 40);
+        assert!(
+            shown.contains("✗ 1 failed: clippy") && shown.contains("1 cancelled"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("1 comment") && !shown.contains("1 suggestion"),
+            "{shown}"
+        );
+        press(&mut app, KeyCode::Char('2'));
+        let shown = screen(&app, 200, 40);
+        assert!(
+            shown.contains("treetop reads the logs of the first 5 failed checks"),
+            "a log not read says so, not that it could not be:\n{shown}"
+        );
+        press(&mut app, KeyCode::Char('j'));
+        let shown = screen(&app, 200, 40);
+        assert!(
+            shown.contains("Validation (affected) was cancelled."),
             "{shown}"
         );
     }

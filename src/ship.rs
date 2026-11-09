@@ -138,7 +138,12 @@ pub enum Outcome {
     #[default]
     Pending,
     Skipped,
+    /// Stopped before it finished, such as a run a newer push superseded.
+    Cancelled,
 }
+
+/// The failed checks whose logs a `view` reads, each a call to the forge.
+pub const VIEW_LOGS: usize = 5;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]

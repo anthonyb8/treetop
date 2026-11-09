@@ -145,6 +145,9 @@ impl Check {
             outcome: match self.outcome() {
                 Outcome::Passed if skipped => ship::Outcome::Skipped,
                 Outcome::Passed => ship::Outcome::Passed,
+                Outcome::Failed if self.conclusion.as_deref() == Some("CANCELLED") => {
+                    ship::Outcome::Cancelled
+                }
                 Outcome::Failed => ship::Outcome::Failed,
                 Outcome::Pending => ship::Outcome::Pending,
             },
@@ -412,9 +415,6 @@ const VIEW_FIELDS: &str = "number,title,url,state,isDraft,author,baseRefName,hea
                            headRefOid,body,additions,deletions,changedFiles,commits,\
                            reviewDecision,mergeStateStatus,statusCheckRollup,reviews,comments";
 
-/// The failed checks whose logs `view` reads, each a `gh` call.
-const VIEW_LOGS: usize = 3;
-
 /// A PR's review threads, which only GraphQL says are resolved.
 const THREADS: &str = "query($owner: String!, $repo: String!, $number: Int!) {
   repository(owner: $owner, name: $repo) {
@@ -521,8 +521,9 @@ fn pr_view(viewed: Viewed, threads: Vec<ThreadNode>) -> PrView {
     checks.sort_by_key(|c| match c.outcome {
         ship::Outcome::Failed => 0,
         ship::Outcome::Pending => 1,
-        ship::Outcome::Passed => 2,
-        ship::Outcome::Skipped => 3,
+        ship::Outcome::Cancelled => 2,
+        ship::Outcome::Passed => 3,
+        ship::Outcome::Skipped => 4,
     });
     let mut people = Vec::new();
     let mut findings: Vec<Finding> = Vec::new();
@@ -706,16 +707,14 @@ fn latest_checks(rollup: Vec<Check>) -> Vec<Check> {
     latest
 }
 
-/// The failed checks whose logs `view` reads: ones that failed before ones
-/// that were cancelled, which say little, up to `VIEW_LOGS`.
+/// The failed checks whose logs `view` reads, up to `VIEW_LOGS`: a
+/// cancelled one has no failure to show.
 fn log_targets(checks: &[Check]) -> Vec<&Check> {
-    let mut failed: Vec<&Check> = checks
+    checks
         .iter()
-        .filter(|c| c.outcome() == Outcome::Failed)
-        .collect();
-    failed.sort_by_key(|c| c.conclusion.as_deref() == Some("CANCELLED"));
-    failed.truncate(VIEW_LOGS);
-    failed
+        .filter(|c| c.outcome() == Outcome::Failed && c.conclusion.as_deref() != Some("CANCELLED"))
+        .take(ship::VIEW_LOGS)
+        .collect()
 }
 
 /// What a failed check's log read says: its tail, why it is empty, or why
@@ -1151,9 +1150,11 @@ mod tests {
         let read: Vec<&str> = log_targets(&latest).iter().map(|c| c.name()).collect();
         assert_eq!(
             read,
-            ["test (3.12)", "lint"],
-            "a real failure is read before a cancelled one"
+            ["test (3.12)"],
+            "a cancelled check has no failure to read"
         );
+        let lint = latest.iter().find(|c| c.name() == "lint").map(Check::view);
+        assert_eq!(lint.map(|c| c.outcome), Some(ship::Outcome::Cancelled));
     }
 
     #[test]

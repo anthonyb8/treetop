@@ -646,7 +646,7 @@ Those show `ready` in the Issues screen's WORK column, where `p` picks one up.
 It has four tabs, which `1` to `4` switch, as do `h` and `l`; `j` and `k` move between items, and `d` and `u` scroll through one too long for the screen.
 
 - **Overview**: who wants to merge what, where its checks, review, CodeRabbit, open threads and merge stand, and its description.
-- **Checks**: each check with its workflow and how long it ran; a failed one shows the end of its log below, and Enter opens a check on GitHub.
+- **Checks**: each check with its workflow and how long it ran, failures first and cancelled runs after them; a failed one shows the end of its log below, read for the first five failures, and Enter opens a check on GitHub.
 - **Comments**: each review thread with the lines of code it is on, coloured as the diff colours them, and each comment on the whole PR, its Markdown drawn as the description's is; a resolved thread folds to one line until it is selected.
 - **CodeRabbit**, on a repository CodeRabbit reviews: its comments as issues and suggestions, each with its severity, place and title, and the selected one with its text and suggested change. Its nitpicks fold into one line, which `z` opens.
 
