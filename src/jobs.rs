@@ -279,6 +279,12 @@ impl Job {
 
 pub enum Event {
     Started(Job),
+    /// A start finished one of its steps, for the job on row `key`, so the
+    /// window it was asked from can show it under way.
+    Step {
+        key: PathBuf,
+        step: &'static str,
+    },
     Finished {
         job: Job,
         is_ok: bool,
@@ -307,7 +313,9 @@ impl Worker {
                     if events_tx.send(Event::Started(job.clone())).is_err() {
                         return;
                     }
+                    PROGRESS.set(Some((events_tx.clone(), job.key.clone())));
                     let (is_ok, output) = run(&mut job);
+                    PROGRESS.set(None);
                     if events_tx
                         .send(Event::Finished { job, is_ok, output })
                         .is_err()
@@ -527,6 +535,14 @@ fn start_steps(
     started
 }
 
+thread_local! {
+    /// Where the job this worker thread runs says each step it finishes,
+    /// and the row it is on: set round each job, so a start's steps reach
+    /// the screen as they end without passing a sender down every call.
+    static PROGRESS: std::cell::RefCell<Option<(Sender<Event>, PathBuf)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// How long each step of a start took, for its log, so a slow start says
 /// which step was slow.
 struct Timed {
@@ -547,6 +563,14 @@ impl Timed {
         let now = std::time::Instant::now();
         self.steps.push((step, now - self.at));
         self.at = now;
+        PROGRESS.with_borrow(|progress| {
+            if let Some((events, key)) = progress {
+                let _ = events.send(Event::Step {
+                    key: key.clone(),
+                    step,
+                });
+            }
+        });
     }
 }
 
@@ -657,17 +681,23 @@ fn timed_steps(
         });
         record.lease_id = lease_id;
     }
-    timed.mark("lease");
+    // A step that did not run here is not marked, so the window says it
+    // was not needed rather than ticking it.
+    if launch.is_new_tree || is_leasing {
+        timed.mark("lease");
+    }
     if is_leasing {
         check(&job.tree.path, log).map_err(|why| format!("check: {why}"))?;
         timed.mark("check");
     }
+    let mut is_branched = false;
     if let Some(name) = &branch
         && resumes
     {
         exec(git(&job.tree.path).args(["switch", name]), GIT_LIMIT, log)
             .map_err(|why| format!("branch: {why}"))?;
         undone.push(Undo::Detach);
+        is_branched = true;
     } else if let Some(name) = &branch
         && !launch.is_new_tree
         && checked_out(&job.tree.path).is_none()
@@ -679,8 +709,12 @@ fn timed_steps(
         )
         .map_err(|why| format!("branch: {why}"))?;
         undone.push(Undo::Branch(name.clone()));
+        is_branched = true;
     }
-    timed.mark("branch");
+    // A fresh tree is leased on its branch.
+    if is_branched || launch.is_new_tree && branch.is_some() {
+        timed.mark("branch");
+    }
     let starter = starter(&launch, &job.tree.path)?;
     let later = Later {
         naming,
@@ -697,8 +731,8 @@ fn timed_steps(
         sidecar::write(&job.tree.path, &record)
             .map_err(|err| format!("sidecar: could not write {}: {err}", sidecar::FILE))?;
         undone.push(Undo::Sidecar);
+        timed.mark("record");
     }
-    timed.mark("record");
     let (plugin, id) = match starter {
         Starter::Command(command) => {
             let (program, args) = command.split_first().ok_or("start: no agent command")?;
@@ -708,6 +742,7 @@ fn timed_steps(
                 log,
             )
             .map_err(|why| format!("start: {why}"))?;
+            timed.mark("agent");
             later.spawn(None);
             return Ok(None);
         }
@@ -1760,6 +1795,52 @@ pub(crate) mod tests {
         unsafe { std::env::remove_var("TREETOP_NEW_AGENT") };
         assert!(failed.unwrap_err().starts_with("start: /nonexistent/agent"));
         assert!(undone.is_empty(), "nothing was leased, branched or written");
+    }
+
+    /// Each step a start ends reaches the screen as it ends, for the
+    /// start's row, before the start finishes: a held tree's start, which
+    /// leases, branches and records nothing, says only its agent's start.
+    #[test]
+    fn a_starts_steps_are_said_for_its_row_as_they_end() {
+        let root = config_root("steps");
+        if !in_own_process("a_starts_steps_are_said_for_its_row_as_they_end", &root) {
+            return;
+        }
+        // A tree already held is started in as it is, by an agent command
+        // that runs and returns, as `TREETOP_NEW_AGENT` names one.
+        // SAFETY: this process runs only this test, on this thread.
+        unsafe { std::env::set_var("TREETOP_NEW_AGENT", "true") };
+        let job = Job {
+            // Named, so no model is asked for a name.
+            launch: Some(Launch {
+                name: Some("login fixer".into()),
+                ..launch("fix login")
+            }),
+            ..Job::new(
+                Kind::Start,
+                Tree {
+                    status: "leased".into(),
+                    ..pool::stand_in(std::env::temp_dir())
+                },
+            )
+        };
+        let row = job.key.clone();
+        let worker = Worker::spawn();
+        worker.push(job);
+        let mut said = Vec::new();
+        for event in worker.events.iter() {
+            match event {
+                Event::Started(_) => {}
+                Event::Step { key, step } => said.push((key, step)),
+                Event::Finished { is_ok, output, .. } => {
+                    assert!(is_ok, "{output}");
+                    break;
+                }
+            }
+        }
+        // Nothing was leased, branched or recorded in a tree already held,
+        // so only the agent's start is said.
+        assert_eq!(said, [(row, "agent")]);
     }
 
     /// A held tree treetop leased, its record naming agent `old00001`, and

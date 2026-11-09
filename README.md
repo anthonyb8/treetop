@@ -41,7 +41,12 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 
 | Key | Does |
 |---|---|
-| Enter | open the agent of the tree under the cursor: its chat in a popup, starting a cold one again, else the tree itself (see [Agent chats](#agent-chats) and [Entering a tree](#entering-a-tree)); on a group's heading, fold the group or open it again, and on the main checkout's, open the chat of its agent when it has one |
+| Enter | give the keys to the chat of the agent in the tree under the cursor, in the window under the table, starting a cold one again, else go to the tree itself (see [Agent chats](#agent-chats) and [Entering a tree](#entering-a-tree)); on a group's heading, fold the group or open it again, and on the main checkout's, open the chat of its agent when it has one |
+| Ctrl+Q | give the keys to the chat in the window under the table, and from the chat back to the table; with two windows, move them round the table, the left window and the right one |
+| Ctrl+P | open the command palette: every action, the tree under the cursor's first, found by typing a few of its words, a tree number or a branch, and run with Enter |
+| Ctrl+F | zoom: on the table, the table over the whole screen; in a window, the windows, with the table folded to their trees' rows; again, back |
+| Ctrl+\\ | show two windows under the table, the tree under the cursor on the left and the next tree down on the right, or one again |
+| `←` `→` | step through the window's tabs: chat, diff, PR, run, shell and info |
 | `t` | go to the tree itself, even when its agent has a chat: its tmux pane or a window in it, else a shell there (see [Entering a tree](#entering-a-tree)) |
 | `n` | start a new agent in the tree under the cursor: a free one is leased for it, on a branch named for the task, and a held one keeps its branch; on the main checkout's heading, start one in the main checkout, for work that needs no tree |
 | `N` | start a new agent in a fresh tree, on a branch named for the task (see [New agents](#new-agents)) |
@@ -50,7 +55,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | `E` | hide the inbox, giving the list its width back, or show it again |
 | `:` | ask the assistant about the tree under the cursor, or write `@17 ...` for that tree's agent (see [The assistant](#the-assistant)) |
 | `a` | open the assistant's chat, where it answers, starting it if there is none |
-| `d` | open the side-by-side diff of the tree under the cursor in a popup |
+| `d` | show the side-by-side diff of the tree under the cursor in the window's diff tab, with the keys |
 | `r` | return the marked trees, or the one under the cursor, to the pool; its dialog names each tree's branch, its uncommitted and unpushed counts, the pid of every live process a return would stop and any [keel run](#keel-runs) that holds it, and `D` in it destroys them from disk instead, after reviewing treehouse's preview of each |
 | Space | mark or unmark the tree under the cursor |
 | `x` | put the tree under the cursor on the Backburner, or bring it back, with the cursor following it; `X` folds or opens Backburner |
@@ -60,7 +65,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | `p` | share the port the tree serves with your phone and show its address as a QR code to scan with the phone's camera; it runs `tether share <port>`, or the `share` the config names (see [Config](#config)); pressed again on a port already shared, it takes the share down; a tree serving several offers the same menu as `o` |
 | `P` | put the port the tree serves on the internet, for anyone with the link, and copy that link to the clipboard; it runs `tether share --public <port>`, or the `publish` the config names; pressed again on a port already public, it takes it off the internet, as `x` in its popup does, with `tether unshare <port>`, or the `unpublish` the config names; a tree serving several offers the same menu as `o` |
 | `Q` | show a shared port's QR code and address again, without sharing anything: treetop reads them back from `tether shares`, so a port shared before it started shows too; on a port that is not shared it says which key shares it |
-| `v` | open the tree's PR in a popup: its checks, review threads and CodeRabbit's comments (see [The PR view](#the-pr-view)) |
+| `v` | show the tree's PR in the window's PR tab, with the keys: its checks, review threads and CodeRabbit's comments (see [The PR view](#the-pr-view)) |
 | `O` | open the tree's PR the same way (see [After the agent](#after-the-agent)) |
 | `f` | send what failed on the tree's PR, a check's log or a review's requested changes, to its agent |
 | `R` | resume the tree's stopped or failed agent in the tree, with its conversation and the flags it was started with, rather than a fresh dispatch that loses them |
@@ -81,7 +86,7 @@ In a true-colour terminal (`COLORTERM=truecolor`) treetop draws in gruvbox-mater
 The columns are what a destroy would lose.
 GIT says what is not safe yet, in a Powerlevel10k prompt's symbols: `⇡2` commits on no remote, `+1` staged, `!3` unstaged and `?4` untracked files, each only when there are some, so a clean tree is blank.
 `─` means git could not read a held tree, which deserves a look before it goes.
-PORTS lists every TCP port the tree's processes listen on, lowest first, so a frontend and a backend both show; the processes themselves are in the detail pane and the return dialog.
+PORTS lists every TCP port the tree's processes listen on, lowest first, so a frontend and a backend both show; the processes themselves are in the info tab and the return dialog.
 A port shared with your phone carries a `p` after it, and one on the internet a `P`: the key that put it there, so what anyone with the link can open is on the row rather than only in the popup that shared it.
 treetop reads which ports are shared back from `tether shares`, or the `shares` the config names, every 10 seconds and at once after `p`, `P` or `x`, so a share made outside treetop, or before it started, is marked too.
 `o` opens the port in the browser on a desktop, and where the tree serves several it opens a menu of them, each with the process listening on it, picked with its number or `j`/`k` and Enter; on a server reached over SSH it copies the URL to the clipboard of the computer you are typing at, through the terminal (OSC 52; inside tmux, `set-clipboard on`).
@@ -120,7 +125,7 @@ On opening, treetop draws the last listing it saved under `$XDG_CACHE_HOME/treet
 
 ## The diff
 
-`d` opens the tree under the cursor in a side-by-side diff, in a popup over the pool, the way a pull request shows it: everything its branch changes against its base, the branch it was cut from (see [New agents](#new-agents)) or else the pool's (`base_branch` in `treehouse.toml`, else `origin/HEAD`), measured from their merge base, plus uncommitted and untracked files.
+`d` shows the tree under the cursor in a side-by-side diff, in the window's diff tab with the keys, the way a pull request shows it: everything its branch changes against its base, the branch it was cut from (see [New agents](#new-agents)) or else the pool's (`base_branch` in `treehouse.toml`, else `origin/HEAD`), measured from their merge base, plus uncommitted and untracked files.
 Removed lines sit on the left and the added lines that replace them on the right, row by row, with line numbers on both sides; within a changed line, the words that differ are highlighted.
 Every file runs in one scroll, each under a header with its path and its additions and deletions, and the header of the file you are reading stays pinned to the top.
 Code is coloured as an editor colours it, by the grammars [bat](https://github.com/sharkdp/bat) ships, for every language they cover, such as Rust, TypeScript, Svelte, TOML and Markdown; a file with none, such as plain text, stays one colour.
@@ -138,7 +143,7 @@ In a terminal without true colour, code stays one colour, since 16 colours canno
 | `h` `l` | sideways, for lines wider than their half |
 | `g` `G` | the top or the end |
 | `Ctrl-R` | read the diff again |
-| Esc, `Tab`, `q` | back to the pool |
+| Esc, `Tab`, `q`, Ctrl+Q | give the keys back to the table; the diff stays in its tab |
 
 The diff is read in the background and holds still while it is open; reopening it after the tree's counts have moved reads it again.
 Only the rows on screen are drawn, so a diff of fifty thousand lines scrolls as fast as a short one.
@@ -362,7 +367,7 @@ A ship plugin says where each tree's branch stands after its agent:
 
 `stage` is one of `running`, `gate`, `failed`, `draft`, `checks`, `ci_failed`, `changes`, `review`, `approved`, `merged`, `closed` or `idle`; any other reads as `running`.
 `gate`, `failed`, `ci_failed` and `changes` need you.
-`label` is the few characters the PR column shows, such as `#12 ✗ ci`, `detail` the lines the detail pane adds, and `head` the commit the PR or run is on.
+`label` is the few characters the PR column shows, such as `#12 ✗ ci`, `detail` the lines the info tab adds, and `head` the commit the PR or run is on.
 `idle` means it has nothing current to say, such as a pipeline whose run ended, so the next plugin's answer shows.
 
 Claude Code's plugin is built in, and `treetop plugin claude` serves it on stdin and stdout like any other; a plugin of your own named `claude` replaces it.
@@ -372,7 +377,7 @@ treetop starts new agents with it unless `TREETOP_NEW_AGENT` names a command.
 ## What the actions run
 
 Both run in the background, up to four trees at once, while treetop stays on screen; each row's STATUS shows queued, returning, destroying, returned, destroyed or failed.
-The detail pane under the list shows the end of each tree's last action's output, and a failure also shows its last line in the status line.
+The info tab shows the end of each tree's last action's output, and a failure also shows its last line in the status line.
 
 - **Return** first shows a dialog listing each tree's uncommitted files, unpushed commits and running processes, or "unknown changes" where git cannot read it. On `y`, for each tree at once:
   1. it removes the tree's background agents through their plugin, running, cold or failed, so none is found in the tree when it is leased again; a plugin that answers `clear` removes every one that worked in the tree, those it does not show included; a session that moved in with `EnterWorktree` runs from elsewhere, so treehouse would not stop it, and removing it can hand the tree back already, through the `WorktreeRemove` hook, which the return then takes as done; an agent its plugin cannot remove is stopped instead, so the tree stops keeping it awake;
@@ -390,9 +395,48 @@ The tree treetop was started in is never a target, because returning or destroyi
 
 ## Agent chats
 
-Enter opens the chat of the agent in the tree under the cursor in a popup over treetop, the way `d` opens the diff.
-The pool stays on screen, dimmed, round the popup's border, so a chat never passes for a Claude Code session of your own; a bar on the popup's first row, inside its border, names the tree, branch and agent, with the keys out at its right.
-The chat's terminal is the size of the inside of the popup, and follows it when the terminal is resized.
+The Trees screen is two windows over the bottom bar: the table, with the inbox beside it, on top, and under them a window on the tree under the cursor.
+The table's window is as tall as its rows, or the inbox's entries where there are more, up to just under half the screen; the window under it takes the rest.
+The window that has the keys has its border in the title colour, as Neovim marks the window the cursor is in.
+
+The window under the table names the tree and its branch in its border, and has its tabs in a bar on its first row; `←` and `→` step through them, and a click on one shows it:
+
+- **chat**: the agent's chat, live, where an agent offers one.
+- **diff**: the tree's diff, as `d` shows it (see [The diff](#the-diff)), on a held tree; the main checkout's heading has no diff or PR tab, as `d` and `v` do nothing there.
+- **PR**: the tree's PR, as `v` shows it (see [The PR view](#the-pr-view)), on a held tree, named with what the PR column says of it.
+- **run**: the steps of the keel run that holds the tree, the one under way picked out, while an active or paused run holds it (see [keel runs](#keel-runs)).
+- **shell**: a shell in a held tree, live, in `$SHELL`, run in a terminal of treetop's own as a chat is; Ctrl+Q gives it the keys, and it keeps running behind the screen as a chat does.
+- **info**: the tree in full (see [The info tab](#the-info-tab)).
+
+**Ctrl+\\** on the table puts two windows side by side under it: the tree the cursor was on stays in the left one, marked ◧, and the cursor moves to the next tree down, in the right one, marked ◨; each window's tree carries its mark in the table.
+The cursor drives the window that last had the keys, so moving it changes only that one, and the other keeps its tree and tab, its chat or shell running live behind.
+Ctrl+Q moves the keys round the table, the left window and the right one; giving a window the keys puts the cursor on its tree.
+A window given the keys with nothing in it to type into, its info or run, keeps them from the table: Esc or `q` gives them back, and `←` and `→` step through its tabs.
+Ctrl+\\ again goes back to one window, the one that last had the keys.
+A terminal too narrow for both shows the window the cursor drives alone, its title saying `1 of 2` or `2 of 2`, and Ctrl+Q still moves between them.
+The double is kept per workspace under `$XDG_STATE_HOME/treetop`, so treetop opens it again as it was left.
+Inside a chat, Ctrl+\\ still goes to the next agent's chat (see [Agent chats](#agent-chats)).
+
+**Ctrl+P** opens the command palette over whatever is on screen: every action treetop has, those on the tree under the cursor first and then the pool's, each with the key that does the same at its right.
+Typing narrows it to the commands with every word typed, those starting with the first word first; a tree number or a branch offers to open that tree, as Enter on it does, clearing a filter or opening a folded group that hid it.
+Up and Down pick a command, Enter runs it as its key does on the table, and Esc closes it.
+In a tree's agent chat treetop takes Ctrl+P for it, as it takes Ctrl+Q; a shell keeps it, as its history's previous line, and so do the assistant's and scratch chats.
+
+**Ctrl+F** zooms: on the table, to the screen treetop had before its windows, the table unboxed over the screen above the bar with the tree under the cursor in full in a pane under it, and the keys; in a window, the windows take it, the table folded to the rows of their trees where the terminal has room for them, and the inbox set aside.
+Ctrl+F again zooms back out.
+In an agent's chat treetop takes Ctrl+F for this, as it takes Ctrl+Q; a shell keeps it, as cursor-forward and as page down in vim and less.
+
+Moving the cursor keeps the tab, so the diff tab shows each tree's diff in turn and the PR tab each tree's PR, once the cursor rests on it; a PR read before shows as it was last read, and `v` reads it afresh.
+A tab the tree under the cursor has not got shows its info instead.
+At the right of the bar, how full the agent's context is and what its session has spent.
+Once the cursor has rested on a tree for a moment, the chat tab shows its agent's chat, so moving down the list opens no chat on the way; a tree whose agent is not running says Enter starts it again, since opening it would.
+
+Enter, or Ctrl+Q, gives the chat the keys, and a click in it does too; **Ctrl+Q** in the chat gives them back to the table, with the chat still running on screen, and so does a click outside it.
+An agent's question counts as seen once its chat has had the keys, not when it only showed in the window.
+The chat's terminal is the size of the inside of the window, under its tab bar, and follows it when the terminal is resized or the inbox is shown or hidden.
+
+The assistant's chat (`a`) and the scratch chats (`C`) belong to no tree, so they open in a popup over treetop instead, the way `d` opens the diff; so does a tree's chat given the keys over the Issues screen, or on a terminal too short for the window, and one without the keys there stays out of sight.
+The pool stays on screen, dimmed, round the popup's border, so a chat never passes for a Claude Code session of your own; a bar on the popup's first row, inside its border, names the agent, with the keys out at its right.
 Where the popup is at least 100 columns wide, a sidebar at its right takes 30 of them and shows how full the agent's context is: tokens used, the window, and a bar that turns to warning colours from 75%, as the agent nears compacting it.
 Under that is an estimate of where those tokens come from: the memory files and skills listing Claude Code put in before the first request, the rest of that request as the system prompt and tools, and everything since as the conversation.
 Claude Code's numbers come from its transcript: the tokens its latest request sent, against a window of a million tokens for a Claude 5 model, a `[1m]` one or one already past 200k, else 200k.
@@ -401,7 +445,7 @@ Below it, Usage shows how much of your plan is used, a bar for each limit, such 
 Claude Code's limits are asked of Anthropic as `/usage` asks, with Claude Code's login from `~/.claude/.credentials.json`, once a minute and every five minutes while that fails.
 treetop only reads the login: an expired one is left for Claude Code to renew, since renewing it here would sign Claude Code out, and until then the sidebar shows the reading Claude Code last kept in `~/.claude.json`, with its age.
 At the bottom is the chat's tree: its git state and PR as the list's columns show them, then under Ports each port it serves with the process listening on it, then under PR its link and what its plugin says of it, such as its checks and review.
-**Ctrl+Q** always comes back to the list as you left it, whatever the chat is doing, and Enter on another tree opens that one.
+**Ctrl+Q** always gives the keys back, whatever the chat is doing: from a popup, back to the list as you left it.
 **Ctrl+\\** goes straight to the next agent's chat, down the list as filtered, skipping trees with none and wrapping at the end; the cursor follows, so Ctrl+Q lands on the tree you were last in.
 Neither key is a Claude Code default.
 The agent's session keeps running after you leave.
@@ -411,12 +455,13 @@ A chat you leave keeps running in the background with its screen current, so Ent
 
 treetop runs the chat in a terminal of its own and draws it, so nothing the chat does to its terminal reaches yours, and treetop keeps refreshing behind it.
 Keys, pastes and the mouse go to the chat: the wheel scrolls back through it, three lines a step, and clicks work as they do in Claude itself.
-treetop takes the mouse only while a chat is open; on the list, the terminal and tmux keep it.
+Over the window's chat while the table has the keys, the wheel still scrolls it, wherever treetop has the mouse.
+treetop takes the mouse while a chat has the keys, and while the inbox is beside the list for its clicks; elsewhere the terminal and tmux keep it.
 From the keyboard, Ctrl+O opens Claude's transcript view, where j/k move a line and Ctrl+u/Ctrl+d half a page; PgUp and PgDn also work where a keyboard has them.
 
 A background Claude Code session (started with `claude --bg`, or backgrounded) opens with `claude attach`, which never starts a second copy.
 Ctrl+Z also leaves it.
-The popup only ever shows the agent it was opened on: `←` on an empty prompt, which would open Claude's own list of sessions, does nothing, and if the chat reaches that list another way, such as double Ctrl+C, treetop opens the agent's chat again at once and says so in the status line.
+A chat only ever shows the agent it was opened on: `←` on an empty prompt, which would open Claude's own list of sessions, does nothing, and if the chat reaches that list another way, such as double Ctrl+C, treetop opens the agent's chat again at once and says so in the status line.
 
 An agent with an `attach` command in its `agent.json` opens the same way.
 An agent running in a tmux pane, such as an interactive `claude`, belongs to that pane and cannot be opened elsewhere: Enter goes to the tree instead, which inside tmux switches to its pane.
@@ -425,7 +470,7 @@ An agent running in a tmux pane, such as an interactive `claude`, belongs to tha
 
 treetop is where agents are sent out, and the assistant is who keeps track of them for you.
 
-`n` opens the compose box in the middle of the screen for a new agent in the tree under the cursor: a free tree is leased for it with `treehouse lease`, and one already held is started in as it is.
+`n` opens the compose box in the window under the table, the one the cursor drives, for a new agent in the tree under the cursor: a free tree is leased for it with `treehouse lease`, and one already held is started in as it is.
 `N` opens it for a new agent in a fresh tree from the pool instead, leased with `treehouse get --lease` when the job runs, so two quick dispatches never share one.
 `:` opens it to the assistant, about the tree under the cursor (see below).
 
@@ -515,7 +560,7 @@ A fresh tree from `N` also has a base line under it: the branch the tree is cut 
 On it, `←` and `→` step through the repository's branches, local and on origin, the pool's base first and the rest most recently committed first.
 Typing there narrows them to those that start with what you type, then those that contain it, ignoring case, and `←` and `→` step through the matches; Backspace and Ctrl+U widen them again.
 It only ever names a real branch: when what you type matches none, the line says so, and Enter keeps the box open until it does.
-treetop leases the tree with `treehouse get --lease --base <branch>` and records the base in the tree's `treetop.json`, so its diff goes against it and the detail pane says `from <branch>`.
+treetop leases the tree with `treehouse get --lease --base <branch>` and records the base in the tree's `treetop.json`, so its diff goes against it and the info tab says `from <branch>`.
 `n` on a free tree cannot take a base, since `treehouse lease` takes the tree as it is.
 `b` renames the branch of the tree under the cursor, or names one on a detached HEAD.
 
@@ -523,6 +568,9 @@ The agent is `claude --bg --name <the task's first words> -- <task>`, which Clau
 An empty task starts the agent idle and opens its chat as soon as it shows up, so its first message is typed there.
 
 A start runs as steps, each with its own timeout: lease the tree (`treehouse get --lease --branch`), check it is a clean worktree, name the branch, write `treetop.json`, start the agent, and wait for `claude agents` to list it, since `claude --bg` exits as soon as the session is queued.
+The window the box was written in follows the start as it runs: each step ticked as it ends, one it did not need marked as such, and the one under way, then its chat, once the agent runs and its tree is listed, with the keys; the row of a fresh tree reads `starting...` in the table meanwhile.
+A step that fails is marked in the window with why, until Esc; Esc while it runs hides it, and the start carries on, its chat left for Enter.
+The window holds no keys while a start runs, so a second start can follow the first at once; in a double, the other window keeps its tree.
 When a step fails, the ones before it are undone in reverse: the agent stopped, the record removed, the branch deleted and the tree returned. The row shows "failed" and the status line which step failed and why.
 The start's log ends with how long each step took, such as `took 1.4s: lease 0.0s branch 0.0s record 0.0s agent 1.4s attach 0.0s`, so a slow start says which step was slow.
 Up to four actions run at once, each on its own tree, so a slow one never holds up the rest.
@@ -545,7 +593,7 @@ The row's STATUS says `handoff...` meanwhile, and `h` again stops waiting.
 Once the agent has stopped working and you are free on the list, treetop reads the file, takes it out of the tree, and opens it in the compose box, which grows to the screen for it and shows it from the top until you type, which brings its end into view.
 Read it over there, add to it, or press Ctrl+E to edit it in `$VISUAL`, else `$EDITOR`; Enter starts the new agent on it, and Esc drops it.
 The new agent runs under the old one's name, and once it runs, the tree's `treetop.json` names it and the old one is stopped, so `R`, the reports and keeping the tree awake follow the new one.
-The old conversation is kept: `claude attach <id>`, with the id the detail pane's last action names, opens it.
+The old conversation is kept: `claude attach <id>`, with the id the info tab's last action names, opens it.
 A start that fails leaves the old agent working, as it was.
 Only a tree treetop leased can hand off, since its `treetop.json` is what moves the tree to the new agent, and only a running background agent can be asked; a stopped one is started again with `R` first.
 With `TREETOP_NEW_AGENT` set, a handoff is refused before it starts anything, since treetop cannot name a custom command's agent in the tree.
@@ -553,7 +601,7 @@ In an agent's chat, from 75% of its context the sidebar says so: Ctrl+Q, then `h
 
 ### What agents say
 
-Every background agent's latest report is read from Claude Code's job files under `~/.claude/jobs` and marks its tree's row in AGENT: `●` while it needs you, `✓` once it is done. What it said, the question it waits on, its answer, else what it is doing now, is in the detail pane, and a question opens its chat (see [Asks open their chat](#asks-open-their-chat)).
+Every background agent's latest report is read from Claude Code's job files under `~/.claude/jobs` and marks its tree's row in AGENT: `●` while it needs you, `✓` once it is done. What it said, the question it waits on, its answer, else what it is doing now, is in the info tab, and a question opens its chat (see [Asks open their chat](#asks-open-their-chat)).
 A report belongs to the tree whose `treetop.json` names its job, or where its agent runs now, so a recycled tree never shows the last agent's words.
 An agent sitting at a question dialog or permission prompt needs you too, though its report still says working, since only its chat can answer it.
 Trees waiting on you come first in the list, and the cursor stays on its tree as rows move.
@@ -563,9 +611,9 @@ The assistant's own reports are left off its row, since it speaks through its ch
 
 ### Asks open their chat
 
-An agent that asks you something, a question or a permission prompt, gets its chat opened for you, so you answer it there in full.
+An agent that asks you something, a question or a permission prompt, gets its chat opened for you with the keys, in the window under the table, so you answer it there in full.
 It waits until you are free on the list: never over a chat, the compose box, a filter, the diff, a dialog or the Issues screen.
-Leaving a chat with Ctrl+Q opens the next ask, so once you are done with other work they come to you one after another until none is left.
+Giving the keys back with Ctrl+Q opens the next ask, so once you are done with other work they come to you one after another until none is left.
 Each ask opens once: one you have seen, opened for you or asked while its chat was open, stays shut until that agent asks something new, and its row keeps its `●` for Enter.
 A finished agent never opens, nor does a busy one whose last report still asks, nor one with no chat here, such as `claude` in a tmux pane.
 A filter that hides the asking tree is cleared, so the cursor lands on it.
@@ -584,7 +632,7 @@ With only one workspace nothing extra is read.
 What needs you comes first, then what failed, then what is done, newest first in each.
 
 Enter on an entry, or a click on it, opens it as Enter on its tree's row does: the agent's chat, with its question at the bottom.
-A PR's entry puts the cursor on its tree instead, with its checks in the detail pane, where `f` sends a failure to its agent.
+A PR's entry puts the cursor on its tree instead, with its checks in the info tab, where `f` sends a failure to its agent.
 Another workspace's entry switches to it first, then opens it there; an agent with no chat, such as `claude` in a tmux pane, is gone to inside tmux, as `t` does.
 A chat, the diff or the compose box opens in the room left of the inbox, which stays bright and keeps updating beside it; clicking an entry from inside a chat leaves that chat for the one clicked.
 An opened entry dims and sinks under SEEN, and so does an ask whose chat opened for you; `x` dismisses an entry until it changes, such as the agent asking something new, or a PR failing again on a new push.
@@ -597,9 +645,9 @@ Either way the list's heading bar runs on across its top with `✉`, yellow whil
 While the inbox is shown, treetop takes the mouse over the list so a click reaches it; most terminals still select text with Shift held.
 `E` hides it, and the mouse with it, until `E` again.
 
-### The detail pane
+### The info tab
 
-Under the list, the pane shows the tree under the cursor in full: where it is, who holds it, its agents, ports and processes, everything its agent last said with its latest steps, its PR, and the outcome of its last action.
+The window under the table's info tab shows the tree under the cursor in full: where it is, who holds it, its agents, ports and processes, everything its agent last said with its latest steps, its PR, and the outcome of its last action.
 Only this workspace's agents open their chat; agents elsewhere are counted in the summary.
 The summary counts the trees that need you, and, as "elsewhere", agents outside the pool waiting on you, which have no row.
 A question more than a day old whose session no longer runs counts nowhere, since its process ended without saying so and nothing is left to answer it.
@@ -609,7 +657,7 @@ These job files are internal to Claude Code, like its session files, so a releas
 
 [keel](https://github.com/anthonyb8/keel) records each routed task as a run: the playbook it follows, the step it is on, its goal, and the decisions flagged for attention.
 treetop reads them with `keel status --json` every 5 seconds, which only reads keel's files, and joins each run to the tree whose path it names.
-The RUN column, the detail pane's `run` line and the phone's tree card and screen show it; with no `keel` on PATH there is no column and nothing is asked again.
+The RUN column, the info tab's `run` line and the phone's tree card and screen show it; with no `keel` on PATH there is no column and nothing is asked again.
 keel keeps a tree whose run is active or paused out of its own sweeps and hooks, since its steps are not done even with every change pushed.
 treetop's return dialog and the phone's sheet warn of such a run, and `treetop return` and the guard hook refuse the tree to agents until `keel run stop` ends the run.
 
@@ -620,8 +668,8 @@ The PR column follows it, from the repository's ship plugins, so treetop knows n
 
 - **GitHub**, built in and the default, reads every PR of the repository with one `gh pr list` and matches them to the trees' branches, the newest PR winning where a branch has several.
   It uses your own `gh` login, so treetop holds no token, and it only reads: it never pushes, opens, merges or reviews a PR.
-  The column shows `#12 draft`, `#12 ci …` while checks run, `#12 ✗ ci`, `#12 changes`, `#12 review`, `#12 approved`, `#12 merged` or `#12 closed`; the detail pane adds the link, the checks and the review.
-  With no `gh`, no login or no GitHub remote, the column stays empty and the detail pane says why.
+  The column shows `#12 draft`, `#12 ci …` while checks run, `#12 ✗ ci`, `#12 changes`, `#12 review`, `#12 approved`, `#12 merged` or `#12 closed`; the info tab adds the link, the checks and the review.
+  With no `gh`, no login or no GitHub remote, the column stays empty and the info tab says why.
 - **no-mistakes**, built in and used only where `ship` names it, reads the branch's pipeline run with `no-mistakes axi status` in its tree, whoever started it: `s`, the agent, or a `git push` through the gate.
   While the run is under way the column shows its step, `nm review …`, or `nm review ⏸` when it waits at a gate; a run that failed on the commit the tree is still on shows `nm ✗ review`.
   Once the run ends, the next plugin's answer shows, so `ship = ["no-mistakes", "github"]` follows a tree from its gate to its merge.
@@ -642,7 +690,7 @@ Those show `ready` in the Issues screen's WORK column, where `p` picks one up.
 
 ## The PR view
 
-`v` opens the PR of the tree under the cursor in a popup over the pool, read afresh each time it opens, since review comments land without a push; the last read shows while the new one comes in.
+`v` shows the PR of the tree under the cursor in the window's PR tab with the keys, read afresh each time, since review comments land without a push; the last read shows while the new one comes in.
 It has four tabs, which `1` to `4` switch, as do `h` and `l`; `j` and `k` move between items, and `d` and `u` scroll through one too long for the screen.
 
 - **Overview**: who wants to merge what, where its checks, review, CodeRabbit, open threads and merge stand, and its description.
@@ -652,7 +700,7 @@ It has four tabs, which `1` to `4` switch, as do `h` and `l`; `j` and `k` move b
 
 `f` sends the selected item to the tree's agents, as `m` sends a message: a failed check with its log, a thread with its code and replies, or a CodeRabbit comment as the prompt CodeRabbit writes for agents.
 `F` on the CodeRabbit tab sends every open comment but the nitpicks at once.
-`O` opens the PR in the browser, `^R` reads it again, and Esc or `q` closes it.
+`O` opens the PR in the browser, `^R` reads it again, and Esc, `q` or Ctrl+Q gives the keys back to the table, the PR staying in its tab.
 
 It reads through the repository's first ship plugin that answers `view`: GitHub's reads `gh pr view`, the PR's review threads over GraphQL, and the failed checks' logs, with your own `gh` login, and still only reads.
 CodeRabbit's comments are read from the markers it leaves in them; one it writes in a shape treetop does not know shows as a plain comment rather than going missing.
@@ -714,7 +762,7 @@ A Linear source gets all of this; an issue source on another ticket plugin lists
 The tree's `treetop.json` records the ticket, so the TICKET column shows it, the filter finds it, and `p` on a ticket already in a tree goes to that tree rather than starting a second agent.
 On the trees, `i` opens the issue the tree under the cursor works on, on the whole screen, and Esc comes back to the trees.
 A tree started without an issue gets one the same way: `i` on it, or `I` on any leased tree to change it, shows the Issues list to choose from, with search and filters, and Enter records the issue in the tree's `treetop.json`, so the TICKET and WORK columns show it at once.
-A step that fails undoes the ones before it, as any start does; marking the ticket started is the exception, and a failure there only shows in the detail pane, since the agent is already working.
+A step that fails undoes the ones before it, as any start does; marking the ticket started is the exception, and a failure there only shows in the info tab, since the agent is already working.
 `treetop pick END-123` does the same from a shell.
 
 The first message comes from `prompt` in the config when it is set, with `{id}`, `{title}`, `{description}`, `{url}` and `{branch}` filled in:
@@ -793,7 +841,7 @@ On the iPhone:
 3. Tap Share, then Add to Home Screen, then Add.
 4. Open treetop from its icon. It runs full screen, and a new treetop on the server reaches it the next time it opens.
 
-Tap a tree for what the terminal's detail pane says about it: its agent and what it asks or last said, its git state, the ports it serves and what serves them, its PR with its checks and a link to it, and its agent's timeline, each status line it wrote once.
+Tap a tree for what the terminal's info tab says about it: its agent and what it asks or last said, its git state, the ports it serves and what serves them, its PR with its checks and a link to it, and its agent's timeline, each status line it wrote once.
 Back, the button or the phone's own gesture, lands on the pool where you left it.
 
 A port is a button wherever it shows: on a tree's card, beside the main checkout, on the tree's screen and at the top of its chat.

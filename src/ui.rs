@@ -18,7 +18,7 @@ use ratatui::widgets::{
 use crate::agents::{Agent, Status};
 use crate::app::{
     App, DiffView, Group, Item, JobState, ListRow, LogEntry, Opening, Outcome, Pending, Phone,
-    Picker, PortMenu, Reach, Review, SCRATCH, ScratchMenu, Shipping,
+    Picker, PortMenu, Reach, Review, SCRATCH, ScratchMenu, Shipping, WindowTab, Zoom,
 };
 use crate::assistant;
 use crate::chat::Chat;
@@ -39,8 +39,10 @@ use crate::theme::theme;
 
 /// The bar's keys, most useful first: on a narrow bar the keys at the end
 /// are the ones left out, and `?` lists them all.
-const KEYS: [(&str, &str); 14] = [
+const KEYS: [(&str, &str); 16] = [
     ("Enter", "open"),
+    ("^Q", "window"),
+    ("^P", "commands"),
     ("?", "help"),
     ("e", "inbox"),
     ("n", "new here"),
@@ -66,6 +68,11 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
         "Agents",
         &[
             ("Enter", "open, fold heading"),
+            ("^Q", "window, table"),
+            ("^\\", "two windows, one"),
+            ("^F", "zoom table, windows"),
+            ("^P", "command palette"),
+            ("\u{2190} \u{2192}", "chat, info tab"),
             ("n", "new agent here"),
             ("N", "agent in new tree"),
             ("m", "message agents"),
@@ -177,7 +184,13 @@ pub fn palette() -> issues::Palette {
 
 /// Draws the screen: the trees, or the Issues screen when it is shown,
 /// with whatever is open over it.
-pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>, issues: Option<&issues::Screen>) {
+pub fn draw(
+    frame: &mut Frame,
+    app: &App,
+    chat: Option<&Chat>,
+    other_chat: Option<&Chat>,
+    issues: Option<&issues::Screen>,
+) {
     // The theme's text colour is the base for every cell; widgets below only
     // add accents, so nothing falls back to a theme's dim default.
     frame.render_widget(Block::new().style(fg(theme().text)), frame.area());
@@ -186,12 +199,48 @@ pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>, issues: Option<&i
         None => {
             let [main, footer] =
                 Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
-            let inbox = inbox_layout(app, main);
-            let [body, detail] =
-                Layout::vertical([Constraint::Fill(1), Constraint::Length(DETAIL_HEIGHT)])
-                    .areas(inbox.list);
-            draw_table(frame, app, body);
-            draw_detail(frame, app, detail);
+            let windows = windows(app, main);
+            let inbox = inbox_layout(app, &windows);
+            if is_classic(app) {
+                // Zoomed, the table is the screen treetop had before its
+                // windows: unboxed, the detail pane under it.
+                let [body, detail] =
+                    Layout::vertical([Constraint::Fill(1), Constraint::Length(DETAIL_HEIGHT)])
+                        .areas(inbox.list);
+                draw_table(frame, app, body, false);
+                draw_detail(frame, app, detail);
+            } else {
+                let fold = folds(app, main);
+                // The table has the keys unless the window or the inbox does.
+                let title = if fold {
+                    " Trees · ^F shows them all "
+                } else {
+                    " Trees "
+                };
+                // Marked only while nothing else takes the keys: a window,
+                // the inbox, a compose box or the palette.
+                let has_keys = !app.is_window_focused
+                    && app.rail.is_none()
+                    && app.prompt.is_none()
+                    && app.palette.is_none();
+                let block = window_block(has_keys).title(title);
+                let body = block.inner(inbox.list);
+                frame.render_widget(block, inbox.list);
+                draw_table(frame, app, body, fold);
+            }
+            if let Some(area) = windows.window {
+                let screen = frame.area();
+                let (cursor_area, other_area) = pane_areas(app, area);
+                let shown = chat.filter(|c| !floats(app, is_popup_chat(c), screen));
+                let pane = Pane {
+                    is_alone: other_area.is_none() && app.other_window().is_some(),
+                    ..cursor_pane(app)
+                };
+                draw_window(frame, app, cursor_area, &pane, shown);
+                if let (Some(area), Some(pane)) = (other_area, other_pane(app)) {
+                    draw_window(frame, app, area, &pane, other_chat);
+                }
+            }
             draw_footer(frame, app, footer);
             if let Some(area) = inbox.strip {
                 draw_inbox_strip(frame, app, area);
@@ -201,13 +250,24 @@ pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>, issues: Option<&i
             }
         }
     }
-    if chat.is_some()
-        || app.view.is_some()
-        || app.pr_popup.is_some()
-        || app.prompt.is_some()
-        || app.opening.is_some()
+    let popup_chat = chat.filter(|c| floats(app, is_popup_chat(c), frame.area()));
+    let floating_tab = !app.is_issues
+        && floats(app, false, frame.area())
+        && (app.has_keys_on(WindowTab::Diff) || app.has_keys_on(WindowTab::Pr));
+    let form = window_form(app, frame.area());
+    // A chat on its way floats in a popup unless the window shows it; a
+    // window start gives way to any other prompt opened over it.
+    let popup_opening = app.opening.as_ref().filter(|o| {
+        form.is_none()
+            && (o.key.is_none() || app.prompt.is_none() && !has_window(app, frame.area()))
+    });
+    if popup_chat.is_some()
+        || floating_tab
+        || app.prompt.is_some() && form.is_none()
+        || popup_opening.is_some()
         || app.picker.is_some()
         || app.port_menu.is_some()
+        || app.palette.is_some()
         || app.phone.is_some()
         || app.scratch_menu.is_some()
         || app.is_help
@@ -219,16 +279,21 @@ pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>, issues: Option<&i
             .buffer_mut()
             .set_style(area, Style::new().add_modifier(Modifier::DIM));
     }
-    if let Some(chat) = chat {
+    if let Some(chat) = popup_chat {
         draw_chat(frame, app, chat);
-    } else if let Some(opening) = &app.opening {
+    } else if floating_tab {
+        draw_floating_tab(frame, app);
+    } else if let Some(opening) = popup_opening {
         draw_opening(frame, app, opening);
-    } else if let Some(view) = &app.view {
-        draw_diff_view(frame, app, view);
-    } else if let Some(popup) = &app.pr_popup {
-        draw_pr_view(frame, app, popup);
     } else if let Some(prompt) = &app.prompt {
-        draw_prompt(frame, stage(app, frame.area()), prompt);
+        draw_prompt(
+            frame,
+            form.map_or_else(
+                || stage(app, frame.area()),
+                |area| Block::bordered().inner(area),
+            ),
+            prompt,
+        );
     } else if let Some(picker) = &app.picker {
         draw_picker(frame, app, picker);
     } else if let Some(menu) = &app.port_menu {
@@ -248,6 +313,91 @@ pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>, issues: Option<&i
     } else if app.is_help {
         draw_help(frame, &HELP);
     }
+    // The palette opens over whatever is on screen, a chat's popup too.
+    if let Some(palette) = &app.palette {
+        draw_palette(frame, app, palette);
+    }
+}
+
+/// The rows of commands the palette shows at most.
+const PALETTE_ROWS: u16 = 14;
+
+/// The command palette: what has been typed, then the commands it narrows
+/// to, each with its key at the right, the one picked under the cursor.
+fn draw_palette(frame: &mut Frame, app: &App, palette: &crate::app::Palette) {
+    let t = theme();
+    let commands = app.commands();
+    let screen = frame.area();
+    let width = screen.width.saturating_sub(4).min(72);
+    let rows = u16::try_from(commands.len())
+        .unwrap_or(u16::MAX)
+        .clamp(1, PALETTE_ROWS);
+    let height = (rows + 4).min(screen.height);
+    // Its top holds still as it narrows: placed for the tallest it gets.
+    let tallest = (PALETTE_ROWS + 4).min(screen.height);
+    let area = Rect {
+        y: screen.y + screen.height.saturating_sub(tallest) / 4,
+        ..popup::centered(screen, width, height)
+    };
+    let keys = [("↑↓", "pick"), ("Enter", "run"), ("Esc", "close")];
+    let block = popup_block(Line::styled(
+        " Commands ",
+        fg(t.title).add_modifier(Modifier::BOLD),
+    ))
+    .title_bottom(Line::from(fitting_keys(&keys, width.saturating_sub(2))));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let [input, rule, list] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+    ])
+    .areas(inner);
+    // A query too long for the field shows its end, where the typing is,
+    // and the cursor stays after it, inside the box.
+    let room = usize::from(input.width.saturating_sub(3));
+    let mut shown = palette.query.as_str();
+    while Line::raw(shown).width() > room {
+        let mut chars = shown.chars();
+        chars.next();
+        shown = chars.as_str();
+    }
+    let typed = if palette.query.is_empty() {
+        Line::from(vec![
+            Span::raw("❯ "),
+            Span::styled("a command, a tree number or a branch", fg(t.muted)),
+        ])
+    } else {
+        Line::raw(format!("❯ {shown}"))
+    };
+    frame.render_widget(Paragraph::new(typed), input);
+    frame.set_cursor_position(Position::new(
+        input.x + 2 + u16::try_from(Line::raw(shown).width()).unwrap_or(0),
+        input.y,
+    ));
+    frame.render_widget(
+        Paragraph::new("─".repeat(usize::from(rule.width))).style(fg(t.border)),
+        rule,
+    );
+    if commands.is_empty() {
+        frame.render_widget(Paragraph::new(" nothing matches").style(fg(t.muted)), list);
+        return;
+    }
+    let rows: Vec<Row> = commands
+        .iter()
+        .map(|command| {
+            Row::new(vec![
+                Cell::from(format!(" {}", command.label)),
+                Cell::from(Line::styled(format!("{} ", command.key), fg(t.muted)).right_aligned()),
+            ])
+        })
+        .collect();
+    // The table scrolls so the command picked stays in view.
+    let table = Table::new(rows, [Constraint::Fill(1), Constraint::Length(6)])
+        .row_highlight_style(t.cursor);
+    let mut state = TableState::default().with_selected(Some(palette.selected));
+    frame.render_stateful_widget(table, list, &mut state);
 }
 
 /// The pool at a glance, for the right end of the bottom bar: counts,
@@ -590,9 +740,10 @@ fn row(app: &App, tree: &Tree) -> Row<'static> {
         Some(b) => Cell::from(b.clone()),
         None => Cell::from("(detached)").style(fg(t.muted)),
     };
+    let name = Line::from(vec![Span::raw(tree.name.clone()), window_marks(app, tree)]);
     let mut cells = vec![
         Cell::from(mark),
-        Cell::from(tree.name.clone()),
+        Cell::from(name),
         status_cell(app, tree),
         Cell::from(
             tree.sidecar
@@ -618,7 +769,7 @@ fn row(app: &App, tree: &Tree) -> Row<'static> {
     })
 }
 
-fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_table(frame: &mut Frame, app: &App, area: Rect, fold: bool) {
     let t = theme();
     let mut titles = vec!["", "#", "STATUS", "TICKET", "BRANCH", "AGENT"];
     if !app.runs.is_empty() {
@@ -634,8 +785,12 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
     // further down the table.
     let mut rows: Vec<Row> = Vec::new();
     let mut selected = 0;
+    let kept = fold.then(|| zoomed_rows(app));
     for (at, list_row) in app.rows().into_iter().enumerate() {
-        if matches!(list_row, ListRow::Heading { .. }) && at > 0 {
+        if kept.as_ref().is_some_and(|kept| !kept.contains(&at)) {
+            continue;
+        }
+        if matches!(list_row, ListRow::Heading { .. }) && at > 0 && kept.is_none() {
             rows.push(Row::new(Vec::<Cell>::new()));
         }
         if at == app.selected {
@@ -671,6 +826,27 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
         .row_highlight_style(t.cursor);
     let mut state = TableState::default().with_selected(Some(selected));
     frame.render_stateful_widget(table, area, &mut state);
+}
+
+/// In a double, the marks of the windows showing `tree`, left then right,
+/// for its row or, for the main checkout, its heading; a tree in both
+/// carries both.
+fn window_marks(app: &App, tree: &Tree) -> Span<'static> {
+    // Zoomed to the table no window shows, so no tree is marked.
+    let marks: String = app
+        .other_window()
+        .filter(|_| !is_classic(app))
+        .map(|(other, _)| {
+            let here = app.window_tree().is_some_and(|t| t.path == tree.path);
+            let there = other.path == tree.path;
+            let on = |side: usize| if side == app.side { here } else { there };
+            (0..2)
+                .filter(|&side| on(side))
+                .map(|side| SIDES[side])
+                .collect()
+        })
+        .unwrap_or_default();
+    Span::styled(marks, fg(theme().title))
 }
 
 /// A group's heading: folded or open, which group, and how many trees it
@@ -720,8 +896,10 @@ fn heading_row(
             vec![Span::styled(format!("{count} set aside"), fg(t.muted))],
         ),
     };
-    if main.is_some() {
+    if let Some(main) = main {
         name.push(Span::styled("  · main checkout", fg(t.muted)));
+        name.push(Span::raw(" "));
+        name.push(window_marks(app, main));
     }
     let waits = if is_folded && waiting > 0 {
         Cell::from(format!("● {waiting} waiting on you"))
@@ -744,10 +922,6 @@ fn heading_row(
         cells.push(git_cell(main, app.behind));
     }
     Row::new(cells)
-}
-
-fn pane_block() -> Block<'static> {
-    Block::bordered().border_style(fg(theme().border))
 }
 
 /// Where the tree is, who holds it, its agents, ports and processes.
@@ -990,7 +1164,14 @@ fn footer_left(app: &App, width: u16) -> Line<'static> {
         ));
     }
     let used = u16::try_from(narrowing.iter().map(Span::width).sum::<usize>()).unwrap_or(width);
-    let mut spans = fitting_keys(&KEYS, width.saturating_sub(used));
+    // Zoomed to the table there is no window for Ctrl+Q to give the keys
+    // to, and the bar is the one treetop had before its windows.
+    let keys: Vec<(&str, &str)> = KEYS
+        .iter()
+        .copied()
+        .filter(|(key, _)| !(is_classic(app) && matches!(*key, "^Q" | "^P")))
+        .collect();
+    let mut spans = fitting_keys(&keys, width.saturating_sub(used));
     spans.extend(narrowing);
     Line::from(spans)
 }
@@ -1053,6 +1234,645 @@ const INBOX_FULL_FROM: u16 = 180;
 /// Columns the strip of counts takes, its border included.
 const STRIP_WIDTH: u16 = 5;
 
+/// The smallest the table's window gets, its border included: its header
+/// and a few trees.
+const TABLE_MIN: u16 = 7;
+
+/// The share of the screen above the bar, in percent, the table's window
+/// takes at most, so the window under it keeps room for a chat.
+const TABLE_SHARE: u16 = 45;
+
+/// The smallest window under the table worth drawing, its border and tab
+/// bar included; below it the table takes the whole screen.
+const WINDOW_MIN: u16 = 5;
+
+/// Where the Trees screen's windows go in `main`, the screen above the bar.
+struct Windows {
+    /// The table and the inbox beside it.
+    top: Rect,
+    /// The window under them, showing the tree under the cursor.
+    window: Option<Rect>,
+    /// Zoomed to the windows, the table folds to their trees' rows.
+    folded: bool,
+}
+
+/// The table's window is as tall as its rows, or the inbox's entries
+/// beside it where there are more, between TABLE_MIN and TABLE_SHARE of
+/// `main`; the window under it takes the rest.
+fn windows(app: &App, main: Rect) -> Windows {
+    match app.zoom {
+        // The table over the whole screen, as treetop was before windows.
+        Some(Zoom::Table) => {
+            return Windows {
+                top: main,
+                window: None,
+                folded: false,
+            };
+        }
+        // The windows, under the rows of their trees and the header.
+        Some(Zoom::Windows) => {
+            let height = u16::try_from(zoomed_rows(app).len())
+                .unwrap_or(u16::MAX)
+                .saturating_add(3);
+            if folds(app, main) {
+                let [top, window] =
+                    Layout::vertical([Constraint::Length(height), Constraint::Fill(1)]).areas(main);
+                return Windows {
+                    top,
+                    window: Some(window),
+                    folded: true,
+                };
+            }
+        }
+        None => {}
+    }
+    let rows = app.rows();
+    // Each heading after the first has a blank line above it.
+    let blanks = rows
+        .iter()
+        .skip(1)
+        .filter(|row| matches!(row, ListRow::Heading { .. }))
+        .count();
+    let table = u16::try_from(rows.len() + blanks)
+        .unwrap_or(u16::MAX)
+        .saturating_add(3);
+    // The inbox beside the table in full wants room for its entries too:
+    // its title, its lines and its keys, inside its border.
+    let inbox = if main.width >= INBOX_FULL_FROM && !app.inbox.is_hidden {
+        let lines = inbox_lines(app, Rect::new(0, 0, INBOX_WIDTH - 4, u16::MAX)).len();
+        u16::try_from(lines).unwrap_or(u16::MAX).saturating_add(5)
+    } else {
+        0
+    };
+    let wanted = table.max(inbox);
+    let most = (main.height * TABLE_SHARE / 100).max(TABLE_MIN);
+    let height = wanted.clamp(TABLE_MIN, most);
+    if main.height < height + WINDOW_MIN {
+        return Windows {
+            top: main,
+            window: None,
+            folded: false,
+        };
+    }
+    let [top, window] =
+        Layout::vertical([Constraint::Length(height), Constraint::Fill(1)]).areas(main);
+    Windows {
+        top,
+        window: Some(window),
+        folded: false,
+    }
+}
+
+/// Zoomed to the table: the screen treetop had before its windows.
+fn is_classic(app: &App) -> bool {
+    app.zoom == Some(Zoom::Table)
+}
+
+/// Rows the detail pane takes under the table zoomed, borders included.
+const DETAIL_HEIGHT: u16 = 12;
+
+/// The tree under the cursor in full, or the main checkout on its heading,
+/// in the pane under the table zoomed, as the info tab has it.
+fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
+    let block = Block::bordered().border_style(fg(theme().border));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let lines = match app.window_tree() {
+        Some(tree) => detail_text(app, tree, inner),
+        None if app.is_loaded => vec![Line::raw("no trees match")],
+        None => Vec::new(),
+    };
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+/// Zoomed to the windows with room for them, the table folds to their
+/// trees' rows; too short for that, it stays whole.
+fn folds(app: &App, main: Rect) -> bool {
+    let height = u16::try_from(zoomed_rows(app).len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(3);
+    app.zoom == Some(Zoom::Windows) && main.height >= height + WINDOW_MIN
+}
+
+/// The rows of the list the table keeps, zoomed to the windows: the row
+/// under the cursor, and the second window's tree in a double.
+fn zoomed_rows(app: &App) -> Vec<usize> {
+    let other = app.other_window().map(|(tree, _)| tree.path.clone());
+    app.rows()
+        .iter()
+        .enumerate()
+        .filter(|(at, row)| {
+            *at == app.selected
+                || matches!(row, ListRow::Tree(t) if Some(&t.path) == other.as_ref())
+        })
+        .map(|(at, _)| at)
+        .collect()
+}
+
+/// A window's border: the title colour on the one that has the keys, as
+/// Neovim marks the window the cursor is in.
+fn window_block(has_keys: bool) -> Block<'static> {
+    let t = theme();
+    let color = if has_keys { t.title } else { t.border };
+    Block::bordered()
+        .border_style(fg(color))
+        .title_style(Style::new().add_modifier(Modifier::BOLD))
+}
+
+/// A chat that floats in a popup rather than the window under the table:
+/// the assistant's and the scratch chats, which belong to no tree.
+pub fn is_popup(agent: &str, tree: &str) -> bool {
+    assistant::is_assistant(agent) || tree == SCRATCH
+}
+
+pub fn is_popup_chat(chat: &Chat) -> bool {
+    is_popup(&chat.agent, &chat.tree)
+}
+
+/// A chat drawn in a popup: the assistant's and the scratch ones always,
+/// and a tree's while it has the keys where the window under the table is
+/// not on `screen`, over the Issues screen or on a terminal too short for
+/// the window. Without the keys there it is not drawn at all, so it never
+/// covers what has them.
+pub fn floats(app: &App, is_popup: bool, screen: Rect) -> bool {
+    is_popup || app.is_window_focused && (app.is_issues || window_chat_area(app, screen).is_none())
+}
+
+/// Inside the window under the table: its tab bar, then where its chat or
+/// info goes.
+fn window_areas(area: Rect) -> [Rect; 2] {
+    let inner = Block::bordered().inner(area);
+    Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(inner)
+}
+
+/// Where the chat in the window under the table goes on `screen`, for
+/// sizing its terminal and placing its mouse events.
+pub fn window_chat_area(app: &App, screen: Rect) -> Option<Rect> {
+    let [main, _] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(screen);
+    let window = windows(app, main).window?;
+    Some(window_areas(pane_areas(app, window).0)[1])
+}
+
+/// The two windows' marks, left and right, in their titles and on their
+/// trees' rows.
+const SIDES: [&str; 2] = ["◧", "◨"];
+
+/// The narrowest window area two windows share side by side; below it a
+/// double shows the window the cursor drives alone.
+const DOUBLE_FROM: u16 = 140;
+
+/// Where the window the cursor drives goes in `window`, and the second
+/// window of a double beside it: halves on its side, or the whole for the
+/// cursor's window alone.
+fn pane_areas(app: &App, window: Rect) -> (Rect, Option<Rect>) {
+    if app.other_window().is_none() || window.width < DOUBLE_FROM {
+        return (window, None);
+    }
+    // Equal halves, an odd column left blank at the right, so one chat size
+    // fits either window.
+    let half = window.width / 2;
+    let halves: [Rect; 2] = [
+        Rect {
+            width: half,
+            ..window
+        },
+        Rect {
+            x: window.x + half,
+            width: half,
+            ..window
+        },
+    ];
+    (halves[app.side], Some(halves[1 - app.side]))
+}
+
+/// Where a new agent's compose box and its start go: the window the cursor
+/// drives, while one is on screen. None draws them in a popup, as before:
+/// the assistant's, a scratch chat's, and over the Issues screen.
+fn window_form(app: &App, screen: Rect) -> Option<Rect> {
+    if app.is_issues {
+        return None;
+    }
+    let [main, _] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(screen);
+    let (cursor, other) = pane_areas(app, windows(app, main).window?);
+    if app.prompt.as_ref().is_some_and(Prompt::starts_agent) {
+        return Some(cursor);
+    }
+    // A start stays in the window it was asked from, wherever the keys
+    // have gone since; on a terminal too narrow for both it shows only
+    // while that window is the one on screen.
+    let start = app.window_start().filter(|_| app.prompt.is_none())?;
+    match start.side.filter(|_| app.other_window().is_some()) {
+        Some(side) if side != app.side => other,
+        _ => Some(cursor),
+    }
+}
+
+/// The window under the table is on screen, for a tree's start to show in
+/// rather than a popup.
+fn has_window(app: &App, screen: Rect) -> bool {
+    !app.is_issues && window_chat_area(app, screen).is_some()
+}
+
+/// The steps a start goes through, in order: the name its log gives each,
+/// and what the window says for it.
+const START_STEPS: [(&str, &str); 6] = [
+    ("lease", "lease a tree"),
+    ("check", "check it is a clean worktree"),
+    ("branch", "name its branch"),
+    ("record", "write treetop.json"),
+    ("agent", "start the agent"),
+    ("attach", "find its chat"),
+];
+
+/// A start under way in the window: each step ticked as it ends, a step
+/// it went past marked skipped, the one under way, or the one it failed
+/// at with why.
+fn start_lines(app: &App, opening: &Opening, key: &std::path::Path) -> Vec<Line<'static>> {
+    let t = theme();
+    let done = app.steps.get(key).map(Vec::as_slice).unwrap_or_default();
+    let last = START_STEPS
+        .iter()
+        .rposition(|(step, _)| done.contains(step));
+    let mut lines = vec![
+        Line::styled(
+            format!("Starting {}", opening.agent),
+            Style::new().add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+    ];
+    let mut is_next = true;
+    for (at, (step, label)) in START_STEPS.iter().enumerate() {
+        // A start in a tree already held leases, branches and records
+        // nothing.
+        if !opening.leases && !matches!(*step, "agent" | "attach") {
+            continue;
+        }
+        let (glyph, style, note) = if done.contains(step) {
+            ("✓", fg(t.success), String::new())
+        } else if last.is_some_and(|last| at < last) {
+            ("-", fg(t.muted), "  not needed here".to_string())
+        } else if is_next {
+            is_next = false;
+            match &opening.failed {
+                Some(why) => ("✗", fg(t.danger), format!("  {why}")),
+                None => (
+                    "◌",
+                    fg(t.warning).add_modifier(Modifier::BOLD),
+                    String::new(),
+                ),
+            }
+        } else {
+            ("·", fg(t.muted), String::new())
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{glyph} "), style),
+            Span::styled(*label, style),
+            Span::styled(note, fg(t.danger)),
+        ]));
+    }
+    if is_next && opening.failed.is_none() {
+        lines.push(Line::styled("◌ waiting for its chat", fg(t.warning)));
+    }
+    lines.push(Line::raw(""));
+    let keys = if opening.failed.is_some() {
+        "Esc closes this"
+    } else {
+        "Esc hides this; the start carries on"
+    };
+    lines.push(Line::styled(keys, fg(t.muted)));
+    lines
+}
+
+/// What a window draws: the tree it shows and its tabs, whether it has the
+/// keys, its mark in a double, and whether the cursor drives it.
+struct Pane<'a> {
+    tree: Option<&'a Tree>,
+    tab: WindowTab,
+    tabs: Vec<WindowTab>,
+    has_keys: bool,
+    side: Option<usize>,
+    is_cursor: bool,
+    /// One of a double shown alone, the terminal too narrow for both.
+    is_alone: bool,
+}
+
+/// The window the cursor drives.
+fn cursor_pane(app: &App) -> Pane<'_> {
+    let is_double = app.other_window().is_some();
+    Pane {
+        tree: app.window_tree(),
+        tab: app.shown_tab(),
+        tabs: app.window_tabs(),
+        has_keys: app.is_window_focused,
+        side: is_double.then_some(app.side),
+        is_cursor: true,
+        is_alone: false,
+    }
+}
+
+/// The second window of a double, keeping its tree while the cursor
+/// drives the other.
+fn other_pane(app: &App) -> Option<Pane<'_>> {
+    let (tree, tab) = app.other_window()?;
+    Some(Pane {
+        tree: Some(tree),
+        tab,
+        tabs: app.tabs_of(tree),
+        has_keys: false,
+        side: Some(1 - app.side),
+        is_cursor: false,
+        is_alone: false,
+    })
+}
+
+/// A tab's name in the window's bar, with what the PR column or the run
+/// says of it where there is something.
+fn tab_label(app: &App, tree: Option<&Tree>, tab: WindowTab) -> String {
+    match tab {
+        WindowTab::Chat => "chat".into(),
+        WindowTab::Diff => "diff".into(),
+        WindowTab::Pr => match tree.and_then(|t| t.ship.as_ref()) {
+            Some(ship) => format!("PR {}", ship.label),
+            None => "PR".into(),
+        },
+        WindowTab::Run => match tree.and_then(|t| app.run_of(t)) {
+            Some(run) => format!("run {}", run.step()),
+            None => "run".into(),
+        },
+        WindowTab::Shell => "shell".into(),
+        WindowTab::Info => "info".into(),
+    }
+}
+
+/// The window's tabs, the one shown picked out, each with the columns it
+/// takes in the bar, the same for drawing them as for a click.
+fn tab_spans(app: &App, pane: &Pane) -> Vec<(WindowTab, Span<'static>)> {
+    let t = theme();
+    pane.tabs
+        .iter()
+        .map(|&tab| {
+            let style = if tab == pane.tab { t.header } else { t.bar };
+            (
+                tab,
+                Span::styled(format!(" {} ", tab_label(app, pane.tree, tab)), style),
+            )
+        })
+        .collect()
+}
+
+/// The steps of the keel run in `tree`, each with its state, the one under
+/// way picked out.
+fn run_lines(app: &App, tree: &Tree) -> Vec<Line<'static>> {
+    let t = theme();
+    let Some(run) = app.run_of(tree) else {
+        return vec![Line::styled("No keel run holds this tree.", fg(t.muted))];
+    };
+    let mut lines = vec![
+        Line::styled(
+            format!("keel run · {} · {}", run.playbook, run.goal),
+            Style::new().add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+    ];
+    for (index, step) in run.steps.iter().enumerate() {
+        let (glyph, style) = match step.state.as_str() {
+            "done" => ("✓", fg(t.success)),
+            "doing" => ("◌", fg(t.warning).add_modifier(Modifier::BOLD)),
+            "skipped" => ("-", fg(t.muted)),
+            _ => ("·", Style::new()),
+        };
+        let is_current = run.current == Some(index + 1);
+        let row = Style::new().patch(if is_current { t.cursor } else { Style::new() });
+        lines.push(
+            Line::from(vec![
+                Span::styled(format!("{:>2} ", index + 1), fg(t.muted)),
+                Span::styled(format!("{glyph} "), style),
+                Span::styled(step.title.clone(), style),
+            ])
+            .style(row),
+        );
+    }
+    lines
+}
+
+/// How full the window agent's context is and what its session has spent,
+/// for the right of its tab bar, where the chat popup's sidebar has them in
+/// full.
+fn context_note(agent: Option<&Agent>) -> Vec<Span<'static>> {
+    let t = theme();
+    let Some(agent) = agent else {
+        return Vec::new();
+    };
+    let mut spans = Vec::new();
+    if let Some(context) = &agent.context {
+        spans.push(Span::styled(
+            format!(
+                "context {}% of {}",
+                percent(context),
+                tokens(context.window)
+            ),
+            context_style(context),
+        ));
+    }
+    if let Some(spend) = &agent.spend {
+        let total = spend.input + spend.cache_read + spend.cache_write + spend.output;
+        if !spans.is_empty() {
+            spans.push(Span::styled(" · ", fg(t.muted)));
+        }
+        spans.push(Span::styled(
+            format!("{} tokens spent", tokens(total)),
+            fg(t.muted),
+        ));
+    }
+    if !spans.is_empty() {
+        spans.push(Span::raw(" "));
+    }
+    spans
+}
+
+/// The window under the table: the tree under the cursor, named in its
+/// border, its tabs in a bar on the first row, and under them its agent's
+/// chat, live, or its info. `chat` is the chat open in the window, which
+/// shows only while it is the window agent's.
+fn draw_window(frame: &mut Frame, app: &App, area: Rect, pane: &Pane, chat: Option<&Chat>) {
+    let t = theme();
+    // The cursor's window gives way to a new agent's compose box, drawn
+    // over it, and then to its start until its chat opens.
+    if window_form(app, frame.area()) == Some(area) {
+        let mark = pane
+            .side
+            .map(|side| format!("{} ", SIDES[side]))
+            .unwrap_or_default();
+        let block = window_block(true).title(format!(" {mark}New agent "));
+        let body = Block::new()
+            .padding(Padding::horizontal(1))
+            .inner(block.inner(area));
+        frame.render_widget(block, area);
+        if app.prompt.is_none()
+            && let Some(opening) = app.window_start()
+            && let Some(key) = opening.key.as_deref()
+        {
+            frame.render_widget(Paragraph::new(start_lines(app, opening, key)), body);
+        }
+        return;
+    }
+    let tree = pane.tree;
+    let mark = pane
+        .side
+        .map(|side| format!("{} ", SIDES[side]))
+        .unwrap_or_default();
+    // Alone on a terminal too narrow for both, a window says it has a twin.
+    let alone = if pane.is_alone {
+        format!("{} of 2 · ", pane.side.unwrap_or(0) + 1)
+    } else {
+        String::new()
+    };
+    let title = tree.map(|tree| {
+        let branch = tree.branch.as_deref().unwrap_or("(detached)");
+        if tree.is_main {
+            format!(" {mark}{alone}main checkout · {branch} ")
+        } else {
+            format!(" {mark}{alone}Tree {} · {branch} ", tree.name)
+        }
+    });
+    let block = window_block(pane.has_keys).title(title.unwrap_or_default());
+    frame.render_widget(block, area);
+    let [bar, body] = window_areas(area);
+    let Some(tree) = tree else {
+        let text = match app.current_heading() {
+            Some(_) => "a group's heading: Enter folds it or opens it again",
+            None if app.is_loaded => "no trees match",
+            None => "",
+        };
+        let body = Block::new().padding(Padding::horizontal(1)).inner(body);
+        frame.render_widget(Paragraph::new(text).style(fg(t.muted)), body);
+        return;
+    };
+    let agent = App::chat_agent(tree);
+    let tabs: Vec<Span> = tab_spans(app, pane)
+        .into_iter()
+        .map(|(_, span)| span)
+        .collect();
+    frame.render_widget(Paragraph::new(Line::from(tabs)).style(t.bar), bar);
+    let note = Line::from(context_note(agent)).right_aligned();
+    if note.width() + 14 <= usize::from(bar.width) {
+        frame.render_widget(Paragraph::new(note), bar);
+    }
+    let shown_tab = pane.tab;
+    if shown_tab == WindowTab::Shell {
+        match chat.filter(|c| c.tree == tree.name && c.agent == crate::app::SHELL) {
+            Some(chat) if chat.is_ready() => {
+                let cursor = draw_screen(chat.screen(), frame.buffer_mut(), body);
+                if let Some(cursor) = cursor.filter(|_| pane.has_keys) {
+                    frame.set_cursor_position(cursor);
+                }
+            }
+            _ => draw_note(frame, body, "opening a shell in the tree..."),
+        }
+        return;
+    }
+    if matches!(shown_tab, WindowTab::Diff | WindowTab::Pr) {
+        draw_review_tab(frame, app, tree, shown_tab, pane.is_cursor, body);
+        return;
+    }
+    if shown_tab == WindowTab::Chat
+        && let Some(agent) = agent
+    {
+        let shown = chat.filter(|c| c.tree == tree.name && c.agent != crate::app::SHELL);
+        match shown {
+            Some(chat) if !chat.is_ready() => draw_note(frame, body, &opening_note(&chat.agent)),
+            Some(chat) => {
+                let cursor = draw_screen(chat.screen(), frame.buffer_mut(), body);
+                if let Some(cursor) = cursor.filter(|_| pane.has_keys) {
+                    frame.set_cursor_position(cursor);
+                }
+            }
+            _ if agent.status == Some(Status::Cold) => draw_note(
+                frame,
+                body,
+                &format!("{} is not running; Enter starts it again", agent.name),
+            ),
+            _ => draw_note(frame, body, &opening_note(&agent.name)),
+        }
+        return;
+    }
+    // The info sits a column in from the border, as the inbox's entries
+    // do; a chat takes the whole body, as its own screen is drawn.
+    let body = Block::new().padding(Padding::horizontal(1)).inner(body);
+    let lines = if shown_tab == WindowTab::Run {
+        run_lines(app, tree)
+    } else {
+        detail_text(app, tree, body)
+    };
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
+}
+
+/// The diff or the PR of `tree`, as `tab` shows it, in `area`: where the
+/// cursor drives the window, as scrolled; in the other window of a double,
+/// from its top, as last read.
+fn draw_review_tab(
+    frame: &mut Frame,
+    app: &App,
+    tree: &Tree,
+    tab: WindowTab,
+    is_cursor: bool,
+    area: Rect,
+) {
+    if tab == WindowTab::Diff {
+        let view = app
+            .view
+            .as_ref()
+            .filter(|v| is_cursor && v.path == tree.path);
+        match view {
+            Some(view) => draw_diff_view(frame, app, view, area),
+            None if !is_cursor && app.diffs.contains_key(&tree.path) => {
+                let still = DiffView {
+                    path: tree.path.clone(),
+                    scroll: 0,
+                    hscroll: 0,
+                };
+                draw_diff_view(frame, app, &still, area);
+            }
+            None if !is_cursor => {
+                draw_note(frame, area, "the diff reads once this window has the keys")
+            }
+            None => draw_note(frame, area, "reading the diff..."),
+        }
+    } else {
+        let popup = app
+            .pr_popup
+            .as_ref()
+            .filter(|p| is_cursor && p.path == tree.path);
+        match popup {
+            Some(popup) => draw_pr_view(frame, app, popup, area),
+            None if !is_cursor && app.prs.contains_key(&tree.path) => {
+                draw_pr_view(frame, app, &PrPopup::new(tree.path.clone()), area);
+            }
+            None if !is_cursor => {
+                draw_note(frame, area, "the PR reads once this window has the keys")
+            }
+            None => draw_note(frame, area, "reading the PR..."),
+        }
+    }
+}
+
+/// The diff or PR tab with the keys, in a popup where the window under the
+/// table is not on screen, so what has the keys is always seen.
+fn draw_floating_tab(frame: &mut Frame, app: &App) {
+    let Some(tree) = app.window_tree() else {
+        return;
+    };
+    let area = popup::area(stage(app, frame.area()));
+    frame.render_widget(Clear, area);
+    let block = Block::bordered()
+        .border_style(fg(theme().accent))
+        .style(fg(theme().text))
+        .title(format!(" Tree {} ", tree.name));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    draw_review_tab(frame, app, tree, app.shown_tab(), true, inner);
+}
+
 /// Where the list and the inbox go in `main`, the screen above the bar.
 struct InboxLayout {
     list: Rect,
@@ -1062,9 +1882,13 @@ struct InboxLayout {
     strip: Option<Rect>,
 }
 
-fn inbox_layout(app: &App, main: Rect) -> InboxLayout {
+fn inbox_layout(app: &App, windows: &Windows) -> InboxLayout {
+    let main = windows.top;
+    // Zoomed to the windows, the table's few rows leave no room for it
+    // beside them, so it is set aside as if hidden.
+    let is_hidden = app.inbox.is_hidden || windows.folded;
     let is_wide = main.width >= INBOX_FULL_FROM;
-    let beside = match (app.inbox.is_hidden, is_wide) {
+    let beside = match (is_hidden, is_wide) {
         (true, _) => 0,
         (false, true) => INBOX_WIDTH,
         (false, false) => STRIP_WIDTH,
@@ -1106,7 +1930,7 @@ pub fn stage(app: &App, screen: Rect) -> Rect {
     }
     let [main, _] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(screen);
     Rect {
-        width: inbox_layout(app, main).list.width,
+        width: inbox_layout(app, &windows(app, main)).list.width,
         ..screen
     }
 }
@@ -1117,7 +1941,7 @@ pub fn is_on_inbox(app: &App, screen: Rect, mouse: ratatui::crossterm::event::Mo
         return false;
     }
     let [main, _] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(screen);
-    let layout = inbox_layout(app, main);
+    let layout = inbox_layout(app, &windows(app, main));
     let at = Position::new(mouse.column, mouse.row);
     layout
         .rail
@@ -1137,8 +1961,30 @@ pub fn click(
         return None;
     }
     let [main, _] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(screen);
-    let layout = inbox_layout(app, main);
+    let windows = windows(app, main);
+    let layout = inbox_layout(app, &windows);
     let at = Position::new(mouse.column, mouse.row);
+    // A tab in the window's bar shows that tab.
+    if let Some(window) = windows.window {
+        let (cursor_area, other_area) = pane_areas(app, window);
+        // A click on the other window of a double gives it the keys.
+        if other_area.is_some_and(|area| area.contains(at)) {
+            app.focus_side(1 - app.side);
+            return Some(Outcome::Continue);
+        }
+        let [bar, _] = window_areas(cursor_area);
+        if bar.contains(at) {
+            let mut x = bar.x;
+            for (tab, span) in tab_spans(app, &cursor_pane(app)) {
+                let width = u16::try_from(span.width()).unwrap_or(u16::MAX);
+                if (x..x.saturating_add(width)).contains(&at.x) {
+                    app.tab = tab;
+                    return Some(Outcome::Continue);
+                }
+                x = x.saturating_add(width);
+            }
+        }
+    }
     if let Some(rail) = layout.rail.filter(|r| r.contains(at)) {
         let [_, body, _] = inbox_areas(app, rail);
         let row = usize::from(at.y.checked_sub(body.y)?);
@@ -1164,6 +2010,26 @@ fn inbox_areas(app: &App, area: Rect) -> [Rect; 3] {
     .areas(inbox_block(app).inner(area))
 }
 
+/// The inbox's border without its padding: a rule at its left zoomed to
+/// the table, as before the windows, else a box.
+fn inbox_rule(app: &App) -> Block<'static> {
+    if is_classic(app) {
+        Block::new().borders(Borders::LEFT)
+    } else {
+        Block::bordered()
+    }
+}
+
+/// Where the inbox's heading bar runs: across its rule too zoomed to the
+/// table, as before the windows, else inside its box.
+fn heading_area(app: &App, area: Rect) -> Rect {
+    if is_classic(app) {
+        area
+    } else {
+        Block::bordered().inner(area)
+    }
+}
+
 fn inbox_block(app: &App) -> Block<'static> {
     let t = theme();
     let border = if app.rail.is_some() {
@@ -1171,8 +2037,7 @@ fn inbox_block(app: &App) -> Block<'static> {
     } else {
         t.border
     };
-    Block::new()
-        .borders(Borders::LEFT)
+    inbox_rule(app)
         .border_style(fg(border))
         .padding(Padding::horizontal(1))
 }
@@ -1301,7 +2166,7 @@ fn draw_inbox(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         Span::raw("")
     };
-    heading_bar(frame, area);
+    heading_bar(frame, heading_area(app, area));
     let mut heading = Line::from(vec![inbox_icon(waiting), Span::styled(" INBOX", t.header)]);
     let pad = usize::from(title.width).saturating_sub(heading.width() + count.width());
     heading.spans.extend([Span::raw(" ".repeat(pad)), count]);
@@ -1373,12 +2238,10 @@ fn inbox_icon(waiting: usize) -> Span<'static> {
 /// done, for a terminal too narrow for it in full.
 fn draw_inbox_strip(frame: &mut Frame, app: &App, area: Rect) {
     let t = theme();
-    let block = Block::new()
-        .borders(Borders::LEFT)
-        .border_style(fg(t.border));
+    let block = inbox_rule(app).border_style(fg(t.border));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    heading_bar(frame, area);
+    heading_bar(frame, heading_area(app, area));
     let unseen: Vec<Kind> = inbox::shown(app)
         .into_iter()
         .filter(|(_, seen)| !seen)
@@ -1403,22 +2266,11 @@ fn draw_inbox_strip(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-/// Rows the detail pane takes, borders included.
-const DETAIL_HEIGHT: u16 = 12;
-
-/// The tree under the cursor in full, or the main checkout on its heading:
-/// where it is, its agents, what it serves and runs, what its agent last
-/// said with its latest steps, and its last action's outcome.
-fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
+/// The window's info on `tree`, to fill `inner`: where it is, its
+/// agents, what it serves and runs, what its agent last said with its
+/// latest steps, and its last action's outcome.
+fn detail_text(app: &App, tree: &Tree, inner: Rect) -> Vec<Line<'static>> {
     let t = theme();
-    let Some(tree) = app.current().or(app.main_under_cursor()) else {
-        let text = if app.is_loaded { "no trees match" } else { "" };
-        frame.render_widget(Paragraph::new(text).block(pane_block()), area);
-        return;
-    };
-    let block = pane_block();
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
     let mut lines = detail_lines(app, tree);
     let item = app.says(tree);
     if let Some(item) = &item {
@@ -1444,7 +2296,7 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
             ])
         }));
     }
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    lines
 }
 
 /// Where the detail pane's values start, after their label.
@@ -2597,13 +3449,15 @@ fn draw_diff_rows(frame: &mut Frame, layout: &DiffLayout, view: &DiffView, body:
     }
 }
 
-/// The side-by-side diff of one tree against its base, in a popup.
-fn draw_diff_view(frame: &mut Frame, app: &App, view: &DiffView) {
+/// The side-by-side diff of one tree against its base, in `area`, the
+/// window's diff tab.
+fn draw_diff_view(frame: &mut Frame, app: &App, view: &DiffView, area: Rect) {
     let t = theme();
-    // What the diff is sits in a bar on the popup's first row, and the keys
+    // What the diff is sits in a bar on the window's first row, and the keys
     // in one on its last, both drawn like a file header.
-    let [body, key_row] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)])
-        .areas(popup::body(stage(app, frame.area())));
+    let [bar, rest] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
+    let [body, key_row] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(rest);
     let tree = app.trees.iter().find(|tree| tree.path == view.path);
     let mut title = vec![
         Span::styled(" diff ", t.badge),
@@ -2641,7 +3495,7 @@ fn draw_diff_view(frame: &mut Frame, app: &App, view: &DiffView) {
             )));
         }
     }
-    bar_popup(frame, stage(app, frame.area()), title, Vec::new());
+    frame.render_widget(Paragraph::new(Line::from(title)).style(t.diff.header), bar);
     frame.render_widget(
         Paragraph::new(Line::from(fitting_keys(&DIFF_KEYS, key_row.width))).style(t.diff.header),
         key_row,
@@ -2696,11 +3550,10 @@ const PR_KEYS: [&[(&str, &str)]; 4] = [
     ],
 ];
 
-/// A tree's PR in its popup: a bar naming it, its tabs, the tab on show,
-/// the last thing said, and the tab's keys.
-fn draw_pr_view(frame: &mut Frame, app: &App, popup: &PrPopup) {
+/// A tree's PR in `area`, the window's PR tab: a bar naming it, its tabs,
+/// the tab on show, the last thing said, and the tab's keys.
+fn draw_pr_view(frame: &mut Frame, app: &App, popup: &PrPopup, area: Rect) {
     let t = theme();
-    let screen = stage(app, frame.area());
     let tree = app.trees.iter().find(|tree| tree.path == popup.path);
     let read = app.prs.get(&popup.path);
     let answer = read.and_then(|r| r.pr.as_ref());
@@ -2724,7 +3577,7 @@ fn draw_pr_view(frame: &mut Frame, app: &App, popup: &PrPopup) {
             // The title takes what the bar has left beside the badge, the
             // tree and the status, cut with an ellipsis; the branches follow
             // where they fit.
-            let room = usize::from(popup::bar(screen).width).saturating_sub(17 + status_width);
+            let room = usize::from(area.width).saturating_sub(17 + status_width);
             let named = fit(&format!(" #{} {}", pr.number, pr.title), room);
             let left = room.saturating_sub(Line::raw(named.as_str()).width());
             title.push(Span::styled(named, bold));
@@ -2745,7 +3598,14 @@ fn draw_pr_view(frame: &mut Frame, app: &App, popup: &PrPopup) {
     if let Some(tree) = tree {
         title.push(Span::styled(format!("   tree {} ", tree.name), fg(t.muted)));
     }
-    let body = bar_popup(frame, screen, title, status);
+    let [bar, body] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
+    let title = Line::from(title);
+    let status = Line::from(status);
+    let fits = title.width() + status.width() <= usize::from(bar.width);
+    frame.render_widget(Paragraph::new(title).style(t.diff.header), bar);
+    if fits {
+        frame.render_widget(Paragraph::new(status.right_aligned()), bar);
+    }
     let note = app.message.as_deref();
     let [tabs_row, content, note_row, key_row] = Layout::vertical([
         Constraint::Length(1),
@@ -2804,7 +3664,7 @@ fn draw_pr_view(frame: &mut Frame, app: &App, popup: &PrPopup) {
             Some(Ok(_)) => vec![
                 Line::raw(format!("No pull request for {branch} yet.")),
                 Line::styled(
-                    "Close this and press s to start a ship run, which pushes the branch and opens one.",
+                    "Esc, then s, starts a ship run, which pushes the branch and opens one.",
                     fg(t.muted),
                 ),
             ],
@@ -4634,7 +5494,9 @@ mod sidebar_tests {
     fn screen(app: &App, width: u16, height: u16) -> Vec<String> {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| draw(frame, app, None, None)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, app, None, None, None))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         (0..height)
             .map(|y| {
@@ -4690,7 +5552,9 @@ mod inbox_tests {
     fn screen(app: &App, width: u16, height: u16) -> Vec<String> {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| draw(frame, app, None, None)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, app, None, None, None))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         (0..height)
             .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
@@ -4719,7 +5583,7 @@ mod inbox_tests {
     fn a_click_opens_the_entry_drawn_under_it() {
         let mut app = app();
         assert_eq!(
-            click_on(&mut app, 200, 30, "endodeals-web 12"),
+            click_on(&mut app, 200, 50, "endodeals-web 12"),
             Some(Outcome::SwitchTo {
                 checkout: "/code/endodeals-web".into(),
                 tree: "/other/12/web".into(),
@@ -4728,7 +5592,7 @@ mod inbox_tests {
         );
         let mut app = self::app();
         assert!(matches!(
-            click_on(&mut app, 200, 30, "Where should the inbox sit?"),
+            click_on(&mut app, 200, 50, "Where should the inbox sit?"),
             Some(Outcome::Chat { tree, .. }) if tree == "4"
         ));
     }
@@ -4753,18 +5617,18 @@ mod inbox_tests {
         let mut app = app();
         app.rail = Some(0);
         let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(200, 30)).unwrap();
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(200, 50)).unwrap();
         terminal
-            .draw(|frame| draw(frame, &app, None, None))
+            .draw(|frame| draw(frame, &app, None, None, None))
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
-        let lines = screen(&app, 200, 30);
+        let lines = screen(&app, 200, 50);
         let first = lines.iter().position(|l| l.contains("4 ANB-41")).unwrap();
         let cursor = theme().cursor.bg;
-        // The rail's last column, inside its padding, on each of the entry's
-        // two lines.
+        // The rail's last column, inside its border and padding, on each of
+        // the entry's two lines.
         for row in [first, first + 1] {
-            let cell = &buffer[(198, u16::try_from(row).unwrap())];
+            let cell = &buffer[(197, u16::try_from(row).unwrap())];
             assert_eq!(
                 cell.bg,
                 cursor.unwrap_or_default(),
@@ -4835,7 +5699,7 @@ mod inbox_tests {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(200, 30)).unwrap();
         terminal
-            .draw(|frame| draw(frame, &app, None, None))
+            .draw(|frame| draw(frame, &app, None, None, None))
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let lines = screen(&app, 200, 30);
@@ -4868,7 +5732,11 @@ mod inbox_tests {
     #[test]
     fn hiding_the_inbox_gives_the_list_its_width_back() {
         let mut app = app();
-        let wide = |app: &App| screen(app, 200, 30)[0].trim_end().len();
+        // Where the table's window ends, at its top right corner.
+        let wide = |app: &App| {
+            let top = &screen(app, 200, 30)[0];
+            top[..top.find('┐').unwrap()].chars().count()
+        };
         let beside = wide(&app);
         app.handle_key(ratatui::crossterm::event::KeyEvent::from(
             ratatui::crossterm::event::KeyCode::Char('E'),
@@ -4876,14 +5744,16 @@ mod inbox_tests {
         let shown = screen(&app, 200, 30).join("\n");
         assert!(!shown.contains("INBOX"), "{shown}");
         assert!(!shown.contains("●2"), "no strip either:\n{shown}");
-        assert!(wide(&app) < beside, "the list's own header ends the line");
+        assert!(wide(&app) > beside, "the table's window takes the width");
     }
 
     /// The screen as drawn, cell by cell, for what a cell's colours are.
     fn cells(app: &App, width: u16, height: u16) -> ratatui::buffer::Buffer {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| draw(frame, app, None, None)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, app, None, None, None))
+            .unwrap();
         terminal.backend().buffer().clone()
     }
 
@@ -4908,7 +5778,8 @@ mod inbox_tests {
                 theme().warning,
                 "something needs you"
             );
-            for x in [icon - 1, width - 1] {
+            // Across the inbox to its right border.
+            for x in [icon - 1, width - 2] {
                 assert_eq!(drawn[(x, row)].bg, header.unwrap(), "at {x} of {width}");
             }
             let divider = (0..icon)
@@ -4940,7 +5811,9 @@ mod pr_view_tests {
     fn screen(app: &App, width: u16, height: u16) -> String {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| draw(frame, app, None, None)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, app, None, None, None))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         (0..height)
             .map(|y| {
@@ -5020,7 +5893,7 @@ mod pr_view_tests {
     }
 
     #[test]
-    fn the_pr_popup_shows_each_tab_and_says_why_when_it_cannot() {
+    fn the_pr_view_shows_each_tab_and_says_why_when_it_cannot() {
         let mut app = app();
         let path = std::path::PathBuf::from("/pool/4/app");
         while app.current().is_none_or(|t| t.path != path) {
@@ -5090,7 +5963,7 @@ mod pr_view_tests {
         let shown = screen(&app, 200, 40);
         assert!(
             shown.contains("No pull request for me/anb-41-inbox-rail yet.")
-                && shown.contains("Close this and press s to start a ship run"),
+                && shown.contains("Esc, then s, starts a ship run"),
             "{shown}"
         );
         app.pr_loaded(
@@ -5099,8 +5972,10 @@ mod pr_view_tests {
         );
         let shown = screen(&app, 200, 40);
         assert!(shown.contains("gh is not signed in"), "{shown}");
+        // Esc gives the keys back to the table and leaves the PR in its tab.
         press(&mut app, KeyCode::Esc);
-        assert!(!screen(&app, 200, 40).contains("gh is not signed in"));
+        assert!(!app.is_window_focused);
+        assert!(screen(&app, 200, 40).contains("gh is not signed in"));
     }
 
     #[test]
@@ -5113,8 +5988,9 @@ mod pr_view_tests {
         press(&mut app, KeyCode::Char('v'));
         let mut pr = pr();
         pr.state = "MERGED".into();
-        pr.title =
-            "refactor(core): order restriction levels and rename the shown-handles op".into();
+        pr.title = "refactor(core): order restriction levels and rename the shown-handles op \
+                    across every crate in the workspace"
+            .into();
         pr.body =
             "Bumps the workspace to 0.8.0 and updates the examples, the Rust dependency snippets \
                    and the docs that name the version, so nothing still points at the old one."
@@ -5144,7 +6020,7 @@ mod pr_view_tests {
         let header = rows
             .iter()
             .find(|r| r.contains(" pr "))
-            .expect("the popup's bar");
+            .expect("the PR's bar");
         assert!(
             header.contains('…'),
             "a long title is cut with an ellipsis: {header}"
@@ -5215,7 +6091,8 @@ mod pr_view_tests {
             "fix(registry-restore): continue restoring remaining keys when one snapshot fails"
                 .into();
         pr.checks[1].outcome = Checked::Failed;
-        pr.checks[1].name = "CodeScene Code Health Review (issue-1066-a-very-long-branch)".into();
+        pr.checks[1].name =
+            "CodeScene Code Health Review (issue-1066-a-very-long-branch-with-more-to-it)".into();
         pr.threads[0].body = "\u{274c} New issue: [**Complex Method**](https://codescene.io/x) in <sub>x.rs</sub> <!-- hidden -->".into();
         if let Some(bot) = pr.bot.as_mut() {
             bot.reviewing = true;
@@ -5240,14 +6117,15 @@ mod pr_view_tests {
 
         let shown = screen(&app, 100, 40);
         let rows: Vec<&str> = shown.lines().collect();
-        let corner = rows
-            .iter()
-            .position(|r| r.contains('┌'))
-            .expect("the popup");
-        let left = rows[corner]
-            .find('┌')
-            .map(|b| rows[corner][..b].chars().count())
-            .unwrap();
+        // The window's own corner, round its tab bar and the PR.
+        let body = window_chat_area(&app, Rect::new(0, 0, 100, 40)).unwrap();
+        let corner = usize::from(body.y - 2);
+        let left = usize::from(body.x - 1);
+        assert_eq!(
+            rows[corner].chars().nth(left),
+            Some('┌'),
+            "the window is drawn there"
+        );
         let right = left
             + rows[corner]
                 .chars()
@@ -5414,10 +6292,16 @@ mod pr_view_tests {
 
         app.pr_loaded(path, Ok(None));
         let shown = screen(&app, 100, 40);
-        let left = shown
-            .lines()
-            .find_map(|r| r.find('┌').map(|b| Line::raw(&r[..b]).width()))
-            .unwrap();
+        let body = window_chat_area(&app, Rect::new(0, 0, 100, 40)).unwrap();
+        let left = usize::from(body.x - 1);
+        assert_eq!(
+            shown
+                .lines()
+                .nth(usize::from(body.y - 2))
+                .and_then(|r| r.chars().nth(left)),
+            Some('┌'),
+            "the window is drawn there"
+        );
         for row in shown
             .lines()
             .filter(|r| r.contains("yet.") || r.contains("one."))
@@ -5735,15 +6619,26 @@ mod pr_view_tests {
         pr.checks[1].outcome = Checked::Skipped;
         app.pr_loaded(path, Ok(Some(pr)));
         press(&mut app, KeyCode::Char('2'));
-        let shown = screen(&app, 100, 40);
+        let shown = screen(&app, 100, 60);
+        // The window's rows run on as one text, wherever a heading wraps.
+        let text = shown
+            .lines()
+            .map(|row| row.trim_matches(|c| c == '│' || c == ' '))
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(
-            shown.contains("the end of its log"),
+            text.contains("(non-required) · the end of its log ─"),
             "the heading keeps its end:\n{shown}"
         );
         press(&mut app, KeyCode::Char('j'));
-        let shown = screen(&app, 100, 40);
+        let shown = screen(&app, 100, 60);
+        let text = shown
+            .lines()
+            .map(|row| row.trim_matches(|c| c == '│' || c == ' '))
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(
-            shown.contains("was skipped in 3m 40s."),
+            text.contains("(PRD-262) (non-required) was skipped in 3m 40s."),
             "the detail line wraps whole:\n{shown}"
         );
     }
@@ -5829,5 +6724,697 @@ mod pr_view_tests {
             shown.contains("review threads could not be read: HTTP 502"),
             "{shown}"
         );
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+    use crate::inbox::tests::app;
+    use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+    fn drawn(app: &App, width: u16, height: u16) -> Buffer {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, app, None, None, None))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn lines(buffer: &Buffer) -> Vec<String> {
+        let area = buffer.area;
+        (0..area.height)
+            .map(|y| (0..area.width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    /// The app with the cursor on tree `name`.
+    fn on(name: &str) -> App {
+        let mut app = app();
+        app.select_tree(name);
+        assert_eq!(app.current().map(|t| t.name.as_str()), Some(name));
+        app
+    }
+
+    #[test]
+    fn the_window_under_the_table_shows_the_tree_under_the_cursor_and_its_info() {
+        let mut app = on("4");
+        app.tab = WindowTab::Info;
+        let shown = lines(&drawn(&app, 200, 50));
+        let title = shown
+            .iter()
+            .position(|l| l.starts_with("┌ Tree 4 · me/anb-41-inbox-rail "))
+            .unwrap_or_else(|| panic!("the window's title:\n{}", shown.join("\n")));
+        let table_ends = shown.iter().position(|l| l.starts_with('└')).unwrap();
+        assert!(title > table_ends, "the window is under the table");
+        // The info tab holds the lines the detail pane held.
+        for label in ["agents", "ports", "processes"] {
+            assert!(
+                shown[title..]
+                    .iter()
+                    .any(|l| l.starts_with(&format!("│ {label} "))),
+                "{label} in the info:\n{}",
+                shown.join("\n")
+            );
+        }
+        let mut app = on("2");
+        app.tab = WindowTab::Info;
+        let shown = lines(&drawn(&app, 200, 50));
+        assert!(
+            shown
+                .iter()
+                .any(|l| l.starts_with("┌ Tree 2 · me/help-columns "))
+        );
+    }
+
+    #[test]
+    fn a_cold_agent_is_left_closed_with_how_to_start_it() {
+        let shown = lines(&drawn(&on("9"), 200, 50)).join("\n");
+        assert!(
+            shown.contains("port-menu is not running; Enter starts it again"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn the_window_with_the_keys_has_its_border_in_the_title_colour() {
+        let mut app = on("4");
+        let corner = |app: &App, title: &str| {
+            let buffer = drawn(app, 200, 50);
+            let row = lines(&buffer)
+                .iter()
+                .position(|l| l.starts_with(title))
+                .unwrap();
+            buffer[(0, u16::try_from(row).unwrap())].fg
+        };
+        assert_eq!(corner(&app, "┌ Trees "), theme().title);
+        assert_eq!(corner(&app, "┌ Tree 4 "), theme().border);
+        app.is_window_focused = true;
+        assert_eq!(corner(&app, "┌ Trees "), theme().border);
+        assert_eq!(corner(&app, "┌ Tree 4 "), theme().title);
+        // The inbox with the keys is the one window marked.
+        app.is_window_focused = false;
+        app.rail = Some(0);
+        assert_eq!(corner(&app, "┌ Trees "), theme().border);
+        assert_eq!(corner(&app, "┌ Tree 4 "), theme().border);
+    }
+
+    #[test]
+    fn a_click_on_a_tab_shows_it() {
+        let mut app = on("4");
+        let shown = lines(&drawn(&app, 200, 50));
+        let row = shown
+            .iter()
+            .position(|l| l.starts_with("│ chat ") && l.contains(" info "))
+            .unwrap();
+        let column = shown[row]
+            .find(" info ")
+            .map(|b| shown[row][..b].chars().count())
+            .unwrap();
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: u16::try_from(column + 1).unwrap(),
+            row: u16::try_from(row).unwrap(),
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            click(&mut app, Rect::new(0, 0, 200, 50), mouse),
+            Some(Outcome::Continue)
+        );
+        assert_eq!(app.tab, WindowTab::Info);
+    }
+
+    #[test]
+    fn the_table_makes_room_for_the_inbox_and_the_window_for_a_chat() {
+        let app = on("4");
+        let shown = lines(&drawn(&app, 200, 50));
+        // The inbox beside four trees shows every entry and its keys, though
+        // the trees alone would need fewer rows.
+        for text in ["Done: opened PR #31", "e inbox  E hide"] {
+            assert!(
+                shown.iter().any(|l| l.contains(text)),
+                "{text} in the inbox:\n{}",
+                shown.join("\n")
+            );
+        }
+        // The window under the table takes the rest, down to the bar.
+        let window = shown
+            .iter()
+            .position(|l| l.starts_with("┌ Tree 4 "))
+            .unwrap();
+        assert!(shown[window - 1].starts_with('└'), "{}", shown.join("\n"));
+        assert!(shown[48].starts_with('└'), "{}", shown.join("\n"));
+        // Too short for both, the table takes the screen, and a tree's chat
+        // floats in a popup instead.
+        let short = lines(&drawn(&app, 200, 12));
+        assert!(
+            !short.iter().any(|l| l.contains("┌ Tree 4 ")),
+            "{}",
+            short.join("\n")
+        );
+        assert_eq!(window_chat_area(&app, Rect::new(0, 0, 200, 12)), None);
+    }
+
+    #[test]
+    fn a_tree_chat_floats_only_while_it_has_the_keys_where_the_window_cannot_show() {
+        let mut app = on("4");
+        let short = Rect::new(0, 0, 80, 10);
+        let tall = Rect::new(0, 0, 200, 50);
+        // Shown in the window where there is one, keys or not.
+        assert!(!floats(&app, false, tall));
+        // With nowhere to show it and the keys elsewhere, it stays hidden
+        // rather than cover what has them: the table on a short terminal,
+        // the Issues screen or its picker.
+        assert!(!floats(&app, false, short));
+        app.is_issues = true;
+        assert!(!floats(&app, false, tall));
+        // Given the keys there, it floats in a popup so it is seen.
+        app.is_window_focused = true;
+        assert!(floats(&app, false, tall));
+        app.is_issues = false;
+        assert!(floats(&app, false, short));
+        // The assistant's and scratch chats always float.
+        app.is_window_focused = false;
+        assert!(floats(&app, true, tall));
+    }
+
+    #[test]
+    fn the_run_and_diff_tabs_draw_in_the_window() {
+        let mut app = on("4");
+        app.runs.insert(
+            "/pool/4/app".into(),
+            crate::keel::Run {
+                tree: "/pool/4/app".into(),
+                playbook: "issue".into(),
+                goal: "the inbox rail".into(),
+                state: "active".into(),
+                steps: ["Audit it", "Build it", "Verify it"]
+                    .iter()
+                    .zip(["done", "doing", "pending"])
+                    .map(|(title, state)| crate::keel::Step {
+                        title: (*title).into(),
+                        state: state.into(),
+                    })
+                    .collect(),
+                current: Some(2),
+                attention: 0,
+                stale: false,
+            },
+        );
+        app.tab = WindowTab::Run;
+        let buffer = drawn(&app, 200, 50);
+        let shown = lines(&buffer);
+        assert!(
+            shown.iter().any(|l| l.contains(" run 2/3 ")),
+            "the tab says how far"
+        );
+        let doing = shown.iter().position(|l| l.contains("◌ Build it")).unwrap();
+        assert!(shown[doing - 1].contains("✓ Audit it"));
+        assert!(shown[doing + 1].contains("· Verify it"));
+        let x = u16::try_from(shown[doing].find("Build").unwrap()).unwrap();
+        assert_eq!(
+            buffer[(x, u16::try_from(doing).unwrap())].bg,
+            theme().cursor.bg.unwrap_or_default(),
+            "the step under way is picked out"
+        );
+
+        app.handle_key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Char('d'),
+        ));
+        let shown = lines(&drawn(&app, 200, 50));
+        let title = shown
+            .iter()
+            .position(|l| l.starts_with("┌ Tree 4 "))
+            .unwrap();
+        assert!(
+            shown[title + 2].contains(" diff ") && shown[title + 2].contains("tree 4"),
+            "the diff's bar is in the window, under its tabs:\n{}",
+            shown.join("\n")
+        );
+        assert!(
+            shown[title + 3..]
+                .iter()
+                .any(|l| l.contains("reading the diff...")),
+            "{}",
+            shown.join("\n")
+        );
+    }
+
+    #[test]
+    fn on_a_terminal_too_short_for_the_window_the_diff_and_pr_float_in_a_popup() {
+        let press = |app: &mut App, c: char| {
+            app.handle_key(ratatui::crossterm::event::KeyEvent::from(
+                ratatui::crossterm::event::KeyCode::Char(c),
+            ));
+        };
+        let mut app = on("4");
+        press(&mut app, 'd');
+        let shown = lines(&drawn(&app, 100, 9)).join("\n");
+        assert!(
+            shown.contains("reading the diff..."),
+            "the diff is seen:\n{shown}"
+        );
+        press(&mut app, 'q');
+        press(&mut app, 'v');
+        let shown = lines(&drawn(&app, 100, 9)).join("\n");
+        assert!(
+            shown.contains("reading the PR..."),
+            "the PR is seen:\n{shown}"
+        );
+    }
+
+    #[test]
+    fn a_double_shows_two_windows_marked_and_one_at_a_time_when_narrow() {
+        let mut app = on("4");
+        app.handle_key(ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char('\\'),
+            ratatui::crossterm::event::KeyModifiers::CONTROL,
+        ));
+        let cursor = app.window_tree().unwrap().name.clone();
+        let shown = lines(&drawn(&app, 200, 50));
+        let titles = shown
+            .iter()
+            .find(|l| l.starts_with("┌ ◧ Tree 4 "))
+            .unwrap_or_else(|| panic!("{}", shown.join("\n")));
+        assert!(
+            titles.contains(&format!("┌ ◨ Tree {cursor} ")),
+            "both side by side: {titles}"
+        );
+        let row = |name: &str| {
+            shown
+                .iter()
+                .find(|l| l.starts_with(&format!("│  {name}")))
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert!(row("4◧").contains("leased"), "{}", shown.join("\n"));
+        // A tree shown in both windows carries both marks.
+        app.select_tree("4");
+        let shown = lines(&drawn(&app, 200, 50));
+        assert!(
+            shown.iter().any(|l| l.starts_with("│  4◧◨")),
+            "{}",
+            shown.join("\n")
+        );
+        app.select_tree(&cursor);
+        assert!(row(&format!("{cursor}◨")).contains("leased"));
+        // The other window's diff reads once it has the keys, and says so.
+        if let Some(other) = app.other.as_mut() {
+            other.tab = WindowTab::Diff;
+        }
+        let shown = lines(&drawn(&app, 200, 50)).join("\n");
+        assert!(
+            shown.contains("the diff reads once this window has the keys"),
+            "{shown}"
+        );
+        // Too narrow for both, the window the cursor drives shows alone.
+        let shown = lines(&drawn(&app, 120, 50)).join("\n");
+        assert!(
+            shown.contains(&format!("┌ ◨ 2 of 2 · Tree {cursor} ")),
+            "{shown}"
+        );
+        assert!(!shown.contains("┌ ◧"), "{shown}");
+    }
+
+    #[test]
+    fn the_main_checkouts_heading_carries_its_windows_mark() {
+        let mut app = on("4");
+        let mut main = crate::pool::main_tree(std::path::Path::new("/pool/main"));
+        main.branch = Some("main".into());
+        app.base = Some("main".into());
+        app.trees.insert(0, main);
+        app.selected = 0;
+        assert!(
+            app.main_under_cursor().is_some(),
+            "the cursor is on its heading"
+        );
+        app.handle_key(ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char('\\'),
+            ratatui::crossterm::event::KeyModifiers::CONTROL,
+        ));
+        let shown = lines(&drawn(&app, 200, 50));
+        let heading = shown
+            .iter()
+            .find(|l| l.contains("main checkout") && l.starts_with("│▾"))
+            .unwrap_or_else(|| panic!("{}", shown.join("\n")));
+        assert!(heading.contains('◧'), "{heading}");
+    }
+
+    #[test]
+    fn the_two_windows_are_the_same_width_so_one_chat_size_fits_both() {
+        let mut app = on("4");
+        app.handle_key(ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char('\\'),
+            ratatui::crossterm::event::KeyModifiers::CONTROL,
+        ));
+        for width in [200, 201] {
+            let (cursor, other) = pane_areas(&app, Rect::new(0, 0, width, 30));
+            let other = other.unwrap();
+            assert_eq!(cursor.width, other.width, "at {width} columns");
+            assert!(cursor.right().max(other.right()) <= width);
+        }
+    }
+
+    #[test]
+    fn a_new_agents_form_and_its_start_take_the_window_the_cursor_drives() {
+        let mut app = on("4");
+        app.handle_key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Char('N'),
+        ));
+        let shown = lines(&drawn(&app, 200, 50));
+        let window = shown
+            .iter()
+            .position(|l| l.starts_with("┌ New agent "))
+            .unwrap_or_else(|| panic!("{}", shown.join("\n")));
+        let table_ends = shown.iter().position(|l| l.starts_with('└')).unwrap();
+        assert!(window > table_ends, "under the table, not over it");
+        assert!(
+            shown[window..]
+                .iter()
+                .any(|l| l.contains("New agent in a fresh tree")),
+            "{}",
+            shown.join("\n")
+        );
+        // Once sent, the window lists its steps as they end.
+        app.prompt = None;
+        let key = std::path::PathBuf::from("(new tree 1)");
+        app.opening = Some(Opening {
+            agent: "fix login".into(),
+            tree: "new".into(),
+            key: Some(key.clone()),
+            failed: None,
+            leases: true,
+            side: None,
+        });
+        app.job_step(key.clone(), "lease");
+        app.job_step(key.clone(), "branch");
+        let shown = lines(&drawn(&app, 200, 50)).join("\n");
+        for seen in [
+            "Starting fix login",
+            "✓ lease a tree",
+            "- check it is a clean worktree  not needed here",
+            "✓ name its branch",
+            "◌ write treetop.json",
+            "· start the agent",
+            "Esc hides this; the start carries on",
+        ] {
+            assert!(shown.contains(seen), "{seen}:\n{shown}");
+        }
+        if let Some(opening) = app.opening.as_mut() {
+            opening.failed = Some("record: disk full".into());
+        }
+        let shown = lines(&drawn(&app, 200, 50)).join("\n");
+        assert!(
+            shown.contains("✗ write treetop.json  record: disk full"),
+            "{shown}"
+        );
+        assert!(shown.contains("Esc closes this"), "{shown}");
+        // In a tree already held nothing is leased, branched or recorded,
+        // so only the agent's own steps are listed.
+        app.opening = Some(Opening {
+            agent: "add tests".into(),
+            tree: "4".into(),
+            key: Some("/pool/4/app".into()),
+            failed: None,
+            leases: false,
+            side: None,
+        });
+        let shown = lines(&drawn(&app, 200, 50)).join("\n");
+        assert!(shown.contains("◌ start the agent"), "{shown}");
+        assert!(!shown.contains("lease a tree"), "{shown}");
+    }
+
+    #[test]
+    fn a_prompt_opened_over_a_start_is_drawn_and_a_double_keeps_its_other_tree() {
+        let mut app = on("4");
+        app.handle_key(ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char('\\'),
+            ratatui::crossterm::event::KeyModifiers::CONTROL,
+        ));
+        app.handle_key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Char('N'),
+        ));
+        let shown = lines(&drawn(&app, 200, 50));
+        let titles = shown
+            .iter()
+            .find(|l| l.contains("New agent"))
+            .unwrap_or_else(|| panic!("{}", shown.join("\n")));
+        assert!(
+            titles.contains("┌ ◧ Tree 4 "),
+            "the other window keeps its tree: {titles}"
+        );
+        app.prompt = None;
+        app.opening = Some(Opening {
+            agent: "fix login".into(),
+            tree: "new".into(),
+            key: Some("(new tree 1)".into()),
+            failed: None,
+            leases: true,
+            side: None,
+        });
+        app.handle_key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Char(':'),
+        ));
+        assert!(app.prompt.is_some());
+        let shown = lines(&drawn(&app, 200, 50)).join("\n");
+        assert!(shown.contains("Ask the assistant"), "{shown}");
+    }
+
+    #[test]
+    fn a_start_stays_in_the_window_it_was_asked_from_and_the_form_in_its_borders() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let ctrl = |app: &mut App, c: char| {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+        };
+        let mut app = on("4");
+        ctrl(&mut app, '\\');
+        app.handle_key(KeyEvent::from(KeyCode::Char('N')));
+        app.handle_key(KeyEvent::from(KeyCode::Char('x')));
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.window_start().is_some());
+        let started_on = app.side;
+        // The keys go round to the other window and back; the start stays.
+        for _ in 0..2 {
+            ctrl(&mut app, 'q');
+            let shown = lines(&drawn(&app, 200, 50));
+            let titles = shown
+                .iter()
+                .find(|l| l.contains("New agent"))
+                .unwrap_or_else(|| panic!("{}", shown.join("\n")));
+            let mark = SIDES[started_on];
+            assert!(titles.contains(&format!("┌ {mark} New agent ")), "{titles}");
+        }
+        // Esc reaches the window with the keys, not the start.
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.window_start().is_some(), "the start is still shown");
+        // On a short terminal the form keeps inside its window's border.
+        let mut app = on("4");
+        app.handle_key(KeyEvent::from(KeyCode::Char('N')));
+        let shown = lines(&drawn(&app, 80, 20));
+        assert!(
+            shown.iter().any(|l| l.starts_with("┌ New agent ")),
+            "{}",
+            shown.join("\n")
+        );
+    }
+
+    #[test]
+    fn zoomed_to_the_windows_the_table_keeps_their_rows() {
+        let mut app = on("4");
+        // Zoomed to the windows, the table keeps only the window's tree.
+        app.zoom = Some(Zoom::Windows);
+        let shown = lines(&drawn(&app, 200, 50));
+        assert!(
+            shown[0].starts_with("┌ Trees · ^F shows them all "),
+            "{}",
+            shown[0]
+        );
+        assert!(
+            shown[2].contains("me/anb-41-inbox-rail"),
+            "{}",
+            shown.join("\n")
+        );
+        assert!(shown[3].starts_with('└'), "one row: {}", shown.join("\n"));
+        assert!(
+            shown[4].starts_with("┌ Tree 4 "),
+            "the window takes the rest"
+        );
+        assert!(
+            !shown.iter().any(|l| l.contains("INBOX")),
+            "no inbox beside it"
+        );
+        // Given the keys, the inbox set aside opens over the table.
+        app.rail = Some(0);
+        let shown = lines(&drawn(&app, 200, 50));
+        assert!(
+            shown.iter().any(|l| l.contains("INBOX")),
+            "{}",
+            shown.join("\n")
+        );
+        app.rail = None;
+        // In a double, both windows' trees, however far apart in the list.
+        app.other = Some(crate::app::OtherWindow {
+            path: "/pool/9/app".into(),
+            tab: WindowTab::Info,
+        });
+        app.side = 0;
+        let shown = lines(&drawn(&app, 200, 50));
+        assert!(
+            shown[2].contains("me/anb-41-inbox-rail"),
+            "{}",
+            shown.join("\n")
+        );
+        assert!(shown[3].contains("me/port-menu"), "{}", shown.join("\n"));
+        assert!(shown[4].starts_with('└'), "{}", shown.join("\n"));
+    }
+
+    #[test]
+    fn zoomed_the_table_is_the_screen_treetop_had_before_its_windows() {
+        let mut app = on("4");
+        app.zoom = Some(Zoom::Table);
+        let shown = lines(&drawn(&app, 200, 50));
+        // The table's header on the first row, unboxed, as it always was.
+        assert!(shown[0].starts_with("  #    STATUS"), "{}", shown[0]);
+        // The detail pane boxed under it, its last 12 rows above the bar.
+        assert!(shown[37].starts_with('┌'), "{}", shown.join("\n"));
+        assert!(shown[38].starts_with("│/pool/4/app"), "{}", shown[38]);
+        assert!(shown[48].starts_with('└'));
+        // The inbox beside it with its one left border, its heading on the
+        // table's header row.
+        let inbox_at = 200 - usize::from(INBOX_WIDTH);
+        let border: String = shown[5].chars().skip(inbox_at).take(1).collect();
+        assert_eq!(border, "│", "{}", shown[5]);
+        assert!(
+            shown[0]
+                .chars()
+                .skip(inbox_at)
+                .collect::<String>()
+                .contains("INBOX")
+        );
+        // Its key bar too, with no window for Ctrl+Q to give the keys to.
+        assert!(!shown[49].contains("^Q"), "{}", shown[49]);
+        assert!(
+            shown[49].starts_with(" Enter  open  ?  help "),
+            "{}",
+            shown[49]
+        );
+        // Zoomed to the windows on a terminal too short for them, nothing is
+        // folded away and the inbox stays beside the table.
+        app.zoom = Some(Zoom::Windows);
+        let shown = lines(&drawn(&app, 200, 8)).join("\n");
+        assert!(!shown.contains("^F shows them all"), "{shown}");
+        assert!(shown.contains("INBOX"), "{shown}");
+    }
+
+    #[test]
+    fn zoomed_to_the_table_its_rows_carry_no_window_marks() {
+        let mut app = on("4");
+        app.handle_key(ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char('\\'),
+            ratatui::crossterm::event::KeyModifiers::CONTROL,
+        ));
+        app.zoom = Some(Zoom::Table);
+        let shown = lines(&drawn(&app, 200, 50)).join("\n");
+        assert!(!shown.contains('◧') && !shown.contains('◨'), "{shown}");
+    }
+
+    #[test]
+    fn the_palette_shows_what_is_typed_and_the_commands_it_narrows_to() {
+        let mut app = on("4");
+        app.open_palette();
+        for c in "ret".chars() {
+            app.handle_key(ratatui::crossterm::event::KeyEvent::from(
+                ratatui::crossterm::event::KeyCode::Char(c),
+            ));
+        }
+        let buffer = drawn(&app, 200, 50);
+        let shown = lines(&buffer);
+        let typed = shown
+            .iter()
+            .position(|l| l.contains("❯ ret"))
+            .unwrap_or_else(|| panic!("{}", shown.join("\n")));
+        let first = typed + 2;
+        assert!(
+            shown[first].contains(" Return tree 4 to the pool"),
+            "{}",
+            shown[first]
+        );
+        // Its key at the right of the palette, before its border.
+        let row = &shown[first][shown[first].find("Return").unwrap()..];
+        assert!(
+            row.split('│').next().unwrap().trim_end().ends_with(" r"),
+            "{row}"
+        );
+        let at = shown[first].find("Return").unwrap();
+        let x = u16::try_from(shown[first][..at].chars().count()).unwrap();
+        assert_eq!(
+            buffer[(x, u16::try_from(first).unwrap())].bg,
+            theme().cursor.bg.unwrap_or_default(),
+            "the first is picked"
+        );
+    }
+
+    #[test]
+    fn a_long_query_keeps_its_end_and_the_cursor_inside_the_palette_which_holds_still() {
+        let mut app = on("4");
+        app.open_palette();
+        let top = |app: &App| {
+            lines(&drawn(app, 200, 50))
+                .iter()
+                .position(|l| l.contains("┌ Commands "))
+                .unwrap()
+        };
+        let empty = top(&app);
+        let typed = format!("{}{}", "a".repeat(93), "b".repeat(20));
+        for c in typed.chars() {
+            app.handle_key(ratatui::crossterm::event::KeyEvent::from(
+                ratatui::crossterm::event::KeyCode::Char(c),
+            ));
+        }
+        assert_eq!(top(&app), empty, "the palette holds still as it narrows");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(200, 50)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &app, None, None, None))
+            .unwrap();
+        let cursor = terminal.get_cursor_position().unwrap();
+        let shown = lines(terminal.backend().buffer());
+        let row = &shown[usize::from(cursor.y)];
+        let line: String = row.chars().collect();
+        let border = line
+            .char_indices()
+            .filter(|(_, c)| *c == '│')
+            .map(|(i, _)| line[..i].chars().count())
+            .collect::<Vec<_>>();
+        let right = *border
+            .iter()
+            .find(|&&x| x > usize::from(cursor.x))
+            .unwrap_or(&usize::MAX);
+        assert!(
+            usize::from(cursor.x) < right,
+            "cursor inside the box: {line}"
+        );
+        assert!(
+            line.contains("bbbb │"),
+            "the end of the query shows: {line}"
+        );
+    }
+
+    #[test]
+    fn the_table_is_not_marked_while_a_form_or_the_palette_has_the_keys() {
+        let mut app = on("4");
+        let table = |app: &App| {
+            let buffer = drawn(app, 200, 50);
+            buffer[(0, 0)].fg
+        };
+        assert_eq!(table(&app), theme().title, "the table has the keys");
+        app.handle_key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Char('N'),
+        ));
+        assert_eq!(table(&app), theme().border, "the form has them");
+        app.prompt = None;
+        app.open_palette();
+        assert_eq!(table(&app), theme().border, "the palette has them");
     }
 }

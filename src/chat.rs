@@ -569,8 +569,13 @@ impl Drop for Chat {
             return;
         };
         if let Ok(group) = libc::pid_t::try_from(child.id()) {
+            // The hangup a closed terminal sends first, which ends an
+            // interactive shell that ignores SIGTERM, then SIGTERM.
             // SAFETY: the child leads its own session and process group.
-            unsafe { libc::kill(-group, libc::SIGTERM) };
+            unsafe {
+                libc::kill(-group, libc::SIGHUP);
+                libc::kill(-group, libc::SIGTERM);
+            }
         }
         thread::spawn(move || child.wait());
     }
@@ -608,10 +613,6 @@ impl Chats {
         self.open.as_mut()
     }
 
-    pub fn is_open(&self) -> bool {
-        self.open.is_some()
-    }
-
     /// Shows the chat running `command`: the one left running for it if
     /// there is one, at once, else a new one. `hints` say how its screen
     /// shows that it takes a message, or has left its agent.
@@ -623,6 +624,15 @@ impl Chats {
         tree: String,
         hints: Option<Screen>,
     ) -> Result<()> {
+        // The chat already open stays as it is: a second client in its place
+        // would end it and lose what it shows.
+        if let Some(open) = self.open.as_mut().filter(|c| c.command == command) {
+            if open.screen().size() != (rows, cols) {
+                open.resize(rows, cols);
+            }
+            open.hints = open.hints.take().or(hints);
+            return Ok(());
+        }
         let mut chat = match self.background.iter().position(|c| c.command == command) {
             Some(index) => {
                 let mut chat = self.background.remove(index);
@@ -635,6 +645,33 @@ impl Chats {
         };
         chat.hints = chat.hints.take().or(hints);
         self.open = Some(chat);
+        Ok(())
+    }
+
+    /// The chat running `command`, on screen or behind it.
+    pub fn running(&self, command: &[String]) -> Option<&Chat> {
+        self.open
+            .iter()
+            .chain(&self.background)
+            .find(|c| c.command == command)
+    }
+
+    /// Starts the chat running `command` behind the screen, where none runs
+    /// yet, so the second window of a double shows it live.
+    pub fn run_behind(
+        &mut self,
+        command: &[String],
+        (rows, cols): (u16, u16),
+        (agent, tree): (String, String),
+        hints: Option<Screen>,
+    ) -> Result<()> {
+        if self.running(command).is_some() {
+            return Ok(());
+        }
+        let mut chat = Chat::open(command, rows, cols, agent, tree)?;
+        chat.hints = hints;
+        self.background.push(chat);
+        self.trim();
         Ok(())
     }
 
@@ -793,9 +830,9 @@ impl Chats {
 
     /// Ends the background chats whose agent is gone, except one still
     /// delivering a message: attaching to a stopped agent starts it again.
-    pub fn retain(&mut self, is_live: impl Fn(&[String]) -> bool) {
+    pub fn retain(&mut self, is_live: impl Fn(&Chat) -> bool) {
         self.background
-            .retain(|c| !c.outbox.is_empty() || is_live(&c.command));
+            .retain(|c| !c.outbox.is_empty() || is_live(c));
     }
 
     /// Resizes every chat, so one opened later is already the right size.
@@ -904,6 +941,18 @@ fn encode_mouse(
 /// extended key modes, crossterm reports the byte it sends (0x1c) as Ctrl+4.
 pub fn is_next(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('\\' | '4'))
+}
+
+/// Ctrl+F, which zooms the windows from an agent's chat. A shell keeps it,
+/// as cursor-forward and as vim's and less's page down.
+pub fn is_zoom(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('f' | 'F'))
+}
+
+/// Ctrl+P, which opens the command palette from an agent's chat. A shell
+/// keeps it, as its history's previous line.
+pub fn is_palette(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('p' | 'P'))
 }
 
 /// Ctrl+Q, which leaves the chat. Claude Code binds no Ctrl+Q, and in raw
@@ -1089,6 +1138,72 @@ mod tests {
             assert!(started.elapsed() < Duration::from_secs(15), "no outcome");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// What the open chat shows once it has drawn `wanted`.
+    fn shown(chats: &mut Chats, wanted: &str) -> String {
+        let started = Instant::now();
+        loop {
+            chats.pump();
+            let text = chats.open().unwrap().screen().contents();
+            if text.contains(wanted) {
+                return text;
+            }
+            assert!(started.elapsed() < Duration::from_secs(15), "{text}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn ending_a_chat_ends_a_program_that_ignores_sigterm_as_a_shell_does() {
+        // An interactive shell ignores SIGTERM, as this one is made to, and
+        // ends on the hangup a closed terminal sends.
+        let command = [
+            "sh".to_string(),
+            "-c".to_string(),
+            "trap '' TERM; echo started $$; while :; do sleep 1; done".to_string(),
+        ];
+        let mut chats = Chats::default();
+        chats
+            .show(&command, (24, 80), "shell".into(), "tree".into(), None)
+            .unwrap();
+        let text = shown(&mut chats, "started");
+        let pid: libc::pid_t = text
+            .split_whitespace()
+            .nth(1)
+            .and_then(|p| p.parse().ok())
+            .unwrap();
+        drop(chats);
+        let started = Instant::now();
+        // SAFETY: signal 0 only asks whether the process is there.
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{pid} still runs"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn showing_the_chat_already_open_keeps_it_running_rather_than_starting_another() {
+        // Each start of the chat prints its own process id, so a second
+        // client in its place shows a different one.
+        let command = [
+            "sh".to_string(),
+            "-c".to_string(),
+            "echo started $$; sleep 30".to_string(),
+        ];
+        let mut chats = Chats::default();
+        let show = |chats: &mut Chats| {
+            let who = ("agent".to_string(), "tree".to_string());
+            chats.show(&command, (24, 80), who.0, who.1, None).unwrap();
+        };
+        show(&mut chats);
+        let first = shown(&mut chats, "started");
+        show(&mut chats);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(shown(&mut chats, "started"), first);
     }
 
     #[test]

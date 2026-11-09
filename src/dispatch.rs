@@ -195,6 +195,12 @@ impl Prompt {
         }
     }
 
+    /// It starts a new agent in a tree, as `N` and `n` do, so it goes in
+    /// the window under the table rather than a popup.
+    pub fn starts_agent(&self) -> bool {
+        matches!(self.purpose, Purpose::Start { .. }) || self.target() == Some(Target::NewTree)
+    }
+
     pub fn is_handoff(&self) -> bool {
         matches!(self.purpose, Purpose::Handoff { .. })
     }

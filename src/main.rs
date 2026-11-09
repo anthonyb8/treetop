@@ -70,10 +70,10 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 
 use crate::app::{App, Choice, Opening, Outcome};
-use crate::chat::Chats;
+use crate::chat::{Chat, Chats};
 use crate::dispatch::Recipient;
 use crate::jobs::{Kind, Worker};
 use crate::keeper::Keeper;
@@ -84,6 +84,12 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 const TICK: Duration = Duration::from_millis(100);
 /// The tick while a chat is open, so what is typed echoes without a lag.
 const CHAT_TICK: Duration = Duration::from_millis(16);
+/// How long the cursor rests on a tree before the window under the table
+/// opens its chat, so moving down the list starts no chat on the way.
+const WINDOW_REST: Duration = Duration::from_millis(300);
+/// How long before the second window of a double tries again to start a
+/// chat that would not start.
+const OTHER_RETRY: Duration = Duration::from_secs(5);
 /// How often the screen is drawn when nothing has changed, for the listing's
 /// age in the summary.
 const REDRAW: Duration = Duration::from_secs(1);
@@ -110,15 +116,55 @@ fn leave_screen() -> Result<()> {
     Ok(())
 }
 
-/// The size of the terminal a chat runs in: its popup under the bar, less
-/// its sidebar, on the screen left of the inbox.
+/// The size of the terminal a tree's chat runs in: the window under the
+/// table, under its tab bar. Where the screen is too short for that window,
+/// the size a popup chat gets.
 fn chat_size(term: &Term, app: &App) -> Result<(u16, u16)> {
+    let size = term.size()?;
+    let screen = Rect::new(0, 0, size.width, size.height);
+    Ok(match ui::window_chat_area(app, screen) {
+        Some(area) => (area.height.max(1), area.width.max(1)),
+        None => popup_size(term, app)?,
+    })
+}
+
+/// The size of the terminal a popup chat runs in, the assistant's or a
+/// scratch one: its popup under the bar, less its sidebar, on the screen
+/// left of the inbox.
+fn popup_size(term: &Term, app: &App) -> Result<(u16, u16)> {
     let size = term.size()?;
     let stage = ui::stage(app, Rect::new(0, 0, size.width, size.height));
     Ok(popup::terminal_size(stage.height, stage.width))
 }
 
-/// Opens an agent's chat in a popup over treetop, or says why it could not.
+/// A chat takes the keys: one in a popup, or the window's while it has
+/// them on its chat or shell tab.
+fn chat_has_keys(chats: &Chats, app: &App) -> bool {
+    // The palette takes the keys over any chat while it is open.
+    app.palette.is_none()
+        && chats.open().is_some_and(|chat| {
+            ui::is_popup_chat(chat)
+                || app.has_keys_on(app::WindowTab::Chat)
+                || app.has_keys_on(app::WindowTab::Shell)
+        })
+}
+
+/// The chat open is the one the window's tab shows for its tree: its
+/// agent's on the chat tab, whichever agent, and its shell on the shell tab.
+fn is_window_chat(chat: &Chat, app: &App) -> bool {
+    let is_here = app.window_tree().map(|t| t.name.as_str()) == Some(chat.tree.as_str());
+    let is_shell = chat.agent == app::SHELL;
+    is_here
+        && match app.shown_tab() {
+            app::WindowTab::Chat => !is_shell,
+            app::WindowTab::Shell => is_shell,
+            _ => false,
+        }
+}
+
+/// Opens an agent's chat with the keys: a tree's in the window under the
+/// table, its tree under the cursor, and the assistant's or a scratch one
+/// in a popup over treetop. Says why where it could not.
 fn open_chat(
     term: &Term,
     app: &mut App,
@@ -127,7 +173,22 @@ fn open_chat(
     agent: String,
     tree: String,
 ) -> Result<()> {
-    let size = chat_size(term, app)?;
+    let is_popup = ui::is_popup(&agent, &tree);
+    if !is_popup {
+        app.select_tree(&tree);
+        app.tab = app::WindowTab::Chat;
+        if app.window_tree().map(|t| t.name.as_str()) != Some(tree.as_str()) {
+            app.message = Some(format!(
+                "tree {tree} is out of the list; open its group or clear the filter to see its chat"
+            ));
+            return Ok(());
+        }
+    }
+    let size = if is_popup {
+        popup_size(term, app)?
+    } else {
+        chat_size(term, app)?
+    };
     let hints = app
         .trees
         .iter()
@@ -135,18 +196,47 @@ fn open_chat(
         .find(|a| a.attach.as_deref() == Some(command))
         .and_then(|a| a.plugin.as_deref())
         .and_then(plugin::screen_of);
+    if chats.open().is_some_and(|open| open.command() != command) {
+        chats.hide();
+    }
     match chats.show(command, size, agent, tree, hints) {
-        // The mouse is captured only while a chat is open, so the wheel
+        // The mouse is captured while a chat has the keys, so the wheel
         // scrolls it; on the list, the terminal keeps the mouse to itself.
-        Ok(()) => execute!(io::stdout(), EnableMouseCapture)?,
+        Ok(()) => {
+            app.is_window_focused = !is_popup;
+            execute!(io::stdout(), EnableMouseCapture)?;
+        }
         Err(err) => app.message = Some(format!("{err:#}")),
     }
     Ok(())
 }
 
-/// Gives the mouse back to the terminal once no chat is on screen.
+/// Shows the chat of the tree under the cursor in the window under the
+/// table, without the keys, once the cursor has rested on it.
+fn show_in_window(
+    term: &Term,
+    app: &App,
+    chats: &mut Chats,
+    (command, agent, tree): (Vec<String>, String, String),
+) -> Result<()> {
+    let size = chat_size(term, app)?;
+    let hints = app.window_plugin().and_then(plugin::screen_of);
+    // A chat that cannot open says so in the window, as an opening note
+    // that stays; the next cursor move tries another.
+    let _ = chats.show(&command, size, agent, tree, hints);
+    Ok(())
+}
+
+/// Gives the mouse back to the terminal once no chat has the keys.
 fn chat_closed(app: &mut App, agent: &str, tree: &str) -> Result<()> {
     app.message = Some(format!("back from {agent} in tree {tree}"));
+    leave_window(app)
+}
+
+/// The window's chat gives the keys back to the table and keeps running
+/// on screen.
+fn leave_window(app: &mut App) -> Result<()> {
+    app.is_window_focused = false;
     execute!(io::stdout(), DisableMouseCapture)?;
     Ok(())
 }
@@ -274,8 +364,15 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
     // Whether the mouse is captured for an open issue or the inbox, apart
     // from a chat's.
     let mut is_issue_mouse = false;
-    // The size the chats' terminals were last given.
-    let mut chat_sized: Option<(u16, u16)> = None;
+    // The sizes the chats' terminals were last given: the window's, and the
+    // popup's for the one open in a popup.
+    let mut chat_sized: Option<((u16, u16), (u16, u16))> = None;
+    // The tree and tab the window under the table shows, and since when:
+    // its chat, diff or PR opens once the cursor has rested there for
+    // WINDOW_REST.
+    let mut window_wants: (Option<(PathBuf, app::WindowTab)>, Instant) = (None, Instant::now());
+    // The second window's chat last started behind the screen, and when.
+    let mut other_tried: (Option<Vec<String>>, Instant) = (None, Instant::now());
     // A scratch chat starting, and those being deleted, off this thread.
     let mut starting_scratch: Option<mpsc::Receiver<Result<scratch::Scratch, String>>> = None;
     let mut removing_scratch: Vec<mpsc::Receiver<Result<String, String>>> = Vec::new();
@@ -339,7 +436,11 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                         .flatten()
                         .filter_map(|a| a.attach.as_ref())
                         .collect();
-                    chats.retain(|command| live.iter().any(|c| c.as_slice() == command));
+                    // A shell is no agent's, so it stays while its tree does.
+                    chats.retain(|chat| {
+                        live.iter().any(|c| c.as_slice() == chat.command())
+                            || chat.agent == app::SHELL && app.keeps_shell(&chat.tree)
+                    });
                     keeper.keep(app.kept());
                 }
             }
@@ -348,6 +449,7 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             is_stale = true;
             match event {
                 jobs::Event::Started(job) => app.job_started(&job),
+                jobs::Event::Step { key, step } => app.job_step(key, step),
                 jobs::Event::Finished { job, is_ok, output } => {
                     let is_preview = job.kind == Kind::Preview;
                     if job.kind == Kind::Ship {
@@ -383,7 +485,7 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
         }
         // A handoff is read once its agent has written it and stopped, and
         // taken out of the tree, so the new agent never finds it there.
-        if !chats.is_open()
+        if !chat_has_keys(&chats, app)
             && let Some(file) = app.wanted_handoff()
             && let Ok(text) = std::fs::read_to_string(&file)
         {
@@ -459,7 +561,7 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
         // the list does while the inbox is beside it, for clicks on its
         // entries; a chat captures it on its own, and gives it back when it
         // closes.
-        if chats.is_open() {
+        if chat_has_keys(&chats, app) {
             is_issue_mouse = false;
         } else {
             let wants = if app.is_issues {
@@ -564,7 +666,7 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             Err(mpsc::TryRecvError::Empty) => true,
             Err(mpsc::TryRecvError::Disconnected) => false,
         });
-        if !chats.is_open()
+        if !chat_has_keys(&chats, app)
             && let Some(Outcome::Chat {
                 command,
                 agent,
@@ -576,7 +678,7 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
         }
         // An inbox entry from another workspace opens its agent here once
         // the pool is read, before any ask takes the screen.
-        if !chats.is_open() {
+        if !chat_has_keys(&chats, app) {
             match app.arrival() {
                 Some(Outcome::Chat {
                     command,
@@ -604,8 +706,8 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
         // An agent asking you something gets its chat opened once nothing
         // else is on screen, the next as the last one closes.
         match chats.open() {
-            Some(open) => app.saw_chat(open.command()),
-            None => {
+            Some(open) if chat_has_keys(&chats, app) => app.saw_chat(open.command()),
+            _ => {
                 if let Some(Outcome::Chat {
                     command,
                     agent,
@@ -615,6 +717,63 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                     open_chat(term, app, &mut chats, &command, agent, tree)?;
                     is_stale = true;
                 }
+            }
+        }
+        // The window under the table follows the cursor: the chat of the
+        // tree under it, once the cursor has rested there, so moving down
+        // the list opens no chat on the way. Ctrl+Q with nothing open there
+        // opens it at once. A chat already open on the window's tree stays,
+        // whichever of its agents it is and however the listing has it, so
+        // one Enter just started is not closed while it comes up.
+        if !chats.open().is_some_and(ui::is_popup_chat) {
+            let here = app.window_tree().map(|t| (t.path.clone(), app.shown_tab()));
+            if here != window_wants.0 {
+                window_wants = (here, Instant::now());
+                // A double is kept as the cursor leaves it, for a restart.
+                if app.other.is_some() {
+                    app.save_layout();
+                }
+            }
+            let is_rested = app.is_window_focused || window_wants.1.elapsed() >= WINDOW_REST;
+            let wanted = app.window_chat();
+            let is_shown_here = chats.open().is_some_and(|c| is_window_chat(c, app));
+            let is_terminal_tab = matches!(
+                app.shown_tab(),
+                app::WindowTab::Chat | app::WindowTab::Shell
+            );
+            if app.is_window_focused && is_terminal_tab && wanted.is_none() && !is_shown_here {
+                leave_window(app)?;
+            }
+            if !is_shown_here {
+                if chats.open().is_some() {
+                    chats.hide();
+                    is_stale = true;
+                }
+                if let Some(wanted) = wanted.filter(|_| is_rested) {
+                    show_in_window(term, app, &mut chats, wanted)?;
+                    is_stale = true;
+                }
+            }
+            if is_rested {
+                app.sync_window();
+            }
+            // The second window of a double shows its chat or shell live,
+            // run behind the one with the keys; one that will not start is
+            // tried again every OTHER_RETRY rather than on every pass.
+            if let Some((command, agent, tree)) = app.other_chat()
+                && chats.running(&command).is_none()
+                && (other_tried.0.as_ref() != Some(&command)
+                    || other_tried.1.elapsed() >= OTHER_RETRY)
+            {
+                let size = chat_size(term, app)?;
+                let hints = app.other_plugin().and_then(plugin::screen_of);
+                if chats
+                    .run_behind(&command, size, (agent, tree), hints)
+                    .is_ok()
+                {
+                    is_stale = true;
+                }
+                other_tried = (Some(command), Instant::now());
             }
         }
         let pumped = chats.pump();
@@ -639,33 +798,101 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             ));
         }
         if let Some((agent, tree)) = pumped.ended {
-            chat_closed(app, &agent, &tree)?;
+            if app.is_window_focused || ui::is_popup(&agent, &tree) {
+                chat_closed(app, &agent, &tree)?;
+            }
             is_stale = true;
         }
+        // A resize, the inbox shown or hidden, or the windows split or
+        // joined, changes the room a chat has, before it is drawn there.
+        let sizes = (chat_size(term, app)?, popup_size(term, app)?);
+        if chat_sized != Some(sizes) {
+            let ((rows, cols), (popup_rows, popup_cols)) = sizes;
+            chats.resize(rows, cols);
+            let size = term.size()?;
+            let screen = Rect::new(0, 0, size.width, size.height);
+            if let Some(open) = chats
+                .open_mut()
+                .filter(|c| ui::floats(app, ui::is_popup_chat(c), screen))
+            {
+                open.resize(popup_rows, popup_cols);
+            }
+            chat_sized = Some(sizes);
+        }
         if is_stale || drawn_at.elapsed() >= REDRAW {
-            app.screen_height = term.size()?.height;
-            term.draw(|frame| ui::draw(frame, app, chats.open(), issues.as_ref()))?;
+            let size = term.size()?;
+            app.window_rows = ui::window_chat_area(app, Rect::new(0, 0, size.width, size.height))
+                .map_or(0, |area| area.height);
+            let other = app
+                .other_chat()
+                .and_then(|(command, ..)| chats.running(&command));
+            term.draw(|frame| ui::draw(frame, app, chats.open(), other, issues.as_ref()))?;
             is_stale = false;
             drawn_at = Instant::now();
         }
-        if !event::poll(if chats.is_open() { CHAT_TICK } else { TICK })? {
+        if !event::poll(if chat_has_keys(&chats, app) {
+            CHAT_TICK
+        } else {
+            TICK
+        })? {
             continue;
         }
         // A key or a resize: either way the screen is drawn again.
         is_stale = true;
         let event = event::read()?;
-        // A resize, or the inbox shown or hidden, changes the room a chat
-        // has beside it.
-        let size = chat_size(term, app)?;
-        if chat_sized != Some(size) {
-            chats.resize(size.0, size.1);
-            chat_sized = Some(size);
+        // Over the window's chat while the table has the keys, the wheel
+        // scrolls it and a click gives it the keys.
+        if let &Event::Mouse(mouse) = &event
+            && !chat_has_keys(&chats, app)
+            && let Some(open) = chats.open_mut()
+        {
+            let size = term.size()?;
+            let area = ui::window_chat_area(app, Rect::new(0, 0, size.width, size.height));
+            if let Some(area) = area.filter(|a| a.contains(Position::new(mouse.column, mouse.row)))
+            {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                        open.send_mouse(mouse, area);
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        app.is_window_focused = true;
+                        execute!(io::stdout(), EnableMouseCapture)?;
+                    }
+                    _ => {}
+                }
+                continue;
+            }
         }
-        if let Some(open) = chats.open_mut() {
+        if chat_has_keys(&chats, app)
+            && let Some(open) = chats.open_mut()
+        {
+            let size = term.size()?;
+            let is_popup = ui::floats(
+                app,
+                ui::is_popup_chat(open),
+                Rect::new(0, 0, size.width, size.height),
+            );
             let mut is_inbox_click = false;
             match &event {
                 &Event::Key(key) if key.kind != KeyEventKind::Release => {
-                    if chat::is_exit(key) {
+                    // Ctrl+F zooms the windows from an agent's chat; a shell
+                    // keeps it, as cursor-forward and page down.
+                    // From a tree's chat only: the assistant's and a scratch
+                    // chat's popups belong to no tree, and would cover a
+                    // command's dialog.
+                    if chat::is_palette(key) && !is_popup && open.agent != app::SHELL {
+                        app.open_palette();
+                    } else if chat::is_zoom(key)
+                        && !ui::is_popup_chat(open)
+                        && open.agent != app::SHELL
+                    {
+                        app.toggle_zoom(app::Zoom::Windows);
+                    } else if chat::is_exit(key) && !ui::is_popup_chat(open) {
+                        app.cycle_keys();
+                        if !app.is_window_focused {
+                            leave_window(app)?;
+                        }
+                    } else if chat::is_exit(key) {
                         let (agent, tree) = (open.agent.clone(), open.tree.clone());
                         chats.hide();
                         chat_closed(app, &agent, &tree)?;
@@ -691,14 +918,29 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                     // A click on the inbox beside the chat leaves the chat
                     // for the entry clicked, which the list's own click
                     // below opens.
-                    is_inbox_click = mouse.kind == MouseEventKind::Down(MouseButton::Left)
-                        && ui::is_on_inbox(app, screen, mouse);
-                    if is_inbox_click {
+                    let area = if is_popup {
+                        Some(popup::chat(ui::stage(app, screen)))
+                    } else {
+                        ui::window_chat_area(app, screen)
+                    };
+                    let is_click = mouse.kind == MouseEventKind::Down(MouseButton::Left);
+                    let is_over =
+                        area.is_some_and(|a| a.contains(Position::new(mouse.column, mouse.row)));
+                    if is_popup {
+                        is_inbox_click = is_click && ui::is_on_inbox(app, screen, mouse);
+                    } else {
+                        // A click outside the window gives the table the
+                        // keys, and lands there as a click on the list.
+                        is_inbox_click = is_click && !is_over;
+                    }
+                    if is_inbox_click && is_popup {
                         let (agent, tree) = (open.agent.clone(), open.tree.clone());
                         chats.hide();
                         chat_closed(app, &agent, &tree)?;
-                    } else {
-                        open.send_mouse(mouse, popup::chat(ui::stage(app, screen)));
+                    } else if is_inbox_click {
+                        leave_window(app)?;
+                    } else if let Some(area) = area {
+                        open.send_mouse(mouse, area);
                     }
                 }
                 _ => {}
@@ -781,6 +1023,10 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                 app.opening = Some(Opening {
                     agent: "a scratch chat".into(),
                     tree: app::SCRATCH.into(),
+                    key: None,
+                    failed: None,
+                    leases: false,
+                    side: None,
                 });
                 let (done, result) = mpsc::channel();
                 std::thread::spawn(move || {
@@ -920,6 +1166,9 @@ fn show(
         app.scratch_root = scratch::root();
         if let Some(file) = state::asked_file(&checkout) {
             app.keep_asked_in(file);
+        }
+        if let Some(file) = state::layout_file(&checkout) {
+            app.keep_layout_in(file);
         }
         if let Some(file) = inbox::file() {
             app.keep_inbox_in(file);

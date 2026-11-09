@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::Rect;
 
 use crate::agents::{Agent, Status};
 use crate::assistant;
@@ -119,6 +118,107 @@ pub struct Choice {
 pub struct Picker {
     pub choices: Vec<Choice>,
     pub selected: usize,
+}
+
+/// The command palette Ctrl+P opens: what has been typed to narrow it,
+/// and the command picked.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Palette {
+    pub query: String,
+    pub selected: usize,
+}
+
+/// A command the palette offers: what it says it does, the key that does
+/// the same, and what running it presses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Command {
+    pub label: String,
+    pub key: String,
+    run: Run,
+}
+
+/// What running a command does: presses its key on the table, or puts the
+/// cursor on a tree and opens it, as Enter there does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Run {
+    Key(KeyEvent),
+    Open(String),
+}
+
+/// The commands on the tree under the cursor, `{}` its name, each with the
+/// key that does it.
+const TREE_COMMANDS: [(&str, char); 20] = [
+    ("Return tree {} to the pool", 'r'),
+    ("New agent in tree {}", 'n'),
+    ("Write to tree {}'s agent", 'm'),
+    ("Show the diff of tree {}", 'd'),
+    ("Show the PR of tree {}", 'v'),
+    ("Open tree {}'s PR on GitHub", 'O'),
+    ("Send tree {}'s failure to its agent", 'f'),
+    ("Start a ship run of tree {}", 's'),
+    ("Resume tree {}'s agent", 'R'),
+    ("Hand tree {}'s work to a new agent", 'h'),
+    ("Go to tree {} itself", 't'),
+    ("Rename the branch of tree {}", 'b'),
+    ("Park tree {}", 'z'),
+    ("Put tree {} on the Backburner", 'x'),
+    ("Mark tree {}", ' '),
+    ("Open tree {}'s port in the browser", 'o'),
+    ("Share tree {}'s port with the phone", 'p'),
+    ("Put tree {}'s port on the internet", 'P'),
+    ("Open tree {}'s issue", 'i'),
+    ("Choose the issue tree {} works on", 'I'),
+];
+
+/// The commands on the pool, each with the key that does it, `^` for one
+/// with Ctrl.
+const POOL_COMMANDS: [(&str, &str); 13] = [
+    ("New agent in a fresh tree", "N"),
+    ("Ask the assistant", ":"),
+    ("Open the assistant's chat", "a"),
+    ("Issues", "Tab"),
+    ("Switch workspace", "w"),
+    ("Scratch chats", "C"),
+    ("Filter the trees", "/"),
+    ("Open the inbox", "e"),
+    ("Hide or show the inbox", "E"),
+    ("Two windows, or one", "^\\"),
+    ("Zoom the table or the windows", "^F"),
+    ("Every key", "?"),
+    ("Quit", "q"),
+];
+
+/// The key event a command's key stands for.
+fn key_event(key: &str) -> KeyEvent {
+    match key {
+        "Tab" => KeyEvent::from(KeyCode::Tab),
+        _ => match key.strip_prefix('^').and_then(|rest| rest.chars().next()) {
+            Some(c) => KeyEvent::new(KeyCode::Char(c.to_ascii_lowercase()), KeyModifiers::CONTROL),
+            None => KeyEvent::from(KeyCode::Char(key.chars().next().unwrap_or(' '))),
+        },
+    }
+}
+
+/// How well `label` answers `query`: every word typed is in it, scored by
+/// where the first one falls, at its start, at a word's start, or within.
+/// None where a word is missing.
+fn rank(label: &str, query: &str) -> Option<u8> {
+    let label = label.to_lowercase();
+    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    let first = words.first()?;
+    if !words.iter().all(|word| label.contains(word.as_str())) {
+        return None;
+    }
+    Some(if label.starts_with(first.as_str()) {
+        0
+    } else if label
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|word| word.starts_with(first.as_str()))
+    {
+        1
+    } else {
+        2
+    })
 }
 
 /// The ports of a tree serving several, for `o` or `p` to choose from.
@@ -256,6 +356,55 @@ pub struct LogEntry {
     pub output: String,
 }
 
+/// What the window under the table shows of its tree, in the order its
+/// tab bar has them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum WindowTab {
+    /// Its agent's chat, live.
+    #[default]
+    Chat,
+    /// Its diff against its base, as `d` shows it.
+    Diff,
+    /// Its PR: checks, review threads and CodeRabbit, as `v` shows it.
+    Pr,
+    /// The steps of the keel run that holds it.
+    Run,
+    /// A shell in it, live.
+    Shell,
+    /// Where it is, its agents, ports and processes, and what its agent
+    /// last said: the detail the pane under the list used to hold.
+    Info,
+}
+
+/// What Ctrl+F zooms: the table over the whole screen, as treetop was
+/// before the windows, or the windows, the table folded to their trees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Zoom {
+    Table,
+    Windows,
+}
+
+/// What a shell in the window under the table names as its agent.
+pub const SHELL: &str = "shell";
+
+/// The second window of a double: the tree it keeps showing, and its tab,
+/// while the cursor drives the other. Kept per workspace, so a restart
+/// opens the double as it was left.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OtherWindow {
+    pub path: PathBuf,
+    pub tab: WindowTab,
+}
+
+/// A double as it is kept between runs: the second window, the window the
+/// cursor drove and the side it was on.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct KeptLayout {
+    other: Option<OtherWindow>,
+    cursor: Option<OtherWindow>,
+    side: usize,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
     Continue,
@@ -372,8 +521,6 @@ pub struct App {
     /// latest of the tree under the cursor.
     pub log: Vec<LogEntry>,
     pub view: Option<DiffView>,
-    /// The terminal's height, for paging the diff popup.
-    pub screen_height: u16,
     pub diffs: HashMap<PathBuf, LoadedDiff>,
     /// Diffs asked for and not yet loaded, with the counts they were asked at.
     diff_requests: HashMap<PathBuf, Option<Work>>,
@@ -402,9 +549,16 @@ pub struct App {
     /// prints the id `claude attach` takes, so there is no waiting for the
     /// agent to be seen in its tree.
     started_chat: Option<Outcome>,
-    /// A chat on its way: its popup stands in from the moment the box is
-    /// sent until the chat itself opens in the same frame.
+    /// A chat on its way: its popup, or the window under the table for a
+    /// tree's agent, stands in from the moment the box is sent until the
+    /// chat itself opens in the same place.
     pub opening: Option<Opening>,
+    /// The steps each start has finished so far, by its row, as the worker
+    /// says them.
+    pub steps: HashMap<PathBuf, Vec<&'static str>>,
+    /// Since when a started agent's chat has waited for its new tree to be
+    /// listed.
+    started_at: Option<Instant>,
     /// The main checkout of the pool on screen, the workspace.
     pub checkout: PathBuf,
     /// The workspace picker, while it is open.
@@ -495,6 +649,28 @@ pub struct App {
     inbox_file: Option<PathBuf>,
     /// The inbox has the keys, with its cursor on this entry.
     pub rail: Option<usize>,
+    /// The tab the window under the table shows.
+    pub tab: WindowTab,
+    /// The window under the table has the keys: its chat takes them, and
+    /// Ctrl+Q gives them back to the table.
+    pub is_window_focused: bool,
+    /// Rows inside the window under the table, under its tab bar, as last
+    /// drawn: what a page of its diff scrolls by.
+    pub window_rows: u16,
+    /// The second window, in a double; None shows one window.
+    pub other: Option<OtherWindow>,
+    /// What Ctrl+F zoomed, while it is zoomed.
+    pub zoom: Option<Zoom>,
+    /// The command palette, while Ctrl+P has it open.
+    pub palette: Option<Palette>,
+    /// In a double, the side of the window the cursor drives, the one that
+    /// last had the keys: 0 on the left, 1 on the right.
+    pub side: usize,
+    /// Where the double is kept. None keeps it in memory only.
+    layout_file: Option<PathBuf>,
+    /// The window the cursor drove when the double was kept, put back once
+    /// its tree is listed.
+    returning: Option<OtherWindow>,
     /// The tree whose agent opens once this workspace's agents are read:
     /// an inbox entry chosen from another workspace.
     pub arriving: Option<(PathBuf, crate::inbox::Kind)>,
@@ -510,6 +686,18 @@ pub struct Opening {
     pub agent: String,
     /// The tree's name, `new` until a new tree is leased.
     pub tree: String,
+    /// The row of the start a tree's agent comes from, whose steps the
+    /// window under the table shows as they end; None for the assistant's
+    /// and a scratch chat, which open in a popup.
+    pub key: Option<PathBuf>,
+    /// Why its start failed, shown in the window until Esc.
+    pub failed: Option<String>,
+    /// Its start leases a tree, a fresh one or a free one, so it goes
+    /// through every step; one in a tree already held only starts the agent.
+    pub leases: bool,
+    /// In a double, the side of the window it was asked from, which it
+    /// stays in wherever the keys go; None with one window.
+    pub side: Option<usize>,
 }
 
 /// A tree an agent was just started in, and the agents already there, so
@@ -911,6 +1099,453 @@ impl App {
         agents
     }
 
+    /// The tree the window under the table shows: the one under the
+    /// cursor, or the main checkout on its heading.
+    pub fn window_tree(&self) -> Option<&Tree> {
+        self.current().or(self.main_under_cursor())
+    }
+
+    /// The agent the window shows the chat of: the tree's leading agent
+    /// that offers one, as Enter opens it.
+    pub fn window_agent(&self) -> Option<&Agent> {
+        Self::chat_agent(self.window_tree()?)
+    }
+
+    /// The agent a window on `tree` shows the chat of.
+    pub fn chat_agent(tree: &Tree) -> Option<&Agent> {
+        Self::agents_of(tree)
+            .into_iter()
+            .find(|agent| agent.attach.is_some())
+    }
+
+    /// The tabs the window has for its tree.
+    pub fn window_tabs(&self) -> Vec<WindowTab> {
+        match self.window_tree() {
+            Some(tree) => self.tabs_of(tree),
+            None => vec![WindowTab::Info],
+        }
+    }
+
+    /// The tabs a window on `tree` has: the chat where an agent offers one,
+    /// the diff and PR of a held tree, the run while keel has one holding
+    /// it, a shell in a held tree, and its info.
+    pub fn tabs_of(&self, tree: &Tree) -> Vec<WindowTab> {
+        let mut tabs = Vec::new();
+        if Self::chat_agent(tree).is_some() {
+            tabs.push(WindowTab::Chat);
+        }
+        // The main checkout's heading stands for it, and `d` and `v` work
+        // only on a tree's own row.
+        if tree.is_held() && !tree.is_main {
+            tabs.extend([WindowTab::Diff, WindowTab::Pr]);
+        }
+        if crate::keel::holding(&self.runs, &tree.path).is_some() {
+            tabs.push(WindowTab::Run);
+        }
+        // A shell is kept running only while its tree is held.
+        if self.keeps_shell(&tree.name) {
+            tabs.push(WindowTab::Shell);
+        }
+        tabs.push(WindowTab::Info);
+        tabs
+    }
+
+    /// The tab the window shows: the one picked where its tree has it,
+    /// else its info.
+    pub fn shown_tab(&self) -> WindowTab {
+        if self.window_tabs().contains(&self.tab) {
+            self.tab
+        } else {
+            WindowTab::Info
+        }
+    }
+
+    /// The second window of a double, its tree and the tab it shows; None
+    /// while there is no double, or its tree has left the pool.
+    pub fn other_window(&self) -> Option<(&Tree, WindowTab)> {
+        let other = self.other.as_ref()?;
+        let tree = self.trees.iter().find(|t| t.path == other.path)?;
+        let tab = if self.tabs_of(tree).contains(&other.tab) {
+            other.tab
+        } else {
+            WindowTab::Info
+        };
+        Some((tree, tab))
+    }
+
+    /// The terminal the second window shows, kept running behind the one
+    /// with the keys: as `window_chat` has it for the cursor's window.
+    pub fn other_chat(&self) -> Option<(Vec<String>, String, String)> {
+        let (tree, tab) = self.other_window()?;
+        Self::terminal_of(tree, tab)
+    }
+
+    /// The plugin whose screen hints the second window's terminal is read
+    /// by, as `window_plugin` has it.
+    pub fn other_plugin(&self) -> Option<&str> {
+        match self.other_window()? {
+            (tree, WindowTab::Chat) => Self::chat_agent(tree)?.plugin.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Ctrl+P: opens the command palette.
+    pub fn open_palette(&mut self) {
+        self.palette = Some(Palette::default());
+    }
+
+    /// The commands the palette offers for what has been typed: the tree
+    /// under the cursor's first, then the pool's, then, once something is
+    /// typed, each tree to open; the best answers to it first.
+    pub fn commands(&self) -> Vec<Command> {
+        let query = self.palette.as_ref().map_or("", |p| p.query.as_str());
+        let mut all = Vec::new();
+        if let Some(tree) = self.current() {
+            for (label, key) in TREE_COMMANDS {
+                all.push(Command {
+                    label: label.replace("{}", &tree.name),
+                    key: if key == ' ' {
+                        "Space".to_string()
+                    } else {
+                        key.to_string()
+                    },
+                    run: Run::Key(KeyEvent::from(KeyCode::Char(key))),
+                });
+            }
+        }
+        for (label, key) in POOL_COMMANDS {
+            all.push(Command {
+                label: label.to_string(),
+                key: key.to_string(),
+                run: Run::Key(key_event(key)),
+            });
+        }
+        if !query.trim().is_empty() {
+            // Every tree, those a filter or a folded group keeps out of the
+            // list too: opening one brings it back into it.
+            for tree in self.trees.iter().filter(|t| !t.is_main) {
+                let branch = tree.branch.as_deref().unwrap_or("(detached)");
+                all.push(Command {
+                    label: format!("Open tree {} · {branch}", tree.name),
+                    key: String::new(),
+                    run: Run::Open(tree.name.clone()),
+                });
+            }
+            let mut ranked: Vec<(u8, Command)> = all
+                .into_iter()
+                .filter_map(|command| Some((rank(&command.label, query)?, command)))
+                .collect();
+            // A tree whose number is what was typed comes before any other.
+            let exact = |command: &Command| command.run == Run::Open(query.trim().to_string());
+            ranked.sort_by_key(|(score, command)| (!exact(command), *score));
+            return ranked.into_iter().map(|(_, command)| command).collect();
+        }
+        all
+    }
+
+    /// The keys while the palette is open: type to narrow it, Up and Down
+    /// to pick, Enter to run the command picked, Esc to close it.
+    fn handle_palette_key(&mut self, key: KeyEvent) -> Outcome {
+        let count = self.commands().len();
+        let Some(palette) = self.palette.as_mut() else {
+            return Outcome::Continue;
+        };
+        match key.code {
+            KeyCode::Esc => self.palette = None,
+            KeyCode::Down => palette.selected = (palette.selected + 1).min(count.saturating_sub(1)),
+            KeyCode::Up => palette.selected = palette.selected.saturating_sub(1),
+            KeyCode::Backspace => {
+                palette.query.pop();
+                palette.selected = 0;
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                palette.query.push(c);
+                palette.selected = 0;
+            }
+            KeyCode::Enter => {
+                let selected = palette.selected;
+                let picked = self.commands().into_iter().nth(selected);
+                self.palette = None;
+                if let Some(command) = picked {
+                    // A command runs as its key does on the table.
+                    self.is_window_focused = false;
+                    return match command.run {
+                        Run::Key(key) => self.handle_key(key),
+                        Run::Open(name) => {
+                            let path = self
+                                .trees
+                                .iter()
+                                .find(|t| t.name == name)
+                                .map(|t| t.path.clone());
+                            if let Some(path) = path {
+                                self.reveal(path);
+                            }
+                            self.handle_key(KeyEvent::from(KeyCode::Enter))
+                        }
+                    };
+                }
+            }
+            _ => {}
+        }
+        Outcome::Continue
+    }
+
+    /// Ctrl+F: zooms `what`, the table from the table and the windows from
+    /// a window with the keys, or zooms back out.
+    pub fn toggle_zoom(&mut self, what: Zoom) {
+        self.zoom = match self.zoom {
+            Some(_) => None,
+            None => Some(what),
+        };
+    }
+
+    /// Ctrl+\: two windows, the one the cursor drives on the right and the
+    /// tree it was on kept on the left, with the cursor moved to the next
+    /// tree down; or back to one, keeping the window that had the keys.
+    pub fn toggle_double(&mut self) {
+        // A double whose other tree has left the pool counts as none, so
+        // this opens a new one rather than only forgetting it.
+        let was_double = self.other_window().is_some();
+        self.other = None;
+        self.side = 0;
+        if was_double {
+            // Alone, a window keeps the keys only where it takes typing,
+            // as Ctrl+Q gives them to one window.
+            if !matches!(
+                self.shown_tab(),
+                WindowTab::Chat | WindowTab::Shell | WindowTab::Diff | WindowTab::Pr
+            ) {
+                self.is_window_focused = false;
+            }
+            self.save_layout();
+            return;
+        }
+        let Some(tree) = self.window_tree() else {
+            return;
+        };
+        let (path, tab) = (tree.path.clone(), self.tab);
+        let rows = self.rows();
+        let next = (self.selected + 1..rows.len())
+            .chain((0..self.selected).rev())
+            .find(|&at| matches!(rows[at], ListRow::Tree(_)));
+        let Some(at) = next else {
+            self.message = Some("one tree in the list: nothing to put beside it".into());
+            self.save_layout();
+            return;
+        };
+        self.other = Some(OtherWindow { path, tab });
+        self.side = 1;
+        self.selected = at;
+        self.save_layout();
+    }
+
+    /// The window on `side` takes the keys: where the cursor drives the
+    /// other one, the two change places, so the cursor drives this one and
+    /// the tree it was on stays in the other.
+    pub fn focus_side(&mut self, side: usize) {
+        if side != self.side
+            && let Some(other) = self.other.clone()
+            && let Some(name) = self
+                .trees
+                .iter()
+                .find(|t| t.path == other.path)
+                .map(|t| t.name.clone())
+            && let Some(here) = self.window_tree().map(|t| t.path.clone())
+        {
+            let tab = self.tab;
+            self.select_tree(&name);
+            // A filter or a folded group hides its tree from the cursor:
+            // the windows stay as they are rather than both show this one.
+            if self.window_tree().is_none_or(|t| t.path != other.path) {
+                self.message = Some(format!(
+                    "tree {name} is out of the list; clear the filter or open its group to give it the keys"
+                ));
+                return;
+            }
+            self.other = Some(OtherWindow { path: here, tab });
+            self.tab = other.tab;
+            self.side = side;
+            self.save_layout();
+        }
+        self.is_window_focused = true;
+        self.sync_window();
+    }
+
+    /// Ctrl+Q: with one window, gives it the keys where it has something to
+    /// take them, else gives them back to the table; with two, moves them
+    /// on round the table, the left window and the right one.
+    pub fn cycle_keys(&mut self) {
+        if self.other_window().is_some() {
+            match (self.is_window_focused, self.side) {
+                (false, _) => self.focus_side(0),
+                (true, 0) => self.focus_side(1),
+                (true, _) => self.is_window_focused = false,
+            }
+            return;
+        }
+        if self.is_window_focused {
+            self.is_window_focused = false;
+            return;
+        }
+        let can_take = match self.shown_tab() {
+            WindowTab::Chat | WindowTab::Shell => self.window_chat().is_some(),
+            WindowTab::Diff | WindowTab::Pr => true,
+            WindowTab::Run | WindowTab::Info => false,
+        };
+        if can_take {
+            self.is_window_focused = true;
+            self.sync_window();
+        }
+    }
+
+    /// Keeps the double in `file`, opening it as that file left it.
+    pub fn keep_layout_in(&mut self, file: PathBuf) {
+        let layout = crate::state::read::<KeptLayout>(&file);
+        self.other = layout.other;
+        self.side = layout.side;
+        self.returning = layout.cursor.filter(|_| self.other.is_some());
+        self.layout_file = Some(file);
+    }
+
+    /// Keeps the double as it stands: both windows' trees and tabs, so a
+    /// restart opens it as it was left. main calls it as the cursor moves.
+    pub fn save_layout(&self) {
+        let Some(file) = &self.layout_file else {
+            return;
+        };
+        let cursor = self
+            .other
+            .as_ref()
+            .and(self.window_tree())
+            .map(|tree| OtherWindow {
+                path: tree.path.clone(),
+                tab: self.tab,
+            });
+        let layout = KeptLayout {
+            other: self.other.clone(),
+            cursor,
+            side: self.side,
+        };
+        crate::state::write(file, &layout);
+    }
+
+    /// Puts the cursor back where a double was left, once its tree is
+    /// listed and the agents read have sorted the list, which moves rows
+    /// under the cursor until then.
+    fn return_cursor(&mut self) {
+        let Some(cursor) = self.returning.clone().filter(|_| self.is_agents_read) else {
+            return;
+        };
+        let Some(name) = self
+            .trees
+            .iter()
+            .find(|t| t.path == cursor.path)
+            .map(|t| t.name.clone())
+        else {
+            return;
+        };
+        self.select_tree(&name);
+        self.tab = cursor.tab;
+        self.returning = None;
+    }
+
+    /// A shell left running in tree `name` stays while the tree is held,
+    /// and ends once it is returned or destroyed.
+    pub fn keeps_shell(&self, name: &str) -> bool {
+        self.trees.iter().any(|t| t.name == name && t.is_held())
+    }
+
+    /// The plugin whose screen hints the window's terminal is read by: the
+    /// window agent's on the chat tab, and none for a shell.
+    pub fn window_plugin(&self) -> Option<&str> {
+        match self.shown_tab() {
+            WindowTab::Chat => self.window_agent()?.plugin.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// The window has the keys on `tab`.
+    pub fn has_keys_on(&self, tab: WindowTab) -> bool {
+        self.is_window_focused && self.shown_tab() == tab
+    }
+
+    /// The terminal the window shows on its chat or shell tab, as its
+    /// command, its agent and its tree: the window agent's chat while it
+    /// runs, or a shell in the tree. A cold agent is left closed, since
+    /// attaching to it would start it again; Enter does that on purpose.
+    pub fn window_chat(&self) -> Option<(Vec<String>, String, String)> {
+        Self::terminal_of(self.window_tree()?, self.shown_tab())
+    }
+
+    /// The terminal a window on `tree` shows on `tab`, as `window_chat`
+    /// has it.
+    fn terminal_of(tree: &Tree, tab: WindowTab) -> Option<(Vec<String>, String, String)> {
+        match tab {
+            WindowTab::Chat => {
+                let agent = Self::chat_agent(tree)?;
+                if agent.status == Some(Status::Cold) {
+                    return None;
+                }
+                Some((agent.attach.clone()?, agent.name.clone(), tree.name.clone()))
+            }
+            WindowTab::Shell => {
+                let dir = tree.path.display().to_string().replace('\'', "'\\''");
+                let command = format!("cd '{dir}' && exec \"${{SHELL:-sh}}\"");
+                Some((
+                    vec!["sh".into(), "-c".into(), command],
+                    SHELL.into(),
+                    tree.name.clone(),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// Opens what the window's tab shows for the tree under the cursor, once
+    /// the cursor has rested there: its diff, or its PR as last read, read
+    /// now where it never has been. `v` reads it afresh.
+    pub fn sync_window(&mut self) {
+        let Some(tree) = self.window_tree() else {
+            return;
+        };
+        let path = tree.path.clone();
+        match self.shown_tab() {
+            WindowTab::Diff if self.view.as_ref().is_none_or(|v| v.path != path) => {
+                self.open_diff();
+            }
+            WindowTab::Pr if self.pr_popup.as_ref().is_none_or(|p| p.path != path) => {
+                self.pr_popup = Some(PrPopup::new(path.clone()));
+                if !self.prs.contains_key(&path) {
+                    self.read_pr(path);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Moves the cursor to tree `name`, so the window shows the chat opened
+    /// on it, unless a filter or a folded group hides it.
+    pub fn select_tree(&mut self, name: &str) {
+        // The main checkout has no row of its own: its base's heading
+        // stands for it.
+        if let Some(main) = self.trees.iter().find(|t| t.name == name && t.is_main) {
+            let branch = main.branch.clone();
+            let heading = self.rows().iter().position(|row| {
+                matches!(row, ListRow::Heading { group: Group::Base(base), .. } if branch.as_ref() == Some(base))
+            });
+            if let Some(at) = heading {
+                self.selected = at;
+            }
+            return;
+        }
+        let path = self
+            .trees
+            .iter()
+            .find(|t| t.name == name)
+            .map(|t| t.path.clone());
+        self.reselect(path);
+    }
+
     /// The tree under the cursor; None on a heading.
     pub fn current(&self) -> Option<&Tree> {
         match self.rows().get(self.selected) {
@@ -992,6 +1627,7 @@ impl App {
         }
         self.is_agents_read = true;
         self.reselect(cursor);
+        self.return_cursor();
     }
 
     /// Keeps the cursor on the same tree, keeps each surviving tree's probed
@@ -1030,6 +1666,26 @@ impl App {
             None => self.selected.min(last),
         };
         self.is_cursor_placed |= has_tree;
+        self.return_cursor();
+    }
+
+    /// The chat on its way is `job`'s: its window's start, or, for a popup
+    /// with no row, the start that opened it; never a scratch chat's.
+    fn owns_opening(&self, job: &Job) -> bool {
+        self.opening.as_ref().is_some_and(|o| match &o.key {
+            Some(key) => *key == job.key,
+            None => o.tree != SCRATCH,
+        })
+    }
+
+    /// A start on row `key` finished `step`.
+    pub fn job_step(&mut self, key: PathBuf, step: &'static str) {
+        self.steps.entry(key).or_default().push(step);
+    }
+
+    /// The start shown in the window under the table, while there is one.
+    pub fn window_start(&self) -> Option<&Opening> {
+        self.opening.as_ref().filter(|o| o.key.is_some())
     }
 
     pub fn job_started(&mut self, job: &Job) {
@@ -1074,7 +1730,16 @@ impl App {
         let is_assistant = job.launch.as_ref().is_some_and(|l| l.is_assistant);
         if !is_ok {
             if job.kind == Kind::Start {
-                self.opening = None;
+                // A start shown in the window stays there, saying which
+                // step failed and why, until Esc.
+                // Another start's window, or a chat on its way for
+                // something else, is left as it is.
+                if self.owns_opening(&job) {
+                    match self.opening.as_mut().filter(|o| o.key.is_some()) {
+                        Some(opening) => opening.failed = Some(last_line(&output).to_string()),
+                        None => self.opening = None,
+                    }
+                }
             }
             self.jobs.insert(path, JobState::Failed(job.kind));
             self.message = Some(format!(
@@ -1083,7 +1748,13 @@ impl App {
                 job.tree.name,
                 last_line(&output)
             ));
-        } else if job.kind == Kind::Start && task.is_some() {
+        } else if job.kind == Kind::Start
+            && task.is_some()
+            && self
+                .opening
+                .as_ref()
+                .is_none_or(|o| o.key.as_ref() != Some(&job.key))
+        {
             self.jobs
                 .insert(path.clone(), JobState::Done(job.kind, Instant::now()));
             self.message = Some(if is_assistant {
@@ -1107,7 +1778,14 @@ impl App {
                 .find(|t| t.path == path)
                 .map(|t| t.agents.iter().map(|a| a.pid).collect())
                 .unwrap_or_default();
-            match (self.opening.as_mut(), job.attach.clone()) {
+            if self.window_start().is_some() {
+                self.message = Some(format!(
+                    "agent started in tree {}; its chat opens here",
+                    job.tree.name
+                ));
+            }
+            let owns = self.owns_opening(&job);
+            match (self.opening.as_mut().filter(|_| owns), job.attach.clone()) {
                 (None, _) => {
                     self.message = Some(if is_assistant {
                         "the assistant started; a opens its chat".to_string()
@@ -1279,6 +1957,38 @@ impl App {
         });
     }
 
+    /// The keys a window takes with nothing open in it to type into: Esc
+    /// or q gives them back to the table, and the arrows step through its
+    /// tabs.
+    fn handle_window_key(&mut self, key: KeyEvent) -> Outcome {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.is_window_focused = false,
+            KeyCode::Left | KeyCode::Right => self.step_tab(key.code == KeyCode::Right),
+            _ => {}
+        }
+        Outcome::Continue
+    }
+
+    /// Steps the window to its next tab, or its last.
+    fn step_tab(&mut self, is_next: bool) {
+        let tabs = self.window_tabs();
+        let at = tabs
+            .iter()
+            .position(|t| *t == self.shown_tab())
+            .unwrap_or(0);
+        let step = if is_next { 1 } else { tabs.len() - 1 };
+        self.tab = tabs[(at + step) % tabs.len()];
+    }
+
+    /// Shows `tab` in the window under the table with the keys, where the
+    /// tree under the cursor has it.
+    fn show_tab(&mut self, tab: WindowTab) {
+        if self.window_tabs().contains(&tab) {
+            self.tab = tab;
+            self.is_window_focused = true;
+        }
+    }
+
     /// Opens the PR popup on the tree under the cursor, reading its PR
     /// afresh: comments and reviews land without a push, so the last read
     /// shows only until this one comes in.
@@ -1356,12 +2066,16 @@ impl App {
             match key.code {
                 KeyCode::Char('c') => return Outcome::Quit,
                 KeyCode::Char('r') => self.read_pr(path),
+                KeyCode::Char('q' | 'Q') => self.cycle_keys(),
+                KeyCode::Char('f' | 'F') => self.toggle_zoom(Zoom::Windows),
+                KeyCode::Char('p' | 'P') => self.open_palette(),
                 _ => {}
             }
             return Outcome::Continue;
         }
+        // Esc gives the keys back to the table; the PR stays in its tab.
         if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
-            self.pr_popup = None;
+            self.is_window_focused = false;
             return Outcome::Continue;
         }
         let pr = self.prs.get(&path).and_then(|r| r.pr.clone()?.ok()?);
@@ -1491,22 +2205,25 @@ impl App {
                 KeyCode::Char('r') => {
                     self.diffs.remove(&path);
                 }
+                KeyCode::Char('q' | 'Q') => self.cycle_keys(),
+                KeyCode::Char('f' | 'F') => self.toggle_zoom(Zoom::Windows),
+                KeyCode::Char('p' | 'P') => self.open_palette(),
                 _ => {}
             }
             return Outcome::Continue;
         }
+        // Esc gives the keys back to the table; the diff stays in its tab.
         if matches!(key.code, KeyCode::Esc | KeyCode::Tab | KeyCode::Char('q')) {
-            self.view = None;
+            self.is_window_focused = false;
             return Outcome::Continue;
         }
         let (len, starts) = match self.diffs.get(&path).map(|d| &d.layout) {
             Some(Ok(layout)) => (layout.rows.len(), layout.file_starts.clone()),
             _ => (0, Vec::new()),
         };
-        // The popup under its bar, less the file header pinned at its top
-        // and the key bar at its bottom.
-        let body = crate::popup::body(Rect::new(0, 0, 80, self.screen_height)).height;
-        let page = isize::try_from(body.saturating_sub(2)).map_or(1, |p| p.max(1));
+        // The window under its title bar, less the file header pinned at
+        // its top and the key bar at its bottom.
+        let page = isize::try_from(self.window_rows.saturating_sub(3)).map_or(1, |p| p.max(1));
         let Some(view) = self.view.as_mut() else {
             return Outcome::Continue;
         };
@@ -1615,9 +2332,21 @@ impl App {
     /// id to attach to, else once it has shown up in its tree with a chat to
     /// open. Gives up after AWAIT_CHAT, saying so.
     pub fn ready_chat(&mut self) -> Option<Outcome> {
+        // A tree's chat opens in the window under the table, on its tree, so
+        // a new tree's waits until the pool lists it, as long as AWAIT_CHAT.
+        if let Some(Outcome::Chat { tree, .. }) = &self.started_chat
+            && self.window_start().is_some()
+            && !self.trees.iter().any(|t| &t.name == tree)
+        {
+            let since = *self.started_at.get_or_insert_with(Instant::now);
+            if since.elapsed() < AWAIT_CHAT {
+                return None;
+            }
+        }
         if let Some(chat) = self.started_chat.take() {
             self.opening = None;
             self.awaiting_chat = None;
+            self.started_at = None;
             return Some(chat);
         }
         let awaiting = self.awaiting_chat.as_ref()?;
@@ -1681,8 +2410,8 @@ impl App {
     /// Nothing else is on screen or being typed: the list alone, where an
     /// ask's chat may open without taking over something under way.
     fn is_free(&self) -> bool {
-        self.view.is_none()
-            && self.pr_popup.is_none()
+        !self.has_keys_on(WindowTab::Diff)
+            && !self.has_keys_on(WindowTab::Pr)
             && self.prompt.is_none()
             && self.picker.is_none()
             && self.port_menu.is_none()
@@ -1784,8 +2513,8 @@ impl App {
     pub fn wants_mouse(&self) -> bool {
         (!self.inbox.is_hidden || self.rail.is_some())
             && !self.is_issues
-            && self.view.is_none()
-            && self.pr_popup.is_none()
+            && !self.has_keys_on(WindowTab::Diff)
+            && !self.has_keys_on(WindowTab::Pr)
             && self.prompt.is_none()
             && self.picker.is_none()
             && self.port_menu.is_none()
@@ -2980,12 +3709,26 @@ impl App {
             return Outcome::Continue;
         }
         // A pick's task comes from its ticket when the job runs, so it is
-        // never an idle start.
-        if launch.task.trim().is_empty() && launch.ticket.is_none() {
+        // never an idle start. A start from the compose box shows in the
+        // window under the table, its steps as they end, and its chat opens
+        // there once it runs; the assistant's opens only when idle, as it
+        // answers in the background.
+        let is_idle = launch.task.trim().is_empty();
+        if launch.ticket.is_none() && (is_idle || !launch.is_assistant) {
             self.opening = Some(Opening {
-                agent: launch.name.clone().unwrap_or_else(|| "new agent".into()),
+                agent: launch
+                    .name
+                    .clone()
+                    .or_else(|| crate::dispatch::session_name(&launch.task))
+                    .unwrap_or_else(|| "new agent".into()),
                 tree: tree.name.clone(),
+                key: (!launch.is_assistant).then(|| tree.path.clone()),
+                failed: None,
+                leases: launch.is_new_tree || !tree.is_held(),
+                side: self.other_window().is_some().then_some(self.side),
             });
+            self.steps.remove(&tree.path);
+            self.started_at = None;
         }
         let job = Job {
             launch: Some(launch),
@@ -3363,10 +4106,14 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Outcome {
-        if self.view.is_some() {
+        // The palette opens over everything, a diff or a PR with the keys too.
+        if self.palette.is_some() {
+            return self.handle_palette_key(key);
+        }
+        if self.view.is_some() && self.has_keys_on(WindowTab::Diff) {
             return self.handle_view_key(key);
         }
-        if self.pr_popup.is_some() {
+        if self.pr_popup.is_some() && self.has_keys_on(WindowTab::Pr) {
             return self.handle_pr_key(key);
         }
         if self.prompt.is_some() {
@@ -3384,7 +4131,18 @@ impl App {
         if self.scratch_menu.is_some() {
             return self.handle_scratch_key(key);
         }
-        if let Some(opening) = self.opening.clone() {
+        // A start shown in the window under the table holds no keys: Esc
+        // hides it, and the start carries on; the rest work as ever, so a
+        // second start can follow the first at once.
+        // Esc hides it from the table; a window with the keys takes its own.
+        if self.window_start().is_some() && key.code == KeyCode::Esc && !self.is_window_focused {
+            self.opening = None;
+            self.awaiting_chat = None;
+            self.started_chat = None;
+            self.started_at = None;
+            return Outcome::Continue;
+        }
+        if let Some(opening) = self.opening.clone().filter(|o| o.key.is_none()) {
             let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             if is_ctrl && key.code == KeyCode::Char('c') {
                 return Outcome::Quit;
@@ -3404,12 +4162,65 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return match key.code {
                 KeyCode::Char('c') => Outcome::Quit,
+                // Ctrl+Q moves the keys on to the window under the table,
+                // or round the two of a double, once nothing else on screen
+                // waits on them.
+                KeyCode::Char('q' | 'Q') => {
+                    let is_free = self.reviews.is_empty()
+                        && self.pending.is_none()
+                        && self.shipping.is_none()
+                        && !self.is_help
+                        && !self.is_filtering
+                        && self.rail.is_none();
+                    // Zoomed to the table there is no window to give the
+                    // keys to, as before treetop had windows.
+                    if is_free && self.zoom != Some(Zoom::Table) {
+                        self.cycle_keys();
+                    }
+                    Outcome::Continue
+                }
+                // Ctrl+P: the command palette, once nothing else on screen
+                // waits on the keys, so no command lands in a dialog.
+                KeyCode::Char('p' | 'P') => {
+                    let is_free = self.reviews.is_empty()
+                        && self.pending.is_none()
+                        && self.shipping.is_none()
+                        && !self.is_help
+                        && !self.is_filtering
+                        && self.rail.is_none();
+                    if is_free {
+                        self.open_palette();
+                    }
+                    Outcome::Continue
+                }
+                // Ctrl+F: the table, or the window with the keys, zoomed.
+                KeyCode::Char('f' | 'F') => {
+                    let what = if self.is_window_focused {
+                        Zoom::Windows
+                    } else {
+                        Zoom::Table
+                    };
+                    self.toggle_zoom(what);
+                    Outcome::Continue
+                }
+                // Ctrl+\: two windows under the table, or one again.
+                // Without the terminal's extended keys it comes as Ctrl+4.
+                KeyCode::Char('\\' | '4') => {
+                    self.toggle_double();
+                    Outcome::Continue
+                }
                 _ => Outcome::Continue,
             };
         }
         if self.is_help {
             self.is_help = false;
             return Outcome::Continue;
+        }
+        // A window with the keys but nothing to type into, its info or run,
+        // or a chat not open yet, keeps them from the table, so typing meant
+        // for it never runs a table command.
+        if self.is_window_focused {
+            return self.handle_window_key(key);
         }
         if let Some(review) = self.reviews.front_mut() {
             match key.code {
@@ -3495,6 +4306,10 @@ impl App {
         if key.code == KeyCode::Char('w') {
             return Outcome::Workspaces;
         }
+        if matches!(key.code, KeyCode::Left | KeyCode::Right) {
+            self.step_tab(key.code == KeyCode::Right);
+            return Outcome::Continue;
+        }
         if key.code == KeyCode::Char('C') {
             return Outcome::Scratches;
         }
@@ -3524,7 +4339,14 @@ impl App {
             }
             KeyCode::Char('i') => self.show_issue(),
             KeyCode::Char('I') => self.choose_issue(),
-            KeyCode::Char('e') => self.rail = Some(0),
+            KeyCode::Char('e') => {
+                // Zoomed to the windows, the inbox has no room beside the
+                // table: it zooms back out to show itself.
+                if self.zoom == Some(Zoom::Windows) {
+                    self.zoom = None;
+                }
+                self.rail = Some(0);
+            }
             KeyCode::Char('E') => self.toggle_inbox(),
             KeyCode::Char('m') => self.open_message(),
             KeyCode::Char('q') => return self.quit(),
@@ -3573,8 +4395,14 @@ impl App {
             KeyCode::Char('a') => return self.converse(String::new()),
             KeyCode::Char('n') => self.open_start(),
             KeyCode::Char('N') => self.open_dispatch(),
-            KeyCode::Char('d') => self.open_diff(),
-            KeyCode::Char('v') => self.open_pr_view(),
+            KeyCode::Char('d') => {
+                self.open_diff();
+                self.show_tab(WindowTab::Diff);
+            }
+            KeyCode::Char('v') => {
+                self.open_pr_view();
+                self.show_tab(WindowTab::Pr);
+            }
             KeyCode::Char('b') => self.open_rename(),
             KeyCode::Char('r') => {
                 // Destroy is asked inside the return dialog, so it takes
@@ -4125,8 +4953,10 @@ mod tests {
         assert_eq!(app.wanted_diff(), None, "in flight");
         app.diff_loaded(PathBuf::from("/p/4/app"), two_files());
         assert_eq!(app.wanted_diff(), None, "loaded");
+        // Esc gives the keys back to the table; the diff stays in its tab.
         press(&mut app, KeyCode::Esc);
-        assert!(app.view.is_none());
+        assert!(!app.is_window_focused);
+        assert!(app.view.is_some());
         with_work(&mut app, 2);
         press(&mut app, KeyCode::Char('d'));
         assert_eq!(
@@ -4676,7 +5506,7 @@ mod tests {
     #[test]
     fn the_view_scrolls_jumps_between_files_and_stays_in_bounds() {
         let mut app = app();
-        app.screen_height = 10;
+        app.window_rows = 6;
         press(&mut app, KeyCode::Char('d'));
         app.wanted_diff();
         app.diff_loaded(PathBuf::from("/p/4/app"), two_files());
@@ -4691,14 +5521,17 @@ mod tests {
         assert_eq!(
             scroll(&app),
             3,
-            "a page is the popup's inside less its bar, the pinned header and the key bar"
+            "a page is the window's inside less the diff's bar, its pinned header and its key bar"
         );
         press(&mut app, KeyCode::Char('G'));
         assert_eq!(scroll(&app), 14);
         press(&mut app, KeyCode::Char('j'));
         assert_eq!(scroll(&app), 14, "never past the last row");
         press(&mut app, KeyCode::Char('q'));
-        assert!(app.view.is_none(), "q closes the view, not treetop");
+        assert!(
+            !app.is_window_focused && !app.is_quitting && app.view.is_some(),
+            "q gives the table the keys, and leaves treetop and the diff open"
+        );
     }
 
     fn agent(name: &str) -> Agent {
@@ -5191,6 +6024,60 @@ mod tests {
         app.job_finished(job, true, String::new());
         assert_eq!(app.active_jobs(), 0, "the stand-in is cleared");
         assert!(app.message.unwrap().contains("tree 12"));
+    }
+
+    #[test]
+    fn a_start_shows_in_the_window_and_its_chat_opens_once_its_tree_is_listed() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('N'));
+        type_in(&mut app, "fix login");
+        let mut job = queued(press(&mut app, KeyCode::Enter)).remove(0);
+        assert_eq!(
+            app.window_start().and_then(|o| o.key.clone()),
+            Some(job.key.clone())
+        );
+        job.tree.path = PathBuf::from("/p/12/app");
+        job.tree.name = "12".into();
+        job.attach = Some(vec!["claude".into(), "attach".into(), "new1".into()]);
+        app.job_finished(job.clone(), true, String::new());
+        // Its tree is not listed yet, so the window has nowhere to show it.
+        assert_eq!(app.ready_chat(), None);
+        let mut trees = app.trees.clone();
+        trees.push(Tree {
+            name: "12".into(),
+            path: "/p/12/app".into(),
+            ..app.trees[0].clone()
+        });
+        app.set_trees(trees);
+        assert!(matches!(
+            app.ready_chat(),
+            Some(Outcome::Chat { tree, .. }) if tree == "12"
+        ));
+        assert!(app.window_start().is_none());
+    }
+
+    #[test]
+    fn a_failed_start_stays_in_the_window_until_esc_and_esc_hides_one_under_way() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('N'));
+        type_in(&mut app, "fix login");
+        let job = queued(press(&mut app, KeyCode::Enter)).remove(0);
+        app.job_finished(job, false, "lease: no tree is free".into());
+        assert_eq!(
+            app.window_start().and_then(|o| o.failed.clone()).as_deref(),
+            Some("lease: no tree is free")
+        );
+        press(&mut app, KeyCode::Esc);
+        assert!(app.opening.is_none());
+        // Esc while it runs hides it, and the start carries on unopened.
+        press(&mut app, KeyCode::Char('N'));
+        type_in(&mut app, "fix login");
+        let mut job = queued(press(&mut app, KeyCode::Enter)).remove(0);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.opening.is_none());
+        job.attach = Some(vec!["claude".into(), "attach".into(), "new2".into()]);
+        app.job_finished(job, true, String::new());
+        assert_eq!(app.ready_chat(), None, "a hidden start opens no chat");
     }
 
     #[test]
@@ -6294,8 +7181,16 @@ mod tests {
             2,
             "z lists the nitpick"
         );
+        // Esc gives the keys back to the table; the PR stays in its tab.
         press(&mut app, KeyCode::Esc);
-        assert!(app.pr_popup.is_none());
+        assert!(!app.is_window_focused);
+        assert!(app.pr_popup.is_some());
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(
+            app.pr_popup.as_ref().unwrap().selected(),
+            2,
+            "keys go to the table now, not the PR"
+        );
     }
 
     #[test]
@@ -6429,5 +7324,582 @@ mod tests {
         gate.plugin = "no-mistakes".into();
         app.apply_ship(ships(&[("/p/4/app", gate)]));
         app
+    }
+
+    /// Tree 4 with an agent to chat with, in `status`.
+    fn with_chat(status: Status) -> App {
+        let mut app = app();
+        let tree = app.trees.iter_mut().find(|t| t.name == "4").unwrap();
+        tree.agents = vec![Agent {
+            status: Some(status),
+            ..attachable("fixer")
+        }];
+        select(&mut app, "4");
+        app
+    }
+
+    #[test]
+    fn the_window_opens_a_running_agents_chat_and_never_a_cold_one() {
+        let app = with_chat(Status::Busy);
+        assert_eq!(
+            app.window_chat(),
+            Some((
+                vec!["claude".into(), "attach".into(), "fixer".into()],
+                "fixer".into(),
+                "4".into()
+            ))
+        );
+        // Attaching to a cold agent starts it again, so the window leaves it
+        // to Enter.
+        assert_eq!(with_chat(Status::Cold).window_chat(), None);
+        // Left from the chat wraps round to the info tab, which opens no chat.
+        let mut on_info = with_chat(Status::Busy);
+        press(&mut on_info, KeyCode::Left);
+        assert_eq!(on_info.tab, WindowTab::Info);
+        assert_eq!(on_info.window_chat(), None, "the info tab opens no chat");
+        press(&mut on_info, KeyCode::Right);
+        assert_eq!(on_info.tab, WindowTab::Chat);
+    }
+
+    #[test]
+    fn ctrl_q_gives_the_window_the_keys_where_it_has_a_chat_and_never_quits() {
+        let ctrl_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
+        let mut app = with_chat(Status::Idle);
+        assert_eq!(app.handle_key(ctrl_q), Outcome::Continue);
+        assert!(app.is_window_focused);
+        let mut app = with_chat(Status::Idle);
+        select(&mut app, "8");
+        assert_eq!(app.handle_key(ctrl_q), Outcome::Continue);
+        assert!(
+            !app.is_window_focused,
+            "tree 8 has no chat to take the keys"
+        );
+        let mut app = with_chat(Status::Idle);
+        app.rail = Some(0);
+        app.handle_key(ctrl_q);
+        assert!(!app.is_window_focused, "the inbox keeps the keys it has");
+    }
+
+    #[test]
+    fn a_chat_opened_on_the_main_checkout_puts_the_cursor_on_its_heading() {
+        let mut app = app_on_main_heading();
+        select(&mut app, "8");
+        let main = app.trees.iter().find(|t| t.is_main).unwrap().name.clone();
+        app.select_tree(&main);
+        assert_eq!(app.window_tree().map(|t| t.name.clone()), Some(main));
+        app.select_tree("4");
+        assert_eq!(app.window_tree().map(|t| t.name.as_str()), Some("4"));
+    }
+
+    /// A keel run of three steps holding the tree at `path`, on its second.
+    fn run_in(path: &str) -> crate::keel::Run {
+        let step = |title: &str, state: &str| crate::keel::Step {
+            title: title.into(),
+            state: state.into(),
+        };
+        crate::keel::Run {
+            tree: path.into(),
+            playbook: "issue".into(),
+            goal: "fix the login".into(),
+            state: "active".into(),
+            steps: vec![
+                step("Audit it", "done"),
+                step("Build it", "doing"),
+                step("Verify it", "pending"),
+            ],
+            current: Some(2),
+            attention: 0,
+            stale: false,
+        }
+    }
+
+    #[test]
+    fn each_tree_has_the_tabs_it_can_show_and_the_keys_step_through_them() {
+        use WindowTab::*;
+        let mut app = with_chat(Status::Busy);
+        assert_eq!(app.window_tabs(), [Chat, Diff, Pr, Shell, Info]);
+        app.runs.insert("/p/4/app".into(), run_in("/p/4/app"));
+        assert_eq!(app.window_tabs(), [Chat, Diff, Pr, Run, Shell, Info]);
+        for wanted in [Diff, Pr, Run, Shell, Info, Chat] {
+            press(&mut app, KeyCode::Right);
+            assert_eq!(app.shown_tab(), wanted);
+        }
+        // A free tree has nothing to diff, no PR and no agent, and no shell
+        // to keep running in it: `t` opens one there.
+        select(&mut app, "7");
+        assert_eq!(app.window_tabs(), [Info]);
+        app.tab = Diff;
+        assert_eq!(app.shown_tab(), Info, "a tab it has not got shows its info");
+    }
+
+    #[test]
+    fn the_shell_tab_opens_a_shell_in_the_tree() {
+        // A quote in the tree's path must not break out of the command.
+        let dir = std::env::temp_dir().join(format!("treetop-shell-{}/it's", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // As pwd names it, where the temp dir is behind a symlink.
+        let dir = dir.canonicalize().unwrap();
+        let mut app = app();
+        select(&mut app, "8");
+        app.trees.iter_mut().find(|t| t.name == "8").unwrap().path = dir.clone();
+        app.tab = WindowTab::Shell;
+        let (command, agent, tree) = app.window_chat().unwrap();
+        assert_eq!((agent.as_str(), tree.as_str()), (SHELL, "8"));
+        // The user's $SHELL is run in the tree: pwd stands in for it.
+        let ran = std::process::Command::new(&command[0])
+            .args(&command[1..])
+            .env("SHELL", "pwd")
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+        assert_eq!(
+            String::from_utf8_lossy(&ran.stdout).trim(),
+            dir.display().to_string(),
+            "{command:?}"
+        );
+    }
+
+    #[test]
+    fn the_diff_and_pr_tabs_follow_the_cursor_and_a_pr_read_once_is_not_read_again() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('d'));
+        assert!(app.is_window_focused, "d gives the diff the keys");
+        press(&mut app, KeyCode::Esc);
+        select(&mut app, "8");
+        app.sync_window();
+        assert_eq!(
+            app.view.as_ref().map(|v| v.path.clone()),
+            Some("/p/8/app".into())
+        );
+        app.tab = WindowTab::Pr;
+        app.sync_window();
+        assert_eq!(
+            app.pr_wanted,
+            Some("/p/8/app".into()),
+            "read the first time"
+        );
+        app.pr_wanted = None;
+        select(&mut app, "4");
+        app.sync_window();
+        assert_eq!(app.pr_wanted, Some("/p/4/app".into()));
+        app.pr_wanted = None;
+        select(&mut app, "8");
+        app.sync_window();
+        assert_eq!(
+            app.pr_popup.as_ref().map(|p| p.path.clone()),
+            Some("/p/8/app".into())
+        );
+        assert_eq!(app.pr_wanted, None, "tree 8's PR was read already");
+    }
+
+    #[test]
+    fn the_main_checkout_and_a_finished_run_get_no_tab_they_cannot_fill() {
+        use WindowTab::*;
+        // The heading stands for the main checkout, which has no PR and no
+        // diff of a branch of its own, so d and v leave it alone.
+        let app = app_on_main_heading();
+        assert_eq!(app.window_tabs(), [Shell, Info]);
+        let mut app = with_chat(Status::Busy);
+        let mut done = run_in("/p/4/app");
+        done.state = "done".into();
+        app.runs.insert("/p/4/app".into(), done);
+        assert!(
+            !app.window_tabs().contains(&Run),
+            "a done run holds nothing"
+        );
+    }
+
+    #[test]
+    fn only_the_chat_tab_reads_its_screen_by_the_agents_plugin() {
+        let mut app = with_chat(Status::Busy);
+        let tree = app.trees.iter_mut().find(|t| t.name == "4").unwrap();
+        tree.agents[0].plugin = Some("claude".into());
+        assert_eq!(app.window_plugin(), Some("claude"));
+        // A shell is no agent's chat: what it prints is its own.
+        app.tab = WindowTab::Shell;
+        assert_eq!(app.window_plugin(), None);
+    }
+
+    #[test]
+    fn a_shell_left_running_is_kept_while_its_tree_is_held() {
+        let app = app();
+        assert!(app.keeps_shell("4"));
+        assert!(!app.keeps_shell("7"), "a returned tree's shell ends");
+        assert!(!app.keeps_shell("12"), "so does a destroyed one's");
+    }
+
+    fn ctrl(app: &mut App, c: char) {
+        app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+    }
+
+    fn cursor_on(app: &App) -> String {
+        app.window_tree()
+            .map(|t| t.name.clone())
+            .unwrap_or_default()
+    }
+
+    fn other_on(app: &App) -> Option<String> {
+        app.other_window().map(|(t, _)| t.name.clone())
+    }
+
+    #[test]
+    fn ctrl_backslash_puts_the_next_tree_beside_this_one_and_the_cursor_drives_it() {
+        let mut app = with_chat(Status::Busy);
+        ctrl(&mut app, '\\');
+        assert_eq!(
+            other_on(&app).as_deref(),
+            Some("4"),
+            "tree 4 stays on the left"
+        );
+        assert_eq!((cursor_on(&app).as_str(), app.side), ("8", 1));
+        // Moving the cursor to tree 7, past the available group's heading,
+        // changes only the window it drives.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(cursor_on(&app), "7");
+        assert_eq!(other_on(&app).as_deref(), Some("4"));
+        // Without the terminal's extended keys, Ctrl+\ comes as Ctrl+4.
+        ctrl(&mut app, '4');
+        assert_eq!(other_on(&app), None, "one window again");
+    }
+
+    #[test]
+    fn ctrl_q_moves_the_keys_round_the_table_and_both_windows() {
+        let mut app = with_chat(Status::Busy);
+        ctrl(&mut app, '\\');
+        ctrl(&mut app, 'q');
+        assert!(app.is_window_focused);
+        assert_eq!(app.side, 0, "the left window has the keys");
+        assert_eq!(cursor_on(&app), "4", "and the cursor drives it");
+        assert_eq!(other_on(&app).as_deref(), Some("8"));
+        ctrl(&mut app, 'q');
+        assert_eq!((app.side, cursor_on(&app).as_str()), (1, "8"));
+        assert!(app.is_window_focused);
+        ctrl(&mut app, 'q');
+        assert!(!app.is_window_focused, "back to the table");
+        // Back to one window, the one that last had the keys stays.
+        ctrl(&mut app, 'q');
+        ctrl(&mut app, '\\');
+        assert_eq!((cursor_on(&app).as_str(), other_on(&app)), ("4", None));
+    }
+
+    #[test]
+    fn a_double_opens_again_as_it_was_left() {
+        let file = std::env::temp_dir().join(format!("treetop-layout-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let mut app = with_chat(Status::Busy);
+        app.keep_layout_in(file.clone());
+        ctrl(&mut app, '\\');
+        assert_eq!(cursor_on(&app), "8");
+        app.save_layout();
+        // At start the pool is listed before its agents are read, and the
+        // agents then sort it: the cursor goes back to its tree after both.
+        let mut again = App::new(None);
+        again.keep_layout_in(file.clone());
+        let trees = app.trees.clone();
+        again.set_trees(trees);
+        let mut busy = attachable("fixer");
+        busy.status = Some(Status::Waiting);
+        again.apply_agents(&HashMap::from([(PathBuf::from("/p/8/app"), vec![busy])]));
+        assert_eq!(other_on(&again).as_deref(), Some("4"));
+        assert_eq!(cursor_on(&again), "8", "both windows as they were left");
+        assert_eq!(again.side, 1);
+        ctrl(&mut again, '\\');
+        let mut single = with_chat(Status::Busy);
+        single.keep_layout_in(file.clone());
+        assert_eq!(other_on(&single), None, "one window, as it was left");
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn a_double_keeps_its_trees_when_one_is_hidden_and_starts_afresh_once_one_is_gone() {
+        // Hidden by a filter, the other window's tree keeps its place, and
+        // the keys stay where they were.
+        let mut app = with_chat(Status::Busy);
+        ctrl(&mut app, '\\');
+        app.filter = "end-2".into();
+        app.reselect(Some("/p/8/app".into()));
+        ctrl(&mut app, 'q');
+        assert_eq!(other_on(&app).as_deref(), Some("4"));
+        assert_eq!(cursor_on(&app), "8");
+        assert!(!app.is_window_focused);
+        assert!(app.message.as_deref().unwrap_or("").contains("tree 4"));
+        // Its tree gone from the pool, Ctrl+\ opens a new double at once.
+        let mut app = with_chat(Status::Busy);
+        ctrl(&mut app, '\\');
+        app.trees.retain(|t| t.name != "4");
+        select(&mut app, "8");
+        ctrl(&mut app, '\\');
+        assert_eq!(other_on(&app).as_deref(), Some("8"));
+    }
+
+    #[test]
+    fn ctrl_backslash_with_one_tree_listed_says_so_and_keeps_one_window() {
+        let mut app = with_chat(Status::Busy);
+        app.trees.retain(|t| t.name == "4");
+        select(&mut app, "4");
+        ctrl(&mut app, '\\');
+        assert_eq!(other_on(&app), None);
+        assert!(app.message.is_some());
+    }
+
+    #[test]
+    fn a_window_with_no_typing_to_take_keeps_the_keys_from_the_table() {
+        // Tree 7 is free: its window has its info, which takes no typing.
+        let mut app = with_chat(Status::Busy);
+        ctrl(&mut app, '\\');
+        select(&mut app, "7");
+        ctrl(&mut app, 'q');
+        ctrl(&mut app, 'q');
+        assert!(app.is_window_focused);
+        assert_eq!(cursor_on(&app), "7");
+        for key in [KeyCode::Up, KeyCode::Char('n'), KeyCode::Enter] {
+            assert_eq!(press(&mut app, key), Outcome::Continue);
+        }
+        assert_eq!(cursor_on(&app), "7", "the table did not move");
+        assert!(app.prompt.is_none(), "n started nothing");
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.is_window_focused, "Esc gives the keys back");
+    }
+
+    #[test]
+    fn back_to_one_window_the_keys_stay_only_where_there_is_typing_to_take() {
+        let mut app = with_chat(Status::Busy);
+        ctrl(&mut app, '\\');
+        select(&mut app, "7");
+        ctrl(&mut app, 'q');
+        ctrl(&mut app, 'q');
+        assert!(app.is_window_focused, "tree 7's info window has the keys");
+        ctrl(&mut app, '\\');
+        assert!(
+            !app.is_window_focused,
+            "alone, an info window gives them back"
+        );
+    }
+
+    #[test]
+    fn going_round_the_windows_keeps_the_tab_each_was_picked_on() {
+        let mut app = with_chat(Status::Busy);
+        ctrl(&mut app, '\\');
+        app.tab = WindowTab::Shell;
+        select(&mut app, "7");
+        assert_eq!(app.shown_tab(), WindowTab::Info, "a free tree has no shell");
+        for _ in 0..3 {
+            ctrl(&mut app, 'q');
+        }
+        select(&mut app, "8");
+        assert_eq!(app.shown_tab(), WindowTab::Shell, "the shell tab was kept");
+    }
+
+    #[test]
+    fn each_start_minds_its_own_window_and_esc_forgets_the_wait() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('N'));
+        type_in(&mut app, "one");
+        let one = queued(press(&mut app, KeyCode::Enter)).remove(0);
+        press(&mut app, KeyCode::Char('N'));
+        type_in(&mut app, "two");
+        let mut two = queued(press(&mut app, KeyCode::Enter)).remove(0);
+        // The first start failing leaves the second's window be.
+        app.job_finished(one, false, "lease: no tree is free".into());
+        let shown = app.window_start().cloned().unwrap();
+        assert_eq!((shown.agent.as_str(), shown.failed), ("two", None));
+        two.attach = Some(vec!["claude".into(), "attach".into(), "two".into()]);
+        two.tree.name = "8".into();
+        two.tree.path = "/p/8/app".into();
+        app.job_finished(two, true, String::new());
+        assert!(matches!(
+            app.ready_chat(),
+            Some(Outcome::Chat { agent, tree, .. }) if agent == "two" && tree == "8"
+        ));
+        // A start whose tree is not listed yet waits for it; Esc forgets
+        // that wait, so the next start waits afresh.
+        press(&mut app, KeyCode::Char('N'));
+        type_in(&mut app, "three");
+        let mut three = queued(press(&mut app, KeyCode::Enter)).remove(0);
+        three.attach = Some(vec!["claude".into(), "attach".into(), "three".into()]);
+        three.tree.name = "12".into();
+        app.job_finished(three, true, String::new());
+        assert_eq!(app.ready_chat(), None);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.started_at, None);
+    }
+
+    #[test]
+    fn ctrl_f_zooms_the_table_from_the_table_and_the_windows_from_a_window() {
+        let mut app = with_chat(Status::Busy);
+        ctrl(&mut app, 'f');
+        assert_eq!(app.zoom, Some(Zoom::Table));
+        ctrl(&mut app, 'f');
+        assert_eq!(app.zoom, None, "again zooms back out");
+        // From a diff with the keys, the windows.
+        press(&mut app, KeyCode::Char('d'));
+        assert!(app.is_window_focused);
+        ctrl(&mut app, 'f');
+        assert_eq!(app.zoom, Some(Zoom::Windows));
+        assert!(app.is_window_focused, "the diff keeps the keys");
+        ctrl(&mut app, 'f');
+        assert_eq!(app.zoom, None);
+        // From the PR with the keys, the windows too.
+        app.tab = WindowTab::Pr;
+        app.sync_window();
+        assert!(app.has_keys_on(WindowTab::Pr));
+        ctrl(&mut app, 'f');
+        assert_eq!(app.zoom, Some(Zoom::Windows));
+        ctrl(&mut app, 'f');
+        assert_eq!(app.zoom, None);
+        // From a window with nothing to type into, the windows too.
+        press(&mut app, KeyCode::Esc);
+        ctrl(&mut app, '\\');
+        select(&mut app, "7");
+        ctrl(&mut app, 'q');
+        ctrl(&mut app, 'q');
+        assert!(app.is_window_focused);
+        assert_eq!(app.shown_tab(), WindowTab::Info);
+        ctrl(&mut app, 'f');
+        assert_eq!(app.zoom, Some(Zoom::Windows));
+    }
+
+    #[test]
+    fn e_zoomed_to_the_windows_zooms_out_to_show_the_inbox() {
+        let mut app = with_chat(Status::Busy);
+        app.zoom = Some(Zoom::Windows);
+        press(&mut app, KeyCode::Char('e'));
+        assert_eq!(app.rail, Some(0), "the inbox has the keys");
+        assert_eq!(app.zoom, None, "and room to show itself");
+    }
+
+    #[test]
+    fn zoomed_to_the_table_ctrl_q_gives_no_hidden_window_the_keys() {
+        let mut app = with_chat(Status::Busy);
+        ctrl(&mut app, '\\');
+        ctrl(&mut app, 'f');
+        assert_eq!(app.zoom, Some(Zoom::Table));
+        ctrl(&mut app, 'q');
+        assert!(!app.is_window_focused, "the table keeps the keys");
+    }
+
+    fn type_into_palette(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    #[test]
+    fn the_palette_finds_a_command_by_its_words_and_runs_it_as_its_key_does() {
+        let mut app = with_chat(Status::Busy);
+        // From a chat with the keys, as from the table.
+        app.is_window_focused = true;
+        ctrl(&mut app, 'p');
+        assert!(app.palette.is_some());
+        type_into_palette(&mut app, "ret");
+        let first = app.commands().into_iter().next().unwrap();
+        assert_eq!(
+            (first.label.as_str(), first.key.as_str()),
+            ("Return tree 4 to the pool", "r")
+        );
+        press(&mut app, KeyCode::Enter);
+        assert!(app.palette.is_none());
+        assert!(app.pending.is_some(), "the return dialog, as r opens it");
+        assert!(!app.is_window_focused, "it ran on the table");
+        // A command that starts with the word typed comes before one that
+        // has it further in, wherever it sits in the list.
+        app.pending = None;
+        ctrl(&mut app, 'p');
+        type_into_palette(&mut app, "issue");
+        let first = app.commands().into_iter().next().unwrap();
+        assert_eq!(first.label, "Issues");
+    }
+
+    #[test]
+    fn a_tree_number_offers_to_open_that_tree() {
+        let mut app = with_chat(Status::Busy);
+        ctrl(&mut app, 'p');
+        type_into_palette(&mut app, "8");
+        let first = app.commands().into_iter().next().unwrap();
+        assert_eq!(first.label, "Open tree 8 · feature/end-2-b");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.current().map(|t| t.name.as_str()), Some("8"));
+        // Nothing typed, the pool's commands follow the tree's; Esc closes.
+        ctrl(&mut app, 'p');
+        let all = app.commands();
+        assert_eq!(all[0].label, "Return tree 8 to the pool");
+        assert!(
+            all.iter()
+                .any(|c| c.label == "New agent in a fresh tree" && c.key == "N")
+        );
+        assert!(
+            !all.iter().any(|c| c.label.contains(" · ")),
+            "trees to open only once typed"
+        );
+        type_into_palette(&mut app, "zzzz");
+        assert!(app.commands().is_empty());
+        press(&mut app, KeyCode::Esc);
+        assert!(app.palette.is_none());
+    }
+
+    #[test]
+    fn the_palette_takes_the_keys_over_a_diff_and_waits_out_a_dialog() {
+        // Opened from a diff with the keys, the palette takes what is typed.
+        let mut app = with_chat(Status::Busy);
+        press(&mut app, KeyCode::Char('d'));
+        assert!(app.has_keys_on(WindowTab::Diff));
+        ctrl(&mut app, 'p');
+        type_into_palette(&mut app, "ret");
+        assert_eq!(app.palette.as_ref().map(|p| p.query.as_str()), Some("ret"));
+        // Over a dialog it does not open, so no command lands in the dialog.
+        let mut app = with_chat(Status::Busy);
+        press(&mut app, KeyCode::Char('r'));
+        assert!(app.pending.is_some());
+        ctrl(&mut app, 'p');
+        assert!(app.palette.is_none());
+    }
+
+    #[test]
+    fn the_palette_offers_every_tree_and_an_exact_number_first() {
+        // A tree out of the list, behind a filter or in a folded group, is
+        // offered too; opening it brings it back so the cursor lands on it.
+        let mut app = with_chat(Status::Busy);
+        app.filter = "end-1".into();
+        select(&mut app, "4");
+        ctrl(&mut app, 'p');
+        type_into_palette(&mut app, "8");
+        assert!(app.commands()[0].label.starts_with("Open tree 8 · "));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.current().map(|t| t.name.as_str()), Some("8"));
+        assert!(app.filter.is_empty(), "the filter that hid it is cleared");
+        let free = app
+            .trees
+            .iter()
+            .find(|t| t.name == "7")
+            .and_then(|t| app.group_of(t))
+            .unwrap();
+        app.folded.insert(free.clone());
+        assert!(
+            !app.rows()
+                .iter()
+                .any(|r| matches!(r, ListRow::Tree(t) if t.name == "7"))
+        );
+        ctrl(&mut app, 'p');
+        type_into_palette(&mut app, "7");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.current().map(|t| t.name.as_str()), Some("7"));
+        assert!(!app.folded.contains(&free), "its group opened");
+        let mut trees = app.trees.clone();
+        trees.push(Tree {
+            name: "48".into(),
+            path: "/p/48/app".into(),
+            ..app.trees[0].clone()
+        });
+        app.set_trees(trees);
+        ctrl(&mut app, 'p');
+        type_into_palette(&mut app, "8");
+        let opens: Vec<String> = app
+            .commands()
+            .into_iter()
+            .filter(|c| c.label.contains(" · "))
+            .map(|c| c.label)
+            .collect();
+        assert!(opens[0].starts_with("Open tree 8 · "), "{opens:?}");
     }
 }
