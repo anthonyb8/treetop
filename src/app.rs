@@ -464,6 +464,8 @@ pub enum Outcome {
         agent: String,
         tree: String,
     },
+    /// Scroll the window's chat by this many lines, down when positive.
+    ScrollChat(isize),
     /// Type `text` into each agent's chat and submit it.
     Send {
         to: Vec<Recipient>,
@@ -651,9 +653,12 @@ pub struct App {
     pub rail: Option<usize>,
     /// The tab the window under the table shows.
     pub tab: WindowTab,
-    /// The window under the table has the keys: its chat takes them, and
-    /// Ctrl+Q gives them back to the table.
+    /// The window under the table has the keys, in Normal: treetop's keys
+    /// step its tabs and scroll it, and Ctrl+Q gives them back to the table.
     pub is_window_focused: bool,
+    /// The window with the keys is in Insert: its chat or shell takes every
+    /// key but Ctrl+Q, which drops back to Normal.
+    pub is_inserting: bool,
     /// Rows inside the window under the table, under its tab bar, as last
     /// drawn: what a page of its diff scrolls by.
     pub window_rows: u16,
@@ -1368,6 +1373,7 @@ impl App {
             self.save_layout();
         }
         self.is_window_focused = true;
+        self.is_inserting = false;
         self.sync_window();
     }
 
@@ -1375,6 +1381,7 @@ impl App {
     /// take them, else gives them back to the table; with two, moves them
     /// on round the table, the left window and the right one.
     pub fn cycle_keys(&mut self) {
+        self.is_inserting = false;
         if self.other_window().is_some() {
             match (self.is_window_focused, self.side) {
                 (false, _) => self.focus_side(0),
@@ -1957,19 +1964,66 @@ impl App {
         });
     }
 
-    /// The keys a window takes with nothing open in it to type into: Esc
-    /// or q gives them back to the table, and the arrows step through its
-    /// tabs.
+    /// The keys a window takes in Normal, on a tab with no keys of its own:
+    /// Esc or q gives them back to the table, the arrows step through its
+    /// tabs, and on a chat or shell i or Enter starts Insert while j, k, d
+    /// and u scroll it.
     fn handle_window_key(&mut self, key: KeyEvent) -> Outcome {
+        let is_terminal = matches!(self.shown_tab(), WindowTab::Chat | WindowTab::Shell);
+        let half = isize::try_from(self.window_rows / 2).map_or(1, |h| h.max(1));
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.is_window_focused = false,
             KeyCode::Left | KeyCode::Right => self.step_tab(key.code == KeyCode::Right),
+            KeyCode::Char('i') | KeyCode::Enter if is_terminal => {
+                self.is_inserting = self.window_chat().is_some();
+            }
+            KeyCode::Char('j') | KeyCode::Down if is_terminal => return Outcome::ScrollChat(1),
+            KeyCode::Char('k') | KeyCode::Up if is_terminal => return Outcome::ScrollChat(-1),
+            KeyCode::Char('d') if is_terminal => return Outcome::ScrollChat(half),
+            KeyCode::Char('u') if is_terminal => return Outcome::ScrollChat(-half),
             _ => {}
         }
         Outcome::Continue
     }
 
-    /// Steps the window to its next tab, or its last.
+    /// The wheel over the window's diff or PR, with the keys or without:
+    /// three lines a step, as the arrows move them, leaving the keys where
+    /// they are. A chat takes the wheel itself.
+    pub fn wheel_window(&mut self, is_down: bool) {
+        let key = KeyEvent::from(if is_down { KeyCode::Down } else { KeyCode::Up });
+        for _ in 0..3 {
+            match self.shown_tab() {
+                WindowTab::Diff if self.view.is_some() => self.handle_view_key(key),
+                WindowTab::Pr if self.pr_popup.is_some() => self.handle_pr_key(key),
+                _ => return,
+            };
+        }
+    }
+
+    /// The window with the keys is in Insert, on a chat or shell: every key
+    /// but treetop's few Ctrl keys goes to it. A chat floating where its
+    /// window cannot show has no Normal to show, so it is always in Insert.
+    pub fn is_inserting(&self) -> bool {
+        (self.is_inserting || self.chat_floats())
+            && self.is_window_focused
+            && matches!(self.shown_tab(), WindowTab::Chat | WindowTab::Shell)
+    }
+
+    /// The window cannot show as last drawn, over the Issues screen or on a
+    /// terminal too short for it, so a tree's chat with the keys floats in
+    /// a popup instead.
+    pub fn chat_floats(&self) -> bool {
+        self.is_issues || self.window_rows == 0
+    }
+
+    /// Gives the window under the table the keys in Insert, so what is
+    /// typed goes to its chat: Enter on a tree, the inbox, or a click.
+    pub fn insert_in_window(&mut self) {
+        self.is_window_focused = true;
+        self.is_inserting = true;
+    }
+
+    /// Steps the window to its next tab, or its last, in Normal.
     fn step_tab(&mut self, is_next: bool) {
         let tabs = self.window_tabs();
         let at = tabs
@@ -1978,6 +2032,7 @@ impl App {
             .unwrap_or(0);
         let step = if is_next { 1 } else { tabs.len() - 1 };
         self.tab = tabs[(at + step) % tabs.len()];
+        self.is_inserting = false;
     }
 
     /// Shows `tab` in the window under the table with the keys, where the
@@ -1986,6 +2041,7 @@ impl App {
         if self.window_tabs().contains(&tab) {
             self.tab = tab;
             self.is_window_focused = true;
+            self.is_inserting = false;
         }
     }
 
@@ -2073,6 +2129,12 @@ impl App {
             }
             return Outcome::Continue;
         }
+        // The arrows step the window's tabs, as on every tab in Normal; h
+        // and l step the PR's own.
+        if matches!(key.code, KeyCode::Left | KeyCode::Right) {
+            self.step_tab(key.code == KeyCode::Right);
+            return Outcome::Continue;
+        }
         // Esc gives the keys back to the table; the PR stays in its tab.
         if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
             self.is_window_focused = false;
@@ -2106,8 +2168,8 @@ impl App {
                     popup.tab = *tab;
                 }
             }
-            KeyCode::Right | KeyCode::Char('l') => popup.tab = tabs[(at + 1) % tabs.len()],
-            KeyCode::Left | KeyCode::Char('h') => {
+            KeyCode::Char('l') => popup.tab = tabs[(at + 1) % tabs.len()],
+            KeyCode::Char('h') => {
                 popup.tab = tabs[(at + tabs.len() - 1) % tabs.len()];
             }
             KeyCode::Down | KeyCode::Char('j') => step(popup, 1),
@@ -2212,6 +2274,12 @@ impl App {
             }
             return Outcome::Continue;
         }
+        // The arrows step the window's tabs, as on every tab in Normal; h
+        // and l scroll the diff sideways.
+        if matches!(key.code, KeyCode::Left | KeyCode::Right) {
+            self.step_tab(key.code == KeyCode::Right);
+            return Outcome::Continue;
+        }
         // Esc gives the keys back to the table; the diff stays in its tab.
         if matches!(key.code, KeyCode::Esc | KeyCode::Tab | KeyCode::Char('q')) {
             self.is_window_focused = false;
@@ -2248,8 +2316,8 @@ impl App {
                     view.scroll = start;
                 }
             }
-            KeyCode::Right | KeyCode::Char('l') => view.hscroll = view.hscroll.saturating_add(8),
-            KeyCode::Left | KeyCode::Char('h') => view.hscroll = view.hscroll.saturating_sub(8),
+            KeyCode::Char('l') => view.hscroll = view.hscroll.saturating_add(8),
+            KeyCode::Char('h') => view.hscroll = view.hscroll.saturating_sub(8),
             _ => {}
         }
         Outcome::Continue
@@ -2410,8 +2478,9 @@ impl App {
     /// Nothing else is on screen or being typed: the list alone, where an
     /// ask's chat may open without taking over something under way.
     fn is_free(&self) -> bool {
-        !self.has_keys_on(WindowTab::Diff)
-            && !self.has_keys_on(WindowTab::Pr)
+        // A window with the keys holds them in Normal too, so an ask never
+        // swaps out the chat or shell being read there.
+        !self.is_window_focused
             && self.prompt.is_none()
             && self.picker.is_none()
             && self.port_menu.is_none()
@@ -2511,7 +2580,11 @@ impl App {
     /// inbox beside it, so a click can open an entry. Elsewhere the mouse
     /// is left to the terminal, so text selects as it always has.
     pub fn wants_mouse(&self) -> bool {
-        (!self.inbox.is_hidden || self.rail.is_some())
+        // A chat or shell read in Normal takes the wheel, to scroll it, and
+        // a click, to type to it.
+        let is_reading = self.is_window_focused
+            && matches!(self.shown_tab(), WindowTab::Chat | WindowTab::Shell);
+        (!self.inbox.is_hidden || self.rail.is_some() || is_reading)
             && !self.is_issues
             && !self.has_keys_on(WindowTab::Diff)
             && !self.has_keys_on(WindowTab::Pr)
@@ -5532,6 +5605,28 @@ mod tests {
             !app.is_window_focused && !app.is_quitting && app.view.is_some(),
             "q gives the table the keys, and leaves treetop and the diff open"
         );
+        app.wheel_window(false);
+        assert_eq!(scroll(&app), 11, "the wheel: three lines a step");
+        assert!(!app.is_window_focused, "and the table keeps the keys");
+    }
+
+    #[test]
+    fn the_arrows_step_the_window_tabs_from_the_diff_and_the_pr_and_l_scrolls_the_diff() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('v'));
+        assert_eq!(app.shown_tab(), WindowTab::Pr);
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.shown_tab(), WindowTab::Diff, "← from the PR");
+        app.sync_window();
+        app.wanted_diff();
+        app.diff_loaded(PathBuf::from("/p/4/app"), two_files());
+        let hscroll = |app: &App| app.view.as_ref().unwrap().hscroll;
+        press(&mut app, KeyCode::Char('l'));
+        assert_eq!(hscroll(&app), 8, "l scrolls the diff sideways");
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.shown_tab(), WindowTab::Pr, "→ from the diff");
+        assert_eq!(hscroll(&app), 8, "rather than scroll it");
+        assert!(app.is_window_focused, "the window keeps the keys");
     }
 
     fn agent(name: &str) -> Agent {
@@ -6633,6 +6728,37 @@ mod tests {
     }
 
     #[test]
+    fn a_shell_read_in_normal_takes_the_wheel_with_the_inbox_hidden() {
+        let mut app = app();
+        app.inbox.is_hidden = true;
+        app.tab = WindowTab::Shell;
+        assert_eq!(app.shown_tab(), WindowTab::Shell);
+        assert!(!app.wants_mouse(), "the table leaves the mouse alone");
+        app.is_window_focused = true;
+        assert!(app.wants_mouse(), "Normal on a shell scrolls it");
+        app.tab = WindowTab::Info;
+        assert!(!app.wants_mouse(), "nothing to scroll on the info");
+    }
+
+    #[test]
+    fn an_ask_waits_while_a_window_shows_its_chat_in_normal() {
+        let mut app = app();
+        let asking = Agent {
+            status: Some(Status::Waiting),
+            ..attachable("asks")
+        };
+        app.apply_agents(&HashMap::from([(PathBuf::from("/p/8/app"), vec![asking])]));
+        app.apply_reports(Vec::new());
+        for tab in [WindowTab::Chat, WindowTab::Shell] {
+            app.tab = tab;
+            app.is_window_focused = true;
+            assert_eq!(app.next_ask(), None, "never over a chat being read");
+        }
+        app.is_window_focused = false;
+        assert_eq!(chat_of(app.next_ask()).as_deref(), Some("asks"));
+    }
+
+    #[test]
     fn an_ask_a_filter_hides_still_opens_and_the_filter_clears() {
         let mut app = app();
         let asking = Agent {
@@ -7378,6 +7504,67 @@ mod tests {
         app.rail = Some(0);
         app.handle_key(ctrl_q);
         assert!(!app.is_window_focused, "the inbox keeps the keys it has");
+    }
+
+    #[test]
+    fn ctrl_q_lands_in_normal_where_the_keys_scroll_and_step_and_i_or_enter_insert() {
+        let ctrl_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
+        let mut app = with_chat(Status::Idle);
+        app.window_rows = 20;
+        app.handle_key(ctrl_q);
+        assert!(app.is_window_focused && !app.is_inserting(), "Normal");
+        assert_eq!(press(&mut app, KeyCode::Char('j')), Outcome::ScrollChat(1));
+        assert_eq!(press(&mut app, KeyCode::Char('k')), Outcome::ScrollChat(-1));
+        assert_eq!(press(&mut app, KeyCode::Char('d')), Outcome::ScrollChat(10));
+        assert_eq!(
+            press(&mut app, KeyCode::Char('u')),
+            Outcome::ScrollChat(-10)
+        );
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.shown_tab(), WindowTab::Diff);
+        assert!(app.is_window_focused, "the window keeps the keys");
+        press(&mut app, KeyCode::Char('i'));
+        assert!(!app.is_inserting(), "nothing to type into on the diff");
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.shown_tab(), WindowTab::Info);
+        press(&mut app, KeyCode::Char('i'));
+        assert!(!app.is_inserting, "nothing to type into on the info");
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Char('i'));
+        assert!(app.is_inserting(), "i on the chat");
+        // Stepping away and back lands in Normal again.
+        app.tab = WindowTab::Info;
+        assert!(!app.is_inserting());
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.shown_tab(), WindowTab::Chat);
+        assert!(!app.is_inserting(), "a tab stepped to is in Normal");
+        app.handle_key(ctrl_q);
+        assert!(!app.is_window_focused, "Ctrl+Q from Normal: the table");
+        app.handle_key(ctrl_q);
+        assert!(app.is_window_focused && !app.is_inserting(), "and back");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.is_inserting(), "Enter on the chat");
+        // Coming back with Ctrl+Q is Normal, whatever the window was in.
+        app.handle_key(ctrl_q);
+        assert!(!app.is_window_focused);
+        app.handle_key(ctrl_q);
+        assert!(app.is_window_focused && !app.is_inserting());
+    }
+
+    #[test]
+    fn a_chat_floating_where_its_window_cannot_show_takes_the_keys_from_ctrl_q() {
+        let ctrl_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
+        let mut app = with_chat(Status::Idle);
+        app.window_rows = 20;
+        app.handle_key(ctrl_q);
+        assert!(!app.is_inserting(), "drawn in the window: Normal");
+        // Too short for the window, the chat floats with no mode to show.
+        app.window_rows = 0;
+        assert!(app.is_inserting(), "floating: every key to the chat");
+        app.window_rows = 20;
+        app.is_issues = true;
+        assert!(app.is_inserting(), "over the Issues screen too");
     }
 
     #[test]
