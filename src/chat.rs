@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use ratatui::crossterm::event::{
-    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::{Position, Rect};
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
@@ -994,18 +994,30 @@ pub fn is_palette(key: KeyEvent) -> bool {
 
 /// Ctrl+Q, which leaves the chat. Claude Code binds no Ctrl+Q, and in raw
 /// mode it is no flow control, so the chat never needs it; Ctrl+], which
-/// Claude Code uses, passes through. F13 to F24 do the same, for a Caps Lock
-/// remapped to one of them: no keyboard has them, so the chat never needs
-/// them either, and Esc stays free to interrupt Claude Code. xterm and the
-/// terminals that copy it, GNOME's among them, send F13 as Shift+F1 and F19
-/// as Shift+F7.
+/// Claude Code uses, passes through.
 pub fn is_exit(key: KeyEvent) -> bool {
-    let is_shift = key.modifiers.contains(KeyModifiers::SHIFT);
-    match key.code {
-        KeyCode::F(n) => n >= 13 || is_shift && matches!(n, 1 | 7),
-        KeyCode::Char('q' | 'Q') => key.modifiers.contains(KeyModifiers::CONTROL),
-        _ => false,
+    key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('q' | 'Q'))
+}
+
+/// Reads F13 to F24 as Ctrl+Q, so a Caps Lock remapped to one of them does
+/// all Ctrl+Q does, one key instead of two: no keyboard has them, so
+/// nothing needs them, and Esc stays free to interrupt Claude Code. xterm
+/// and the terminals that copy it, GNOME's among them, send F13 as Shift+F1
+/// and F19 as Shift+F7.
+pub fn as_ctrl_q(event: Event) -> Event {
+    match event {
+        Event::Key(key) if is_caps(key) => Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL,
+            key.kind,
+        )),
+        other => other,
     }
+}
+
+fn is_caps(key: KeyEvent) -> bool {
+    let is_shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    matches!(key.code, KeyCode::F(n) if n >= 13 || is_shift && matches!(n, 1 | 7))
 }
 
 /// The bytes a terminal sends for `key`, in the xterm encoding a program
@@ -1525,26 +1537,22 @@ mod tests {
         assert!(!is_exit(key(KeyCode::Char('q'), KeyModifiers::NONE)));
         assert!(!is_exit(key(KeyCode::Char(']'), KeyModifiers::CONTROL)));
         assert!(!is_exit(key(KeyCode::Char('5'), KeyModifiers::CONTROL)));
+        let ctrl_q = Event::Key(key(KeyCode::Char('q'), KeyModifiers::CONTROL));
         for f in [13, 16, 19, 24] {
-            assert!(
-                is_exit(key(KeyCode::F(f), KeyModifiers::NONE)),
-                "a remapped Caps Lock: F{f}"
-            );
+            let caps = Event::Key(key(KeyCode::F(f), KeyModifiers::NONE));
+            assert_eq!(as_ctrl_q(caps), ctrl_q, "a remapped Caps Lock: F{f}");
         }
-        assert!(
-            is_exit(key(KeyCode::F(1), KeyModifiers::SHIFT)),
-            "F13 as xterm sends it"
-        );
-        assert!(
-            is_exit(key(KeyCode::F(7), KeyModifiers::SHIFT)),
-            "F19 as GNOME sends it"
-        );
-        assert!(!is_exit(key(KeyCode::F(1), KeyModifiers::NONE)));
-        assert!(!is_exit(key(KeyCode::F(7), KeyModifiers::NONE)));
-        assert!(!is_exit(key(KeyCode::F(2), KeyModifiers::SHIFT)));
-        assert!(
-            !is_exit(key(KeyCode::Esc, KeyModifiers::NONE)),
-            "Esc interrupts Claude"
-        );
+        let f13 = Event::Key(key(KeyCode::F(1), KeyModifiers::SHIFT));
+        assert_eq!(as_ctrl_q(f13), ctrl_q, "F13 as xterm sends it");
+        let f19 = Event::Key(key(KeyCode::F(7), KeyModifiers::SHIFT));
+        assert_eq!(as_ctrl_q(f19), ctrl_q, "F19 as GNOME sends it");
+        for kept in [
+            key(KeyCode::F(1), KeyModifiers::NONE),
+            key(KeyCode::F(7), KeyModifiers::NONE),
+            key(KeyCode::F(2), KeyModifiers::SHIFT),
+            key(KeyCode::Esc, KeyModifiers::NONE),
+        ] {
+            assert_eq!(as_ctrl_q(Event::Key(kept)), Event::Key(kept));
+        }
     }
 }

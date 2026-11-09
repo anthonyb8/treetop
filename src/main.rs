@@ -844,7 +844,7 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
         }
         // A key or a resize: either way the screen is drawn again.
         is_stale = true;
-        let event = event::read()?;
+        let event = chat::as_ctrl_q(event::read()?);
         // Over the window's chat while the table has the keys, the wheel
         // scrolls it and a click gives it the keys.
         if let &Event::Mouse(mouse) = &event
