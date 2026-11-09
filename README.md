@@ -60,6 +60,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | `p` | share the port the tree serves with your phone and show its address as a QR code to scan with the phone's camera; it runs `tether share <port>`, or the `share` the config names (see [Config](#config)); pressed again on a port already shared, it takes the share down; a tree serving several offers the same menu as `o` |
 | `P` | put the port the tree serves on the internet, for anyone with the link, and copy that link to the clipboard; it runs `tether share --public <port>`, or the `publish` the config names; pressed again on a port already public, it takes it off the internet, as `x` in its popup does, with `tether unshare <port>`, or the `unpublish` the config names; a tree serving several offers the same menu as `o` |
 | `Q` | show a shared port's QR code and address again, without sharing anything: treetop reads them back from `tether shares`, so a port shared before it started shows too; on a port that is not shared it says which key shares it |
+| `v` | open the tree's PR in a popup: its checks, review threads and CodeRabbit's comments (see [The PR view](#the-pr-view)) |
 | `O` | open the tree's PR the same way (see [After the agent](#after-the-agent)) |
 | `f` | send what failed on the tree's PR, a check's log or a review's requested changes, to its agent |
 | `R` | resume the tree's stopped or failed agent in the tree, with its conversation and the flags it was started with, rather than a fresh dispatch that loses them |
@@ -355,6 +356,7 @@ A ship plugin says where each tree's branch stands after its agent:
 |---|---|---|
 | `status` | `dir`, the main checkout, and `trees`: each `{ "dir", "branch" }` | `branches`: one per branch it has something to say about, each with `branch`, `stage`, and optionally `label`, `url`, `head` and `detail` |
 | `logs` | `dir`, the tree, and `branch` | `text`: what failed and the end of its output, for the tree's agent |
+| `view` | `dir`, the tree, and `branch` | `pr`: the branch's PR read whole for the PR view, or null for none: `number`, `title`, `url`, `state`, `draft`, `author`, `base`, `branch`, `head`, `body`, `additions`, `deletions`, `files`, `commits`, `review`, `merge`, `checks` (each `name`, `outcome`, `workflow`, `seconds`, `url`, `log`), `threads` (each `author`, `path`, `line`, `resolved`, `code`, `code_line`, `body`, `replies`) and `bot`, CodeRabbit's review (`reviewed`, `reviewing`, `findings`: each `kind`, `severity`, `path`, `lines`, `title`, `body`, `fix`, `prompt`, `resolved`) |
 | `run` | `dir`, `branch` and `intent` | once the run is under way, which goes on after the call returns |
 | `attach` | `dir` and `branch` | `argv`, the command that shows the run under way in a terminal |
 
@@ -637,6 +639,23 @@ On a tree whose run is under way, `s` opens the run in the popup instead, `no-mi
 A merged tree says so in the return dialog, and `/merged` filters the list to merged trees to mark and return together.
 When a tree that records its issue merges, treetop follows it up in the background: it marks the issue done where its source sets `finish = true`, then reads the issues it blocks, and names each one with nothing else blocking it and nobody working on it in the status line, `END-1 merged · END-2 ready`.
 Those show `ready` in the Issues screen's WORK column, where `p` picks one up.
+
+## The PR view
+
+`v` opens the PR of the tree under the cursor in a popup over the pool, read afresh each time it opens, since review comments land without a push; the last read shows while the new one comes in.
+It has four tabs, which `1` to `4` switch, as do `h` and `l`; `j` and `k` move between items, and `d` and `u` scroll through one too long for the screen.
+
+- **Overview**: who wants to merge what, where its checks, review, CodeRabbit, open threads and merge stand, and its description.
+- **Checks**: each check with its workflow and how long it ran, failures first and cancelled runs after them; a failed one shows the end of its log below, read for the first five failures, and Enter opens a check on GitHub.
+- **Comments**: each review thread with the lines of code it is on, coloured as the diff colours them, and each comment on the whole PR, its Markdown drawn as the description's is; a resolved thread folds to one line until it is selected.
+- **CodeRabbit**, on a repository CodeRabbit reviews: its comments as issues and suggestions, each with its severity, place and title, and the selected one with its text and suggested change. Its nitpicks fold into one line, which `z` opens.
+
+`f` sends the selected item to the tree's agents, as `m` sends a message: a failed check with its log, a thread with its code and replies, or a CodeRabbit comment as the prompt CodeRabbit writes for agents.
+`F` on the CodeRabbit tab sends every open comment but the nitpicks at once.
+`O` opens the PR in the browser, `^R` reads it again, and Esc or `q` closes it.
+
+It reads through the repository's first ship plugin that answers `view`: GitHub's reads `gh pr view`, the PR's review threads over GraphQL, and the failed checks' logs, with your own `gh` login, and still only reads.
+CodeRabbit's comments are read from the markers it leaves in them; one it writes in a shape treetop does not know shows as a plain comment rather than going missing.
 
 ## Issues
 

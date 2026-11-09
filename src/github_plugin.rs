@@ -5,6 +5,8 @@
 //!
 //! `status` is one `gh pr list` for the whole repository, matched to the
 //! branches asked about, so a pool of twenty trees costs one call a minute.
+//! `view` reads one PR whole for its popup: `gh pr view`, its review threads
+//! over GraphQL, and the end of each failed check's log.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -15,8 +17,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::child::{self, End};
+use crate::coderabbit::{self, Finding};
 use crate::plugin::{Code, Error, PROTOCOL};
-use crate::ship::{self, Asked, Ship, Stage};
+use crate::ship::{self, Asked, BotReview, CheckView, PrView, Reply, Ship, Stage, Thread};
 
 /// How long one `gh` command gets.
 const GH_LIMIT: Duration = Duration::from_secs(9);
@@ -75,6 +78,12 @@ struct Check {
     details_url: Option<String>,
     #[serde(default)]
     target_url: Option<String>,
+    #[serde(default)]
+    workflow_name: Option<String>,
+    #[serde(default)]
+    started_at: Option<String>,
+    #[serde(default)]
+    completed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +127,37 @@ impl Check {
         let (_, rest) = url.split_once("/actions/runs/")?;
         let id = rest.split('/').next()?;
         (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())).then_some(id)
+    }
+
+    /// The Actions job behind a check run, from the same link.
+    fn job_id(&self) -> Option<&str> {
+        let url = self.details_url.as_deref()?;
+        let (_, rest) = url.split_once("/job/")?;
+        let id = rest.split(['/', '?', '#']).next()?;
+        (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())).then_some(id)
+    }
+
+    fn view(&self) -> CheckView {
+        let finished = |at: &Option<String>| at.as_deref().and_then(crate::pool::seconds);
+        let skipped = matches!(self.conclusion.as_deref(), Some("SKIPPED" | "NEUTRAL"));
+        CheckView {
+            name: self.name().to_string(),
+            outcome: match self.outcome() {
+                Outcome::Passed if skipped => ship::Outcome::Skipped,
+                Outcome::Passed => ship::Outcome::Passed,
+                Outcome::Failed if self.conclusion.as_deref() == Some("CANCELLED") => {
+                    ship::Outcome::Cancelled
+                }
+                Outcome::Failed => ship::Outcome::Failed,
+                Outcome::Pending => ship::Outcome::Pending,
+            },
+            workflow: self.workflow_name.clone().unwrap_or_default(),
+            seconds: finished(&self.completed_at)
+                .zip(finished(&self.started_at))
+                .and_then(|(end, start)| end.checked_sub(start)),
+            url: self.details_url.clone().or_else(|| self.target_url.clone()),
+            log: None,
+        }
     }
 }
 
@@ -370,6 +410,416 @@ fn review_text(dir: &Path, pr: &Pr) -> Result<String, Error> {
     Ok(text)
 }
 
+/// What `view` reads with `gh pr view`.
+const VIEW_FIELDS: &str = "number,title,url,state,isDraft,author,baseRefName,headRefName,\
+                           headRefOid,body,additions,deletions,changedFiles,commits,\
+                           reviewDecision,mergeStateStatus,statusCheckRollup,reviews,comments";
+
+/// A PR's review threads, which only GraphQL says are resolved.
+const THREADS: &str = "query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100) {
+        nodes {
+          isResolved path line originalLine startLine
+          comments(first: 50) { nodes { author { login } body diffHunk } }
+        }
+      }
+    }
+  }
+}";
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct Viewed {
+    number: u64,
+    title: String,
+    url: Option<String>,
+    state: String,
+    is_draft: bool,
+    author: Option<Login>,
+    base_ref_name: String,
+    head_ref_name: String,
+    head_ref_oid: String,
+    body: String,
+    additions: u64,
+    deletions: u64,
+    changed_files: u64,
+    commits: Vec<Value>,
+    review_decision: Option<String>,
+    merge_state_status: Option<String>,
+    status_check_rollup: Option<Vec<Check>>,
+    reviews: Vec<ViewedReview>,
+    comments: Vec<Said>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct ViewedReview {
+    author: Option<Login>,
+    body: String,
+    commit: Option<Oid>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct Oid {
+    oid: String,
+}
+
+/// A comment, on the PR or in a thread.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct Said {
+    author: Option<Login>,
+    body: String,
+    diff_hunk: String,
+}
+
+impl Said {
+    fn who(&self) -> &str {
+        login(&self.author)
+    }
+}
+
+/// Who wrote something, as GitHub names a deleted account.
+fn login(author: &Option<Login>) -> &str {
+    author.as_ref().map_or("ghost", |a| a.login.as_str())
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct ThreadNode {
+    is_resolved: bool,
+    path: String,
+    line: Option<u64>,
+    original_line: Option<u64>,
+    start_line: Option<u64>,
+    comments: Nodes<Said>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct Nodes<T> {
+    #[serde(default)]
+    nodes: Vec<T>,
+}
+
+/// The last lines of a thread's diff hunk, ending at its line.
+const CODE_LINES: usize = 4;
+
+/// One PR as its popup shows it, from `gh pr view`'s answer and its review
+/// threads; the checks' logs are read after.
+fn pr_view(viewed: Viewed, threads: Vec<ThreadNode>) -> PrView {
+    let checks: Vec<CheckView> = viewed
+        .status_check_rollup
+        .iter()
+        .flatten()
+        .map(Check::view)
+        .collect();
+    let mut checks = checks;
+    // What needs you first: failed, then running, then the rest.
+    checks.sort_by_key(|c| match c.outcome {
+        ship::Outcome::Failed => 0,
+        ship::Outcome::Pending => 1,
+        ship::Outcome::Cancelled => 2,
+        ship::Outcome::Passed => 3,
+        ship::Outcome::Skipped => 4,
+    });
+    let mut people = Vec::new();
+    let mut findings: Vec<Finding> = Vec::new();
+    for node in threads {
+        let mut comments = node.comments.nodes.into_iter();
+        let Some(first) = comments.next() else {
+            continue;
+        };
+        let line = node.line.or(node.original_line);
+        if coderabbit::is_coderabbit(first.who()) {
+            let lines = match (node.start_line, line) {
+                // GitHub can give the start after the end; a range reads up.
+                (Some(start), Some(end)) if start != end => {
+                    Some(format!("{}-{}", start.min(end), start.max(end)))
+                }
+                (_, end) => end.map(|l| l.to_string()),
+            };
+            for mut finding in coderabbit::line_comment(&first.body) {
+                finding.path = Some(node.path.clone());
+                finding.lines.clone_from(&lines);
+                finding.resolved |= node.is_resolved;
+                findings.push(finding);
+            }
+            continue;
+        }
+        let code: Vec<String> = first
+            .diff_hunk
+            .lines()
+            .filter(|l| !l.starts_with("@@"))
+            .map(str::to_string)
+            .collect();
+        people.push(Thread {
+            author: first.who().to_string(),
+            path: Some(node.path),
+            line,
+            resolved: node.is_resolved,
+            code: code[code.len().saturating_sub(CODE_LINES)..].to_vec(),
+            // The hunk is from the commit the comment was made on.
+            code_line: node.original_line.or(node.line),
+            body: first.body.trim().to_string(),
+            replies: comments
+                .map(|c| Reply {
+                    author: c.who().to_string(),
+                    body: c.body.trim().to_string(),
+                })
+                .collect(),
+        });
+    }
+    let mut reviewed = None;
+    for review in &viewed.reviews {
+        let who = login(&review.author).to_string();
+        if coderabbit::is_coderabbit(&who) {
+            reviewed = review.commit.as_ref().map(|c| c.oid.clone()).or(reviewed);
+            for finding in coderabbit::review(&review.body) {
+                let seen = findings.iter().any(|f| {
+                    (&f.path, &f.lines, &f.title) == (&finding.path, &finding.lines, &finding.title)
+                });
+                if !seen {
+                    findings.push(finding);
+                }
+            }
+        } else if !review.body.trim().is_empty() {
+            people.push(general(who, &review.body));
+        }
+    }
+    for comment in &viewed.comments {
+        if !coderabbit::is_coderabbit(comment.who()) && !comment.body.trim().is_empty() {
+            people.push(general(comment.who().to_string(), &comment.body));
+        }
+    }
+    // A repository can have more than one check for CodeRabbit, such as a
+    // workflow that asks it to review; any still running means a review is
+    // coming.
+    let bot_checks: Vec<&CheckView> = checks
+        .iter()
+        .filter(|c| c.name.to_lowercase().contains("coderabbit"))
+        .collect();
+    let bot = (reviewed.is_some() || !findings.is_empty() || !bot_checks.is_empty()).then(|| {
+        findings.sort_by_key(|f| (f.resolved, f.kind));
+        BotReview {
+            reviewed,
+            reviewing: bot_checks
+                .iter()
+                .any(|c| c.outcome == ship::Outcome::Pending),
+            findings,
+        }
+    });
+    PrView {
+        number: viewed.number,
+        title: viewed.title,
+        url: viewed.url,
+        state: viewed.state,
+        draft: viewed.is_draft,
+        author: login(&viewed.author).to_string(),
+        base: viewed.base_ref_name,
+        branch: viewed.head_ref_name,
+        head: viewed.head_ref_oid,
+        body: coderabbit::without_comments(&viewed.body)
+            .trim()
+            .to_string(),
+        additions: viewed.additions,
+        deletions: viewed.deletions,
+        files: viewed.changed_files,
+        commits: viewed.commits.len() as u64,
+        review: match viewed.review_decision.as_deref().unwrap_or_default() {
+            "APPROVED" => "approved",
+            "CHANGES_REQUESTED" => "changes requested",
+            "REVIEW_REQUIRED" => "required",
+            _ => "",
+        }
+        .to_string(),
+        merge: viewed.merge_state_status.unwrap_or_default().to_lowercase(),
+        checks,
+        threads: people,
+        bot,
+        threads_error: None,
+    }
+}
+
+/// A comment on the whole PR, as a thread with no line.
+fn general(author: String, body: &str) -> Thread {
+    Thread {
+        author,
+        body: body.trim().to_string(),
+        ..Thread::default()
+    }
+}
+
+/// A failed job's log as a person reads it: `gh --log-failed` puts the job,
+/// the step and a timestamp before every line, and Actions colours some.
+fn clean_log(log: &str) -> String {
+    log.lines()
+        .map(|line| {
+            let line = match line.splitn(3, '\t').collect::<Vec<_>>()[..] {
+                [_, _, rest] => rest,
+                _ => line,
+            };
+            let line = line.trim_start_matches('\u{feff}');
+            let line = match line.split_once(' ') {
+                Some((stamp, rest)) if crate::pool::seconds(stamp).is_some() => rest,
+                _ => line,
+            };
+            // A log lines its columns up with tabs, which a row drops.
+            without_escapes(line).replace('\t', "    ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `line` with its terminal colour codes (`ESC [ ... m`) taken out.
+fn without_escapes(line: &str) -> String {
+    // gh writes the escape itself as the two characters `^[`.
+    let line = line.replace("^[", "\u{1b}");
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Each check once, as its latest run: GitHub lists every run of a check
+/// on the head, so a workflow run again lists the one it superseded,
+/// cancelled, beside the new one.
+fn latest_checks(rollup: Vec<Check>) -> Vec<Check> {
+    let started = |c: &Check| c.started_at.as_deref().and_then(crate::pool::seconds);
+    let mut latest: Vec<Check> = Vec::new();
+    for check in rollup {
+        let same =
+            |seen: &Check| seen.name() == check.name() && seen.workflow_name == check.workflow_name;
+        match latest.iter_mut().find(|seen| same(seen)) {
+            Some(seen) if started(&check) >= started(seen) => *seen = check,
+            Some(_) => {}
+            None => latest.push(check),
+        }
+    }
+    latest
+}
+
+/// The failed checks whose logs `view` reads, up to `VIEW_LOGS`: a
+/// cancelled one has no failure to show.
+fn log_targets(checks: &[Check]) -> Vec<&Check> {
+    checks
+        .iter()
+        .filter(|c| c.outcome() == Outcome::Failed && c.conclusion.as_deref() != Some("CANCELLED"))
+        .take(ship::VIEW_LOGS)
+        .collect()
+}
+
+/// What a failed check's log read says: its tail, why it is empty, or why
+/// it could not be read.
+fn log_text(check: &Check, log: Result<String, Error>) -> String {
+    match log {
+        Ok(log) if log.trim().is_empty() => {
+            if check.conclusion.as_deref() == Some("CANCELLED") {
+                "It was cancelled before it wrote a log.".to_string()
+            } else {
+                "Its log is empty.".to_string()
+            }
+        }
+        Ok(log) => ship::tail(&clean_log(&log), LOG_LINES),
+        Err(err) => format!("its log could not be read: {err}"),
+    }
+}
+
+fn view(args: &Value) -> Result<Value, Error> {
+    let dir = args
+        .get("dir")
+        .and_then(Value::as_str)
+        .ok_or_else(|| failed("no dir given"))?;
+    let branch = args
+        .get("branch")
+        .and_then(Value::as_str)
+        .ok_or_else(|| failed("no branch given"))?;
+    let dir = Path::new(dir);
+    let viewed = match gh(dir, &["pr", "view", branch, "--json", VIEW_FIELDS]) {
+        Ok(viewed) => viewed,
+        Err(err) if err.message.contains("no pull requests found") => {
+            return Ok(json!({ "pr": null }));
+        }
+        Err(err) => return Err(err),
+    };
+    let mut viewed: Viewed =
+        serde_json::from_str(&viewed).map_err(|err| failed(format!("unreadable PR: {err}")))?;
+    viewed.status_check_rollup = viewed.status_check_rollup.map(latest_checks);
+    let failing: Vec<Check> =
+        log_targets(viewed.status_check_rollup.as_deref().unwrap_or_default())
+            .into_iter()
+            .cloned()
+            .collect();
+    let number = format!("number={}", viewed.number);
+    let threads: Result<Vec<ThreadNode>, Error> = gh(
+        dir,
+        &[
+            "api",
+            "graphql",
+            "-F",
+            "owner={owner}",
+            "-F",
+            "repo={repo}",
+            "-F",
+            &number,
+            "-f",
+            &format!("query={THREADS}"),
+        ],
+    )
+    .and_then(|text| {
+        let read: Value = serde_json::from_str(&text)
+            .map_err(|err| failed(format!("unreadable threads: {err}")))?;
+        let nodes = read
+            .pointer("/data/repository/pullRequest/reviewThreads/nodes")
+            .ok_or_else(|| failed("no review threads in GitHub's answer"))?;
+        serde_json::from_value(nodes.clone())
+            .map_err(|err| failed(format!("unreadable threads: {err}")))
+    });
+    // The rest of the PR still shows when its threads cannot be read, with
+    // why, so none is not taken for an empty list.
+    let (threads, threads_error) = match threads {
+        Ok(threads) => (threads, None),
+        Err(err) => (Vec::new(), Some(err.message)),
+    };
+    let mut pr = pr_view(viewed, threads);
+    pr.threads_error = threads_error;
+    for check in failing {
+        let log = match (check.job_id(), check.run_id()) {
+            (Some(job), _) => match gh(dir, &["run", "view", "--job", job, "--log-failed"]) {
+                // gh waits for the whole run; the job's own log is there once
+                // the job is done, while others in its run still go.
+                Err(err) if err.message.contains("still in progress") => {
+                    let path = format!("repos/{{owner}}/{{repo}}/actions/jobs/{job}/logs");
+                    // Its colour codes come through raw; `clean_log` takes them out.
+                    gh(dir, &["api", "--allow-escape-sequences", &path])
+                }
+                read => read,
+            },
+            (None, Some(run)) => gh(dir, &["run", "view", run, "--log-failed"]),
+            (None, None) => continue,
+        };
+        let text = log_text(&check, log);
+        if let Some(seen) = pr.checks.iter_mut().find(|c| {
+            c.name == check.name() && c.workflow == check.workflow_name.clone().unwrap_or_default()
+        }) {
+            seen.log = Some(text);
+        }
+    }
+    Ok(json!({ "pr": pr }))
+}
+
 fn logs(args: &Value) -> Result<Value, Error> {
     let dir = args
         .get("dir")
@@ -406,10 +856,11 @@ pub fn op(op: &str, args: &Value) -> Result<Value, Error> {
             "protocol": PROTOCOL,
             "name": "github",
             "kind": "ship",
-            "ops": ["status", "logs"],
+            "ops": ["status", "logs", "view"],
         })),
         "status" => status(args),
         "logs" => logs(args),
+        "view" => view(args),
         _ => Err(Error::new(
             Code::Unsupported,
             format!("github does not answer {op}"),
@@ -533,5 +984,221 @@ mod tests {
             json!({ "branches": [] })
         );
         assert_eq!(op("run", &json!({})).unwrap_err().code, Code::Unsupported);
+    }
+
+    /// A line comment as CodeRabbit writes one now: its rating, title and
+    /// text, its prompt for agents, and the markers that close it.
+    const RABBIT_LINE: &str = "<!-- coderabbit-ai-generated:v1 -->\n\n**<picture><img src=\"i.svg\"></picture> Major** · **Correctness**\n\n**Guard the empty list.**\n\n`items[0]` panics on an empty list.\n\n<!-- ai-agent-prompt:start -->\n\n<details>\n<summary>Prompt for AI Agents</summary>\n\n```\nIn src/a.rs at line 12, return early on an empty list.\n```\n\n</details>\n\n<!-- ai-agent-prompt:end -->\n\n<!-- cr-indicator-types:potential_issue -->\n\n<!-- cr-comment:v1:abc -->";
+
+    /// A CodeRabbit review whose text carries one nitpick, under its file.
+    const RABBIT_REVIEW: &str = "**Actionable comments posted: 1**\n\n<details>\n<summary>Nitpick comments: 1</summary><blockquote>\n\n<details>\n<summary>src/b.rs: 1</summary><blockquote>\n\n`3-4`: **Trivial** · **Style**\n\n**Name the closure.**\n\nIt reads better named.\n\n<!-- cr-comment:v1:def -->\n\n</blockquote></details>\n\n</blockquote></details>";
+
+    #[test]
+    fn a_pr_reads_whole_for_its_popup() {
+        let viewed: Viewed = serde_json::from_value(json!({
+            "number": 37, "title": "Highlight syntax", "state": "OPEN", "author": {"login": "me"},
+            "body": "<!-- This is an auto-generated comment: release notes by coderabbit.ai --><!--\ncoderabbit-ai-generated:v1 -->Bumps the workspace.",
+            "headRefOid": "head1", "commits": [{}, {}], "reviewDecision": "REVIEW_REQUIRED",
+            "mergeStateStatus": "BLOCKED",
+            "statusCheckRollup": [
+                {"name": "fmt", "status": "COMPLETED", "conclusion": "SUCCESS", "workflowName": "CI"},
+                {"name": "clippy", "status": "COMPLETED", "conclusion": "FAILURE", "workflowName": "CI",
+                 "startedAt": "2026-11-08T10:00:00Z", "completedAt": "2026-11-08T10:01:12Z",
+                 "detailsUrl": "https://github.com/o/r/actions/runs/991/job/5"},
+                {"name": "Request CodeRabbit Review", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                {"name": "CodeRabbit", "status": "IN_PROGRESS"}
+            ],
+            "reviews": [
+                {"author": {"login": "coderabbitai"}, "body": RABBIT_REVIEW, "commit": {"oid": "old1"}},
+                {"author": {"login": "jlin"}, "body": "Looks good once clippy passes."},
+                {"author": {"login": "jlin"}, "body": ""},
+                // A re-review repeats the nitpick it left before.
+                {"author": {"login": "coderabbitai"}, "body": RABBIT_REVIEW, "commit": {"oid": "new1"}}
+            ],
+            "comments": [{"author": {"login": "coderabbitai"}, "body": "Walkthrough"}]
+        }))
+        .unwrap();
+        let fixed = RABBIT_LINE.replace("Guard the empty list.", "Close the file.");
+        let threads: Vec<ThreadNode> = serde_json::from_value(json!([
+            {"isResolved": true, "path": "src/d.rs", "line": 5,
+             "comments": {"nodes": [{"author": {"login": "coderabbitai"}, "body": fixed}]}},
+            {"isResolved": false, "path": "src/a.rs", "line": 12, "originalLine": 12, "startLine": 10,
+             "comments": {"nodes": [{"author": {"login": "coderabbitai"}, "body": RABBIT_LINE}]}},
+            {"isResolved": false, "path": "src/c.rs", "line": 40, "originalLine": 31,
+             "comments": {"nodes": [
+                 {"author": {"login": "jlin"}, "body": "Why here?",
+                  "diffHunk": "@@ -28,2 +28,4 @@\n a\n b\n+c\n+d\n+e"},
+                 {"author": {"login": "me"}, "body": "Moved it."}
+             ]}}
+        ]))
+        .unwrap();
+        let pr = pr_view(viewed, threads);
+        assert_eq!(
+            (pr.commits, pr.review.as_str(), pr.merge.as_str()),
+            (2, "required", "blocked")
+        );
+        assert_eq!(
+            pr.body, "Bumps the workspace.",
+            "HTML comments are not for reading"
+        );
+        assert_eq!(pr.checks[0].seconds, Some(72));
+        assert_eq!(pr.checks[0].outcome, ship::Outcome::Failed);
+
+        let bot = pr.bot.expect("CodeRabbit reviews this repository");
+        assert!(bot.reviewing, "its check is still running");
+        assert_eq!(
+            bot.reviewed.as_deref(),
+            Some("new1"),
+            "the commit its latest review is of"
+        );
+        let found: Vec<_> = bot
+            .findings
+            .iter()
+            .map(|f| {
+                (
+                    f.kind,
+                    f.path.as_deref(),
+                    f.lines.as_deref(),
+                    f.title.as_str(),
+                    f.resolved,
+                )
+            })
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (
+                    coderabbit::Kind::Issue,
+                    Some("src/a.rs"),
+                    Some("10-12"),
+                    "Guard the empty list.",
+                    false
+                ),
+                (
+                    coderabbit::Kind::Nitpick,
+                    Some("src/b.rs"),
+                    Some("3-4"),
+                    "Name the closure.",
+                    false
+                ),
+                (
+                    coderabbit::Kind::Issue,
+                    Some("src/d.rs"),
+                    Some("5"),
+                    "Close the file.",
+                    true
+                ),
+            ],
+            "open ones by kind, then resolved ones; a repeated one once"
+        );
+
+        let people: Vec<(&str, Option<&str>)> = pr
+            .threads
+            .iter()
+            .map(|t| (t.author.as_str(), t.path.as_deref()))
+            .collect();
+        assert_eq!(
+            people,
+            [("jlin", Some("src/c.rs")), ("jlin", None)],
+            "CodeRabbit's own and empty reviews are not people's comments"
+        );
+        let thread = &pr.threads[0];
+        assert_eq!(
+            thread.code,
+            [" b", "+c", "+d", "+e"],
+            "the hunk's last lines"
+        );
+        assert_eq!(thread.line, Some(40), "the thread shows where it is now");
+        assert_eq!(
+            thread.code_line,
+            Some(31),
+            "the hunk is the comment's own, ending at its original line"
+        );
+        assert_eq!(thread.replies[0].body, "Moved it.");
+    }
+
+    #[test]
+    fn a_failed_log_reads_as_its_lines_alone() {
+        let log = "guard\tReject triggers\t2026-11-08T22:32:19.8973361Z \u{1b}[36;1mruby check.rb\u{1b}[0m\n\
+                   guard\tReject triggers\t2026-11-08T22:32:20.0000000Z ##[error]only workflow_dispatch is permitted\n\
+                   guard\tReject triggers\t2026-11-08T22:32:21.0000000Z ^[[36;1mln -sf node^[[0m\n\
+                   gate\tRun gate\t\u{feff}2026-11-08T22:52:46.7315338Z ##[group]Run merge-gate.sh\n\
+                   test\tRun tests\t2026-11-08T22:52:47.0000000Z FAIL\tgithub.com/caddyserver/caddy\t0.003s\n\
+                   plain line";
+        assert_eq!(
+            clean_log(log),
+            "ruby check.rb\n##[error]only workflow_dispatch is permitted\nln -sf node\n##[group]Run merge-gate.sh\nFAIL    github.com/caddyserver/caddy    0.003s\nplain line",
+            "no job, step or time before each line, and no colour codes"
+        );
+    }
+
+    #[test]
+    fn a_rerun_check_counts_once_and_real_failures_are_read_first() {
+        let rollup: Vec<Check> = serde_json::from_value(json!([
+            {"name": "changes", "status": "COMPLETED", "conclusion": "CANCELLED",
+             "startedAt": "2026-11-08T10:00:00Z", "detailsUrl": "https://github.com/o/r/actions/runs/1/job/11"},
+            {"name": "test (3.12)", "status": "COMPLETED", "conclusion": "FAILURE",
+             "startedAt": "2026-11-08T10:05:00Z", "detailsUrl": "https://github.com/o/r/actions/runs/2/job/21"},
+            {"name": "lint", "status": "COMPLETED", "conclusion": "CANCELLED",
+             "startedAt": "2026-11-08T10:01:00Z", "detailsUrl": "https://github.com/o/r/actions/runs/1/job/12"},
+            {"name": "changes", "status": "COMPLETED", "conclusion": "SUCCESS",
+             "startedAt": "2026-11-08T10:04:00Z", "detailsUrl": "https://github.com/o/r/actions/runs/2/job/22"},
+            {"name": "gate", "workflowName": "AI Triage", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "gate", "workflowName": "Security Scan", "status": "COMPLETED", "conclusion": "SUCCESS"}
+        ]))
+        .unwrap();
+        let latest = latest_checks(rollup);
+        let names: Vec<(&str, Outcome)> = latest.iter().map(|c| (c.name(), c.outcome())).collect();
+        assert_eq!(
+            names,
+            [
+                ("changes", Outcome::Passed),
+                ("test (3.12)", Outcome::Failed),
+                ("lint", Outcome::Failed),
+                ("gate", Outcome::Passed),
+                ("gate", Outcome::Passed),
+            ],
+            "a check run again counts as its latest run, and one in another workflow is another check"
+        );
+        let read: Vec<&str> = log_targets(&latest).iter().map(|c| c.name()).collect();
+        assert_eq!(
+            read,
+            ["test (3.12)"],
+            "a cancelled check has no failure to read"
+        );
+        let lint = latest.iter().find(|c| c.name() == "lint").map(Check::view);
+        assert_eq!(lint.map(|c| c.outcome), Some(ship::Outcome::Cancelled));
+    }
+
+    #[test]
+    fn an_empty_log_says_why_it_is_empty() {
+        let cancelled: Check = serde_json::from_value(
+            json!({"name": "sanitize", "status": "COMPLETED", "conclusion": "CANCELLED"}),
+        )
+        .unwrap();
+        assert_eq!(
+            log_text(&cancelled, Ok(String::new())),
+            "It was cancelled before it wrote a log."
+        );
+        let failed: Check = serde_json::from_value(
+            json!({"name": "test", "status": "COMPLETED", "conclusion": "FAILURE"}),
+        )
+        .unwrap();
+        assert_eq!(log_text(&failed, Ok("  \n".into())), "Its log is empty.");
+        assert_eq!(log_text(&failed, Ok("a\tb\tboom".into())), "boom");
+    }
+
+    #[test]
+    fn a_backwards_range_reads_forwards() {
+        let threads: Vec<ThreadNode> = serde_json::from_value(json!([
+            {"isResolved": false, "path": "src/Container.ts", "line": 1567, "startLine": 1577,
+             "comments": {"nodes": [{"author": {"login": "coderabbitai"}, "body": RABBIT_LINE}]}}
+        ]))
+        .unwrap();
+        let pr = pr_view(Viewed::default(), threads);
+        let lines = pr
+            .bot
+            .and_then(|b| b.findings.first().and_then(|f| f.lines.clone()));
+        assert_eq!(lines.as_deref(), Some("1567-1577"));
     }
 }

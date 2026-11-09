@@ -16,11 +16,12 @@ use crate::handoff;
 use crate::jobs::{Job, Kind, Launch, Message, Pick, Replaced, ShipAction, ShipCall};
 use crate::keeper::Kept;
 use crate::phone::{Code, Shared};
-use crate::plugin::{Plugin, Usage};
+use crate::plugin::{self, Plugin, Usage};
 use crate::pool::{self, Process, Tree, Work};
+use crate::pr_view::{self, PrPopup, PrRead, Tab};
 use crate::reports::{Report, State};
 use crate::scratch::Scratch;
-use crate::ship::{Answer, Stage};
+use crate::ship::{self, Answer, PrView, Stage};
 use crate::sidecar::{Shelf, Sidecar};
 
 /// Where a tree's latest job stands, shown in its STATUS cell.
@@ -376,6 +377,12 @@ pub struct App {
     pub diffs: HashMap<PathBuf, LoadedDiff>,
     /// Diffs asked for and not yet loaded, with the counts they were asked at.
     diff_requests: HashMap<PathBuf, Option<Work>>,
+    /// A tree's PR in its popup over the pool.
+    pub pr_popup: Option<PrPopup>,
+    /// Each tree's PR as the popup last read it.
+    pub prs: HashMap<PathBuf, PrRead>,
+    /// The tree whose PR the popup wants read, until the main loop takes it.
+    pr_wanted: Option<PathBuf>,
     /// `q` was pressed while jobs were running; quit once they finish.
     pub is_quitting: bool,
     pub message: Option<String>,
@@ -1272,6 +1279,208 @@ impl App {
         });
     }
 
+    /// Opens the PR popup on the tree under the cursor, reading its PR
+    /// afresh: comments and reviews land without a push, so the last read
+    /// shows only until this one comes in.
+    fn open_pr_view(&mut self) {
+        let Some(tree) = self.current() else { return };
+        if !tree.is_held() {
+            self.message = Some(format!("tree {} is available: it has no PR", tree.name));
+            return;
+        }
+        let path = tree.path.clone();
+        self.pr_popup = Some(PrPopup::new(path.clone()));
+        self.read_pr(path);
+    }
+
+    fn read_pr(&mut self, path: PathBuf) {
+        self.prs.entry(path.clone()).or_default().is_reading = true;
+        self.pr_wanted = Some(path);
+    }
+
+    /// The PR the popup wants read: the tree, its branch, and the ship
+    /// plugin that reads it. Where none can, the popup says so instead.
+    pub fn wanted_pr(&mut self) -> Option<(PathBuf, String, Plugin)> {
+        let path = self.pr_wanted.take()?;
+        let branch = self
+            .trees
+            .iter()
+            .find(|t| t.path == path)
+            .and_then(|t| t.branch.clone());
+        let plugin = ship::answering(&self.ship_plugins, "view").cloned();
+        let why = match (branch, plugin) {
+            (Some(branch), Some(plugin)) => return Some((path, branch, plugin)),
+            (None, _) => "the tree is on no branch, so it has no PR",
+            (_, None) => "none of this repository's ship plugins can read a PR whole",
+        };
+        self.prs.insert(
+            path,
+            PrRead {
+                pr: Some(Err(why.to_string())),
+                is_reading: false,
+            },
+        );
+        None
+    }
+
+    /// A PR read for the popup, or why it could not be.
+    pub fn pr_loaded(&mut self, path: PathBuf, read: Result<Option<PrView>, plugin::Error>) {
+        let read = read.map_err(|err| match err.code {
+            plugin::Code::Auth => {
+                "gh is not signed in, so treetop cannot read this PR. Run gh auth login."
+                    .to_string()
+            }
+            _ => err.to_string(),
+        });
+        self.prs.insert(
+            path.clone(),
+            PrRead {
+                pr: Some(read),
+                is_reading: false,
+            },
+        );
+        if let Some(popup) = self.pr_popup.as_mut().filter(|p| p.path == path) {
+            let pr = self.prs.get(&path).and_then(|r| r.pr.clone()?.ok()?);
+            match pr {
+                Some(pr) => clamp(popup, &pr),
+                None => popup.tab = Tab::Overview,
+            }
+        }
+    }
+
+    fn handle_pr_key(&mut self, key: KeyEvent) -> Outcome {
+        let Some(path) = self.pr_popup.as_ref().map(|p| p.path.clone()) else {
+            return Outcome::Continue;
+        };
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('c') => return Outcome::Quit,
+                KeyCode::Char('r') => self.read_pr(path),
+                _ => {}
+            }
+            return Outcome::Continue;
+        }
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+            self.pr_popup = None;
+            return Outcome::Continue;
+        }
+        let pr = self.prs.get(&path).and_then(|r| r.pr.clone()?.ok()?);
+        let Some(pr) = pr else {
+            return Outcome::Continue;
+        };
+        let Some(popup) = self.pr_popup.as_mut() else {
+            return Outcome::Continue;
+        };
+        let tabs = pr_view::tabs(&pr);
+        let at = tabs.iter().position(|t| *t == popup.tab).unwrap_or(0);
+        // Anything but a scroll moves off the item, so starts it at its top.
+        if !matches!(
+            key.code,
+            KeyCode::Char('d' | 'u' | 'f' | 'F' | 'O') | KeyCode::Enter
+        ) {
+            popup.offset = 0;
+        }
+        let index = popup.tab.index();
+        let last = pr_view::last_row(&pr, popup.tab, popup.nitpicks);
+        let step = |popup: &mut PrPopup, delta: isize| {
+            popup.selected[index] = popup.selected[index].saturating_add_signed(delta).min(last);
+        };
+        match key.code {
+            KeyCode::Char(c @ '1'..='4') => {
+                let wanted = usize::from(c as u8 - b'1');
+                if let Some(tab) = tabs.get(wanted) {
+                    popup.tab = *tab;
+                }
+            }
+            KeyCode::Right | KeyCode::Char('l') => popup.tab = tabs[(at + 1) % tabs.len()],
+            KeyCode::Left | KeyCode::Char('h') => {
+                popup.tab = tabs[(at + tabs.len() - 1) % tabs.len()];
+            }
+            KeyCode::Down | KeyCode::Char('j') => step(popup, 1),
+            KeyCode::Up | KeyCode::Char('k') => step(popup, -1),
+            KeyCode::Char('d') if popup.tab == Tab::Overview => step(popup, SCROLL),
+            KeyCode::Char('u') if popup.tab == Tab::Overview => step(popup, -SCROLL),
+            KeyCode::Char('d') => popup.offset += SCROLL.unsigned_abs(),
+            KeyCode::Char('u') => popup.offset = popup.offset.saturating_sub(SCROLL.unsigned_abs()),
+            KeyCode::Char('g') => popup.selected[index] = 0,
+            KeyCode::Char('G') => step(popup, isize::MAX),
+            KeyCode::Char('z') if popup.tab == Tab::CodeRabbit => {
+                popup.nitpicks = !popup.nitpicks;
+                clamp(popup, &pr);
+            }
+            KeyCode::Char('O') => {
+                if let Some(url) = pr.url.clone() {
+                    return Outcome::OpenUrl(url);
+                }
+            }
+            KeyCode::Enter if popup.tab == Tab::Checks => {
+                if let Some(url) = pr.checks.get(popup.selected()).and_then(|c| c.url.clone()) {
+                    return Outcome::OpenUrl(url);
+                }
+            }
+            KeyCode::Char('f') => {
+                let selected = popup.selected();
+                let (what, text) = match popup.tab {
+                    Tab::Overview => return Outcome::Continue,
+                    Tab::Checks => match pr.checks.get(selected) {
+                        Some(check) => match pr_view::check_message(&pr, check) {
+                            Some(text) => (format!("{} on #{}", check.name, pr.number), text),
+                            None => {
+                                self.message = Some(format!("{} has not failed", check.name));
+                                return Outcome::Continue;
+                            }
+                        },
+                        None => return Outcome::Continue,
+                    },
+                    Tab::Comments => match pr.threads.get(selected) {
+                        Some(thread) => (
+                            format!("{}'s comment", thread.author),
+                            pr_view::thread_message(&pr, thread),
+                        ),
+                        None => return Outcome::Continue,
+                    },
+                    Tab::CodeRabbit => match pr_view::findings(&pr, popup.nitpicks).get(selected) {
+                        Some(finding) => (
+                            format!(
+                                "CodeRabbit on {}",
+                                pr_view::place(finding.path.as_deref(), finding.lines.as_deref())
+                            ),
+                            pr_view::finding_message(&pr, finding),
+                        ),
+                        None => return Outcome::Continue,
+                    },
+                };
+                return self.send_to_tree(&path, &what, text);
+            }
+            KeyCode::Char('F') if popup.tab == Tab::CodeRabbit => {
+                let open = pr_view::actionable(&pr);
+                if open.is_empty() {
+                    self.message = Some("CodeRabbit has nothing open to send".into());
+                    return Outcome::Continue;
+                }
+                let what = format!("{} CodeRabbit comments", open.len());
+                let text = pr_view::findings_message(&pr, &open);
+                return self.send_to_tree(&path, &what, text);
+            }
+            _ => {}
+        }
+        Outcome::Continue
+    }
+
+    /// `text` to the agents in the tree at `path`, saying `what` went.
+    fn send_to_tree(&mut self, path: &PathBuf, what: &str, text: String) -> Outcome {
+        let Some(tree) = self.trees.iter().find(|t| &t.path == path) else {
+            return Outcome::Continue;
+        };
+        let to = Self::recipients(tree);
+        if to.is_empty() {
+            self.message = Some(format!("no agent in tree {} to send it to", tree.name));
+            return Outcome::Continue;
+        }
+        self.message = Some(format!("sent {what} to the agent in tree {}", tree.name));
+        Outcome::Send { to, text }
+    }
+
     fn handle_view_key(&mut self, key: KeyEvent) -> Outcome {
         let Some(path) = self.view.as_ref().map(|v| v.path.clone()) else {
             return Outcome::Continue;
@@ -1473,6 +1682,7 @@ impl App {
     /// ask's chat may open without taking over something under way.
     fn is_free(&self) -> bool {
         self.view.is_none()
+            && self.pr_popup.is_none()
             && self.prompt.is_none()
             && self.picker.is_none()
             && self.port_menu.is_none()
@@ -1575,6 +1785,7 @@ impl App {
         (!self.inbox.is_hidden || self.rail.is_some())
             && !self.is_issues
             && self.view.is_none()
+            && self.pr_popup.is_none()
             && self.prompt.is_none()
             && self.picker.is_none()
             && self.port_menu.is_none()
@@ -3155,6 +3366,9 @@ impl App {
         if self.view.is_some() {
             return self.handle_view_key(key);
         }
+        if self.pr_popup.is_some() {
+            return self.handle_pr_key(key);
+        }
         if self.prompt.is_some() {
             return self.handle_prompt_key(key);
         }
@@ -3360,6 +3574,7 @@ impl App {
             KeyCode::Char('n') => self.open_start(),
             KeyCode::Char('N') => self.open_dispatch(),
             KeyCode::Char('d') => self.open_diff(),
+            KeyCode::Char('v') => self.open_pr_view(),
             KeyCode::Char('b') => self.open_rename(),
             KeyCode::Char('r') => {
                 // Destroy is asked inside the return dialog, so it takes
@@ -3377,6 +3592,22 @@ impl App {
             _ => {}
         }
         Outcome::Continue
+    }
+}
+
+/// Rows `d` and `u` scroll the PR popup by.
+const SCROLL: isize = 10;
+
+/// The selection kept on a row the PR has, after a read or a fold.
+fn clamp(popup: &mut PrPopup, pr: &PrView) {
+    let tabs = pr_view::tabs(pr);
+    if !tabs.contains(&popup.tab) {
+        popup.tab = Tab::Overview;
+    }
+    for tab in tabs {
+        let index = tab.index();
+        popup.selected[index] =
+            popup.selected[index].min(pr_view::last_row(pr, tab, popup.nitpicks));
     }
 }
 
@@ -5934,6 +6165,137 @@ mod tests {
             "CI failed on #12. Fix it and push.\n\nFailing checks: test"
         );
         assert!(app.ready_failure().is_none(), "sent once");
+    }
+
+    #[test]
+    fn v_opens_the_trees_pr_and_f_sends_what_is_selected_to_its_agent() {
+        use crate::coderabbit::{Finding, Kind as Found};
+        use crate::ship::{BotReview, PrView};
+        let mut app = app();
+        let path = PathBuf::from("/p/4/app");
+        press(&mut app, KeyCode::Char('v'));
+        assert_eq!(
+            app.pr_popup.as_ref().map(|p| p.path.clone()),
+            Some(path.clone())
+        );
+        assert_eq!(app.wanted_pr(), None, "no ship plugin can read it");
+        assert_eq!(
+            app.prs[&path].pr,
+            Some(Err(
+                "none of this repository's ship plugins can read a PR whole".into()
+            ))
+        );
+        app.ship_plugins = vec![Plugin::Builtin("github")];
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert!(app.prs[&path].is_reading, "^R reads it again");
+        assert!(
+            app.prs[&path].pr.is_some(),
+            "the last read shows while ^R reads again"
+        );
+        let (asked, branch, _) = app.wanted_pr().expect("github reads it");
+        assert_eq!((asked, branch.as_str()), (path.clone(), "feature/end-1-a"));
+        app.pr_loaded(
+            path.clone(),
+            Err(plugin::Error::new(plugin::Code::Auth, "run gh auth login")),
+        );
+        assert_eq!(
+            app.prs[&path].pr,
+            Some(Err(
+                "gh is not signed in, so treetop cannot read this PR. Run gh auth login.".into()
+            ))
+        );
+
+        let finding = |kind, title: &str, resolved, prompt: Option<&str>| Finding {
+            kind,
+            path: Some("src/a.rs".into()),
+            lines: Some("12".into()),
+            title: title.into(),
+            body: "Why.".into(),
+            prompt: prompt.map(str::to_string),
+            resolved,
+            ..Finding::default()
+        };
+        let pr = PrView {
+            number: 37,
+            bot: Some(BotReview {
+                findings: vec![
+                    finding(
+                        Found::Issue,
+                        "Guard it.",
+                        false,
+                        Some("Return early at src/a.rs:12."),
+                    ),
+                    finding(Found::Suggestion, "Done already.", true, None),
+                    finding(Found::Nitpick, "Name it.", false, None),
+                ],
+                ..BotReview::default()
+            }),
+            ..PrView::default()
+        };
+        app.pr_loaded(
+            path.clone(),
+            Ok(Some(PrView {
+                bot: None,
+                ..pr.clone()
+            })),
+        );
+        press(&mut app, KeyCode::Char('4'));
+        assert_eq!(
+            app.pr_popup.as_ref().unwrap().tab,
+            Tab::Overview,
+            "no CodeRabbit tab here"
+        );
+
+        app.pr_loaded(path.clone(), Ok(Some(pr)));
+        press(&mut app, KeyCode::Char('4'));
+        assert_eq!(app.pr_popup.as_ref().unwrap().tab, Tab::CodeRabbit);
+        assert_eq!(press(&mut app, KeyCode::Char('f')), Outcome::Continue);
+        assert_eq!(
+            app.message.as_deref(),
+            Some("no agent in tree 4 to send it to")
+        );
+        app.apply_agents(&HashMap::from([(
+            path.clone(),
+            vec![attachable("0908e7f3")],
+        )]));
+        let Outcome::Send { to, text } = press(&mut app, KeyCode::Char('f')) else {
+            panic!("f sends the selected finding");
+        };
+        assert_eq!(to.len(), 1);
+        assert_eq!(
+            text,
+            "CodeRabbit flagged this on #37. Fix it if it still holds, and push.\n\n\
+             src/a.rs:12: Guard it.\n\nReturn early at src/a.rs:12."
+        );
+        assert_eq!(
+            app.message.as_deref(),
+            Some("sent CodeRabbit on src/a.rs:12 to the agent in tree 4")
+        );
+        let Outcome::Send { text, .. } = press(&mut app, KeyCode::Char('F')) else {
+            panic!("F sends every open finding");
+        };
+        assert!(
+            text.starts_with("CodeRabbit left 1 open comment on #37.")
+                && !text.contains("Done already.")
+                && !text.contains("Name it."),
+            "neither the resolved one nor the nitpick: {text}"
+        );
+
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(
+            app.pr_popup.as_ref().unwrap().selected(),
+            1,
+            "the nitpick is folded"
+        );
+        press(&mut app, KeyCode::Char('z'));
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(
+            app.pr_popup.as_ref().unwrap().selected(),
+            2,
+            "z lists the nitpick"
+        );
+        press(&mut app, KeyCode::Esc);
+        assert!(app.pr_popup.is_none());
     }
 
     #[test]

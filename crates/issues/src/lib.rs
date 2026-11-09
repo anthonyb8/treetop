@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 pub use backend::{Backend, Linear, READ_ONLY};
 pub use host::{Host, NoTrees, Work};
+pub use markdown::{Piece, pieces};
 pub use screen::{Action, Screen};
 pub use views::{Group, Section, View, builtin, is_closed, sections};
 

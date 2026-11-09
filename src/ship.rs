@@ -97,6 +97,118 @@ impl Ship {
     }
 }
 
+/// One PR read whole for its popup, as a ship plugin's `view` answers it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrView {
+    pub number: u64,
+    pub title: String,
+    pub url: Option<String>,
+    /// `OPEN`, `CLOSED` or `MERGED`.
+    pub state: String,
+    pub draft: bool,
+    pub author: String,
+    pub base: String,
+    pub branch: String,
+    /// The commit the PR is on.
+    pub head: String,
+    /// Its description, in Markdown.
+    pub body: String,
+    pub additions: u64,
+    pub deletions: u64,
+    pub files: u64,
+    pub commits: u64,
+    /// `approved`, `changes requested`, `required`, or empty.
+    pub review: String,
+    /// Why it can or cannot merge, such as `blocked` or `clean`.
+    pub merge: String,
+    pub checks: Vec<CheckView>,
+    /// Review threads and comments from people, and bots other than the
+    /// one whose findings are in `bot`.
+    pub threads: Vec<Thread>,
+    /// CodeRabbit's review, where it reviews the repository.
+    pub bot: Option<BotReview>,
+    /// Why the review threads could not be read, so none is not taken for
+    /// an empty list.
+    pub threads_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Outcome {
+    Passed,
+    Failed,
+    #[default]
+    Pending,
+    Skipped,
+    /// Stopped before it finished, such as a run a newer push superseded.
+    Cancelled,
+}
+
+/// The failed checks whose logs a `view` reads, each a call to the forge.
+pub const VIEW_LOGS: usize = 5;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CheckView {
+    pub name: String,
+    pub outcome: Outcome,
+    /// The workflow it runs in, such as `CI`, or the app that reports it.
+    pub workflow: String,
+    /// How long it ran, once it has finished.
+    pub seconds: Option<u64>,
+    pub url: Option<String>,
+    /// The end of a failed check's log.
+    pub log: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Thread {
+    pub author: String,
+    /// The file and line a review thread is on; None for a comment on the
+    /// whole PR.
+    pub path: Option<String>,
+    pub line: Option<u64>,
+    pub resolved: bool,
+    /// The last lines of the diff it is on, each starting `+`, `-` or a
+    /// space, ending at its line.
+    pub code: Vec<String>,
+    /// The line number of `code`'s last line.
+    pub code_line: Option<u64>,
+    pub body: String,
+    pub replies: Vec<Reply>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Reply {
+    pub author: String,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BotReview {
+    /// The commit its latest review is of.
+    pub reviewed: Option<String>,
+    /// It is reviewing a newer commit now.
+    pub reviewing: bool,
+    pub findings: Vec<crate::coderabbit::Finding>,
+}
+
+/// The PR on `branch` of the tree at `dir`, as `plugin` reads it whole for
+/// its popup; None when the branch has none.
+pub fn view(plugin: &Plugin, dir: &Path, branch: &str) -> Result<Option<PrView>, Error> {
+    let reply = plugin.call("view", json!({ "dir": dir, "branch": branch }))?;
+    match reply.get("pr") {
+        None | Some(Value::Null) => Ok(None),
+        Some(pr) => serde_json::from_value(pr.clone())
+            .map(Some)
+            .map_err(|err| Error::new(Code::Failed, format!("unreadable PR: {err}"))),
+    }
+}
+
 /// A tree a plugin is asked about: where it is and its branch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Asked {
