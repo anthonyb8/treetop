@@ -835,7 +835,9 @@ Inbox, in the tab bar, is the desktop's [inbox](#the-inbox) on the phone, so wha
 It lists the same entries from every workspace, in the same order under the same headings, and its tab counts what you have not opened yet.
 A tap opens an entry as its notification would, the agent's chat or the tree for a PR or an agent that died, switching to its workspace first; swiping one left dismisses it.
 What you open or dismiss on either is kept in the one `inbox.json`, so the desktop's inbox shows it too once it next reads that file, at a restart or a switch.
-With the server out of reach, it opens on the pool as it last saw it and says so.
+With the server out of reach while it is open, it shows the pool as it last saw it and says so.
+It keeps no copy of itself on the phone, so every open loads the treetop the server runs now; with the server out of reach, it does not open at all.
+If it has not started 8 seconds after opening, it clears anything an older treetop left on the phone and tries once more, and then says it did not start rather than showing a blank screen.
 
 ### Working on the app
 
