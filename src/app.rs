@@ -256,6 +256,17 @@ pub struct LogEntry {
     pub output: String,
 }
 
+/// What the window under the table shows of its tree.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WindowTab {
+    /// Its agent's chat, live.
+    #[default]
+    Chat,
+    /// Where it is, its agents, ports and processes, and what its agent
+    /// last said: the detail the pane under the list used to hold.
+    Info,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
     Continue,
@@ -495,6 +506,11 @@ pub struct App {
     inbox_file: Option<PathBuf>,
     /// The inbox has the keys, with its cursor on this entry.
     pub rail: Option<usize>,
+    /// The tab the window under the table shows.
+    pub tab: WindowTab,
+    /// The window under the table has the keys: its chat takes them, and
+    /// Ctrl+Q gives them back to the table.
+    pub is_window_focused: bool,
     /// The tree whose agent opens once this workspace's agents are read:
     /// an inbox entry chosen from another workspace.
     pub arriving: Option<(PathBuf, crate::inbox::Kind)>,
@@ -909,6 +925,59 @@ impl App {
                 .then(a.name.cmp(&b.name))
         });
         agents
+    }
+
+    /// The tree the window under the table shows: the one under the
+    /// cursor, or the main checkout on its heading.
+    pub fn window_tree(&self) -> Option<&Tree> {
+        self.current().or(self.main_under_cursor())
+    }
+
+    /// The agent the window shows the chat of: the tree's leading agent
+    /// that offers one, as Enter opens it.
+    pub fn window_agent(&self) -> Option<&Agent> {
+        Self::agents_of(self.window_tree()?)
+            .into_iter()
+            .find(|agent| agent.attach.is_some())
+    }
+
+    /// The chat the window shows on its chat tab, as the chat command, its
+    /// agent and its tree: the window agent's while it runs. A cold one is
+    /// left closed, since attaching to it would start it again; Enter does
+    /// that on purpose.
+    pub fn window_chat(&self) -> Option<(Vec<String>, String, String)> {
+        if self.tab != WindowTab::Chat {
+            return None;
+        }
+        let tree = self.window_tree()?;
+        let agent = self.window_agent()?;
+        if agent.status == Some(Status::Cold) {
+            return None;
+        }
+        Some((agent.attach.clone()?, agent.name.clone(), tree.name.clone()))
+    }
+
+    /// Moves the cursor to tree `name`, so the window shows the chat opened
+    /// on it, unless a filter or a folded group hides it.
+    pub fn select_tree(&mut self, name: &str) {
+        // The main checkout has no row of its own: its base's heading
+        // stands for it.
+        if let Some(main) = self.trees.iter().find(|t| t.name == name && t.is_main) {
+            let branch = main.branch.clone();
+            let heading = self.rows().iter().position(|row| {
+                matches!(row, ListRow::Heading { group: Group::Base(base), .. } if branch.as_ref() == Some(base))
+            });
+            if let Some(at) = heading {
+                self.selected = at;
+            }
+            return;
+        }
+        let path = self
+            .trees
+            .iter()
+            .find(|t| t.name == name)
+            .map(|t| t.path.clone());
+        self.reselect(path);
     }
 
     /// The tree under the cursor; None on a heading.
@@ -3404,6 +3473,20 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return match key.code {
                 KeyCode::Char('c') => Outcome::Quit,
+                // Ctrl+Q gives the window under the table the keys, for its
+                // chat to take, once nothing else on screen waits on them.
+                KeyCode::Char('q' | 'Q') => {
+                    let is_free = self.reviews.is_empty()
+                        && self.pending.is_none()
+                        && self.shipping.is_none()
+                        && !self.is_help
+                        && !self.is_filtering
+                        && self.rail.is_none();
+                    if is_free && self.window_chat().is_some() {
+                        self.is_window_focused = true;
+                    }
+                    Outcome::Continue
+                }
                 _ => Outcome::Continue,
             };
         }
@@ -3494,6 +3577,13 @@ impl App {
         }
         if key.code == KeyCode::Char('w') {
             return Outcome::Workspaces;
+        }
+        if matches!(key.code, KeyCode::Left | KeyCode::Right) {
+            self.tab = match self.tab {
+                WindowTab::Chat => WindowTab::Info,
+                WindowTab::Info => WindowTab::Chat,
+            };
+            return Outcome::Continue;
         }
         if key.code == KeyCode::Char('C') {
             return Outcome::Scratches;
@@ -6429,5 +6519,69 @@ mod tests {
         gate.plugin = "no-mistakes".into();
         app.apply_ship(ships(&[("/p/4/app", gate)]));
         app
+    }
+
+    /// Tree 4 with an agent to chat with, in `status`.
+    fn with_chat(status: Status) -> App {
+        let mut app = app();
+        let tree = app.trees.iter_mut().find(|t| t.name == "4").unwrap();
+        tree.agents = vec![Agent {
+            status: Some(status),
+            ..attachable("fixer")
+        }];
+        select(&mut app, "4");
+        app
+    }
+
+    #[test]
+    fn the_window_opens_a_running_agents_chat_and_never_a_cold_one() {
+        let app = with_chat(Status::Busy);
+        assert_eq!(
+            app.window_chat(),
+            Some((
+                vec!["claude".into(), "attach".into(), "fixer".into()],
+                "fixer".into(),
+                "4".into()
+            ))
+        );
+        // Attaching to a cold agent starts it again, so the window leaves it
+        // to Enter.
+        assert_eq!(with_chat(Status::Cold).window_chat(), None);
+        let mut on_info = with_chat(Status::Busy);
+        press(&mut on_info, KeyCode::Right);
+        assert_eq!(on_info.tab, WindowTab::Info);
+        assert_eq!(on_info.window_chat(), None, "the info tab opens no chat");
+        press(&mut on_info, KeyCode::Left);
+        assert_eq!(on_info.tab, WindowTab::Chat);
+    }
+
+    #[test]
+    fn ctrl_q_gives_the_window_the_keys_where_it_has_a_chat_and_never_quits() {
+        let ctrl_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
+        let mut app = with_chat(Status::Idle);
+        assert_eq!(app.handle_key(ctrl_q), Outcome::Continue);
+        assert!(app.is_window_focused);
+        let mut app = with_chat(Status::Idle);
+        select(&mut app, "8");
+        assert_eq!(app.handle_key(ctrl_q), Outcome::Continue);
+        assert!(
+            !app.is_window_focused,
+            "tree 8 has no chat to take the keys"
+        );
+        let mut app = with_chat(Status::Idle);
+        app.rail = Some(0);
+        app.handle_key(ctrl_q);
+        assert!(!app.is_window_focused, "the inbox keeps the keys it has");
+    }
+
+    #[test]
+    fn a_chat_opened_on_the_main_checkout_puts_the_cursor_on_its_heading() {
+        let mut app = app_on_main_heading();
+        select(&mut app, "8");
+        let main = app.trees.iter().find(|t| t.is_main).unwrap().name.clone();
+        app.select_tree(&main);
+        assert_eq!(app.window_tree().map(|t| t.name.clone()), Some(main));
+        app.select_tree("4");
+        assert_eq!(app.window_tree().map(|t| t.name.as_str()), Some("4"));
     }
 }

@@ -18,7 +18,7 @@ use ratatui::widgets::{
 use crate::agents::{Agent, Status};
 use crate::app::{
     App, DiffView, Group, Item, JobState, ListRow, LogEntry, Opening, Outcome, Pending, Phone,
-    Picker, PortMenu, Reach, Review, SCRATCH, ScratchMenu, Shipping,
+    Picker, PortMenu, Reach, Review, SCRATCH, ScratchMenu, Shipping, WindowTab,
 };
 use crate::assistant;
 use crate::chat::Chat;
@@ -39,8 +39,9 @@ use crate::theme::theme;
 
 /// The bar's keys, most useful first: on a narrow bar the keys at the end
 /// are the ones left out, and `?` lists them all.
-const KEYS: [(&str, &str); 14] = [
+const KEYS: [(&str, &str); 15] = [
     ("Enter", "open"),
+    ("^Q", "window"),
     ("?", "help"),
     ("e", "inbox"),
     ("n", "new here"),
@@ -66,6 +67,8 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
         "Agents",
         &[
             ("Enter", "open, fold heading"),
+            ("^Q", "window, table"),
+            ("\u{2190} \u{2192}", "chat, info tab"),
             ("n", "new agent here"),
             ("N", "agent in new tree"),
             ("m", "message agents"),
@@ -186,12 +189,22 @@ pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>, issues: Option<&i
         None => {
             let [main, footer] =
                 Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
-            let inbox = inbox_layout(app, main);
-            let [body, detail] =
-                Layout::vertical([Constraint::Fill(1), Constraint::Length(DETAIL_HEIGHT)])
-                    .areas(inbox.list);
+            let windows = windows(app, main);
+            let inbox = inbox_layout(app, windows.top);
+            // The table has the keys unless the window or the inbox does.
+            let block = window_block(!app.is_window_focused && app.rail.is_none()).title(" Trees ");
+            let body = block.inner(inbox.list);
+            frame.render_widget(block, inbox.list);
             draw_table(frame, app, body);
-            draw_detail(frame, app, detail);
+            if let Some(area) = windows.window {
+                let screen = frame.area();
+                draw_window(
+                    frame,
+                    app,
+                    area,
+                    chat.filter(|c| !floats(app, is_popup_chat(c), screen)),
+                );
+            }
             draw_footer(frame, app, footer);
             if let Some(area) = inbox.strip {
                 draw_inbox_strip(frame, app, area);
@@ -201,7 +214,8 @@ pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>, issues: Option<&i
             }
         }
     }
-    if chat.is_some()
+    let popup_chat = chat.filter(|c| floats(app, is_popup_chat(c), frame.area()));
+    if popup_chat.is_some()
         || app.view.is_some()
         || app.pr_popup.is_some()
         || app.prompt.is_some()
@@ -219,7 +233,7 @@ pub fn draw(frame: &mut Frame, app: &App, chat: Option<&Chat>, issues: Option<&i
             .buffer_mut()
             .set_style(area, Style::new().add_modifier(Modifier::DIM));
     }
-    if let Some(chat) = chat {
+    if let Some(chat) = popup_chat {
         draw_chat(frame, app, chat);
     } else if let Some(opening) = &app.opening {
         draw_opening(frame, app, opening);
@@ -746,10 +760,6 @@ fn heading_row(
     Row::new(cells)
 }
 
-fn pane_block() -> Block<'static> {
-    Block::bordered().border_style(fg(theme().border))
-}
-
 /// Where the tree is, who holds it, its agents, ports and processes.
 fn detail_lines(app: &App, tree: &Tree) -> Vec<Line<'static>> {
     let t = theme();
@@ -1053,6 +1063,233 @@ const INBOX_FULL_FROM: u16 = 180;
 /// Columns the strip of counts takes, its border included.
 const STRIP_WIDTH: u16 = 5;
 
+/// The smallest the table's window gets, its border included: its header
+/// and a few trees.
+const TABLE_MIN: u16 = 7;
+
+/// The share of the screen above the bar, in percent, the table's window
+/// takes at most, so the window under it keeps room for a chat.
+const TABLE_SHARE: u16 = 45;
+
+/// The smallest window under the table worth drawing, its border and tab
+/// bar included; below it the table takes the whole screen.
+const WINDOW_MIN: u16 = 5;
+
+/// Where the Trees screen's windows go in `main`, the screen above the bar.
+struct Windows {
+    /// The table and the inbox beside it.
+    top: Rect,
+    /// The window under them, showing the tree under the cursor.
+    window: Option<Rect>,
+}
+
+/// The table's window is as tall as its rows, or the inbox's entries
+/// beside it where there are more, between TABLE_MIN and TABLE_SHARE of
+/// `main`; the window under it takes the rest.
+fn windows(app: &App, main: Rect) -> Windows {
+    let rows = app.rows();
+    // Each heading after the first has a blank line above it.
+    let blanks = rows
+        .iter()
+        .skip(1)
+        .filter(|row| matches!(row, ListRow::Heading { .. }))
+        .count();
+    let table = u16::try_from(rows.len() + blanks)
+        .unwrap_or(u16::MAX)
+        .saturating_add(3);
+    // The inbox beside the table in full wants room for its entries too:
+    // its title, its lines and its keys, inside its border.
+    let inbox = if main.width >= INBOX_FULL_FROM && !app.inbox.is_hidden {
+        let lines = inbox_lines(app, Rect::new(0, 0, INBOX_WIDTH - 4, u16::MAX)).len();
+        u16::try_from(lines).unwrap_or(u16::MAX).saturating_add(5)
+    } else {
+        0
+    };
+    let wanted = table.max(inbox);
+    let most = (main.height * TABLE_SHARE / 100).max(TABLE_MIN);
+    let height = wanted.clamp(TABLE_MIN, most);
+    if main.height < height + WINDOW_MIN {
+        return Windows {
+            top: main,
+            window: None,
+        };
+    }
+    let [top, window] =
+        Layout::vertical([Constraint::Length(height), Constraint::Fill(1)]).areas(main);
+    Windows {
+        top,
+        window: Some(window),
+    }
+}
+
+/// A window's border: the title colour on the one that has the keys, as
+/// Neovim marks the window the cursor is in.
+fn window_block(has_keys: bool) -> Block<'static> {
+    let t = theme();
+    let color = if has_keys { t.title } else { t.border };
+    Block::bordered()
+        .border_style(fg(color))
+        .title_style(Style::new().add_modifier(Modifier::BOLD))
+}
+
+/// A chat that floats in a popup rather than the window under the table:
+/// the assistant's and the scratch chats, which belong to no tree.
+pub fn is_popup(agent: &str, tree: &str) -> bool {
+    assistant::is_assistant(agent) || tree == SCRATCH
+}
+
+pub fn is_popup_chat(chat: &Chat) -> bool {
+    is_popup(&chat.agent, &chat.tree)
+}
+
+/// A chat drawn in a popup: the assistant's and the scratch ones always,
+/// and a tree's while it has the keys where the window under the table is
+/// not on `screen`, over the Issues screen or on a terminal too short for
+/// the window. Without the keys there it is not drawn at all, so it never
+/// covers what has them.
+pub fn floats(app: &App, is_popup: bool, screen: Rect) -> bool {
+    is_popup || app.is_window_focused && (app.is_issues || window_chat_area(app, screen).is_none())
+}
+
+/// Inside the window under the table: its tab bar, then where its chat or
+/// info goes.
+fn window_areas(area: Rect) -> [Rect; 2] {
+    let inner = Block::bordered().inner(area);
+    Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(inner)
+}
+
+/// Where the chat in the window under the table goes on `screen`, for
+/// sizing its terminal and placing its mouse events.
+pub fn window_chat_area(app: &App, screen: Rect) -> Option<Rect> {
+    let [main, _] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(screen);
+    windows(app, main).window.map(|area| window_areas(area)[1])
+}
+
+const TABS: [(WindowTab, &str); 2] = [(WindowTab::Chat, "chat"), (WindowTab::Info, "info")];
+
+/// The tab the window shows: info for a tree with no agent to chat with,
+/// whichever tab is picked.
+fn shown_tab(app: &App) -> WindowTab {
+    if app.window_agent().is_some() {
+        app.tab
+    } else {
+        WindowTab::Info
+    }
+}
+
+/// The window's tabs, the one shown picked out, each with the columns it
+/// takes in the bar, the same for drawing them as for a click.
+fn tab_spans(app: &App) -> Vec<(WindowTab, Span<'static>)> {
+    let t = theme();
+    let shown = shown_tab(app);
+    TABS.iter()
+        .map(|&(tab, label)| {
+            let style = if tab == shown { t.header } else { t.bar };
+            (tab, Span::styled(format!(" {label} "), style))
+        })
+        .collect()
+}
+
+/// How full the window agent's context is and what its session has spent,
+/// for the right of its tab bar, where the chat popup's sidebar has them in
+/// full.
+fn context_note(agent: Option<&Agent>) -> Vec<Span<'static>> {
+    let t = theme();
+    let Some(agent) = agent else {
+        return Vec::new();
+    };
+    let mut spans = Vec::new();
+    if let Some(context) = &agent.context {
+        spans.push(Span::styled(
+            format!(
+                "context {}% of {}",
+                percent(context),
+                tokens(context.window)
+            ),
+            context_style(context),
+        ));
+    }
+    if let Some(spend) = &agent.spend {
+        let total = spend.input + spend.cache_read + spend.cache_write + spend.output;
+        if !spans.is_empty() {
+            spans.push(Span::styled(" · ", fg(t.muted)));
+        }
+        spans.push(Span::styled(
+            format!("{} tokens spent", tokens(total)),
+            fg(t.muted),
+        ));
+    }
+    if !spans.is_empty() {
+        spans.push(Span::raw(" "));
+    }
+    spans
+}
+
+/// The window under the table: the tree under the cursor, named in its
+/// border, its tabs in a bar on the first row, and under them its agent's
+/// chat, live, or its info. `chat` is the chat open in the window, which
+/// shows only while it is the window agent's.
+fn draw_window(frame: &mut Frame, app: &App, area: Rect, chat: Option<&Chat>) {
+    let t = theme();
+    let tree = app.window_tree();
+    let title = tree.map(|tree| {
+        let branch = tree.branch.as_deref().unwrap_or("(detached)");
+        if tree.is_main {
+            format!(" main checkout · {branch} ")
+        } else {
+            format!(" Tree {} · {branch} ", tree.name)
+        }
+    });
+    let block = window_block(app.is_window_focused).title(title.unwrap_or_default());
+    frame.render_widget(block, area);
+    let [bar, body] = window_areas(area);
+    let Some(tree) = tree else {
+        let text = match app.current_heading() {
+            Some(_) => "a group's heading: Enter folds it or opens it again",
+            None if app.is_loaded => "no trees match",
+            None => "",
+        };
+        let body = Block::new().padding(Padding::horizontal(1)).inner(body);
+        frame.render_widget(Paragraph::new(text).style(fg(t.muted)), body);
+        return;
+    };
+    let agent = app.window_agent();
+    let tabs: Vec<Span> = tab_spans(app).into_iter().map(|(_, span)| span).collect();
+    frame.render_widget(Paragraph::new(Line::from(tabs)).style(t.bar), bar);
+    let note = Line::from(context_note(agent)).right_aligned();
+    if note.width() + 14 <= usize::from(bar.width) {
+        frame.render_widget(Paragraph::new(note), bar);
+    }
+    if shown_tab(app) == WindowTab::Chat
+        && let Some(agent) = agent
+    {
+        let shown = chat.filter(|c| c.tree == tree.name);
+        match shown {
+            Some(chat) if !chat.is_ready() => draw_note(frame, body, &opening_note(&chat.agent)),
+            Some(chat) => {
+                let cursor = draw_screen(chat.screen(), frame.buffer_mut(), body);
+                if let Some(cursor) = cursor.filter(|_| app.is_window_focused) {
+                    frame.set_cursor_position(cursor);
+                }
+            }
+            _ if agent.status == Some(Status::Cold) => draw_note(
+                frame,
+                body,
+                &format!("{} is not running; Enter starts it again", agent.name),
+            ),
+            _ => draw_note(frame, body, &opening_note(&agent.name)),
+        }
+        return;
+    }
+    // The info sits a column in from the border, as the inbox's entries
+    // do; a chat takes the whole body, as its own screen is drawn.
+    let body = Block::new().padding(Padding::horizontal(1)).inner(body);
+    frame.render_widget(
+        Paragraph::new(detail_text(app, tree, body)).wrap(Wrap { trim: false }),
+        body,
+    );
+}
+
 /// Where the list and the inbox go in `main`, the screen above the bar.
 struct InboxLayout {
     list: Rect,
@@ -1106,7 +1343,7 @@ pub fn stage(app: &App, screen: Rect) -> Rect {
     }
     let [main, _] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(screen);
     Rect {
-        width: inbox_layout(app, main).list.width,
+        width: inbox_layout(app, windows(app, main).top).list.width,
         ..screen
     }
 }
@@ -1117,7 +1354,7 @@ pub fn is_on_inbox(app: &App, screen: Rect, mouse: ratatui::crossterm::event::Mo
         return false;
     }
     let [main, _] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(screen);
-    let layout = inbox_layout(app, main);
+    let layout = inbox_layout(app, windows(app, main).top);
     let at = Position::new(mouse.column, mouse.row);
     layout
         .rail
@@ -1137,8 +1374,24 @@ pub fn click(
         return None;
     }
     let [main, _] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(screen);
-    let layout = inbox_layout(app, main);
+    let windows = windows(app, main);
+    let layout = inbox_layout(app, windows.top);
     let at = Position::new(mouse.column, mouse.row);
+    // A tab in the window's bar shows that tab.
+    if let Some(window) = windows.window {
+        let [bar, _] = window_areas(window);
+        if bar.contains(at) {
+            let mut x = bar.x;
+            for (tab, span) in tab_spans(app) {
+                let width = u16::try_from(span.width()).unwrap_or(u16::MAX);
+                if (x..x.saturating_add(width)).contains(&at.x) {
+                    app.tab = tab;
+                    return Some(Outcome::Continue);
+                }
+                x = x.saturating_add(width);
+            }
+        }
+    }
     if let Some(rail) = layout.rail.filter(|r| r.contains(at)) {
         let [_, body, _] = inbox_areas(app, rail);
         let row = usize::from(at.y.checked_sub(body.y)?);
@@ -1171,8 +1424,7 @@ fn inbox_block(app: &App) -> Block<'static> {
     } else {
         t.border
     };
-    Block::new()
-        .borders(Borders::LEFT)
+    Block::bordered()
         .border_style(fg(border))
         .padding(Padding::horizontal(1))
 }
@@ -1301,7 +1553,7 @@ fn draw_inbox(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         Span::raw("")
     };
-    heading_bar(frame, area);
+    heading_bar(frame, Block::bordered().inner(area));
     let mut heading = Line::from(vec![inbox_icon(waiting), Span::styled(" INBOX", t.header)]);
     let pad = usize::from(title.width).saturating_sub(heading.width() + count.width());
     heading.spans.extend([Span::raw(" ".repeat(pad)), count]);
@@ -1373,12 +1625,10 @@ fn inbox_icon(waiting: usize) -> Span<'static> {
 /// done, for a terminal too narrow for it in full.
 fn draw_inbox_strip(frame: &mut Frame, app: &App, area: Rect) {
     let t = theme();
-    let block = Block::new()
-        .borders(Borders::LEFT)
-        .border_style(fg(t.border));
+    let block = Block::bordered().border_style(fg(t.border));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    heading_bar(frame, area);
+    heading_bar(frame, inner);
     let unseen: Vec<Kind> = inbox::shown(app)
         .into_iter()
         .filter(|(_, seen)| !seen)
@@ -1403,22 +1653,11 @@ fn draw_inbox_strip(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-/// Rows the detail pane takes, borders included.
-const DETAIL_HEIGHT: u16 = 12;
-
-/// The tree under the cursor in full, or the main checkout on its heading:
-/// where it is, its agents, what it serves and runs, what its agent last
-/// said with its latest steps, and its last action's outcome.
-fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
+/// The window's info on `tree`, to fill `inner`: where it is, its
+/// agents, what it serves and runs, what its agent last said with its
+/// latest steps, and its last action's outcome.
+fn detail_text(app: &App, tree: &Tree, inner: Rect) -> Vec<Line<'static>> {
     let t = theme();
-    let Some(tree) = app.current().or(app.main_under_cursor()) else {
-        let text = if app.is_loaded { "no trees match" } else { "" };
-        frame.render_widget(Paragraph::new(text).block(pane_block()), area);
-        return;
-    };
-    let block = pane_block();
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
     let mut lines = detail_lines(app, tree);
     let item = app.says(tree);
     if let Some(item) = &item {
@@ -1444,7 +1683,7 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
             ])
         }));
     }
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    lines
 }
 
 /// Where the detail pane's values start, after their label.
@@ -4719,7 +4958,7 @@ mod inbox_tests {
     fn a_click_opens_the_entry_drawn_under_it() {
         let mut app = app();
         assert_eq!(
-            click_on(&mut app, 200, 30, "endodeals-web 12"),
+            click_on(&mut app, 200, 50, "endodeals-web 12"),
             Some(Outcome::SwitchTo {
                 checkout: "/code/endodeals-web".into(),
                 tree: "/other/12/web".into(),
@@ -4728,7 +4967,7 @@ mod inbox_tests {
         );
         let mut app = self::app();
         assert!(matches!(
-            click_on(&mut app, 200, 30, "Where should the inbox sit?"),
+            click_on(&mut app, 200, 50, "Where should the inbox sit?"),
             Some(Outcome::Chat { tree, .. }) if tree == "4"
         ));
     }
@@ -4753,18 +4992,18 @@ mod inbox_tests {
         let mut app = app();
         app.rail = Some(0);
         let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(200, 30)).unwrap();
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(200, 50)).unwrap();
         terminal
             .draw(|frame| draw(frame, &app, None, None))
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
-        let lines = screen(&app, 200, 30);
+        let lines = screen(&app, 200, 50);
         let first = lines.iter().position(|l| l.contains("4 ANB-41")).unwrap();
         let cursor = theme().cursor.bg;
-        // The rail's last column, inside its padding, on each of the entry's
-        // two lines.
+        // The rail's last column, inside its border and padding, on each of
+        // the entry's two lines.
         for row in [first, first + 1] {
-            let cell = &buffer[(198, u16::try_from(row).unwrap())];
+            let cell = &buffer[(197, u16::try_from(row).unwrap())];
             assert_eq!(
                 cell.bg,
                 cursor.unwrap_or_default(),
@@ -4868,7 +5107,11 @@ mod inbox_tests {
     #[test]
     fn hiding_the_inbox_gives_the_list_its_width_back() {
         let mut app = app();
-        let wide = |app: &App| screen(app, 200, 30)[0].trim_end().len();
+        // Where the table's window ends, at its top right corner.
+        let wide = |app: &App| {
+            let top = &screen(app, 200, 30)[0];
+            top[..top.find('┐').unwrap()].chars().count()
+        };
         let beside = wide(&app);
         app.handle_key(ratatui::crossterm::event::KeyEvent::from(
             ratatui::crossterm::event::KeyCode::Char('E'),
@@ -4876,7 +5119,7 @@ mod inbox_tests {
         let shown = screen(&app, 200, 30).join("\n");
         assert!(!shown.contains("INBOX"), "{shown}");
         assert!(!shown.contains("●2"), "no strip either:\n{shown}");
-        assert!(wide(&app) < beside, "the list's own header ends the line");
+        assert!(wide(&app) > beside, "the table's window takes the width");
     }
 
     /// The screen as drawn, cell by cell, for what a cell's colours are.
@@ -4908,7 +5151,8 @@ mod inbox_tests {
                 theme().warning,
                 "something needs you"
             );
-            for x in [icon - 1, width - 1] {
+            // Across the inbox to its right border.
+            for x in [icon - 1, width - 2] {
                 assert_eq!(drawn[(x, row)].bg, header.unwrap(), "at {x} of {width}");
             }
             let divider = (0..icon)
@@ -5240,14 +5484,15 @@ mod pr_view_tests {
 
         let shown = screen(&app, 100, 40);
         let rows: Vec<&str> = shown.lines().collect();
-        let corner = rows
-            .iter()
-            .position(|r| r.contains('┌'))
-            .expect("the popup");
-        let left = rows[corner]
-            .find('┌')
-            .map(|b| rows[corner][..b].chars().count())
-            .unwrap();
+        // The popup's own corner, not the windows' under it.
+        let area = popup::area(stage(&app, Rect::new(0, 0, 100, 40)));
+        let corner = usize::from(area.y);
+        let left = usize::from(area.x);
+        assert_eq!(
+            rows[corner].chars().nth(left),
+            Some('┌'),
+            "the popup is drawn there"
+        );
         let right = left
             + rows[corner]
                 .chars()
@@ -5414,10 +5659,16 @@ mod pr_view_tests {
 
         app.pr_loaded(path, Ok(None));
         let shown = screen(&app, 100, 40);
-        let left = shown
-            .lines()
-            .find_map(|r| r.find('┌').map(|b| Line::raw(&r[..b]).width()))
-            .unwrap();
+        let area = popup::area(stage(&app, Rect::new(0, 0, 100, 40)));
+        let left = usize::from(area.x);
+        assert_eq!(
+            shown
+                .lines()
+                .nth(usize::from(area.y))
+                .and_then(|r| r.chars().nth(left)),
+            Some('┌'),
+            "the popup is drawn there"
+        );
         for row in shown
             .lines()
             .filter(|r| r.contains("yet.") || r.contains("one."))
@@ -5829,5 +6080,176 @@ mod pr_view_tests {
             shown.contains("review threads could not be read: HTTP 502"),
             "{shown}"
         );
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+    use crate::inbox::tests::app;
+    use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+    fn drawn(app: &App, width: u16, height: u16) -> Buffer {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app, None, None)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn lines(buffer: &Buffer) -> Vec<String> {
+        let area = buffer.area;
+        (0..area.height)
+            .map(|y| (0..area.width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    /// The app with the cursor on tree `name`.
+    fn on(name: &str) -> App {
+        let mut app = app();
+        app.select_tree(name);
+        assert_eq!(app.current().map(|t| t.name.as_str()), Some(name));
+        app
+    }
+
+    #[test]
+    fn the_window_under_the_table_shows_the_tree_under_the_cursor_and_its_info() {
+        let mut app = on("4");
+        app.tab = WindowTab::Info;
+        let shown = lines(&drawn(&app, 200, 50));
+        let title = shown
+            .iter()
+            .position(|l| l.starts_with("┌ Tree 4 · me/anb-41-inbox-rail "))
+            .unwrap_or_else(|| panic!("the window's title:\n{}", shown.join("\n")));
+        let table_ends = shown.iter().position(|l| l.starts_with('└')).unwrap();
+        assert!(title > table_ends, "the window is under the table");
+        // The info tab holds the lines the detail pane held.
+        for label in ["agents", "ports", "processes"] {
+            assert!(
+                shown[title..]
+                    .iter()
+                    .any(|l| l.starts_with(&format!("│ {label} "))),
+                "{label} in the info:\n{}",
+                shown.join("\n")
+            );
+        }
+        let mut app = on("2");
+        app.tab = WindowTab::Info;
+        let shown = lines(&drawn(&app, 200, 50));
+        assert!(
+            shown
+                .iter()
+                .any(|l| l.starts_with("┌ Tree 2 · me/help-columns "))
+        );
+    }
+
+    #[test]
+    fn a_cold_agent_is_left_closed_with_how_to_start_it() {
+        let shown = lines(&drawn(&on("9"), 200, 50)).join("\n");
+        assert!(
+            shown.contains("port-menu is not running; Enter starts it again"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn the_window_with_the_keys_has_its_border_in_the_title_colour() {
+        let mut app = on("4");
+        let corner = |app: &App, title: &str| {
+            let buffer = drawn(app, 200, 50);
+            let row = lines(&buffer)
+                .iter()
+                .position(|l| l.starts_with(title))
+                .unwrap();
+            buffer[(0, u16::try_from(row).unwrap())].fg
+        };
+        assert_eq!(corner(&app, "┌ Trees "), theme().title);
+        assert_eq!(corner(&app, "┌ Tree 4 "), theme().border);
+        app.is_window_focused = true;
+        assert_eq!(corner(&app, "┌ Trees "), theme().border);
+        assert_eq!(corner(&app, "┌ Tree 4 "), theme().title);
+        // The inbox with the keys is the one window marked.
+        app.is_window_focused = false;
+        app.rail = Some(0);
+        assert_eq!(corner(&app, "┌ Trees "), theme().border);
+        assert_eq!(corner(&app, "┌ Tree 4 "), theme().border);
+    }
+
+    #[test]
+    fn a_click_on_a_tab_shows_it() {
+        let mut app = on("4");
+        let shown = lines(&drawn(&app, 200, 50));
+        let row = shown
+            .iter()
+            .position(|l| l.starts_with("│ chat  info "))
+            .unwrap();
+        let column = shown[row]
+            .find(" info ")
+            .map(|b| shown[row][..b].chars().count())
+            .unwrap();
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: u16::try_from(column + 1).unwrap(),
+            row: u16::try_from(row).unwrap(),
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            click(&mut app, Rect::new(0, 0, 200, 50), mouse),
+            Some(Outcome::Continue)
+        );
+        assert_eq!(app.tab, WindowTab::Info);
+    }
+
+    #[test]
+    fn the_table_makes_room_for_the_inbox_and_the_window_for_a_chat() {
+        let app = on("4");
+        let shown = lines(&drawn(&app, 200, 50));
+        // The inbox beside four trees shows every entry and its keys, though
+        // the trees alone would need fewer rows.
+        for text in ["Done: opened PR #31", "e inbox  E hide"] {
+            assert!(
+                shown.iter().any(|l| l.contains(text)),
+                "{text} in the inbox:\n{}",
+                shown.join("\n")
+            );
+        }
+        // The window under the table takes the rest, down to the bar.
+        let window = shown
+            .iter()
+            .position(|l| l.starts_with("┌ Tree 4 "))
+            .unwrap();
+        assert!(shown[window - 1].starts_with('└'), "{}", shown.join("\n"));
+        assert!(shown[48].starts_with('└'), "{}", shown.join("\n"));
+        // Too short for both, the table takes the screen, and a tree's chat
+        // floats in a popup instead.
+        let short = lines(&drawn(&app, 200, 12));
+        assert!(
+            !short.iter().any(|l| l.contains("┌ Tree 4 ")),
+            "{}",
+            short.join("\n")
+        );
+        assert_eq!(window_chat_area(&app, Rect::new(0, 0, 200, 12)), None);
+    }
+
+    #[test]
+    fn a_tree_chat_floats_only_while_it_has_the_keys_where_the_window_cannot_show() {
+        let mut app = on("4");
+        let short = Rect::new(0, 0, 80, 10);
+        let tall = Rect::new(0, 0, 200, 50);
+        // Shown in the window where there is one, keys or not.
+        assert!(!floats(&app, false, tall));
+        // With nowhere to show it and the keys elsewhere, it stays hidden
+        // rather than cover what has them: the table on a short terminal,
+        // the Issues screen or its picker.
+        assert!(!floats(&app, false, short));
+        app.is_issues = true;
+        assert!(!floats(&app, false, tall));
+        // Given the keys there, it floats in a popup so it is seen.
+        app.is_window_focused = true;
+        assert!(floats(&app, false, tall));
+        app.is_issues = false;
+        assert!(floats(&app, false, short));
+        // The assistant's and scratch chats always float.
+        app.is_window_focused = false;
+        assert!(floats(&app, true, tall));
     }
 }

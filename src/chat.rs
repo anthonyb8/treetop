@@ -608,10 +608,6 @@ impl Chats {
         self.open.as_mut()
     }
 
-    pub fn is_open(&self) -> bool {
-        self.open.is_some()
-    }
-
     /// Shows the chat running `command`: the one left running for it if
     /// there is one, at once, else a new one. `hints` say how its screen
     /// shows that it takes a message, or has left its agent.
@@ -623,6 +619,15 @@ impl Chats {
         tree: String,
         hints: Option<Screen>,
     ) -> Result<()> {
+        // The chat already open stays as it is: a second client in its place
+        // would end it and lose what it shows.
+        if let Some(open) = self.open.as_mut().filter(|c| c.command == command) {
+            if open.screen().size() != (rows, cols) {
+                open.resize(rows, cols);
+            }
+            open.hints = open.hints.take().or(hints);
+            return Ok(());
+        }
         let mut chat = match self.background.iter().position(|c| c.command == command) {
             Some(index) => {
                 let mut chat = self.background.remove(index);
@@ -1089,6 +1094,41 @@ mod tests {
             assert!(started.elapsed() < Duration::from_secs(15), "no outcome");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// What the open chat shows once it has drawn `wanted`.
+    fn shown(chats: &mut Chats, wanted: &str) -> String {
+        let started = Instant::now();
+        loop {
+            chats.pump();
+            let text = chats.open().unwrap().screen().contents();
+            if text.contains(wanted) {
+                return text;
+            }
+            assert!(started.elapsed() < Duration::from_secs(15), "{text}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn showing_the_chat_already_open_keeps_it_running_rather_than_starting_another() {
+        // Each start of the chat prints its own process id, so a second
+        // client in its place shows a different one.
+        let command = [
+            "sh".to_string(),
+            "-c".to_string(),
+            "echo started $$; sleep 30".to_string(),
+        ];
+        let mut chats = Chats::default();
+        let show = |chats: &mut Chats| {
+            let who = ("agent".to_string(), "tree".to_string());
+            chats.show(&command, (24, 80), who.0, who.1, None).unwrap();
+        };
+        show(&mut chats);
+        let first = shown(&mut chats, "started");
+        show(&mut chats);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(shown(&mut chats, "started"), first);
     }
 
     #[test]
