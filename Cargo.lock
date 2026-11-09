@@ -2144,6 +2144,7 @@ dependencies = [
  "tiny_http",
  "toml",
  "two-face",
+ "unicode-width",
  "ureq",
  "vt100",
 ]

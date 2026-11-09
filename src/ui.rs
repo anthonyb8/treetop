@@ -3278,13 +3278,11 @@ fn wrap_led(
             }
         }
     }
-    let size =
-        |word: &[(String, Style)]| word.iter().map(|(t, _)| t.chars().count()).sum::<usize>();
+    // Columns as the terminal draws them: a CJK character takes two.
+    let cols = |text: &str| unicode_width::UnicodeWidthStr::width(text);
+    let size = |word: &[(String, Style)]| word.iter().map(|(t, _)| cols(t)).sum::<usize>();
     let bare = |word: &[(String, Style)]| {
-        size(word)
-            - word
-                .last()
-                .map_or(0, |(t, _)| t.chars().count() - t.trim_end().chars().count())
+        size(word) - word.last().map_or(0, |(t, _)| cols(t) - cols(t.trim_end()))
     };
     let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
     let (mut used, mut is_empty) = (0, true);
@@ -3297,17 +3295,28 @@ fn wrap_led(
         }
         for (text, style) in word {
             let mut text = text;
-            while used + text.trim_end().chars().count() > width {
-                let room = width.saturating_sub(used).max(1);
-                let head: String = text.chars().take(room).collect();
-                text = text.chars().skip(room).collect();
+            while used + cols(text.trim_end()) > width {
+                let room = width.saturating_sub(used);
+                // As many chars as fit the room, and at least one.
+                let mut fill = 0;
+                let cut = text
+                    .char_indices()
+                    .find(|(_, c)| {
+                        fill += unicode_width::UnicodeWidthChar::width(*c).unwrap_or(0);
+                        fill > room
+                    })
+                    .map_or(text.len(), |(at, _)| {
+                        at.max(text.chars().next().map_or(0, char::len_utf8))
+                    });
+                let head = text[..cut].to_string();
+                text = text[cut..].to_string();
                 if let Some(row) = rows.last_mut() {
                     row.push(Span::styled(head, style));
                 }
                 rows.push(lead.clone());
                 used = hang;
             }
-            used += text.chars().count();
+            used += cols(&text);
             if let Some(row) = rows.last_mut() {
                 row.push(Span::styled(text, style));
             }
@@ -5598,5 +5607,35 @@ mod pr_view_tests {
             shown.contains("WorkflowStatus.Suspended") && !shown.contains("`WorkflowStatus"),
             "a title's code shows without its backticks:\n{shown}"
         );
+    }
+
+    #[test]
+    fn wide_characters_wrap_by_the_columns_they_take() {
+        let mut app = app();
+        let path = std::path::PathBuf::from("/pool/4/app");
+        while app.current().is_none_or(|t| t.path != path) {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Char('v'));
+        let mut pr = pr();
+        if let Some(bot) = pr.bot.as_mut() {
+            bot.findings[0].body =
+                "上传结果需要权限，整个作业随之变红，即使声明了 `security-events: write` 也一样，\
+                而且整个作业随之变红，即使没有发现任何泄露也会失败。"
+                    .into();
+        }
+        app.pr_loaded(path, Ok(Some(pr)));
+        press(&mut app, KeyCode::Char('4'));
+        let shown = screen(&app, 100, 40);
+        // The screen has a cell a char, so a wide char's filler is a space.
+        let text: String = shown.split_whitespace().collect();
+        for words in [
+            "security-events:write",
+            "也一样",
+            "没有发现任何泄露也会失败。",
+        ] {
+            let squeezed: String = words.split_whitespace().collect();
+            assert!(text.contains(&squeezed), "{words} is drawn whole:\n{shown}");
+        }
     }
 }
