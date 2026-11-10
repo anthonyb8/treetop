@@ -1307,6 +1307,10 @@ const TABLE_MIN: u16 = 7;
 /// takes at most, so the window under it keeps room for a chat.
 const TABLE_SHARE: u16 = 45;
 
+/// The share the table's window takes at most while the window under it
+/// has the keys, so a chat being worked in gets four fifths of the screen.
+const TABLE_SHARE_IN_WINDOW: u16 = 20;
+
 /// The smallest window under the table worth drawing, its border and tab
 /// bar included; below it the table takes the whole screen.
 const WINDOW_MIN: u16 = 5;
@@ -1323,7 +1327,8 @@ struct Windows {
 
 /// The table's window is as tall as its rows, or the inbox's entries
 /// beside it where there are more, between TABLE_MIN and TABLE_SHARE of
-/// `main`; the window under it takes the rest.
+/// `main`, or TABLE_SHARE_IN_WINDOW while the window has the keys; the
+/// window under it takes the rest.
 fn windows(app: &App, main: Rect) -> Windows {
     match app.zoom {
         // The table over the whole screen, as treetop was before windows.
@@ -1370,7 +1375,12 @@ fn windows(app: &App, main: Rect) -> Windows {
         0
     };
     let wanted = table.max(inbox);
-    let most = (main.height * TABLE_SHARE / 100).max(TABLE_MIN);
+    let share = if app.is_window_focused {
+        TABLE_SHARE_IN_WINDOW
+    } else {
+        TABLE_SHARE
+    };
+    let most = (main.height * share / 100).max(TABLE_MIN);
     let height = wanted.clamp(TABLE_MIN, most);
     if main.height < height + WINDOW_MIN {
         return Windows {
@@ -7013,6 +7023,26 @@ mod window_tests {
             short.join("\n")
         );
         assert_eq!(window_chat_area(&app, Rect::new(0, 0, 200, 12)), None);
+    }
+
+    #[test]
+    fn the_window_takes_four_fifths_of_the_screen_while_it_has_the_keys() {
+        let mut app = on("4");
+        let top = |app: &App| {
+            lines(&drawn(app, 200, 50))
+                .iter()
+                .position(|l| l.starts_with("┌ Tree 4 "))
+                .unwrap()
+        };
+        let table = top(&app);
+        // Given the keys, the window grows to four fifths of the 49 rows
+        // above the bar, and the table keeps the rest.
+        app.is_window_focused = true;
+        assert_eq!(top(&app), 9);
+        // Back on the table, the window is the size it was.
+        app.is_window_focused = false;
+        assert_eq!(top(&app), table);
+        assert!(table > 9, "the table is taller than a fifth: {table}");
     }
 
     #[test]
