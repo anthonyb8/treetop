@@ -397,6 +397,7 @@ The tree treetop was started in is never a target, because returning or destroyi
 
 The Trees screen is two windows over the bottom bar: the table, with the inbox beside it, on top, and under them a window on the tree under the cursor.
 The table's window is as tall as its rows, or the inbox's entries where there are more, up to just under half the screen; the window under it takes the rest.
+While the window under the table has the keys, the table shrinks to a fifth of the screen, scrolling to keep the cursor's row in view, so the window gets the other four fifths; giving the keys back to the table puts both back.
 The window that has the keys has its border in the title colour, as Neovim marks the window the cursor is in.
 
 The window under the table names the tree and its branch in its border, and has its tabs in a bar on its first row; `←` and `→` step through them, and a click on one shows it:
