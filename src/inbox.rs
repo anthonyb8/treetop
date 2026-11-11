@@ -1,14 +1,16 @@
-//! The inbox down the right of the list: each tree whose agent needs you,
-//! died or finished, and each whose PR failed its checks or merged, from
-//! this workspace and the others. Another workspace's background agents are
-//! placed in its trees by their reports, and its PRs and its agents waiting
-//! in a pane come from a slower read of its pool. It is a view of how things
-//! stand now, not a log of what happened, so an agent already waiting when
-//! treetop opens is in it.
+//! What wants you across this workspace and the others: each tree whose
+//! agent needs you, died or finished, and each whose PR failed its checks or
+//! merged. Another workspace's background agents are placed in its trees by
+//! their reports, and its PRs and its agents waiting in a pane come from a
+//! slower read of its pool. It is a view of how things stand now, not a log
+//! of what happened, so an agent already waiting when treetop opens is in it.
 //!
-//! What counts is decided here for the phone's pushes too, so the inbox and
-//! the phone never disagree. Which entries you have opened or dismissed is
-//! kept under treetop's state directory, so a restart or a switch keeps them.
+//! Of those, what is waiting on you, an agent asking, a PR whose checks
+//! failed and an agent that died, is what the banner and the tmux status
+//! line show until it stops being true. What counts is decided here for the
+//! phone's pushes too, so the desktop and the phone never disagree. Which
+//! entries the phone has opened or dismissed is kept under treetop's state
+//! directory.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -59,7 +61,7 @@ pub fn pr_kind(stage: Stage) -> Option<Kind> {
 }
 
 /// What an entry is about, in the order the inbox groups them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Kind {
     NeedsYou,
     /// Its PR's checks failed.
@@ -72,15 +74,6 @@ pub enum Kind {
 }
 
 impl Kind {
-    /// The heading the entry goes under while unseen.
-    pub fn heading(self) -> &'static str {
-        match self {
-            Kind::NeedsYou => "NEEDS YOU",
-            Kind::Failed | Kind::Died => "FAILED",
-            Kind::Done | Kind::Merged => "DONE",
-        }
-    }
-
     fn rank(self) -> u8 {
         match self {
             Kind::NeedsYou => 0,
@@ -313,6 +306,51 @@ pub fn entries(app: &App) -> Vec<Entry> {
     entries
 }
 
+/// What a waiting entry is about: its kind and tree, not the moment it
+/// last said so, so an agent still asking is the one ask however often it
+/// writes its report, and comes back as a new one only once it has stopped.
+pub type About = (Kind, PathBuf);
+
+impl Entry {
+    pub fn about(&self) -> About {
+        (self.kind, self.path.clone())
+    }
+}
+
+/// What waits on you, across every workspace read: agents asking, PRs
+/// whose checks failed and agents that died, the oldest first. Each is as
+/// old as it has waited: since treetop first saw it, or since it happened
+/// where that was earlier. Each leaves once it stops being true, so there
+/// is nothing to dismiss.
+pub fn waiting(app: &App) -> Vec<Entry> {
+    let mut waiting: Vec<Entry> = entries(app)
+        .into_iter()
+        .filter(|e| matches!(e.kind, Kind::NeedsYou | Kind::Failed | Kind::Died))
+        .map(|mut e| {
+            e.at = app.waiting_since(&e.about()).or(e.at);
+            e
+        })
+        .collect();
+    waiting.sort_by(|a, b| {
+        // Where no time is known yet, as before treetop has looked, last.
+        a.at.is_none()
+            .cmp(&b.at.is_none())
+            .then(a.at.cmp(&b.at))
+            .then(a.away.is_some().cmp(&b.away.is_some()))
+            .then(a.tree.cmp(&b.tree))
+    });
+    waiting
+}
+
+/// Where an entry's tree is, for a line naming several: its number, after
+/// its workspace's name when that is another.
+pub fn place_of(entry: &Entry) -> String {
+    match &entry.away {
+        Some(away) => format!("{}:{}", away.name, entry.tree),
+        None => entry.tree.clone(),
+    }
+}
+
 /// What a PR entry is remembered by: the commit its PR is on, so a new push
 /// that fails again is new, else its label.
 fn pr_key(kind: Kind, tree: &Tree, ship: &Ship) -> String {
@@ -421,7 +459,7 @@ fn reported_away(app: &App) -> Vec<Entry> {
 /// directory is in, as agents are placed: one whose sidecar names a job only
 /// for that job, else only if it wrote since that tree's lease began, since
 /// a tree returned and handed out again is not still the old agent's.
-fn place<'a>(report: &Report, pools: &'a [Pool]) -> Option<(&'a Pool, &'a Tree)> {
+pub fn place<'a>(report: &Report, pools: &'a [Pool]) -> Option<(&'a Pool, &'a Tree)> {
     let dir = report.dir.as_deref()?;
     let wrote = secs(report.updated);
     pools.iter().find_map(|pool| {
@@ -469,15 +507,13 @@ pub fn shown(app: &App) -> Vec<(Entry, bool)> {
 }
 
 /// What you have done with the inbox, kept across runs: the entries opened
-/// and dismissed, and whether it is hidden.
+/// and dismissed.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Marks {
     #[serde(default)]
     pub seen: BTreeSet<String>,
     #[serde(default)]
     pub dismissed: BTreeSet<String>,
-    #[serde(default)]
-    pub is_hidden: bool,
 }
 
 /// How many keys each set keeps. An entry's key changes when it does, so
@@ -494,7 +530,6 @@ impl Marks {
         *self = change(file, |marks| {
             marks.seen.extend(mine.seen);
             marks.dismissed.extend(mine.dismissed);
-            marks.is_hidden = mine.is_hidden;
         });
     }
 }
@@ -681,6 +716,15 @@ pub mod tests {
         app
     }
 
+    /// Settles everything in `app` that waits on you: the asks and the
+    /// dead agent reported, tree 7's failed PR and the other workspace.
+    pub fn nothing_waits(app: &mut App) {
+        app.reports.clear();
+        app.trees.retain(|t| t.name != "7");
+        app.pools.clear();
+        assert!(waiting(app).is_empty(), "{:?}", waiting(app));
+    }
+
     fn order(app: &App) -> Vec<(Kind, String, bool)> {
         shown(app)
             .into_iter()
@@ -713,25 +757,47 @@ pub mod tests {
         assert_eq!(away.title.as_deref(), Some("END-88 checkout-tax"));
     }
 
+    /// Presses `e` until it does what `wanted` looks for, at most once
+    /// round everything waiting.
+    fn press_e_until(app: &mut App, wanted: impl Fn(&App, &Outcome) -> bool) -> Outcome {
+        for _ in 0..=waiting(app).len() {
+            let outcome = press(app, KeyCode::Char('e'));
+            if wanted(app, &outcome) {
+                return outcome;
+            }
+        }
+        panic!("e never got there: {:?}", order(app));
+    }
+
     #[test]
-    fn enter_opens_the_agents_chat_and_the_entry_sinks_under_seen() {
+    fn e_goes_to_the_oldest_that_waits_and_again_round_the_rest() {
         let mut app = app();
-        press(&mut app, KeyCode::Char('e'));
-        assert_eq!(app.rail, Some(0));
-        let opened = press(&mut app, KeyCode::Enter);
+        // Tree 9's agent died 1,900s ago, the oldest.
+        assert_eq!(press(&mut app, KeyCode::Char('e')), Outcome::Continue);
+        assert_eq!(app.current().map(|t| t.name.as_str()), Some("9"));
+        assert!(app.message.as_deref().unwrap().contains("R resumes"));
+        assert!(
+            matches!(press(&mut app, KeyCode::Char('e')), Outcome::SwitchTo { ref tree, .. } if tree == Path::new("/other/12/web")),
+            "then the ask of 360s ago, in another workspace"
+        );
         assert_eq!(
-            opened,
+            press(&mut app, KeyCode::Char('e')),
             Outcome::Chat {
                 command: vec!["claude".into(), "attach".into(), "j4".into()],
                 agent: "inbox-rail".into(),
                 tree: "4".into(),
-            }
+            },
+            "then the ask of 120s ago here"
         );
-        assert_eq!(app.rail, None, "the list has the keys back");
         assert_eq!(app.current().map(|t| t.name.as_str()), Some("4"));
+        assert_eq!(press(&mut app, KeyCode::Char('e')), Outcome::Continue);
+        assert_eq!(app.current().map(|t| t.name.as_str()), Some("7"));
+        assert!(app.message.as_deref().unwrap().contains("f sends"));
+        assert_eq!(press(&mut app, KeyCode::Char('e')), Outcome::Continue);
         assert_eq!(
-            order(&app).last(),
-            Some(&(Kind::NeedsYou, "4".into(), true))
+            app.current().map(|t| t.name.as_str()),
+            Some("9"),
+            "and round again"
         );
     }
 
@@ -746,27 +812,14 @@ pub mod tests {
     }
 
     #[test]
-    fn a_failed_pr_puts_the_cursor_on_its_tree_and_says_f_sends_it() {
-        let mut app = app();
-        app.rail = Some(3);
-        assert_eq!(press(&mut app, KeyCode::Enter), Outcome::Continue);
-        assert_eq!(app.current().map(|t| t.name.as_str()), Some("7"));
-        assert!(
-            app.message.as_deref().unwrap().contains("f sends"),
-            "{:?}",
-            app.message
-        );
-    }
-
-    #[test]
     fn a_dismissed_entry_stays_gone_across_runs_until_its_agent_asks_again() {
         let file = std::env::temp_dir().join(format!("treetop-inbox-{}.json", std::process::id()));
         let _ = fs::remove_file(&file);
-        let mut app = app();
-        app.keep_inbox_in(file.clone());
-        app.rail = Some(0);
-        press(&mut app, KeyCode::Char('x'));
-        assert!(!order(&app).iter().any(|(_, tree, _)| tree == "4"));
+        // The phone dismisses it.
+        let key = shown(&app())[0].0.key.clone();
+        change(&file, |marks| {
+            marks.dismissed.insert(key);
+        });
 
         let mut again = self::app();
         again.keep_inbox_in(file.clone());
@@ -790,21 +843,19 @@ pub mod tests {
         phone.dismissed.insert("from the phone".into());
         phone.write(&file);
 
-        desktop.rail = Some(0);
-        press(&mut desktop, KeyCode::Char('x'));
+        desktop.saw_chat(&["claude".into(), "attach".into(), "j4".into()]);
 
         let kept: Marks = crate::state::read(&file);
         assert!(kept.dismissed.contains("from the phone"));
-        assert_eq!(kept.dismissed.len(), 2, "{kept:?}");
+        assert_eq!(kept.seen.len(), 1, "{kept:?}");
         let _ = fs::remove_file(&file);
     }
 
     #[test]
     fn another_workspaces_entry_switches_there_and_opens_its_agent() {
         let mut app = app();
-        app.rail = Some(1);
         assert_eq!(
-            press(&mut app, KeyCode::Enter),
+            press_e_until(&mut app, |_, o| matches!(o, Outcome::SwitchTo { .. })),
             Outcome::SwitchTo {
                 checkout: "/code/endodeals-web".into(),
                 tree: "/other/12/web".into(),
@@ -946,9 +997,16 @@ pub mod tests {
         );
         assert_eq!(failed.title.as_deref(), Some("END-91 fix-login"));
 
-        app.rail = shown(&app).iter().position(|(e, _)| e.key == failed.key);
         assert_eq!(
-            press(&mut app, KeyCode::Enter),
+            press_e_until(&mut app, |_, o| {
+                matches!(
+                    o,
+                    Outcome::SwitchTo {
+                        kind: Kind::Failed,
+                        ..
+                    }
+                )
+            }),
             Outcome::SwitchTo {
                 checkout: "/code/endodeals-web".into(),
                 tree: "/other/7/web".into(),
@@ -1022,8 +1080,7 @@ pub mod tests {
         let mut app = app();
         read_elsewhere(&mut app, "abc");
         let failed = entry_of(&app, "7");
-        app.rail = shown(&app).iter().position(|(e, _)| e.key == failed.key);
-        press(&mut app, KeyCode::Char('x'));
+        app.inbox.dismissed.insert(failed.key);
         assert_eq!(away_seven(&app), None, "dismissed");
         // The next read finds a new push, failing too.
         let live = app
@@ -1085,27 +1142,104 @@ pub mod tests {
     }
 
     #[test]
-    fn hiding_the_inbox_gives_the_mouse_back_to_the_terminal() {
-        let mut app = app();
-        assert!(app.wants_mouse());
-        press(&mut app, KeyCode::Char('E'));
-        assert!(!app.wants_mouse());
-        assert!(app.inbox.is_hidden);
+    fn the_bell_rings_once_for_what_starts_waiting_and_tmux_says_what_waits() {
+        // Treetop opening: its trees listed, its agents' reports not yet read.
+        let read = app();
+        let mut app = App::new(None);
+        app.trees = read.trees.clone();
+        app.pools = read.pools.clone();
+        app.is_loaded = true;
+        app.is_agents_read = true;
+        assert_eq!(app.watch_waiting(), None, "no look before the reports");
+        app.apply_reports(read.reports.clone());
+        // What already waits once they are read rings nothing.
+        let (is_new, line) = app.watch_waiting().unwrap();
+        assert!(!is_new);
+        assert_eq!(
+            line.as_deref(),
+            Some("● 4 waiting · 9 endodeals-web:12 4 7"),
+            "the oldest first; tree 7's failed PR since treetop saw it"
+        );
+        assert_eq!(app.watch_waiting(), Some((false, line)), "nor again");
+        // Tree 4's agent, still asking, writes its report again: the same
+        // ask, so no bell.
+        let mut reports = app.reports.clone();
+        reports[0] = report("j4", "/pool/4/app", State::Blocked, "Still: where?", 1);
+        app.apply_reports(reports);
+        assert_eq!(app.watch_waiting().map(|(is_new, _)| is_new), Some(false));
+        // Tree 2's agent comes to ask something, and the other workspace's,
+        // back at work a moment, asks again: the bell rings for them here,
+        // with no news besides.
+        let mut reports = app.reports.clone();
+        reports[3].state = State::Working;
+        app.apply_reports(reports.clone());
+        app.watch_waiting();
+        reports[1] = report("j2", "/pool/2/app", State::Blocked, "Which column?", 5);
+        reports[3].state = State::Blocked;
+        assert_eq!(app.apply_reports(reports), Vec::<String>::new());
+        let (is_new, line) = app.watch_waiting().unwrap();
+        assert!(is_new, "a new ask rings");
+        assert_eq!(
+            line.as_deref(),
+            Some("● 5 waiting · 9 endodeals-web:12 4 2 7"),
+            "the oldest first"
+        );
+        // Once nothing waits, the status line clears.
+        nothing_waits(&mut app);
+        assert_eq!(app.watch_waiting(), Some((false, None)));
     }
 
     #[test]
-    fn asks_wait_while_the_inbox_has_the_keys_and_esc_gives_them_back() {
+    fn e_keeps_its_place_across_a_switch_of_workspace() {
+        let mut here = app();
+        press(&mut here, KeyCode::Char('e'));
+        assert!(matches!(
+            press(&mut here, KeyCode::Char('e')),
+            Outcome::SwitchTo { .. }
+        ));
+        // The switch starts the next workspace afresh, with what `e` had
+        // been through carried over; here the same trees, read from there.
+        let mut there = app();
+        there.keep_watch(here.take_watch());
+        assert!(
+            matches!(press(&mut there, KeyCode::Char('e')), Outcome::Chat { ref tree, .. } if tree == "4"),
+            "on to the one after tree 12, not back to the first"
+        );
+        assert_eq!(
+            there.watch_waiting().map(|(is_new, _)| is_new),
+            Some(false),
+            "and the switch rings nothing"
+        );
+    }
+
+    #[test]
+    fn e_from_a_chat_in_normal_leaves_it_for_what_waits() {
         let mut app = app();
-        press(&mut app, KeyCode::Char('e'));
-        press(&mut app, KeyCode::Char('j'));
-        assert_eq!(app.rail, Some(1));
-        assert_eq!(app.next_ask(), None, "no chat opens over the inbox");
-        press(&mut app, KeyCode::Esc);
-        assert_eq!(app.rail, None);
-        press(&mut app, KeyCode::Char('e'));
-        press(&mut app, KeyCode::Tab);
-        assert_eq!(app.rail, None, "Tab gives the keys back too");
-        assert!(!app.is_issues, "rather than opening Issues");
-        assert!(matches!(app.next_ask(), Some(Outcome::Chat { tree, .. }) if tree == "4"));
+        app.select_tree("2");
+        app.tab = crate::app::WindowTab::Chat;
+        app.is_window_focused = true;
+        assert_eq!(press(&mut app, KeyCode::Char('e')), Outcome::Continue);
+        assert_eq!(
+            app.current().map(|t| t.name.as_str()),
+            Some("9"),
+            "the oldest, tree 9's dead agent"
+        );
+        assert!(!app.is_window_focused, "the window gives the keys up");
+    }
+
+    #[test]
+    fn e_with_nothing_waiting_says_so() {
+        let mut app = app();
+        nothing_waits(&mut app);
+        assert_eq!(press(&mut app, KeyCode::Char('e')), Outcome::Continue);
+        assert_eq!(app.message.as_deref(), Some("nothing is waiting on you"));
+    }
+
+    #[test]
+    fn the_banner_takes_the_mouse_only_while_something_waits() {
+        let mut app = app();
+        assert!(app.wants_mouse(), "for a click on the banner");
+        nothing_waits(&mut app);
+        assert!(!app.wants_mouse(), "text selects in the terminal as ever");
     }
 }
