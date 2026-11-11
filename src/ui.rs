@@ -82,6 +82,7 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
             ("R", "resume agent"),
             ("h", "hand off work"),
             ("e", "next that waits"),
+            ("E", "while you were away"),
         ],
     ),
     (
@@ -288,6 +289,7 @@ pub fn draw(
         || app.phone.is_some()
         || app.scratch_menu.is_some()
         || app.is_help
+        || app.is_away_shown()
     {
         // The banner stays bright and live; only what the popup sits over
         // dims.
@@ -329,11 +331,116 @@ pub fn draw(
         draw_confirm(frame, pending);
     } else if app.is_help {
         draw_help(frame, &HELP);
+    } else if app.is_away_shown() {
+        draw_away(frame, app);
     }
     // The palette opens over whatever is on screen, a chat's popup too.
     if let Some(palette) = &app.palette {
         draw_palette(frame, app, palette);
     }
+}
+
+/// The widest "While you were away" gets.
+const AWAY_WIDTH: u16 = 88;
+
+/// "While you were away": what still waits, the first highlighted for
+/// Enter, each with its tree, ticket, age and what it is about; then what
+/// finished or merged meanwhile; or that you are caught up.
+fn draw_away(frame: &mut Frame, app: &App) {
+    let t = theme();
+    let Some(away) = &app.away else {
+        return;
+    };
+    let screen = stage(app, frame.area());
+    let width = screen.width.saturating_sub(4).min(AWAY_WIDTH);
+    let inner_width = usize::from(width.saturating_sub(4));
+    let items = app.away_items();
+    let mut lines: Vec<Line> = Vec::new();
+    if items.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("✓ ", fg(t.success)),
+            Span::raw("All caught up. Nothing is waiting on you."),
+        ]));
+    }
+    for (at, entry) in items.iter().enumerate() {
+        let (mark, colour) = if entry.kind == Kind::NeedsYou {
+            ("●", t.warning)
+        } else {
+            ("✗", t.danger)
+        };
+        let age = entry.at.map(reports::age).unwrap_or_default();
+        let head = format!(
+            "{mark} {} {}",
+            inbox::place_of(entry).replace(':', " "),
+            waits_for(entry.kind)
+        );
+        let title = entry.title.clone().unwrap_or_default();
+        let room = inner_width.saturating_sub(head.chars().count() + age.len() + 2);
+        let title = fit(&title, room);
+        let pad = inner_width
+            .saturating_sub(head.chars().count() + 1 + title.chars().count() + age.len());
+        let style = if at == 0 { t.cursor } else { Style::new() };
+        lines.push(
+            Line::from(vec![
+                Span::styled(head, fg(colour).add_modifier(Modifier::BOLD)),
+                Span::raw(format!(" {title}{}", " ".repeat(pad))),
+                Span::styled(age, fg(t.muted)),
+            ])
+            .style(style),
+        );
+        let what = format!("  {}", fit(&entry.what, inner_width.saturating_sub(2)));
+        let pad = inner_width.saturating_sub(what.chars().count());
+        lines.push(Line::raw(format!("{what}{}", " ".repeat(pad))).style(style));
+    }
+    let done = app.away_done();
+    // On a short screen the list gives way, so the foot still shows.
+    let room = usize::from(screen.height.saturating_sub(2)).saturating_sub(if done.is_empty() {
+        0
+    } else {
+        2
+    });
+    lines.truncate(room);
+    if !done.is_empty() {
+        lines.push(Line::raw(""));
+        let also: Vec<String> = done
+            .iter()
+            .map(|e| {
+                let did = if e.kind == Kind::Merged {
+                    "merged"
+                } else {
+                    "finished"
+                };
+                format!("✓ {} {did}", inbox::place_of(e))
+            })
+            .collect();
+        lines.push(Line::styled(
+            fit(&format!("Also: {}", also.join(" · ")), inner_width),
+            fg(t.muted),
+        ));
+    }
+    let keys: &[(&str, &str)] = if items.is_empty() {
+        &[("any key", "close")]
+    } else if items.len() > 1 {
+        &[("Enter", "go"), ("s", "later"), ("Esc", "close")]
+    } else {
+        &[("Enter", "go"), ("Esc", "close")]
+    };
+    let gone = format!(" gone {} ", reports::age(away.since));
+    let height = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2);
+    let area = popup::centered(screen, width, height.min(screen.height));
+    let block = popup_block(Line::styled(
+        " While you were away ",
+        fg(t.title).add_modifier(Modifier::BOLD),
+    ))
+    .title_top(Line::styled(gone, fg(t.muted)).right_aligned())
+    .title_bottom(Line::from(fitting_keys(keys, width.saturating_sub(2))))
+    .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// The rows of commands the palette shows at most.
@@ -5553,6 +5660,54 @@ mod banner_tests {
                 .modifier
                 .contains(Modifier::DIM),
             "the list under the popup dims"
+        );
+    }
+
+    #[test]
+    fn while_you_were_away_lists_what_waits_then_what_finished() {
+        let mut app = app();
+        // Treetop's first look, as it takes once the pool is read.
+        app.watch_waiting();
+        app.note_idle(std::time::Duration::from_secs(47 * 60));
+        // Tree 4's agent finishes while you are away.
+        let mut reports = app.reports.clone();
+        reports[0] = crate::inbox::tests::report(
+            "j4",
+            "/pool/4/app",
+            crate::reports::State::Done,
+            "Done: it sits right",
+            30,
+        );
+        app.apply_reports(reports);
+        assert!(app.back());
+        let shown = screen(&app, 120, 30);
+        let text = shown.join("\n");
+        let at = |part: &str| {
+            shown
+                .iter()
+                .position(|l| l.contains(part))
+                .unwrap_or_else(|| panic!("{part} in\n{text}"))
+        };
+        assert!(shown[at("While you were away")].contains("gone 47m"));
+        // The oldest first, and tree 2, finished before you went, nowhere.
+        assert!(at("9 agent died") < at("endodeals-web 12 needs you"));
+        assert!(at("endodeals-web 12 needs you") < at("7 checks failed"));
+        assert!(shown[at("Also:")].contains("✓ 4 finished"));
+        assert!(
+            !shown[at("Also:")].contains(" 2 "),
+            "{}",
+            shown[at("Also:")]
+        );
+        assert!(text.contains("Enter  go  s  later  Esc  close"), "{text}");
+        // On a short screen the list gives way to the foot.
+        let short = screen(&app, 80, 10).join("\n");
+        assert!(short.contains("Also: ✓ 4 finished"), "{short}");
+        // Nothing left: caught up.
+        crate::inbox::tests::nothing_waits(&mut app);
+        assert!(
+            screen(&app, 120, 30)
+                .iter()
+                .any(|l| l.contains("All caught up. Nothing is waiting on you."))
         );
     }
 

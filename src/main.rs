@@ -234,6 +234,22 @@ fn chat_closed(app: &mut App, agent: &str, tree: &str) -> Result<()> {
     leave_window(app)
 }
 
+/// A key or paste: back from away with something waiting, it opens "While
+/// you were away" and goes no further. A popup chat, the assistant's or a
+/// scratch one, holds the keys whatever the table does, so it is put away
+/// for the sheet, as a click on the banner puts it away.
+fn come_back(chats: &mut Chats, app: &mut App) -> Result<bool> {
+    let is_popup = chats.open().is_some_and(ui::is_popup_chat);
+    if is_popup && app.is_due_back() {
+        let open = chats.open().map(|c| (c.agent.clone(), c.tree.clone()));
+        chats.hide();
+        if let Some((agent, tree)) = open {
+            chat_closed(app, &agent, &tree)?;
+        }
+    }
+    Ok(app.back())
+}
+
 /// The window's chat gives the keys back to the table and keeps running
 /// on screen.
 fn leave_window(app: &mut App) -> Result<()> {
@@ -349,6 +365,10 @@ fn choices() -> Vec<Choice> {
         .collect()
 }
 
+/// How often treetop asks tmux how long since anyone typed, for "While you
+/// were away".
+const IDLE_EVERY: Duration = Duration::from_secs(5);
+
 fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
     let refresher = Refresher::spawn(checkout.to_path_buf(), app.trees.clone());
     let worker = Worker::spawn();
@@ -397,6 +417,8 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
     let mut updating: Option<mpsc::Receiver<Result<String, String>>> = None;
     // The line tmux's status shows for what waits on you, as last set.
     let mut shown_waiting: Option<Option<String>> = None;
+    // When tmux was last asked how long since anyone typed.
+    let mut idle_read = Instant::now();
     loop {
         while let Ok(update) = refresher.updates.try_recv() {
             is_stale = true;
@@ -827,6 +849,17 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             }
             chat_sized = Some(sizes);
         }
+        if idle_read.elapsed() >= IDLE_EVERY {
+            idle_read = Instant::now();
+            let idle = if app.is_in_tmux {
+                tmux::idle()
+            } else {
+                Some(app.since_key())
+            };
+            if let Some(idle) = idle {
+                app.note_idle(idle);
+            }
+        }
         if is_stale && let Some((is_new, line)) = app.watch_waiting() {
             if is_new {
                 ring()?;
@@ -857,6 +890,16 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
         // A key or a resize: either way the screen is drawn again.
         is_stale = true;
         let event = chat::as_ctrl_q(event::read()?);
+        // Back from away, the first key or paste opens what waited
+        // meanwhile and goes no further, so it reaches no agent.
+        let is_typed = match &event {
+            Event::Key(key) => key.kind == KeyEventKind::Press,
+            Event::Paste(_) => true,
+            _ => false,
+        };
+        if is_typed && come_back(&mut chats, app)? {
+            continue;
+        }
         // Over the window's chat while the table has the keys, the wheel
         // scrolls it and a click gives it the keys.
         if let &Event::Mouse(mouse) = &event
@@ -1316,4 +1359,47 @@ fn restart(workspace: &Path) -> Result<()> {
         .current_dir(workspace)
         .exec();
     Err(err).with_context(|| format!("starting {}", exe.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn back_from_away_the_assistants_popup_gives_way_to_the_sheet() {
+        let mut app = inbox::tests::app();
+        let mut chats = Chats::default();
+        chats
+            .show(
+                &["cat".into()],
+                (20, 60),
+                assistant::NAME.into(),
+                app::SCRATCH.into(),
+                None,
+            )
+            .unwrap();
+        assert!(chat_has_keys(&chats, &app));
+        app.note_idle(Duration::from_secs(10 * 60));
+        assert!(
+            come_back(&mut chats, &mut app).unwrap(),
+            "the key goes no further"
+        );
+        assert!(!chat_has_keys(&chats, &app), "nor do the keys after it");
+        assert!(app.is_away_shown());
+        // Not away, the popup keeps the keys.
+        let mut app = inbox::tests::app();
+        let mut chats = Chats::default();
+        chats
+            .show(
+                &["cat".into()],
+                (20, 60),
+                assistant::NAME.into(),
+                app::SCRATCH.into(),
+                None,
+            )
+            .unwrap();
+        assert!(!come_back(&mut chats, &mut app).unwrap());
+        assert!(chat_has_keys(&chats, &app));
+    }
 }

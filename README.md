@@ -52,6 +52,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | `N` | start a new agent in a fresh tree, on a branch named for the task (see [New agents](#new-agents)) |
 | `m` | write a message to the agents in the marked trees, or the tree under the cursor |
 | `e` | go to what waits on you, the one the banner names first, and again to the next, from the table or a chat in Normal (see [What waits on you](#what-waits-on-you)) |
+| `E` | show "While you were away" again, what waits on you to go through one at a time |
 | `:` | ask the assistant about the tree under the cursor, or write `@17 ...` for that tree's agent (see [The assistant](#the-assistant)) |
 | `a` | open the assistant's chat, where it answers, starting it if there is none |
 | `d` | show the side-by-side diff of the tree under the cursor in the window's diff tab, with the keys |
@@ -655,6 +656,12 @@ The oldest comes first: each is as old as it has waited, from when it happened, 
 Inside tmux, the status line of every window shows `● 2 waiting · 17 22` at its right for as long as anything waits, and clears once nothing does or treetop quits.
 treetop sets it on its session over the global `status-right`, and unsets it again, so your own `status-right` is left as it was.
 When something starts waiting, treetop rings the terminal bell, once, so it is heard from any window; the assistant finishing an answer rings it too, and shows it in the status line for five seconds.
+
+Back after ten minutes or more with no key typed in any tmux window, or in treetop outside tmux, your first key opens "While you were away", and goes no further, so it reaches no agent; typing in another window meanwhile keeps you present, so it never opens.
+It lists what still waits, the oldest first with how long ago, and at its foot what finished or merged while you were away.
+Enter opens the first, as `e` would, and the sheet stands aside until that one stops waiting, such as once you answer the agent; then the keys come back to the table and the sheet shows again with the next first, until it says you are all caught up.
+`s` puts the first off till last, and Esc closes it.
+`E` shows it again as you left it.
 
 Another workspace's entries carry its name, such as `keel:3`, and opening one switches there first; an agent with no chat, such as `claude` in a tmux pane, is gone to inside tmux, as `t` does.
 Its background agents are placed in their trees by the workspace's last listing; its PRs that failed, and its agents waiting at a prompt in a tmux pane, come from a read of its pool every three minutes, for the workspaces opened in the last week, so they can show a few minutes late.

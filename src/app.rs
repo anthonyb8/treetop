@@ -172,7 +172,7 @@ const TREE_COMMANDS: [(&str, char); 20] = [
 
 /// The commands on the pool, each with the key that does it, `^` for one
 /// with Ctrl.
-const POOL_COMMANDS: [(&str, &str); 12] = [
+const POOL_COMMANDS: [(&str, &str); 13] = [
     ("New agent in a fresh tree", "N"),
     ("Ask the assistant", ":"),
     ("Open the assistant's chat", "a"),
@@ -181,6 +181,7 @@ const POOL_COMMANDS: [(&str, &str); 12] = [
     ("Scratch chats", "C"),
     ("Filter the trees", "/"),
     ("Go to what waits on you", "e"),
+    ("While you were away", "E"),
     ("Two windows, or one", "^\\"),
     ("Zoom the table or the windows", "^F"),
     ("Every key", "?"),
@@ -424,8 +425,8 @@ pub enum Outcome {
     /// Show the pool of the repository checked out here instead.
     Switch(PathBuf),
     /// Show the pool of the repository checked out at `checkout`, and open
-    /// what its inbox entry of `kind` for the tree at `tree` opens once it
-    /// is read: an inbox entry of another workspace.
+    /// what waits, of `kind`, in the tree at `tree` once it is read: what
+    /// waits in another workspace.
     SwitchTo {
         checkout: PathBuf,
         tree: PathBuf,
@@ -482,6 +483,30 @@ pub enum Outcome {
 pub struct Watch {
     went: Option<crate::inbox::About>,
     since: HashMap<crate::inbox::About, std::time::SystemTime>,
+    /// "While you were away", open, closed with Esc, or due at the next
+    /// key, so a sheet that switched workspace comes along.
+    away: Option<Catchup>,
+    closed_away: Option<Catchup>,
+    went_away: Option<Catchup>,
+    /// What had finished or merged at your last key.
+    done_seen: std::collections::HashSet<crate::inbox::About>,
+}
+
+/// How long without a key, in tmux or treetop, counts as away.
+const AWAY: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// "While you were away": what waits, gone through one at a time, and
+/// what finished or merged meanwhile.
+#[derive(Debug, Clone)]
+pub struct Catchup {
+    /// When you went.
+    pub since: std::time::SystemTime,
+    /// What had finished or merged already, left out of the foot.
+    done_before: std::collections::HashSet<crate::inbox::About>,
+    /// Put off with `s`, in the order put off, after the rest.
+    later: Vec<crate::inbox::About>,
+    /// Opened with Enter: the sheet stands aside until it stops waiting.
+    on: Option<crate::inbox::About>,
 }
 
 #[derive(Default)]
@@ -647,8 +672,8 @@ pub struct App {
     is_cursor_placed: bool,
     /// An agent writing the handoff for the one that takes over from it.
     handing: Option<Handing>,
-    /// The other workspaces' pools as their caches list them, where the
-    /// inbox places their agents.
+    /// The other workspaces' pools as their caches list them, where what
+    /// waits there is placed.
     pub pools: Vec<crate::inbox::Pool>,
     /// The other workspaces' trees with their agents and PRs, as the last
     /// read of each found them, by its checkout.
@@ -665,6 +690,18 @@ pub struct App {
     /// bell once; what already waits when treetop opens or switches here
     /// rings nothing.
     has_looked: bool,
+    /// You have been away since then, and the next key opens what waited
+    /// meanwhile.
+    went_away: Option<Catchup>,
+    /// "While you were away", open; it shows while the table has the keys.
+    pub away: Option<Catchup>,
+    /// The sheet as Esc closed it, for `E` to bring back.
+    closed_away: Option<Catchup>,
+    /// What had finished or merged at your last key, so the sheet's foot
+    /// has all that did while you were away.
+    done_seen: std::collections::HashSet<crate::inbox::About>,
+    /// When treetop last had a key, where tmux cannot say.
+    last_key: Option<std::time::Instant>,
     /// The tab the window under the table shows.
     pub tab: WindowTab,
     /// The window under the table has the keys, in Normal: treetop's keys
@@ -691,7 +728,7 @@ pub struct App {
     /// its tree is listed.
     returning: Option<OtherWindow>,
     /// The tree whose agent opens once this workspace's agents are read:
-    /// an inbox entry chosen from another workspace.
+    /// what waits there, gone to from another workspace.
     pub arriving: Option<(PathBuf, crate::inbox::Kind)>,
 }
 
@@ -2493,15 +2530,24 @@ impl App {
     /// Nothing else is on screen or being typed: the list alone, where an
     /// ask's chat may open without taking over something under way.
     fn is_free(&self) -> bool {
+        // An ask waits, too, for a start shown in the window, which it
+        // would swap out.
+        self.is_on_table() && self.opening.is_none() && !self.is_away_shown()
+    }
+
+    /// The table has the keys, with nothing over it but the sheet, or a
+    /// start shown in the window, which holds none.
+    fn is_on_table(&self) -> bool {
         // A window with the keys holds them in Normal too, so an ask never
         // swaps out the chat or shell being read there.
         !self.is_window_focused
             && self.prompt.is_none()
+            && self.palette.is_none()
             && self.picker.is_none()
             && self.port_menu.is_none()
             && self.phone.is_none()
             && self.scratch_menu.is_none()
-            && self.opening.is_none()
+            && self.opening.as_ref().is_none_or(|o| o.key.is_some())
             && self.awaiting_chat.is_none()
             && self.started_chat.is_none()
             && !self.is_help
@@ -2627,6 +2673,11 @@ impl App {
             self.message = Some("nothing is waiting on you".into());
             return Outcome::Continue;
         };
+        self.go_to(entry)
+    }
+
+    /// Opens `entry`, as Enter on its tree's row would.
+    fn go_to(&mut self, entry: crate::inbox::Entry) -> Outcome {
         self.watch.went = Some(entry.about());
         self.is_window_focused = false;
         self.is_inserting = false;
@@ -2653,6 +2704,13 @@ impl App {
             && waiting
                 .iter()
                 .any(|e| !self.watch.since.contains_key(&e.about()));
+        self.back_to_the_sheet(&waiting);
+        if !self.has_looked {
+            // As if a key: what is done already is no news, and away
+            // counts from now outside tmux.
+            self.done_seen = self.done().iter().map(crate::inbox::Entry::about).collect();
+            self.last_key.get_or_insert_with(std::time::Instant::now);
+        }
         self.has_looked = true;
         // `waiting` already carries each one's time from the last look, or
         // its own for one seen first now.
@@ -2668,6 +2726,23 @@ impl App {
         Some((is_new, line))
     }
 
+    /// What Enter opened from the sheet no longer waits, and its chat or
+    /// tree is still in front of you: the keys come back to the table,
+    /// where the sheet shows again with the next first.
+    fn back_to_the_sheet(&mut self, waiting: &[crate::inbox::Entry]) {
+        let Some(on) = self
+            .away
+            .as_mut()
+            .and_then(|a| a.on.take_if(|on| !waiting.iter().any(|e| e.about() == *on)))
+        else {
+            return;
+        };
+        if self.current().is_some_and(|t| t.path == on.1) {
+            self.is_window_focused = false;
+            self.is_inserting = false;
+        }
+    }
+
     /// Since when `about` has waited, as the last look saw it.
     pub fn waiting_since(&self, about: &crate::inbox::About) -> Option<std::time::SystemTime> {
         self.watch.since.get(about).copied()
@@ -2675,15 +2750,193 @@ impl App {
 
     /// What waits as last looked, for the workspace switched to next.
     pub fn take_watch(&mut self) -> Watch {
-        std::mem::take(&mut self.watch)
+        Watch {
+            away: self.away.take(),
+            closed_away: self.closed_away.take(),
+            went_away: self.went_away.take(),
+            done_seen: std::mem::take(&mut self.done_seen),
+            ..std::mem::take(&mut self.watch)
+        }
     }
 
     /// Takes up what waits as the workspace switched from last looked.
-    pub fn keep_watch(&mut self, watch: Watch) {
+    pub fn keep_watch(&mut self, mut watch: Watch) {
+        self.away = watch.away.take();
+        self.closed_away = watch.closed_away.take();
+        self.went_away = watch.went_away.take();
+        self.done_seen = std::mem::take(&mut watch.done_seen);
         self.watch = watch;
     }
 
-    /// Puts the cursor on the tree at `path` and opens what an inbox entry
+    /// What has finished or merged, as the sheet's foot counts them.
+    fn done(&self) -> Vec<crate::inbox::Entry> {
+        crate::inbox::entries(self)
+            .into_iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    crate::inbox::Kind::Done | crate::inbox::Kind::Merged
+                )
+            })
+            .collect()
+    }
+
+    fn away_from(&self, since: std::time::SystemTime) -> Catchup {
+        Catchup {
+            since,
+            done_before: self.done_seen.clone(),
+            later: Vec::new(),
+            on: None,
+        }
+    }
+
+    /// Nothing has been typed, in tmux or here, for `idle`: from AWAY on,
+    /// you are away, and the next key opens what waited meanwhile.
+    pub fn note_idle(&mut self, idle: std::time::Duration) {
+        if idle >= AWAY && self.went_away.is_none() {
+            let since = std::time::SystemTime::now() - idle;
+            self.went_away = Some(self.away_from(since));
+        }
+    }
+
+    /// How long since treetop last had a key, for `note_idle` outside tmux.
+    pub fn since_key(&self) -> std::time::Duration {
+        self.last_key
+            .map_or_else(Default::default, |at| at.elapsed())
+    }
+
+    /// The next key back from away opens the sheet, as `back` would, if
+    /// nothing in front of the table keeps it.
+    pub fn is_due_back(&self) -> bool {
+        self.went_away.is_some() && !crate::inbox::waiting(self).is_empty()
+    }
+
+    /// A key or a paste, wherever it was going. Back from away with
+    /// something waiting, it opens "While you were away" instead, the keys
+    /// back on the table, help closed, and says so, so it goes no further.
+    /// A dialog or a box being typed in keeps it, and the sheet waits for
+    /// the first key once that is gone, since neither is an agent.
+    pub fn back(&mut self) -> bool {
+        self.last_key = Some(std::time::Instant::now());
+        self.done_seen = self.done().iter().map(crate::inbox::Entry::about).collect();
+        let Some(mut away) = self.went_away.take() else {
+            return false;
+        };
+        if crate::inbox::waiting(self).is_empty() {
+            return false;
+        }
+        // The table takes the keys back, from a chat, help or the Issues
+        // screen, unless a dialog or a box being typed in is open, which
+        // keeps the key, with everything left as it was.
+        let was = (
+            self.is_window_focused,
+            self.is_inserting,
+            self.is_help,
+            self.is_issues,
+        );
+        self.is_window_focused = false;
+        self.is_inserting = false;
+        self.is_help = false;
+        self.is_issues = false;
+        if !self.is_on_table() {
+            (
+                self.is_window_focused,
+                self.is_inserting,
+                self.is_help,
+                self.is_issues,
+            ) = was;
+            self.went_away = Some(away);
+            return false;
+        }
+        self.stop_attaching();
+        // Away again with the sheet open: what was put off stays put off.
+        if let Some(open) = self.away.take().or_else(|| self.closed_away.take()) {
+            away.later = open.later;
+        }
+        self.away = Some(away);
+        true
+    }
+
+    /// The sheet is on screen: open, and not stood aside for what Enter
+    /// opened while that still waits and its tree is under the cursor.
+    pub fn is_away_shown(&self) -> bool {
+        let Some(away) = &self.away else {
+            return false;
+        };
+        // Aside while what Enter opened still waits and you are on it.
+        let is_aside = away.on.as_ref().is_some_and(|on| {
+            self.current().is_some_and(|t| t.path == on.1)
+                && crate::inbox::waiting(self).iter().any(|e| &e.about() == on)
+        });
+        !is_aside && self.is_on_table()
+    }
+
+    /// What the sheet lists: what waits, oldest first, what `s` put off
+    /// after the rest.
+    pub fn away_items(&self) -> Vec<crate::inbox::Entry> {
+        let later = self.away.as_ref().map_or(&[][..], |a| &a.later[..]);
+        let mut items = crate::inbox::waiting(self);
+        items.sort_by_key(|e| later.iter().position(|l| *l == e.about()));
+        items
+    }
+
+    /// What finished or merged while you were away, for the sheet's foot.
+    pub fn away_done(&self) -> Vec<crate::inbox::Entry> {
+        let Some(away) = &self.away else {
+            return Vec::new();
+        };
+        // A finish whose time is known counts from when you went; a merge,
+        // which has none, from your last key.
+        self.done()
+            .into_iter()
+            .filter(|e| !away.done_before.contains(&e.about()))
+            .filter(|e| e.at.is_none_or(|at| at >= away.since))
+            .collect()
+    }
+
+    /// The keys while the sheet is on screen: Enter opens the first, `s`
+    /// puts it off till last, Esc closes the sheet; with nothing left,
+    /// any key closes it. Others do nothing, `q` too, since the sheet can
+    /// come back while you are still typing.
+    fn handle_away_key(&mut self, key: KeyEvent) -> Outcome {
+        let items = self.away_items();
+        let Some(first) = items.first().cloned() else {
+            self.away = None;
+            return Outcome::Continue;
+        };
+        let Some(away) = self.away.as_mut() else {
+            return Outcome::Continue;
+        };
+        match key.code {
+            KeyCode::Enter => {
+                away.on = Some(first.about());
+                return self.go_to(first);
+            }
+            KeyCode::Char('s') if items.len() > 1 => {
+                away.later.retain(|l| *l != first.about());
+                away.later.push(first.about());
+            }
+            KeyCode::Esc => {
+                away.on = None;
+                self.closed_away = self.away.take();
+            }
+            _ => {}
+        }
+        Outcome::Continue
+    }
+
+    /// `E`: "While you were away" again, as Esc left it, else what waits
+    /// now.
+    fn open_away(&mut self) {
+        let away = self
+            .closed_away
+            .take()
+            .or_else(|| self.away.take())
+            .unwrap_or_else(|| self.away_from(std::time::SystemTime::now()));
+        self.away = Some(Catchup { on: None, ..away });
+    }
+
+    /// Puts the cursor on the tree at `path` and opens what an entry
     /// of `kind` for it opens: for a PR, its checks in the detail pane;
     /// else its agent, as Enter on its row does.
     fn open_tree(&mut self, path: PathBuf, kind: crate::inbox::Kind) -> Outcome {
@@ -2711,7 +2964,7 @@ impl App {
         }
     }
 
-    /// What the inbox entry another workspace switched here for opens, once
+    /// What waits here, which another workspace switched here for, opens once
     /// the agents are read and nothing else is on screen, the cursor going
     /// to its tree either way: its chat, or inside tmux the pane its agent
     /// runs in. Outside tmux an agent with no chat is left for `t`, rather
@@ -4221,6 +4474,10 @@ impl App {
         if self.scratch_menu.is_some() {
             return self.handle_scratch_key(key);
         }
+        // The sheet over the table takes its keys, Esc included.
+        if self.is_away_shown() {
+            return self.handle_away_key(key);
+        }
         // A start shown in the window under the table holds no keys: Esc
         // hides it, and the start carries on; the rest work as ever, so a
         // second start can follow the first at once.
@@ -4425,6 +4682,7 @@ impl App {
             KeyCode::Char('i') => self.show_issue(),
             KeyCode::Char('I') => self.choose_issue(),
             KeyCode::Char('e') => return self.go_waiting(true),
+            KeyCode::Char('E') => self.open_away(),
             KeyCode::Char('m') => self.open_message(),
             KeyCode::Char('q') => return self.quit(),
             KeyCode::Char('U') => return self.restart(),

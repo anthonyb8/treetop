@@ -1212,6 +1212,242 @@ pub mod tests {
         );
     }
 
+    fn ten_minutes() -> Duration {
+        Duration::from_secs(10 * 60)
+    }
+
+    #[test]
+    fn the_first_key_back_from_away_opens_what_waited_and_goes_no_further() {
+        let mut app = app();
+        app.select_tree("2");
+        app.tab = crate::app::WindowTab::Chat;
+        app.insert_in_window();
+        assert!(app.is_inserting(), "typing in tree 2's chat");
+        app.note_idle(Duration::from_secs(9 * 60));
+        assert!(!app.back(), "nine minutes is not away");
+        app.note_idle(ten_minutes());
+        assert!(app.back(), "the key is swallowed");
+        assert!(!app.is_inserting(), "and the chat no longer has the keys");
+        assert!(app.is_away_shown());
+        assert!(!app.back(), "only the first key");
+        // Away with nothing waiting opens nothing.
+        let mut idle = self::app();
+        nothing_waits(&mut idle);
+        idle.note_idle(ten_minutes());
+        assert!(!idle.back());
+        assert!(!idle.is_away_shown());
+    }
+
+    #[test]
+    fn enter_works_through_what_waited_and_s_puts_one_off() {
+        let mut app = app();
+        app.note_idle(ten_minutes());
+        app.back();
+        let first = |app: &App| app.away_items().first().map(|e| e.tree.clone());
+        assert_eq!(first(&app).as_deref(), Some("9"));
+        // `s` puts tree 9 off till last.
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(first(&app).as_deref(), Some("12"));
+        assert_eq!(app.away_items().last().map(|e| e.tree.as_str()), Some("9"));
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(first(&app).as_deref(), Some("4"));
+        // Enter opens tree 4's chat, and the sheet stands aside while it asks.
+        let Outcome::Chat { tree, .. } = press(&mut app, KeyCode::Enter) else {
+            panic!("Enter opens tree 4's chat");
+        };
+        assert_eq!(tree, "4");
+        assert!(!app.is_away_shown(), "out of the way of tree 4's chat");
+        // Answered, tree 4 no longer asks: the sheet is back, the next first,
+        // 9 and 12 still put off.
+        let mut reports = app.reports.clone();
+        for r in reports.iter_mut().filter(|r| r.job == "j4") {
+            r.state = State::Working;
+        }
+        app.apply_reports(reports);
+        assert!(app.is_away_shown());
+        assert_eq!(first(&app).as_deref(), Some("7"));
+        // Esc closes it; `E` brings it back as it was, 9 and 12 still last.
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.is_away_shown());
+        press(&mut app, KeyCode::Char('E'));
+        assert!(app.is_away_shown());
+        assert_eq!(first(&app).as_deref(), Some("7"));
+        // Caught up, any key closes it.
+        nothing_waits(&mut app);
+        press(&mut app, KeyCode::Char('x'));
+        assert!(!app.is_away_shown() && app.away.is_none());
+    }
+
+    #[test]
+    fn what_finished_after_your_last_key_is_in_the_foot_though_you_were_not_yet_away() {
+        let mut app = app();
+        app.watch_waiting();
+        app.back();
+        // Tree 4's agent finishes a minute after your last key, nine before
+        // treetop counts you away.
+        let mut reports = app.reports.clone();
+        reports[0] = report("j4", "/pool/4/app", State::Done, "Done", 60);
+        app.apply_reports(reports);
+        app.note_idle(ten_minutes());
+        assert!(app.back());
+        let done: Vec<String> = app.away_done().into_iter().map(|e| e.tree).collect();
+        assert_eq!(done, ["4"], "and tree 2, done before you went, is not");
+    }
+
+    #[test]
+    fn the_sheet_comes_along_when_enter_switches_workspace() {
+        let mut here = app();
+        here.note_idle(ten_minutes());
+        here.back();
+        press(&mut here, KeyCode::Char('s'));
+        assert!(matches!(
+            press(&mut here, KeyCode::Enter),
+            Outcome::SwitchTo { .. }
+        ));
+        // The other workspace, as the switch opens it.
+        let mut there = app();
+        there.keep_watch(here.take_watch());
+        assert!(there.away.is_some(), "the sheet came along");
+        there.reports.retain(|r| r.job != "j12");
+        assert!(there.is_away_shown(), "back once it is answered");
+        assert_eq!(
+            there.away_items().first().map(|e| e.tree.as_str()),
+            Some("4"),
+            "with the next first"
+        );
+    }
+
+    #[test]
+    fn answering_in_the_chat_enter_opened_brings_the_sheet_back() {
+        let mut app = app();
+        app.watch_waiting();
+        app.note_idle(ten_minutes());
+        app.back();
+        press(&mut app, KeyCode::Char('s'));
+        press(&mut app, KeyCode::Char('s'));
+        assert!(matches!(
+            press(&mut app, KeyCode::Enter),
+            Outcome::Chat { ref tree, .. } if tree == "4"
+        ));
+        // The chat opens in the window with the keys, and you answer there.
+        app.insert_in_window();
+        let mut reports = app.reports.clone();
+        reports[0].state = State::Working;
+        app.apply_reports(reports);
+        app.watch_waiting();
+        assert!(!app.is_inserting(), "the keys come back to the table");
+        assert!(app.is_away_shown());
+        assert_eq!(app.away_items().first().map(|e| e.tree.as_str()), Some("7"));
+    }
+
+    #[test]
+    fn what_finished_before_you_went_is_not_in_the_foot() {
+        let mut app = app();
+        app.watch_waiting();
+        // Tree 4's agent finished an hour ago, while you typed elsewhere.
+        let mut reports = app.reports.clone();
+        reports[0] = report("j4", "/pool/4/app", State::Done, "Done", 3_600);
+        app.apply_reports(reports);
+        app.note_idle(ten_minutes());
+        app.back();
+        assert!(app.away_done().is_empty(), "{:?}", app.away_done());
+    }
+
+    #[test]
+    fn away_again_from_a_chat_the_sheet_opened_opens_it_again() {
+        let mut app = app();
+        app.note_idle(ten_minutes());
+        app.back();
+        press(&mut app, KeyCode::Char('s'));
+        press(&mut app, KeyCode::Char('s'));
+        press(&mut app, KeyCode::Enter);
+        app.insert_in_window();
+        // You leave with tree 4's chat open and its ask unanswered.
+        app.note_idle(Duration::from_secs(60 * 60));
+        assert!(app.back(), "the first key back goes to no agent");
+        assert!(!app.is_inserting());
+        assert!(app.is_away_shown());
+        assert_eq!(
+            app.away_items().last().map(|e| e.tree.as_str()),
+            Some("12"),
+            "what was put off stays put off"
+        );
+    }
+
+    #[test]
+    fn with_help_open_the_first_key_back_shows_the_sheet() {
+        let mut app = app();
+        app.is_help = true;
+        app.note_idle(ten_minutes());
+        assert!(app.back());
+        assert!(app.is_away_shown(), "help gives way to the sheet");
+        // The palette, being typed in, keeps the first key back.
+        let mut app = self::app();
+        app.open_palette();
+        app.note_idle(ten_minutes());
+        assert!(!app.back(), "the key goes to the palette");
+        assert!(!app.is_away_shown());
+    }
+
+    #[test]
+    fn a_start_shown_in_the_window_does_not_keep_the_sheet_shut() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('N'));
+        for c in "fix login".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            app.window_start().is_some(),
+            "the start shows in the window"
+        );
+        app.note_idle(ten_minutes());
+        assert!(app.back());
+        assert!(app.is_away_shown());
+        // Esc closes the sheet, and the start stays shown.
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.is_away_shown());
+        assert!(app.window_start().is_some());
+        // A stray `q` on the sheet quits nothing.
+        press(&mut app, KeyCode::Char('E'));
+        assert_eq!(press(&mut app, KeyCode::Char('q')), Outcome::Continue);
+    }
+
+    #[test]
+    fn leaving_the_tree_enter_put_you_on_brings_the_sheet_back() {
+        let mut app = app();
+        app.note_idle(ten_minutes());
+        app.back();
+        // Tree 9's dead agent, first: Enter puts the cursor on it.
+        assert_eq!(press(&mut app, KeyCode::Enter), Outcome::Continue);
+        assert!(!app.is_away_shown(), "aside while you are on tree 9");
+        app.select_tree("2");
+        assert!(app.is_away_shown(), "back once you move off it");
+        assert_eq!(app.away_items().first().map(|e| e.tree.as_str()), Some("9"));
+    }
+
+    #[test]
+    fn back_from_away_over_the_issues_screen_the_sheet_shows_on_the_trees() {
+        let mut app = app();
+        app.select_tree("2");
+        app.tab = crate::app::WindowTab::Chat;
+        app.is_issues = true;
+        app.insert_in_window();
+        app.note_idle(ten_minutes());
+        assert!(app.back(), "the key reaches neither the agent nor Issues");
+        assert!(!app.is_issues && app.is_away_shown());
+        // A box being typed in keeps the key, and the keys stay where they
+        // were.
+        let mut app = self::app();
+        app.select_tree("2");
+        app.tab = crate::app::WindowTab::Chat;
+        app.insert_in_window();
+        app.open_palette();
+        app.note_idle(ten_minutes());
+        assert!(!app.back());
+        assert!(app.is_window_focused, "left as it was");
+    }
+
     #[test]
     fn e_from_a_chat_in_normal_leaves_it_for_what_waits() {
         let mut app = app();

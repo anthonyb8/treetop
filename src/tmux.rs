@@ -194,6 +194,26 @@ pub fn show_waiting(line: Option<&str>) {
     let _ = tmux(&["set-option", "status-right", &shown]);
 }
 
+/// How long since anyone typed in any client of this tmux server, or with
+/// every client detached, in any of its sessions; None where tmux cannot
+/// say.
+pub fn idle() -> Option<std::time::Duration> {
+    let latest = |what: &str, format: &str| {
+        tmux(&[what, "-F", format])
+            .ok()?
+            .lines()
+            .filter_map(|at| at.trim().parse::<u64>().ok())
+            .max()
+    };
+    let latest = latest("list-clients", "#{client_activity}")
+        .or_else(|| latest("list-sessions", "#{session_activity}"))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(std::time::Duration::from_secs(now.saturating_sub(latest)))
+}
+
 pub fn open(tree: &Tree) -> Result<String> {
     if let Some(switched) = open_agent(tree)? {
         return Ok(switched);

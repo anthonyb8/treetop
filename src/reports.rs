@@ -24,7 +24,7 @@ use serde_json::Value;
 
 use crate::pool::Tree;
 
-/// How long a finished or stopped job stays in the inbox. One still working
+/// How long a finished or stopped job stays among what wants you. One still working
 /// stays however old it is, and so does one waiting on you while its session
 /// still runs.
 const RECENT: Duration = Duration::from_secs(24 * 60 * 60);
