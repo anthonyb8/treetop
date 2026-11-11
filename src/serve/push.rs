@@ -27,10 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::app::App;
-use crate::inbox::{Kind, Said, pr_kind, said};
-use crate::ship::Stage;
-
-use super::pool::title;
+use crate::inbox::Kind;
 
 /// How long a push service keeps a message for a phone that is off.
 const TTL: &str = "86400";
@@ -356,81 +353,127 @@ fn query_escape(value: &str) -> String {
     escaped
 }
 
-/// What each tree looked like the last time: its agent's state and its
-/// PR's stage.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Seen {
-    trees: HashMap<String, (Option<Said>, Option<Stage>)>,
+/// How long something waits on you before the phone is pushed, and how
+/// long you must have been away from tmux by then.
+pub const FIRST: Duration = Duration::from_secs(5 * 60);
+
+/// How long it waits before the one reminder; after that, no more.
+pub const AGAIN: Duration = Duration::from_secs(30 * 60);
+
+/// How long something can drop out of what waits, as an agent read as
+/// busy for a moment, and come back as the same thing, not pushed again.
+const FORGET: Duration = Duration::from_secs(2 * 60);
+
+/// Pushes it has had: none, the first, or the reminder, after which none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Pushes {
+    None,
+    First,
+    Spent,
 }
 
-impl Seen {
-    pub fn of(app: &App) -> Seen {
-        let trees = app
-            .trees
-            .iter()
-            .filter(|t| t.is_held() && !t.is_main)
-            .map(|tree| {
-                let said = said(app, tree);
-                (
-                    tree.name.clone(),
-                    (said, tree.ship.as_ref().map(|s| s.stage)),
-                )
-            })
-            .collect();
-        Seen { trees }
-    }
+/// What has been pushed about one waiting thing.
+#[derive(Debug, Clone, Copy)]
+struct Pushed {
+    pushes: Pushes,
+    /// When the last push went, so the reminder comes AGAIN - FIRST after
+    /// it however late the first was.
+    at: Option<SystemTime>,
+    /// When it was last seen waiting, for FORGET.
+    seen: SystemTime,
+}
 
-    /// What changed from `self` to `now` that is worth a push: an agent
-    /// coming to need you, finishing or dying, and a PR's checks failing or
-    /// it merging. A tree seen for the first time says nothing, so a
-    /// server starting up does not push the whole pool. Each opens its tree
-    /// in `workspace`, its own, whichever one the phone last showed: tree 17
-    /// of one repository is not tree 17 of another.
-    pub fn notices(&self, now: &Seen, app: &App, workspace: &str) -> Vec<Notice> {
+/// When the phone is pushed about what waits in this workspace's trees:
+/// once it has waited FIRST while you are away from tmux, again at AGAIN
+/// and not sooner than AGAIN - FIRST after the first, and never after.
+/// Answered at the desk before then, it is never pushed.
+#[derive(Debug, Default)]
+pub struct Schedule {
+    /// What has been pushed, by what it is about; None until the first
+    /// look, which pushes nothing, so a server starting up does not buzz
+    /// the phone with the whole pool.
+    pushed: Option<HashMap<crate::inbox::About, Pushed>>,
+}
+
+impl Schedule {
+    /// The pushes due as of `now`, with you `idle` in tmux for so long, or
+    /// None where tmux cannot say, which counts as away. Each opens its
+    /// tree in `workspace`, its own, whichever one the phone last showed:
+    /// tree 17 of one repository is not tree 17 of another. A push names
+    /// the tree and what it waits for, never what the agent wrote. Another
+    /// workspace's are left to that workspace's own pool.
+    pub fn due(
+        &mut self,
+        app: &App,
+        idle: Option<Duration>,
+        now: SystemTime,
+        workspace: &str,
+    ) -> Vec<Notice> {
+        let waiting: Vec<crate::inbox::Entry> = crate::inbox::waiting(app)
+            .into_iter()
+            .filter(|e| e.away.is_none())
+            .collect();
+        let Some(pushed) = self.pushed.as_mut() else {
+            let spent = |_| Pushed {
+                pushes: Pushes::Spent,
+                at: None,
+                seen: now,
+            };
+            self.pushed = Some(waiting.iter().map(|e| (e.about(), spent(()))).collect());
+            return Vec::new();
+        };
+        pushed.retain(|about, p| {
+            waiting.iter().any(|e| e.about() == *about)
+                || now.duration_since(p.seen).unwrap_or_default() < FORGET
+        });
+        let is_away = idle.is_none_or(|idle| idle >= FIRST);
         let query = format!("?workspace={}", query_escape(workspace));
         let mut notices = Vec::new();
-        for (name, (said, stage)) in &now.trees {
-            let Some((was_said, was_stage)) = self.trees.get(name) else {
-                continue;
+        for entry in &waiting {
+            let p = pushed.entry(entry.about()).or_insert(Pushed {
+                pushes: Pushes::None,
+                at: None,
+                seen: now,
+            });
+            p.seen = now;
+            let since = |at: Option<SystemTime>| {
+                at.and_then(|at| now.duration_since(at).ok())
+                    .unwrap_or_default()
             };
-            let tree = app.trees.iter().find(|t| &t.name == name);
-            let heading = tree
-                .and_then(|t| {
-                    let ticket = t.sidecar.as_ref().and_then(|s| s.ticket.clone());
-                    title(t.branch.as_deref(), ticket.as_deref())
-                })
-                .map_or_else(|| name.clone(), |title| format!("{name} · {title}"));
-            let chat = format!("/trees/{name}/chat{query}");
-            let page = format!("/trees/{name}{query}");
-            if said != was_said {
-                let what = match said {
-                    Some(Said::NeedsYou) => Some(("Needs you", &chat)),
-                    Some(Said::Done) => Some(("Done", &chat)),
-                    Some(Said::Died) => Some(("Its agent's process died", &page)),
-                    _ => None,
-                };
-                if let Some((what, url)) = what {
-                    notices.push(Notice {
-                        title: heading.clone(),
-                        body: what.into(),
-                        url: url.clone(),
-                    });
-                }
+            let waited = since(entry.at);
+            let is_due = match p.pushes {
+                Pushes::None => waited >= FIRST,
+                Pushes::First => waited >= AGAIN && since(p.at) >= AGAIN - FIRST,
+                Pushes::Spent => false,
+            };
+            if !is_due || !is_away {
+                continue;
             }
-            if stage != was_stage {
-                let what = match stage.and_then(pr_kind) {
-                    Some(Kind::Failed) => Some("Its PR's checks failed"),
-                    Some(Kind::Merged) => Some("Its PR merged"),
-                    _ => None,
-                };
-                if let Some(what) = what {
-                    notices.push(Notice {
-                        title: heading.clone(),
-                        body: what.into(),
-                        url: page.clone(),
-                    });
-                }
-            }
+            p.pushes = if p.pushes == Pushes::None {
+                Pushes::First
+            } else {
+                Pushes::Spent
+            };
+            p.at = Some(now);
+            let title = entry.title.as_ref().map_or_else(
+                || entry.tree.clone(),
+                |title| format!("{} · {title}", entry.tree),
+            );
+            let (what, page) = match entry.kind {
+                Kind::NeedsYou => ("Needs you", "/chat"),
+                Kind::Failed => ("Its PR's checks failed", ""),
+                _ => ("Its agent's process died", ""),
+            };
+            let body = if p.pushes == Pushes::First {
+                what.to_string()
+            } else {
+                format!("Still: {what}, {}m", waited.as_secs() / 60)
+            };
+            notices.push(Notice {
+                title,
+                body,
+                url: format!("/trees/{}{page}{query}", entry.tree),
+            });
         }
         notices.sort_by(|a, b| a.url.cmp(&b.url));
         notices
@@ -443,7 +486,7 @@ mod tests {
     use crate::agents::{Agent, Source, Status};
     use crate::reports::{Report, State};
     use crate::serve::pool::tests::tree;
-    use crate::ship::Ship;
+    use crate::ship::{Ship, Stage};
     use std::path::PathBuf;
 
     fn scratch(name: &str) -> PathBuf {
@@ -581,14 +624,14 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    fn report(job: &str, dir: &str, state: State) -> Report {
+    fn report(job: &str, dir: &str, state: State, updated: SystemTime) -> Report {
         Report {
             job: job.into(),
             name: job.into(),
             state,
             text: "what it said, which no push carries".into(),
             dir: Some(PathBuf::from(dir)),
-            updated: UNIX_EPOCH + Duration::from_secs(100),
+            updated,
             steps: Vec::new(),
         }
     }
@@ -605,62 +648,209 @@ mod tests {
         }))
     }
 
-    #[test]
-    fn a_change_worth_a_buzz_pushes_once_and_never_the_agent_s_words() {
-        let mut app = App::new(None);
-        let mut seventeen = tree("17", "me/END-123-fix-login");
-        seventeen.agents = vec![Agent {
-            name: "login".into(),
+    fn agent(job: &str) -> Agent {
+        Agent {
+            name: job.into(),
             pid: Some(1),
             status: Some(Status::Busy),
             source: Source::Plugin,
             is_background: true,
             attach: None,
-            job: Some("j17".into()),
+            job: Some(job.into()),
             plugin: None,
             active_at: None,
             context: None,
             spend: None,
             label: None,
-        }];
-        seventeen.ship = ship(Stage::Checks);
-        app.set_trees(vec![seventeen, tree("14", "me/END-140-limits")]);
-        app.apply_reports(vec![report("j17", "/pool/17", State::Working)]);
-        let before = Seen::of(&app);
+        }
+    }
 
-        // 17's agent asks something and its checks fail; 14 is unchanged.
-        app.apply_reports(vec![report("j17", "/pool/17", State::Blocked)]);
-        app.trees[0].ship = ship(Stage::CiFailed);
-        let now = Seen::of(&app);
-        let notices = before.notices(&now, &app, "my app");
-        assert_eq!(
-            notices,
-            [
-                Notice {
-                    title: "17 · END-123 fix-login".into(),
-                    body: "Needs you".into(),
-                    url: "/trees/17/chat?workspace=my%20app".into(),
-                },
-                Notice {
-                    title: "17 · END-123 fix-login".into(),
-                    body: "Its PR's checks failed".into(),
-                    url: "/trees/17?workspace=my%20app".into(),
-                },
-            ]
+    const MIN: Duration = Duration::from_secs(60);
+
+    /// A pool of trees 17 and 14, their agents working and 17's PR under
+    /// checks, read as of `start`.
+    fn pool(start: SystemTime) -> App {
+        let mut app = App::new(None);
+        let mut seventeen = tree("17", "me/END-123-fix-login");
+        seventeen.agents = vec![agent("j17")];
+        seventeen.ship = ship(Stage::Checks);
+        let mut fourteen = tree("14", "me/END-140-limits");
+        fourteen.agents = vec![agent("j14")];
+        app.set_trees(vec![seventeen, fourteen]);
+        app.is_agents_read = true;
+        app.apply_reports(vec![
+            report("j17", "/pool/17", State::Working, start),
+            report("j14", "/pool/14", State::Working, start),
+        ]);
+        app
+    }
+
+    #[test]
+    fn an_ask_pushes_once_you_are_away_five_minutes_and_again_at_thirty_then_never() {
+        let start = SystemTime::now();
+        let at = |minutes: u32| start + MIN * minutes;
+        let mut app = pool(start);
+        let mut schedule = Schedule::default();
+        let away = Some(10 * MIN);
+        assert!(schedule.due(&app, away, at(0), "my app").is_empty());
+        // 17's agent asks.
+        app.apply_reports(vec![report("j17", "/pool/17", State::Blocked, start)]);
+        app.watch_waiting();
+        let bodies = |schedule: &mut Schedule, idle, minutes| -> Vec<String> {
+            schedule
+                .due(&app, idle, at(minutes), "my app")
+                .into_iter()
+                .map(|n| n.body)
+                .collect()
+        };
+        assert!(bodies(&mut schedule, away, 4).is_empty(), "too soon");
+        assert!(
+            bodies(&mut schedule, Some(MIN), 6).is_empty(),
+            "you are at the desk"
         );
-        // Read again with nothing changed, nothing pushes.
-        assert!(now.notices(&Seen::of(&app), &app, "app").is_empty());
-        // A tree seen for the first time says nothing.
-        assert!(Seen::default().notices(&now, &app, "app").is_empty());
-        // Done, then merged.
-        app.apply_reports(vec![report("j17", "/pool/17", State::Done)]);
-        app.trees[0].ship = ship(Stage::Merged);
-        let bodies: Vec<String> = now
-            .notices(&Seen::of(&app), &app, "app")
+        let first = schedule.due(&app, away, at(7), "my app");
+        assert_eq!(
+            first,
+            [Notice {
+                title: "17 · END-123 fix-login".into(),
+                body: "Needs you".into(),
+                url: "/trees/17/chat?workspace=my%20app".into(),
+            }],
+            "never what the agent wrote"
+        );
+        assert!(bodies(&mut schedule, away, 20).is_empty(), "once");
+        assert!(
+            bodies(&mut schedule, away, 31).is_empty(),
+            "25 minutes after the first"
+        );
+        assert_eq!(bodies(&mut schedule, away, 32), ["Still: Needs you, 32m"]);
+        assert!(bodies(&mut schedule, away, 120).is_empty(), "then never");
+    }
+
+    #[test]
+    fn the_reminder_comes_well_after_the_first_push_however_late_that_was() {
+        let start = SystemTime::now();
+        let at = |minutes: u32| start + MIN * minutes;
+        let mut app = pool(start);
+        let mut schedule = Schedule::default();
+        schedule.due(&app, Some(MIN), at(0), "app");
+        app.apply_reports(vec![report("j17", "/pool/17", State::Blocked, start)]);
+        app.watch_waiting();
+        // At the desk until minute 35, then away.
+        assert!(schedule.due(&app, Some(MIN), at(34), "app").is_empty());
+        let away = Some(10 * MIN);
+        assert_eq!(schedule.due(&app, away, at(35), "app").len(), 1);
+        assert!(
+            schedule.due(&app, away, at(36), "app").is_empty(),
+            "not a second buzz straight after the first"
+        );
+        assert_eq!(
+            schedule.due(&app, away, at(60), "app").len(),
+            1,
+            "25 minutes on"
+        );
+    }
+
+    #[test]
+    fn an_ask_that_flickers_out_and_back_is_the_one_ask() {
+        let start = SystemTime::now();
+        let at = |minutes: u32| start + MIN * minutes;
+        let mut app = pool(start);
+        let mut schedule = Schedule::default();
+        schedule.due(&app, None, at(0), "app");
+        app.apply_reports(vec![report("j17", "/pool/17", State::Blocked, start)]);
+        app.watch_waiting();
+        assert_eq!(schedule.due(&app, None, at(6), "app").len(), 1);
+        // For a moment its agent reads as busy, then asks again.
+        app.apply_reports(vec![report("j17", "/pool/17", State::Working, start)]);
+        schedule.due(&app, None, at(7), "app");
+        app.apply_reports(vec![report("j17", "/pool/17", State::Blocked, start)]);
+        app.watch_waiting();
+        assert!(
+            schedule.due(&app, None, at(8), "app").is_empty(),
+            "no second first push"
+        );
+    }
+
+    #[test]
+    fn answered_at_the_desk_in_time_and_what_finishes_or_merges_never_push() {
+        let start = SystemTime::now();
+        let at = |minutes: u32| start + MIN * minutes;
+        let mut app = pool(start);
+        let mut schedule = Schedule::default();
+        // As the server does each round: what waits is looked at, then due.
+        // With no tmux to ask, idle counts as away.
+        let mut due = |app: &mut App, minutes| {
+            app.watch_waiting();
+            schedule.due(app, None, at(minutes), "app")
+        };
+        assert!(due(&mut app, 0).is_empty());
+        app.apply_reports(vec![report("j14", "/pool/14", State::Blocked, start)]);
+        assert!(due(&mut app, 3).is_empty());
+        // Answered at the desk before five minutes are up.
+        app.apply_reports(vec![report("j14", "/pool/14", State::Working, start)]);
+        assert!(due(&mut app, 10).is_empty());
+        // 17 finishes and its PR merges, each seen at once and long ago by
+        // the time it is asked about.
+        app.apply_reports(vec![report("j17", "/pool/17", State::Done, start)]);
+        app.apply_ship(Ok(crate::ship::Answer {
+            ships: [(PathBuf::from("/pool/17"), *ship(Stage::Merged).unwrap())].into(),
+            failures: Vec::new(),
+        }));
+        assert!(due(&mut app, 10).is_empty());
+        assert!(due(&mut app, 60).is_empty());
+    }
+
+    #[test]
+    fn failed_checks_and_a_dead_agent_push_to_their_tree_but_not_what_waited_as_the_server_started()
+    {
+        let start = SystemTime::now();
+        let at = |minutes: u32| start + MIN * minutes;
+        let mut app = pool(start);
+        // Already waiting as the server starts: 17's agent asking.
+        app.apply_reports(vec![report("j17", "/pool/17", State::Blocked, start)]);
+        let mut schedule = Schedule::default();
+        app.watch_waiting();
+        assert!(schedule.due(&app, None, at(0), "app").is_empty());
+        // Then 14's agent dies and 17's checks fail.
+        app.apply_reports(vec![
+            report("j17", "/pool/17", State::Blocked, start),
+            report("j14", "/pool/14", State::Failed, start),
+        ]);
+        app.apply_ship(Ok(crate::ship::Answer {
+            ships: [(PathBuf::from("/pool/17"), *ship(Stage::CiFailed).unwrap())].into(),
+            failures: Vec::new(),
+        }));
+        app.watch_waiting();
+        let pushed: Vec<(String, String)> = schedule
+            .due(&app, None, at(6), "app")
             .into_iter()
-            .map(|n| n.body)
+            .map(|n| (n.url, n.body))
             .collect();
-        assert_eq!(bodies, ["Done", "Its PR merged"]);
+        assert_eq!(
+            pushed,
+            [
+                (
+                    "/trees/14?workspace=app".into(),
+                    "Its agent's process died".into()
+                ),
+                (
+                    "/trees/17?workspace=app".into(),
+                    "Its PR's checks failed".into()
+                ),
+            ],
+            "17's ask, waiting from the start, never pushes"
+        );
+        let reminded: Vec<String> = schedule
+            .due(&app, None, at(60), "app")
+            .into_iter()
+            .map(|n| n.url)
+            .collect();
+        assert_eq!(
+            reminded,
+            ["/trees/14?workspace=app", "/trees/17?workspace=app"],
+            "nor reminds"
+        );
     }
 
     #[test]

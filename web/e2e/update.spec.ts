@@ -52,7 +52,7 @@ test.beforeEach(async () => {
     };
     if (path === "/api/pool") return json(pool);
     if (path === "/api/workspaces") return json({ default: "app", workspaces: ["app"] });
-    if (path.startsWith("/api/inbox")) return json({ workspace: "app", entries: [], unseen: 0, is_reading: false });
+    if (path.startsWith("/api/waiting")) return json({ workspace: "app", entries: [], also: [], is_reading: false });
     if (path.startsWith("/api/")) {
       response.writeHead(404, { "Content-Type": "application/json" });
       return response.end(JSON.stringify({ error: "not in this test" }));

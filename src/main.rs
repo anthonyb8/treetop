@@ -32,6 +32,7 @@ mod keeper;
 mod live;
 mod naming;
 mod nomistakes_plugin;
+mod notify;
 mod phone;
 mod plugin;
 mod pool;
@@ -130,7 +131,7 @@ fn chat_size(term: &Term, app: &App) -> Result<(u16, u16)> {
 
 /// The size of the terminal a popup chat runs in, the assistant's or a
 /// scratch one: its popup under the bar, less its sidebar, on the screen
-/// left of the inbox.
+/// under the banner.
 fn popup_size(term: &Term, app: &App) -> Result<(u16, u16)> {
     let size = term.size()?;
     let stage = ui::stage(app, Rect::new(0, 0, size.width, size.height));
@@ -234,6 +235,22 @@ fn chat_closed(app: &mut App, agent: &str, tree: &str) -> Result<()> {
     leave_window(app)
 }
 
+/// A key or paste: back from away with something waiting, it opens "While
+/// you were away" and goes no further. A popup chat, the assistant's or a
+/// scratch one, holds the keys whatever the table does, so it is put away
+/// for the sheet, as a click on the banner puts it away.
+fn come_back(chats: &mut Chats, app: &mut App) -> Result<bool> {
+    let is_popup = chats.open().is_some_and(ui::is_popup_chat);
+    if is_popup && app.is_due_back() {
+        let open = chats.open().map(|c| (c.agent.clone(), c.tree.clone()));
+        chats.hide();
+        if let Some((agent, tree)) = open {
+            chat_closed(app, &agent, &tree)?;
+        }
+    }
+    Ok(app.back())
+}
+
 /// The window's chat gives the keys back to the table and keeps running
 /// on screen.
 fn leave_window(app: &mut App) -> Result<()> {
@@ -242,13 +259,19 @@ fn leave_window(app: &mut App) -> Result<()> {
     Ok(())
 }
 
-/// Rings the terminal bell and, inside tmux, shows the most pressing piece of
-/// news in the status line, so an agent that needs you is heard from any
-/// window. News comes what needs you first.
-fn announce(news: &[String]) -> Result<()> {
+/// Rings the terminal bell, which tmux passes on from whatever window you
+/// are in.
+fn ring() -> Result<()> {
     let mut out = io::stdout();
     out.write_all(b"\x07")?;
     out.flush()?;
+    Ok(())
+}
+
+/// Rings the bell and, inside tmux, shows the news in the status line for
+/// a moment: the assistant's answer, which is no tree's, so never waits.
+fn announce(news: &[String]) -> Result<()> {
+    ring()?;
     if let Some(first) = news.first()
         && tmux::is_inside()
     {
@@ -324,8 +347,7 @@ fn send(
 enum Exit {
     Quit,
     /// Show the pool of the repository checked out here instead, and open
-    /// what the inbox entry for the tree at the second path opens, once it
-    /// is read.
+    /// what waits in the tree at the second path, once it is read.
     Switch(PathBuf, Option<(PathBuf, inbox::Kind)>),
     /// Start the treetop installed over this one, on this workspace.
     Restart,
@@ -344,7 +366,16 @@ fn choices() -> Vec<Choice> {
         .collect()
 }
 
-fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
+/// How often treetop asks tmux how long since anyone typed, for "While you
+/// were away".
+const IDLE_EVERY: Duration = Duration::from_secs(5);
+
+fn run(
+    term: &mut Term,
+    app: &mut App,
+    checkout: &Path,
+    desktop: &mut notify::Desktop,
+) -> Result<Exit> {
     let refresher = Refresher::spawn(checkout.to_path_buf(), app.trees.clone());
     let worker = Worker::spawn();
     let away = inbox::spawn_reader(checkout.to_path_buf());
@@ -362,7 +393,7 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
     let mut drawn_at = Instant::now();
     let mut chats = Chats::default();
     let mut keeper = Keeper::default();
-    // Whether the mouse is captured for an open issue or the inbox, apart
+    // Whether the mouse is captured for an open issue or the banner, apart
     // from a chat's.
     let mut is_issue_mouse = false;
     // The sizes the chats' terminals were last given: the window's, and the
@@ -390,6 +421,10 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
     let mut snapshots = snapshot::Clock::default();
     // `U` installing a newer release, off this thread.
     let mut updating: Option<mpsc::Receiver<Result<String, String>>> = None;
+    // The line tmux's status shows for what waits on you, as last set.
+    let mut shown_waiting: Option<Option<String>> = None;
+    // When tmux was last asked how long since anyone typed.
+    let mut idle_read = Instant::now();
     loop {
         while let Ok(update) = refresher.updates.try_recv() {
             is_stale = true;
@@ -416,10 +451,7 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                 }
                 Update::Sidecars(sidecars) => app.apply_sidecars(sidecars),
                 Update::Ship(answer) => {
-                    let news = app.apply_ship(answer);
-                    if !news.is_empty() {
-                        announce(&news)?;
-                    }
+                    app.apply_ship(answer);
                     for job in app.ready_landings() {
                         worker.push(job);
                     }
@@ -559,9 +591,8 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
         }
         was_issues = app.is_issues;
         // An open issue takes the mouse, for its links and the wheel, and
-        // the list does while the inbox is beside it, for clicks on its
-        // entries; a chat captures it on its own, and gives it back when it
-        // closes.
+        // the list does while the banner is up, for a click on it; a chat
+        // captures it on its own, and gives it back when it closes.
         if chat_has_keys(&chats, app) {
             is_issue_mouse = false;
         } else {
@@ -677,8 +708,8 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             open_chat(term, app, &mut chats, &command, agent, tree)?;
             is_stale = true;
         }
-        // An inbox entry from another workspace opens its agent here once
-        // the pool is read, before any ask takes the screen.
+        // What waits in another workspace, gone to from here, opens its
+        // agent once the pool is read, before any ask takes the screen.
         if !chat_has_keys(&chats, app) {
             match app.arrival() {
                 Some(Outcome::Chat {
@@ -808,7 +839,7 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
             }
             is_stale = true;
         }
-        // A resize, the inbox shown or hidden, or the windows split or
+        // A resize, the banner coming or going, or the windows split or
         // joined, changes the room a chat has, before it is drawn there.
         let sizes = (chat_size(term, app)?, popup_size(term, app)?);
         if chat_sized != Some(sizes) {
@@ -823,6 +854,39 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                 open.resize(popup_rows, popup_cols);
             }
             chat_sized = Some(sizes);
+        }
+        if idle_read.elapsed() >= IDLE_EVERY {
+            idle_read = Instant::now();
+            let idle = if app.is_in_tmux {
+                tmux::idle()
+            } else {
+                Some(app.since_key())
+            };
+            if let Some(idle) = idle {
+                app.note_idle(idle);
+            }
+        }
+        if is_stale && let Some((is_new, line)) = app.watch_waiting() {
+            if is_new {
+                ring()?;
+            }
+            if app.is_in_tmux && shown_waiting.as_ref() != Some(&line) {
+                tmux::show_waiting(line.as_deref());
+                shown_waiting = Some(line);
+            }
+            let now = SystemTime::now();
+            let read: Vec<PathBuf> = app.away_live.keys().cloned().collect();
+            let due = desktop.due(&inbox::waiting(app), &read, now);
+            if !due.is_empty() {
+                let passthrough = app.is_in_tmux.then(tmux::allow_passthrough);
+                let (bytes, said) = desktop.tell(&due, passthrough.as_deref(), now);
+                let mut out = io::stdout();
+                out.write_all(&bytes)?;
+                out.flush()?;
+                if said.is_some() {
+                    app.message = said;
+                }
+            }
         }
         if is_stale || drawn_at.elapsed() >= REDRAW {
             let size = term.size()?;
@@ -845,6 +909,16 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
         // A key or a resize: either way the screen is drawn again.
         is_stale = true;
         let event = chat::as_ctrl_q(event::read()?);
+        // Back from away, the first key or paste opens what waited
+        // meanwhile and goes no further, so it reaches no agent.
+        let is_typed = match &event {
+            Event::Key(key) => key.kind == KeyEventKind::Press,
+            Event::Paste(_) => true,
+            _ => false,
+        };
+        if is_typed && come_back(&mut chats, app)? {
+            continue;
+        }
         // Over the window's chat while the table has the keys, the wheel
         // scrolls it and a click gives it the keys.
         if let &Event::Mouse(mouse) = &event
@@ -877,7 +951,7 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                 ui::is_popup_chat(open),
                 Rect::new(0, 0, size.width, size.height),
             );
-            let mut is_inbox_click = false;
+            let mut is_list_click = false;
             match &event {
                 &Event::Key(key) if key.kind != KeyEventKind::Release => {
                     // Ctrl+F zooms the windows from an agent's chat; a shell
@@ -926,9 +1000,9 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                 &Event::Mouse(mouse) => {
                     let size = term.size()?;
                     let screen = Rect::new(0, 0, size.width, size.height);
-                    // A click on the inbox beside the chat leaves the chat
-                    // for the entry clicked, which the list's own click
-                    // below opens.
+                    // A click on the banner over the chat leaves the chat
+                    // for what it names, which the list's own click below
+                    // opens.
                     let area = if is_popup {
                         Some(popup::chat(ui::stage(app, screen)))
                     } else {
@@ -938,17 +1012,17 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                     let is_over =
                         area.is_some_and(|a| a.contains(Position::new(mouse.column, mouse.row)));
                     if is_popup {
-                        is_inbox_click = is_click && ui::is_on_inbox(app, screen, mouse);
+                        is_list_click = is_click && ui::is_on_banner(app, screen, mouse);
                     } else {
                         // A click outside the window gives the table the
                         // keys, and lands there as a click on the list.
-                        is_inbox_click = is_click && !is_over;
+                        is_list_click = is_click && !is_over;
                     }
-                    if is_inbox_click && is_popup {
+                    if is_list_click && is_popup {
                         let (agent, tree) = (open.agent.clone(), open.tree.clone());
                         chats.hide();
                         chat_closed(app, &agent, &tree)?;
-                    } else if is_inbox_click {
+                    } else if is_list_click {
                         leave_window(app)?;
                     } else if let Some(area) = area {
                         open.send_mouse(mouse, area);
@@ -956,7 +1030,7 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                 }
                 _ => {}
             }
-            if !is_inbox_click {
+            if !is_list_click {
                 continue;
             }
         }
@@ -1186,12 +1260,18 @@ fn show(
     is_issues: bool,
 ) -> Result<Option<PathBuf>> {
     let mut here = Some(start);
+    // What waits, as the last workspace looked, so `e` keeps its place.
+    let mut watch = app::Watch::default();
+    // What the desktop has been told of, kept across a switch too, so a
+    // reminder still comes.
+    let mut desktop = notify::Desktop::default();
     let mut is_issues = is_issues;
     let mut arriving = None;
     loop {
         std::env::set_current_dir(&checkout)?;
         workspaces::record(&checkout);
         let mut app = App::new(here.take());
+        app.keep_watch(std::mem::take(&mut watch));
         app.is_in_tmux = tmux::is_inside();
         app.checkout = checkout.clone();
         app.user = branch::user();
@@ -1202,9 +1282,6 @@ fn show(
         if let Some(file) = state::layout_file(&checkout) {
             app.keep_layout_in(file);
         }
-        if let Some(file) = inbox::file() {
-            app.keep_inbox_in(file);
-        }
         app.arriving = arriving.take();
         app.pools = inbox::other_pools(&checkout);
         app.ship_plugins = ship::plugins(&checkout).0;
@@ -1213,7 +1290,15 @@ fn show(
             cached.insert(0, pool::main_tree(&checkout));
             app.set_cached(cached);
         }
-        match run(term, &mut app, &checkout)? {
+        let exit = run(term, &mut app, &checkout, &mut desktop);
+        desktop.switched();
+        watch = app.take_watch();
+        // Leaving treetop takes what waits off tmux's status line; a switch
+        // shows the next workspace's at once.
+        if app.is_in_tmux && !matches!(exit, Ok(Exit::Switch(..))) {
+            tmux::show_waiting(None);
+        }
+        match exit? {
             Exit::Quit => return Ok(None),
             Exit::Switch(next, tree) => {
                 checkout = next;
@@ -1294,4 +1379,47 @@ fn restart(workspace: &Path) -> Result<()> {
         .current_dir(workspace)
         .exec();
     Err(err).with_context(|| format!("starting {}", exe.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn back_from_away_the_assistants_popup_gives_way_to_the_sheet() {
+        let mut app = inbox::tests::app();
+        let mut chats = Chats::default();
+        chats
+            .show(
+                &["cat".into()],
+                (20, 60),
+                assistant::NAME.into(),
+                app::SCRATCH.into(),
+                None,
+            )
+            .unwrap();
+        assert!(chat_has_keys(&chats, &app));
+        app.note_idle(Duration::from_secs(10 * 60));
+        assert!(
+            come_back(&mut chats, &mut app).unwrap(),
+            "the key goes no further"
+        );
+        assert!(!chat_has_keys(&chats, &app), "nor do the keys after it");
+        assert!(app.is_away_shown());
+        // Not away, the popup keeps the keys.
+        let mut app = inbox::tests::app();
+        let mut chats = Chats::default();
+        chats
+            .show(
+                &["cat".into()],
+                (20, 60),
+                assistant::NAME.into(),
+                app::SCRATCH.into(),
+                None,
+            )
+            .unwrap();
+        assert!(!come_back(&mut chats, &mut app).unwrap());
+        assert!(chat_has_keys(&chats, &app));
+    }
 }

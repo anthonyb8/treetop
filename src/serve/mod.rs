@@ -14,12 +14,12 @@
 mod actions;
 mod answer;
 mod chat;
-mod inbox;
 mod install;
 mod issues;
 mod pool;
 mod push;
 mod tree;
+mod waiting;
 
 pub use pool::title;
 
@@ -74,7 +74,7 @@ pub struct Pool {
     seen: Mutex<Watch>,
     /// The merged tickets last looked at, and what they left ready.
     ready: Mutex<(Merged, Vec<String>)>,
-    /// The other workspaces' agents and PRs, read slowly for the inbox from
+    /// The other workspaces' agents and PRs, read slowly for what waits from
     /// the first time the phone asks for it.
     away: Mutex<Option<Away>>,
     pub app: Mutex<App>,
@@ -252,7 +252,7 @@ impl Pool {
             Update::Work(work) => app.apply_work(&work),
             Update::Reports(reports) => {
                 // Another workspace leases trees as its agents start, so its
-                // cache is read again to place their reports in the inbox.
+                // cache is read again to place their reports.
                 app.pools = crate::inbox::other_pools(&self.checkout);
                 app.apply_reports(reports);
             }
@@ -268,22 +268,29 @@ impl Pool {
             Update::Agents(agents) => app.apply_agents(&agents),
             Update::Shares(shares) => app.apply_shares(shares),
         }
-        // Pushes are judged once the pool has been read in full: agents,
-        // reports and PRs. Until then a change is only the reading catching
-        // up, and pushing it would buzz the phone with the whole pool.
-        let Some(push) = &self.push else {
-            return;
-        };
+        // What waits, and pushes, are judged once the pool has been read in
+        // full: agents, reports and PRs. Until then a change is only the
+        // reading catching up, and pushing it would buzz the phone with the
+        // whole pool.
         if !watch.is_read(&app) {
             return;
         }
-        let now = push::Seen::of(&app);
+        // Keeps each waiting thing's age, from when it was first seen, for
+        // the phone's list as much as for pushes.
+        app.watch_waiting();
+        let Some(push) = &self.push else {
+            return;
+        };
+        // How long since anyone typed in tmux, asked now and then, since
+        // a pool updates every few seconds.
+        if watch.idle_read.is_none_or(|at| at.elapsed() >= IDLE_EVERY) {
+            watch.idle_read = Some(std::time::Instant::now());
+            watch.idle = crate::tmux::idle();
+        }
+        let idle = watch.idle;
         let notices = watch
-            .last
-            .as_ref()
-            .map(|last| last.notices(&now, &app, &self.name))
-            .unwrap_or_default();
-        watch.last = Some(now);
+            .schedule
+            .due(&app, idle, std::time::SystemTime::now(), &self.name);
         if !notices.is_empty() {
             let push = Arc::clone(push);
             thread::spawn(move || {
@@ -307,8 +314,14 @@ struct Watch {
     started: std::time::Instant,
     has_reports: bool,
     has_ship: bool,
-    last: Option<push::Seen>,
+    schedule: push::Schedule,
+    /// How long since anyone typed in tmux, as last asked, and when.
+    idle: Option<std::time::Duration>,
+    idle_read: Option<std::time::Instant>,
 }
+
+/// How often the server asks tmux how long since anyone typed.
+const IDLE_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl Watch {
     /// `app`'s agents, reports and PRs have all been read, or the PRs not
@@ -326,7 +339,9 @@ impl Default for Watch {
             started: std::time::Instant::now(),
             has_reports: false,
             has_ship: false,
-            last: None,
+            schedule: push::Schedule::default(),
+            idle: None,
+            idle_read: None,
         }
     }
 }
@@ -791,17 +806,21 @@ pub fn route(state: &State, asked: &Asked) -> Reply {
             let rest = path["/api/issues".len()..].trim_start_matches('/');
             issues::route(&pool, &decode(rest), asked)
         }
-        (method, path) if path == "/api/inbox" || path.starts_with("/api/inbox/") => {
+        // The old inbox's paths too, for a page opened before this treetop.
+        (method, path)
+            if path == "/api/waiting"
+                || path == "/api/inbox"
+                || path.starts_with("/api/inbox/") =>
+        {
             if *method != Method::Get && !is_same_site(asked) {
                 return Reply::error(403, "only treetop's own page can act");
             }
             let pool = state.pool(asked.query.get("workspace").map(String::as_str));
-            inbox::route(
-                &pool,
-                method,
-                path["/api/inbox".len()..].trim_start_matches('/'),
-                asked,
-            )
+            let call = path
+                .strip_prefix("/api/inbox")
+                .unwrap_or_default()
+                .trim_start_matches('/');
+            waiting::route(&pool, method, call)
         }
         (method, path) if path.starts_with("/api/trees/") => {
             let pool = state.pool(asked.query.get("workspace").map(String::as_str));
@@ -1332,6 +1351,38 @@ mod tests {
         assert_eq!(ask("/api/push/unsubscribe", own, gone), 200);
         assert!(!is_kept());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_old_page_s_inbox_marks_answer_and_do_nothing() {
+        let state = State::new("me".into(), PathBuf::from("/nowhere"));
+        // A pool already started, so that none is spawned to read /nowhere.
+        state.pools.lock().unwrap().insert(
+            PathBuf::from("/nowhere"),
+            Arc::new(Pool {
+                name: "app".into(),
+                checkout: PathBuf::from("/nowhere"),
+                kick: Mutex::new(std::sync::mpsc::channel().0),
+                push: None,
+                seen: Mutex::default(),
+                ready: Mutex::default(),
+                away: Mutex::new(None),
+                app: Mutex::new(crate::inbox::tests::app()),
+            }),
+        );
+        for path in ["/api/inbox/seen", "/api/inbox/dismiss"] {
+            let reply = route(
+                &state,
+                &Asked {
+                    method: &Method::Post,
+                    origin: Some("https://server.tailnet.ts.net:7777"),
+                    host: Some("server.tailnet.ts.net:7777"),
+                    body: br#"{"key": "Failed:/pool/7/app:abc"}"#,
+                    ..asked(path, Some("me"))
+                },
+            );
+            assert_eq!(reply.status, 200, "{path}");
+        }
     }
 
     #[test]

@@ -130,6 +130,103 @@ pub fn notify(text: &str) {
     let _ = tmux(&["display-message", "-d", "5000", text]);
 }
 
+/// The session options `show_waiting` changes, which it keeps first and
+/// puts back as they were.
+const KEPT: [&str; 2] = ["status-right", "status-right-length"];
+
+/// The tmux user option holding the session's own value of `option` while
+/// treetop's line is up, empty for none; set once kept, so a second treetop
+/// or one started after another died keeps the first's copy.
+fn kept(option: &str) -> String {
+    format!("@treetop-{option}")
+}
+
+/// Reads an option of this session: its own value, or with `-g` the global
+/// one, empty where it has none.
+fn option(scope: &str, name: &str) -> String {
+    tmux(&["show-options", scope, name])
+        .unwrap_or_default()
+        .trim_end()
+        .to_string()
+}
+
+/// Puts `line`, what waits on you, at the left of this session's
+/// status-right in the warning colours, where every window shows it until
+/// it is cleared; None clears it, putting back what the session had.
+pub fn show_waiting(line: Option<&str>) {
+    let Some(line) = line else {
+        if option("-qv", "@treetop-kept").is_empty() {
+            return;
+        }
+        for name in KEPT {
+            let own = option("-qv", &kept(name));
+            let _ = if own.is_empty() {
+                tmux(&["set-option", "-u", name])
+            } else {
+                tmux(&["set-option", name, &own])
+            };
+            let _ = tmux(&["set-option", "-u", &kept(name)]);
+        }
+        let _ = tmux(&["set-option", "-u", "@treetop-kept"]);
+        return;
+    };
+    if option("-qv", "@treetop-kept").is_empty() {
+        for name in KEPT {
+            let _ = tmux(&["set-option", &kept(name), &option("-qv", name)]);
+        }
+        let _ = tmux(&["set-option", "@treetop-kept", "1"]);
+    }
+    // What the session showed before: its own, else the global one.
+    let before = |name: &str| {
+        Some(option("-qv", &kept(name)))
+            .filter(|own| !own.is_empty())
+            .unwrap_or_else(|| option("-gv", name))
+    };
+    let shown = format!(
+        "#[fg=black,bg=yellow,bold] {} #[default] {}",
+        line.replace('#', "##"),
+        before("status-right")
+    );
+    // Room for the line on top of what was there, so tmux cuts neither.
+    let room: usize = before("status-right-length").parse().unwrap_or(40);
+    let room = (room + line.chars().count() + 3).to_string();
+    let _ = tmux(&["set-option", "status-right-length", &room]);
+    let _ = tmux(&["set-option", "status-right", &shown]);
+}
+
+/// treetop's own pane's `allow-passthrough`, as it takes effect there, from
+/// the pane, its window or the global setting: its pane by `$TMUX_PANE`,
+/// since without a target tmux reads the pane on screen.
+pub fn allow_passthrough() -> String {
+    let pane = std::env::var("TMUX_PANE").unwrap_or_default();
+    let mut args = vec!["display-message", "-p"];
+    if !pane.is_empty() {
+        args.extend(["-t", pane.as_str()]);
+    }
+    args.push("#{allow-passthrough}");
+    tmux(&args).unwrap_or_default().trim().to_string()
+}
+
+/// How long since anyone typed in any client of this tmux server, or with
+/// every client detached, in any of its sessions; None where tmux cannot
+/// say.
+pub fn idle() -> Option<std::time::Duration> {
+    let latest = |what: &str, format: &str| {
+        tmux(&[what, "-F", format])
+            .ok()?
+            .lines()
+            .filter_map(|at| at.trim().parse::<u64>().ok())
+            .max()
+    };
+    let latest = latest("list-clients", "#{client_activity}")
+        .or_else(|| latest("list-sessions", "#{session_activity}"))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(std::time::Duration::from_secs(now.saturating_sub(latest)))
+}
+
 pub fn open(tree: &Tree) -> Result<String> {
     if let Some(switched) = open_agent(tree)? {
         return Ok(switched);

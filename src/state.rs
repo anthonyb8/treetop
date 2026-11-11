@@ -29,8 +29,7 @@ pub fn layout_file(checkout: &Path) -> Option<PathBuf> {
     Some(dir()?.join(format!("layout-{}.json", crate::cache::key(checkout))))
 }
 
-/// What `file` holds, else the empty value: the seen asks, or the inbox's
-/// marks.
+/// What `file` holds, else the empty value, such as the seen asks.
 pub fn read<T: serde::de::DeserializeOwned + Default>(file: &Path) -> T {
     fs::read_to_string(file)
         .ok()

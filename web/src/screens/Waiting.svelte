@@ -1,83 +1,53 @@
 <script lang="ts">
   import { flip } from "svelte/animate";
-  import { ApiError, type InboxEntry, type InboxKind } from "../api";
-  import SwipeRow from "../components/SwipeRow.svelte";
-  import { dismissEntry, inbox, isElsewhere, loadInbox, openEntry } from "../inbox.svelte";
+  import type { WaitingKind } from "../api";
+  import { isElsewhere, loadWaiting, openEntry, waiting } from "../waiting.svelte";
   import { Pull, PULL_PX } from "../pull.svelte";
   import { ago } from "../time";
 
-  /** The headings unseen entries go under, as the desktop's inbox has them. */
-  const headings: Record<InboxKind, string> = {
-    needs_you: "Needs you",
-    failed: "Failed",
-    died: "Failed",
-    done: "Done",
-    merged: "Done",
-  };
-
-  let dismissFailure = $state<string | null>(null);
   let scroller: HTMLElement | undefined = $state();
   let isLoading = $state(false);
-
-  /** The entries in runs under one heading each, in the order given. */
-  let sections = $derived.by(() => {
-    const out: { heading: string; entries: InboxEntry[] }[] = [];
-    for (const entry of inbox.list?.entries ?? []) {
-      const heading = entry.seen ? "Seen" : headings[entry.kind];
-      const last = out.at(-1);
-      if (last?.heading === heading) last.entries.push(entry);
-      else out.push({ heading, entries: [entry] });
-    }
-    return out;
-  });
-  let needs = $derived(inbox.list?.entries.filter((e) => !e.seen && e.kind === "needs_you").length ?? 0);
+  let count = $derived(waiting.list?.entries.length ?? 0);
 
   async function refresh() {
     isLoading = true;
-    await loadInbox();
+    await loadWaiting();
     isLoading = false;
   }
   const pull = new Pull(() => void refresh());
 
-  async function dismiss(entry: InboxEntry) {
-    dismissFailure = null;
-    try {
-      await dismissEntry(entry);
-    } catch (err) {
-      dismissFailure = err instanceof ApiError ? err.message : "It did not go through";
-    }
-  }
-
   /** What the entry's mark says, for a screen reader. */
-  const labels: Record<InboxKind, string> = {
+  const labels: Record<WaitingKind, string> = {
     needs_you: "needs you",
     failed: "PR failed",
     died: "agent died",
-    done: "done",
-    merged: "PR merged",
   };
+
+  /** What finished or merged, on one line at the foot. */
+  let also = $derived(
+    (waiting.list?.also ?? [])
+      .map((f) => `${isElsewhere(f) ? `${f.workspace} ` : ""}${f.tree} ${f.kind === "merged" ? "merged" : "finished"}`)
+      .join(" · "),
+  );
 </script>
 
 <div class="screen">
   <header>
-    <h1>Inbox</h1>
+    <h1>Waiting</h1>
     <p class="sub">
-      {#if !inbox.list}
+      {#if !waiting.list}
         {" "}
-      {:else if needs}
-        <b>{needs}</b> need{needs === 1 ? "s" : ""} you{#if inbox.list.unseen > needs}{" · "}{inbox.list.unseen - needs} more new{/if}
-      {:else if inbox.list.unseen}
-        {inbox.list.unseen} new
+      {:else if count}
+        <b>{count}</b> waiting on you
       {:else}
         All caught up
       {/if}
     </p>
   </header>
 
-  {#if inbox.failure && inbox.list}
-    <p class="banner" role="status">{inbox.failure} - showing the inbox as it last was.</p>
+  {#if waiting.failure && waiting.list}
+    <p class="banner" role="status">{waiting.failure} - showing what waited when last asked.</p>
   {/if}
-  {#if dismissFailure}<p class="banner failed" role="alert">{dismissFailure}</p>{/if}
 
   <main
     bind:this={scroller}
@@ -91,10 +61,10 @@
         stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8" /><path d="M21 3v5h-5" /></svg>
     </div>
 
-    {#if !inbox.list}
-      {#if inbox.failure}
+    {#if !waiting.list}
+      {#if waiting.failure}
         <div class="state">
-          <p>{inbox.failure}.</p>
+          <p>{waiting.failure}.</p>
           <button type="button" class="ghost" onclick={() => refresh()}>Try again</button>
         </div>
       {:else}
@@ -103,55 +73,48 @@
           <div class="skeleton"></div>
         </div>
       {/if}
-    {:else if !inbox.list.entries.length}
+    {:else if !count}
       <div class="state empty">
         <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"
-          ><path d="M3 13h5l1.5 3h5L16 13h5" /><path d="M5.5 5h13L21 13v6H3v-6z" /></svg>
-        <p>Nothing needs you.</p>
-        <p class="hint">Agents that ask, finish or die, and PRs that fail or merge, in every workspace, show here.</p>
+          ><circle cx="12" cy="12" r="9" /><path d="M8.5 12.5l2.5 2.5 4.5-5.5" /></svg>
+        <p>Nothing is waiting on you.</p>
+        <p class="hint">An agent asking, a PR whose checks fail and an agent that dies, in every workspace, wait here until they are dealt with.</p>
       </div>
     {:else}
-      {#each sections as section, i (`${section.heading}-${i}`)}
-        <section aria-label={section.heading}>
-          <h2 class={section.heading === "Seen" ? "" : section.entries[0]!.kind}>{section.heading}</h2>
-          <div class="list">
-            {#each section.entries as entry (entry.key)}
-              <div animate:flip={{ duration: 250 }}>
-                <SwipeRow label="Dismiss" onswipe={() => dismiss(entry)}>
-                  <button type="button" class="entry" class:seen={entry.seen} onclick={() => openEntry(entry)}
-                    aria-label="tree {entry.tree}{isElsewhere(entry) ? ` in ${entry.workspace}` : ''}, {labels[entry.kind]}">
-                    <span class="mark {entry.kind}" aria-hidden="true">
-                      {#if entry.kind === "needs_you"}
-                        <svg viewBox="0 0 16 16" width="16" height="16"><circle cx="8" cy="8" r="6.5" fill="currentColor" /></svg>
-                      {:else if entry.kind === "done" || entry.kind === "merged"}
-                        <svg viewBox="0 0 16 16" width="16" height="16"><path d="M3.5 8.5l3 3 6-7" fill="none" stroke="currentColor"
-                            stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></svg>
-                      {:else}
-                        <svg viewBox="0 0 16 16" width="16" height="16"><path d="M4 4l8 8M12 4l-8 8" fill="none" stroke="currentColor"
-                            stroke-width="2" stroke-linecap="round" /></svg>
-                      {/if}
-                    </span>
-                    <span class="body">
-                      <span class="top">
-                        <span class="tree mono">{entry.tree}</span>
-                        <span class="title">{entry.title ?? "no branch"}</span>
-                        {#if entry.ago !== null}<span class="when">{ago(entry.ago)}</span>{/if}
-                      </span>
-                      <span class="what">{entry.what || labels[entry.kind]}</span>
-                      {#if isElsewhere(entry)}
-                        <span class="where mono">{entry.workspace}</span>
-                      {/if}
-                    </span>
-                    <svg class="chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                      stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6" /></svg>
-                  </button>
-                </SwipeRow>
-              </div>
-            {/each}
+      <div class="list">
+        {#each waiting.list.entries as entry (entry.key)}
+          <div animate:flip={{ duration: 250 }}>
+            <button type="button" class="entry" onclick={() => openEntry(entry)}
+              aria-label="tree {entry.tree}{isElsewhere(entry) ? ` in ${entry.workspace}` : ''}, {labels[entry.kind]}">
+              <span class="mark {entry.kind}" aria-hidden="true">
+                {#if entry.kind === "needs_you"}
+                  <svg viewBox="0 0 16 16" width="16" height="16"><circle cx="8" cy="8" r="6.5" fill="currentColor" /></svg>
+                {:else}
+                  <svg viewBox="0 0 16 16" width="16" height="16"><path d="M4 4l8 8M12 4l-8 8" fill="none" stroke="currentColor"
+                      stroke-width="2" stroke-linecap="round" /></svg>
+                {/if}
+              </span>
+              <span class="body">
+                <span class="top">
+                  <span class="tree mono">{entry.tree}</span>
+                  <span class="title">{entry.title ?? "no branch"}</span>
+                  {#if entry.ago !== null}<span class="when">{ago(entry.ago)}</span>{/if}
+                </span>
+                <span class="what">{entry.what || labels[entry.kind]}</span>
+                {#if isElsewhere(entry)}
+                  <span class="where mono">{entry.workspace}</span>
+                {/if}
+              </span>
+              <svg class="chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6" /></svg>
+            </button>
           </div>
-        </section>
-      {/each}
+        {/each}
+      </div>
+    {/if}
+    {#if waiting.list && also}
+      <p class="also"><span class="tick" aria-hidden="true">✓</span> Also: {also}</p>
     {/if}
   </main>
 </div>
@@ -192,17 +155,13 @@
     background: var(--yellow-bg);
     color: var(--yellow);
   }
-  .banner.failed {
-    background: var(--red-bg);
-    color: var(--red);
-  }
   main {
     flex: 1;
     overflow-y: auto;
     -webkit-overflow-scrolling: touch;
     display: flex;
     flex-direction: column;
-    gap: 20px;
+    gap: 16px;
     padding: 16px 16px 24px;
     transform: translateY(var(--pulled));
     transition: transform 0.2s;
@@ -227,30 +186,6 @@
     to {
       transform: rotate(360deg);
     }
-  }
-  section {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-  }
-  h2 {
-    margin: 0;
-    font-size: 12px;
-    font-weight: 600;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--muted);
-  }
-  h2.needs_you {
-    color: var(--yellow);
-  }
-  h2.failed,
-  h2.died {
-    color: var(--red);
-  }
-  h2.done,
-  h2.merged {
-    color: var(--green);
   }
   .list {
     display: flex;
@@ -289,15 +224,6 @@
   .mark.failed,
   .mark.died {
     color: var(--red);
-  }
-  .mark.done,
-  .mark.merged {
-    color: var(--green);
-  }
-  .seen .mark,
-  .seen .what,
-  .seen .title {
-    opacity: 0.6;
   }
   .body {
     flex: 1;
@@ -355,6 +281,16 @@
     flex: none;
     align-self: center;
     color: var(--line-strong);
+  }
+  .also {
+    margin: 0;
+    padding: 0 4px;
+    font-size: 13px;
+    line-height: 1.4;
+    color: var(--muted);
+  }
+  .tick {
+    color: var(--green);
   }
   .state {
     display: flex;
