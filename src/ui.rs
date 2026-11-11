@@ -262,6 +262,9 @@ pub fn draw(
                     draw_window(frame, app, area, &pane, other_chat);
                 }
             }
+            if let Some(area) = windows.usage {
+                draw_usage_column(frame, app, area);
+            }
             draw_footer(frame, app, rows.footer);
             if let Some(area) = rows.banner {
                 draw_banner(frame, app, area);
@@ -1399,35 +1402,63 @@ const TABLE_SHARE: u16 = 45;
 /// bar included; below it the table takes the whole screen.
 const WINDOW_MIN: u16 = 5;
 
+/// Columns the column beside the table takes, its border included.
+const USAGE_WIDTH: u16 = 38;
+
+/// The narrowest screen the column runs down the right of: the table's
+/// fixed columns take about a hundred, so this leaves BRANCH and AGENT room
+/// to read. Below it the bar keeps its one line of context and spend.
+const USAGE_FROM: u16 = 180;
+
 /// Where the Trees screen's windows go in `main`, the screen above the bar.
 struct Windows {
     /// The table.
     top: Rect,
+    /// Down the right of the table and the window, how full the window
+    /// agent's context is, how much of the plan is used and what its session
+    /// has spent.
+    usage: Option<Rect>,
     /// The window under them, showing the tree under the cursor.
     window: Option<Rect>,
 }
 
 /// The table's window is as tall as its rows, between TABLE_MIN and
-/// TABLE_SHARE of `main`; the window under it takes the rest.
+/// TABLE_SHARE of `main`; the window under it takes the rest. From
+/// USAGE_FROM the column runs down the right of both, its full height.
 fn windows(app: &App, main: Rect) -> Windows {
+    let (main, usage) = if main.width >= USAGE_FROM {
+        let [left, usage] =
+            Layout::horizontal([Constraint::Fill(1), Constraint::Length(USAGE_WIDTH)]).areas(main);
+        (left, Some(usage))
+    } else {
+        (main, None)
+    };
     match app.zoom {
         // The table over the whole screen, as treetop was before windows.
         Some(Zoom::Table) => {
             return Windows {
                 top: main,
+                usage,
                 window: None,
             };
         }
-        // The windows, under the rows of their trees and the header.
+        // The windows, under the rows of their trees and the header, the
+        // column set aside for them.
         Some(Zoom::Windows) => {
             let height = u16::try_from(zoomed_rows(app).len())
                 .unwrap_or(u16::MAX)
                 .saturating_add(3);
-            if folds(app, main) {
+            let whole = Rect {
+                width: main.width + usage.map_or(0, |u| u.width),
+                ..main
+            };
+            if folds(app, whole) {
                 let [top, window] =
-                    Layout::vertical([Constraint::Length(height), Constraint::Fill(1)]).areas(main);
+                    Layout::vertical([Constraint::Length(height), Constraint::Fill(1)])
+                        .areas(whole);
                 return Windows {
                     top,
+                    usage: None,
                     window: Some(window),
                 };
             }
@@ -1449,6 +1480,7 @@ fn windows(app: &App, main: Rect) -> Windows {
     if main.height < height + WINDOW_MIN {
         return Windows {
             top: main,
+            usage,
             window: None,
         };
     }
@@ -1456,8 +1488,53 @@ fn windows(app: &App, main: Rect) -> Windows {
         Layout::vertical([Constraint::Length(height), Constraint::Fill(1)]).areas(main);
     Windows {
         top,
+        usage,
         window: Some(window),
     }
+}
+
+/// The column's lines for `tree`, `width` wide and at most `rows` tall
+/// where it can: its agent's context and spend, and the plan's usage, which
+/// shows even with no agent. Too tall, the estimate of where the context
+/// comes from gives way first, so the plan and the spend still show.
+fn column_lines(app: &App, tree: Option<&Tree>, width: u16, rows: u16) -> Vec<Line<'static>> {
+    let now = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let agent = tree.and_then(App::chat_agent);
+    let lines = agent_lines(agent, tree, app.usage.as_ref(), now, width);
+    if lines.len() <= usize::from(rows) {
+        return lines;
+    }
+    let mut brief = agent.cloned();
+    if let Some(context) = brief.as_mut().and_then(|a| a.context.as_mut()) {
+        context.parts.clear();
+    }
+    agent_lines(brief.as_ref(), tree, app.usage.as_ref(), now, width)
+}
+
+/// The column's box, titled as the windows are.
+fn usage_block() -> Block<'static> {
+    Block::bordered()
+        .title(" Usage ")
+        .border_style(fg(theme().border))
+        .padding(Padding::horizontal(1))
+}
+
+/// The column beside the table, for the window's tree.
+fn draw_usage_column(frame: &mut Frame, app: &App, area: Rect) {
+    let block = usage_block();
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Paragraph::new(column_lines(
+            app,
+            app.window_tree(),
+            inner.width,
+            inner.height,
+        )),
+        inner,
+    );
 }
 
 /// The Trees screen's rows on `screen`: the banner, while anything waits
@@ -4801,6 +4878,24 @@ fn sidebar_lines(
     now: u64,
     width: u16,
 ) -> Vec<Line<'static>> {
+    let mut lines = agent_lines(agent, tree, usage, now, width);
+    if let Some(tree) = tree {
+        lines.push(Line::raw(""));
+        lines.extend(tree_lines(tree, width));
+    }
+    lines
+}
+
+/// How full `agent`'s context is, with the hand-off hint where it nears its
+/// end in a pool tree, then how much of the plan is used and what its
+/// session has spent: the chat sidebar's, and the column beside the table.
+fn agent_lines(
+    agent: Option<&Agent>,
+    tree: Option<&Tree>,
+    usage: Option<&Usage>,
+    now: u64,
+    width: u16,
+) -> Vec<Line<'static>> {
     let context = agent.and_then(|a| a.context.as_ref());
     let mut lines = context_lines(context, width);
     // Nearing its compaction, an agent in a pool tree can hand its work to
@@ -4814,10 +4909,6 @@ fn sidebar_lines(
     }
     lines.push(Line::raw(""));
     lines.extend(usage_lines(usage, agent.and_then(|a| a.spend), now, width));
-    if let Some(tree) = tree {
-        lines.push(Line::raw(""));
-        lines.extend(tree_lines(tree, width));
-    }
     lines
 }
 
@@ -5336,6 +5427,174 @@ mod sidebar_tests {
             ],
             at: Some(NOW - 180),
         }
+    }
+
+    /// The pool with tree `name` under the cursor, tree 4's agent's context
+    /// and spend as `agent()` has them, and the plan as `usage()` has it,
+    /// its limits resetting in 2h and 3d by the real clock the column reads.
+    fn pool_on(name: &str) -> App {
+        let mut app = crate::inbox::tests::app();
+        app.select_tree(name);
+        assert_eq!(app.current().map(|t| t.name.as_str()), Some(name));
+        let fixture = agent();
+        if let Some(tree) = app.trees.iter_mut().find(|t| t.name == "4") {
+            tree.agents[0].context = fixture.context;
+            tree.agents[0].spend = fixture.spend;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut usage = usage();
+        usage.limits[0].resets_at = Some(now + 2 * 3_600 + 1_800);
+        usage.limits[1].resets_at = Some(now + 3 * 86_400 + 3_600);
+        app.usage = Some(usage);
+        app
+    }
+
+    /// Tree 4's agent at `used` tokens of its million.
+    fn with_context(mut app: App, used: u64) -> App {
+        let tree = app.trees.iter_mut().find(|t| t.name == "4").unwrap();
+        tree.agents[0].context.as_mut().unwrap().used = used;
+        app
+    }
+
+    /// The screen at `width` by 80, room for the column in full, each line,
+    /// and the column at its right.
+    fn drawn(app: &App, width: u16) -> (Vec<String>, Vec<String>) {
+        drawn_at(app, width, 80)
+    }
+
+    /// The screen at `width` by `height`, each line, and the column.
+    fn drawn_at(app: &App, width: u16, height: u16) -> (Vec<String>, Vec<String>) {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, app, None, None, None))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let lines: Vec<String> = (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect();
+        let column = lines
+            .iter()
+            .map(|l| l.chars().skip(usize::from(width - USAGE_WIDTH)).collect())
+            .collect();
+        (lines, column)
+    }
+
+    #[test]
+    fn the_column_beside_the_table_shows_the_agent_s_context_the_plan_and_the_session() {
+        let app = pool_on("4");
+        let (_, column) = drawn(&app, 200);
+        let text = column.join("\n");
+        for part in [
+            "Context",
+            "260k of 1M",
+            "conversation",
+            "Usage",
+            "5-hour",
+            "resets in 2h",
+            "weekly Fable",
+            "resets in 3d",
+            "This session",
+            "cache read",
+            "25.3M",
+        ] {
+            assert!(text.contains(part), "{part} in\n{text}");
+        }
+        assert!(
+            !text.contains("Ports"),
+            "the tree is the info tab's:\n{text}"
+        );
+        // The column follows the cursor: on a tree with no agent, context
+        // is not known and the plan still shows.
+        let mut app = pool_on("7");
+        app.trees
+            .iter_mut()
+            .find(|t| t.name == "7")
+            .unwrap()
+            .agents
+            .clear();
+        let (_, column) = drawn(&app, 200);
+        let text = column.join("\n");
+        assert!(
+            text.contains("Context") && text.contains("not known for this agent"),
+            "{text}"
+        );
+        assert!(!text.contains("260k of 1M"), "{text}");
+        assert!(
+            text.contains("5-hour") && text.contains("resets in"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn from_75_percent_context_the_column_says_how_to_hand_off() {
+        let hint = "Ctrl+Q, then h hands off";
+        let (_, column) = drawn(&with_context(pool_on("4"), 750_000), 200);
+        let text = column.join("\n");
+        assert!(text.contains(hint), "{text}");
+        let (_, column) = drawn(&with_context(pool_on("4"), 740_000), 200);
+        let text = column.join("\n");
+        assert!(!text.contains(hint), "{text}");
+    }
+
+    #[test]
+    fn moving_the_cursor_leaves_the_window_under_the_table_its_size() {
+        // Tree 4's agent says all of its context; tree 2's says none.
+        let top_of_window = |name: &str| {
+            let app = pool_on(name);
+            window_chat_area(&app, Rect::new(0, 0, 200, 50)).map(|area| area.y)
+        };
+        assert_eq!(top_of_window("4"), top_of_window("2"));
+    }
+
+    #[test]
+    fn at_ordinary_heights_the_column_shows_the_plan_and_the_session_in_full() {
+        // An agent near its compaction, its context split four ways as
+        // Claude Code's are.
+        let mut app = with_context(pool_on("4"), 760_000);
+        let tree = app.trees.iter_mut().find(|t| t.name == "4").unwrap();
+        tree.agents[0].context.as_mut().unwrap().parts =
+            ["conversation", "system & tools", "memory files", "skills"]
+                .into_iter()
+                .map(|name| Part {
+                    name: name.into(),
+                    tokens: 100_000,
+                })
+                .collect();
+        for (width, height) in [(180, 40), (200, 50)] {
+            let (_, column) = drawn_at(&app, width, height);
+            let text = column.join("\n");
+            for part in [
+                "memory files",
+                "hands off",
+                "weekly Fable",
+                "resets in 3d",
+                "output",
+            ] {
+                assert!(text.contains(part), "{part} at {width}x{height}:\n{text}");
+            }
+        }
+        // Too short for it all, the split gives way and the rest shows.
+        let (_, column) = drawn_at(&app, 180, 22);
+        let text = column.join("\n");
+        assert!(!text.contains("Estimated split"), "{text}");
+        for part in ["hands off", "weekly Fable", "output"] {
+            assert!(text.contains(part), "{part} at 180x22:\n{text}");
+        }
+    }
+
+    #[test]
+    fn below_180_columns_the_column_is_left_out() {
+        let (lines, _) = drawn(&pool_on("4"), 179);
+        let text = lines.join("\n");
+        assert!(!text.contains("This session"), "{text}");
+        assert!(
+            text.contains("context 26% of 1M"),
+            "the bar keeps its line:\n{text}"
+        );
     }
 
     fn text(lines: &[Line]) -> Vec<String> {
@@ -6813,7 +7072,8 @@ mod window_tests {
     #[test]
     fn the_table_is_as_tall_as_its_rows_and_the_window_takes_the_rest() {
         let app = on("4");
-        let shown = lines(&drawn(&app, 200, 50));
+        // Narrower than the column beside it needs.
+        let shown = lines(&drawn(&app, 179, 50));
         // The window under the table takes the rest, down to the bar.
         let window = shown
             .iter()
@@ -6827,6 +7087,20 @@ mod window_tests {
             shown.join("\n")
         );
         assert!(shown[48].starts_with('└'), "{}", shown.join("\n"));
+        // Wide enough for the column, the table is as tall as ever, and the
+        // column runs down the right of it and the window both, to the bar.
+        let wide = lines(&drawn(&app, 200, 50));
+        let below = wide
+            .iter()
+            .position(|l| l.starts_with("┌ Tree 4 "))
+            .unwrap();
+        assert_eq!(below, window, "{}", wide.join("\n"));
+        assert!(
+            wide[1].ends_with("┌ Usage ─────────────────────────────┐"),
+            "{}",
+            wide[1]
+        );
+        assert!(wide[48].ends_with('┘'), "{}", wide[48]);
         // Too short for both, the table takes the screen, and a tree's chat
         // floats in a popup instead.
         let short = lines(&drawn(&app, 200, 12));

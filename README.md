@@ -429,6 +429,8 @@ In an agent's chat treetop takes Ctrl+F for this, as it takes Ctrl+Q; a shell ke
 Moving the cursor keeps the tab, so the diff tab shows each tree's diff in turn and the PR tab each tree's PR, once the cursor rests on it; a PR read before shows as it was last read, and `v` reads it afresh.
 A tab the tree under the cursor has not got shows its info instead.
 At the right of the bar, how full the agent's context is and what its session has spent.
+From 180 columns a Usage column down the right of the table and the window has them in full, as the chat popup's sidebar does, for the tree under the cursor: how full its agent's context is and where that comes from, from 75% in a pool tree the hint that `h` hands it off, how much of the plan is used, a bar for each limit with when it resets, which shows even on a tree with no agent, and what the session has spent.
+On a screen too short for all of it, where the context comes from gives way first.
 Once the cursor has rested on a tree for a moment, the chat tab shows its agent's chat, so moving down the list opens no chat on the way; a tree whose agent is not running says Enter starts it again, since opening it would.
 
 Enter gives the chat's window the keys in Normal and Enter again starts Insert, ready to type to, while a click in the chat goes straight to Insert; Ctrl+Q gives the window the keys in Normal too (see [Normal and Insert](#normal-and-insert)), and a click outside it gives them back to the table, with the chat still running on screen.
