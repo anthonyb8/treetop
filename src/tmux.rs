@@ -194,6 +194,19 @@ pub fn show_waiting(line: Option<&str>) {
     let _ = tmux(&["set-option", "status-right", &shown]);
 }
 
+/// treetop's own pane's `allow-passthrough`, as it takes effect there, from
+/// the pane, its window or the global setting: its pane by `$TMUX_PANE`,
+/// since without a target tmux reads the pane on screen.
+pub fn allow_passthrough() -> String {
+    let pane = std::env::var("TMUX_PANE").unwrap_or_default();
+    let mut args = vec!["display-message", "-p"];
+    if !pane.is_empty() {
+        args.extend(["-t", pane.as_str()]);
+    }
+    args.push("#{allow-passthrough}");
+    tmux(&args).unwrap_or_default().trim().to_string()
+}
+
 /// How long since anyone typed in any client of this tmux server, or with
 /// every client detached, in any of its sessions; None where tmux cannot
 /// say.

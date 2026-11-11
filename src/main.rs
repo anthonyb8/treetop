@@ -32,6 +32,7 @@ mod keeper;
 mod live;
 mod naming;
 mod nomistakes_plugin;
+mod notify;
 mod phone;
 mod plugin;
 mod pool;
@@ -369,7 +370,12 @@ fn choices() -> Vec<Choice> {
 /// were away".
 const IDLE_EVERY: Duration = Duration::from_secs(5);
 
-fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
+fn run(
+    term: &mut Term,
+    app: &mut App,
+    checkout: &Path,
+    desktop: &mut notify::Desktop,
+) -> Result<Exit> {
     let refresher = Refresher::spawn(checkout.to_path_buf(), app.trees.clone());
     let worker = Worker::spawn();
     let away = inbox::spawn_reader(checkout.to_path_buf());
@@ -868,6 +874,19 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                 tmux::show_waiting(line.as_deref());
                 shown_waiting = Some(line);
             }
+            let now = SystemTime::now();
+            let read: Vec<PathBuf> = app.away_live.keys().cloned().collect();
+            let due = desktop.due(&inbox::waiting(app), &read, now);
+            if !due.is_empty() {
+                let passthrough = app.is_in_tmux.then(tmux::allow_passthrough);
+                let (bytes, said) = desktop.tell(&due, passthrough.as_deref(), now);
+                let mut out = io::stdout();
+                out.write_all(&bytes)?;
+                out.flush()?;
+                if said.is_some() {
+                    app.message = said;
+                }
+            }
         }
         if is_stale || drawn_at.elapsed() >= REDRAW {
             let size = term.size()?;
@@ -1243,6 +1262,9 @@ fn show(
     let mut here = Some(start);
     // What waits, as the last workspace looked, so `e` keeps its place.
     let mut watch = app::Watch::default();
+    // What the desktop has been told of, kept across a switch too, so a
+    // reminder still comes.
+    let mut desktop = notify::Desktop::default();
     let mut is_issues = is_issues;
     let mut arriving = None;
     loop {
@@ -1268,7 +1290,8 @@ fn show(
             cached.insert(0, pool::main_tree(&checkout));
             app.set_cached(cached);
         }
-        let exit = run(term, &mut app, &checkout);
+        let exit = run(term, &mut app, &checkout, &mut desktop);
+        desktop.switched();
         watch = app.take_watch();
         // Leaving treetop takes what waits off tmux's status line; a switch
         // shows the next workspace's at once.

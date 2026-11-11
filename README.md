@@ -656,6 +656,9 @@ The oldest comes first: each is as old as it has waited, from when it happened, 
 Inside tmux, the status line of every window shows `● 2 waiting · 17 22` at its right for as long as anything waits, and clears once nothing does or treetop quits.
 treetop sets it on its session over the global `status-right`, and unsets it again, so your own `status-right` is left as it was.
 When something starts waiting, treetop rings the terminal bell, once, so it is heard from any window; the assistant finishing an answer rings it too, and shows it in the status line for five seconds.
+It shows a desktop notification too, on the machine whose terminal treetop is in, a laptop reaching the server over SSH included: the tree, its ticket and branch, what it waits for and, for an ask, the question.
+It goes as the terminal's own notification escape, OSC 777, which foot, WezTerm, Ghostty, kitty and urxvt show, so nothing more runs on the server; something still waiting at thirty minutes is shown once more, saying how long, and what already waits when treetop opens is not.
+Inside tmux it needs `allow-passthrough` set to `all` (`tmux set -g allow-passthrough all`), since `on` passes it only from the window on screen, and until it is, treetop says so once on its status line.
 
 Back after ten minutes or more with no key typed in any tmux window, or in treetop outside tmux, your first key opens "While you were away", and goes no further, so it reaches no agent; typing in another window meanwhile keeps you present, so it never opens.
 It lists what still waits, the oldest first with how long ago, and at its foot what finished or merged while you were away.

@@ -1485,7 +1485,7 @@ fn screen_rows(app: &App, screen: Rect) -> ScreenRows {
 }
 
 /// What a waiting entry is, in the banner's words.
-fn waits_for(kind: Kind) -> &'static str {
+pub fn waits_for(kind: Kind) -> &'static str {
     match kind {
         Kind::Failed => "checks failed",
         Kind::Died => "agent died",
