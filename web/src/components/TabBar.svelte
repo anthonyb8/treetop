@@ -1,14 +1,14 @@
 <script lang="ts">
-  import { inbox } from "../inbox.svelte";
+  import { waiting } from "../waiting.svelte";
   import { link, nav } from "../nav.svelte";
 
-  /** The screens treetop has, as Tab switches them in the terminal, the
-   *  inbox the desktop keeps beside the list, and what the screen on show
-   *  starts, one tap away. */
-  let { tab }: { tab: "trees" | "inbox" | "issues" } = $props();
+  /** The screens treetop has, as Tab switches them in the terminal, what
+   *  waits on you in every workspace, and what the screen on show starts,
+   *  one tap away. */
+  let { tab }: { tab: "trees" | "waiting" | "issues" } = $props();
 
   let canAdd = $derived(tab !== "issues" || nav.canCreate);
-  let unseen = $derived(inbox.list?.unseen ?? 0);
+  let count = $derived(waiting.list?.entries.length ?? 0);
 </script>
 
 <nav aria-label="Screens">
@@ -18,12 +18,12 @@
     <span>Trees</span>
     {#if nav.needs > 0}<span class="badge" aria-label="{nav.needs} waiting on you">{nav.needs}</span>{/if}
   </a>
-  <a class="tab" class:on={tab === "inbox"} href="/inbox" onclick={link} aria-current={tab === "inbox" ? "page" : undefined}>
+  <a class="tab" class:on={tab === "waiting"} href="/waiting" onclick={link} aria-current={tab === "waiting" ? "page" : undefined}>
     <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
       stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"
-      ><path d="M3 13h5l1.5 3h5L16 13h5" /><path d="M5.5 5h13L21 13v6H3v-6z" /></svg>
-    <span>Inbox</span>
-    {#if unseen > 0}<span class="badge" aria-label="{unseen} new in the inbox">{unseen}</span>{/if}
+      ><circle cx="12" cy="12" r="8.5" /><circle cx="12" cy="12" r="3" /></svg>
+    <span>Waiting</span>
+    {#if count > 0}<span class="badge" aria-label="{count} waiting in every workspace">{count}</span>{/if}
   </a>
   <a class="tab" class:on={tab === "issues"} href="/issues" onclick={link} aria-current={tab === "issues" ? "page" : undefined}>
     <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"

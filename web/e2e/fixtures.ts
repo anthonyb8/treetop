@@ -1,5 +1,5 @@
 import type { Page } from "@playwright/test";
-import type { Card, Inbox, IssueDetail, IssueRow, IssueSources, IssueTeam, IssueView, Pool, Tree } from "../src/api";
+import type { Card, IssueDetail, IssueRow, IssueSources, IssueTeam, IssueView, Pool, Tree, Waiting } from "../src/api";
 
 /** What `shot` takes besides the file it writes. */
 type ShotOptions = Omit<NonNullable<Parameters<Page["screenshot"]>[0]>, "path">;
@@ -103,9 +103,9 @@ export const tree17: Tree = {
 };
 
 /** Answers the app's API calls with `answer` for the pool, and an empty
- * inbox, which a test can answer otherwise by routing it after. */
+ * list of what waits, which a test can answer otherwise by routing it after. */
 export async function serve(page: Page, answer: () => Pool | "down") {
-  await page.route("**/api/inbox**", (route) => route.fulfill({ json: { workspace: "app", entries: [], unseen: 0, is_reading: false } satisfies Inbox }));
+  await page.route("**/api/waiting**", (route) => route.fulfill({ json: { workspace: "app", entries: [], also: [], is_reading: false } satisfies Waiting }));
   await page.route("**/api/workspaces", (route) =>
     route.fulfill({ json: { default: "app", workspaces: ["app", "treetop"] } }),
   );

@@ -8,14 +8,15 @@ export type Route =
   | { screen: "tree"; tree: string }
   | { screen: "chat"; tree: string }
   | { screen: "new"; tree: string | null }
-  | { screen: "inbox" }
+  | { screen: "waiting" }
   | { screen: "issues" }
   | { screen: "issue"; id: string }
   | { screen: "issue-form"; id: string | null };
 
 export function parse(path: string): Route {
   if (/^\/new\/?$/.test(path)) return { screen: "new", tree: null };
-  if (/^\/inbox\/?$/.test(path)) return { screen: "inbox" };
+  // `/inbox` was its name before, and stays a way there.
+  if (/^\/(waiting|inbox)\/?$/.test(path)) return { screen: "waiting" };
   if (/^\/issues\/?$/.test(path)) return { screen: "issues" };
   if (/^\/issues\/new\/?$/.test(path)) return { screen: "issue-form", id: null };
   const issue = /^\/issues\/([^/]+)(\/edit)?\/?$/.exec(path);

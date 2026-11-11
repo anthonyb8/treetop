@@ -678,11 +678,6 @@ pub struct App {
     /// The other workspaces' trees with their agents and PRs, as the last
     /// read of each found them, by its checkout.
     pub away_live: HashMap<PathBuf, Vec<Tree>>,
-    /// The entries the phone has opened and dismissed, which an ask seen
-    /// here joins, so the phone does not count it as new.
-    pub inbox: crate::inbox::Marks,
-    /// Where `inbox` is kept. None keeps it in memory only.
-    inbox_file: Option<PathBuf>,
     /// What waits on you as the last look saw it, and where `e` is in it,
     /// carried from one workspace to the next.
     watch: Watch,
@@ -2619,23 +2614,6 @@ impl App {
         self.reselect(Some(path));
     }
 
-    /// The agent running the chat `command` has had its ask on screen.
-    pub fn has_asked(&self, command: &str) -> bool {
-        self.asked.contains(command)
-    }
-
-    /// Keeps the inbox's marks in `file`, starting from those it holds.
-    pub fn keep_inbox_in(&mut self, file: PathBuf) {
-        self.inbox = crate::state::read(&file);
-        self.inbox_file = Some(file);
-    }
-
-    fn save_inbox(&mut self) {
-        if let Some(file) = &self.inbox_file {
-            self.inbox.write(file);
-        }
-    }
-
     /// The list is on screen with nothing over it but a dialog, and the
     /// banner over it, so a click can open what it names. Elsewhere the
     /// mouse is left to the terminal, so text selects as it always has.
@@ -3002,21 +2980,10 @@ impl App {
     }
 
     /// The ask in the chat `command` has been on screen: it does not open
-    /// again here, and its inbox entry is seen from every workspace, since
-    /// the asks seen are kept per workspace but the inbox is one.
+    /// again here.
     fn mark_asked(&mut self, command: &[String]) {
-        let command = command.join(" ");
-        let keys: Vec<String> = crate::inbox::entries(self)
-            .into_iter()
-            .filter(|e| e.asking.as_deref() == Some(command.as_str()))
-            .map(|e| e.key)
-            .collect();
-        self.asked.insert(command);
+        self.asked.insert(command.join(" "));
         self.save_asked();
-        if !keys.is_empty() {
-            self.inbox.seen.extend(keys);
-            self.save_inbox();
-        }
     }
 
     /// Takes the ports this machine shares, as the refresher read them.

@@ -1260,9 +1260,6 @@ fn show(
         if let Some(file) = state::layout_file(&checkout) {
             app.keep_layout_in(file);
         }
-        if let Some(file) = inbox::file() {
-            app.keep_inbox_in(file);
-        }
         app.arriving = arriving.take();
         app.pools = inbox::other_pools(&checkout);
         app.ship_plugins = ship::plugins(&checkout).0;

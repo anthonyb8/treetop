@@ -898,14 +898,16 @@ Anything else running in the tree, such as a dev server, keeps it from the phone
 The pool refreshes every five seconds while the app is open, and when you pull down.
 
 The bell in the pool's header turns on notifications, which iOS offers only to the app opened from the home screen.
-Your phone then buzzes when an agent comes to need you, finishes or dies, and when a tree's PR fails its checks or merges, each once; tapping one opens that tree's chat, or the tree for a PR, in the tree's own workspace, whichever one the phone was showing.
+Your phone then buzzes for what [waits on you](#what-waits-on-you) in a workspace's trees, an agent asking, a PR's checks failing or an agent dying, once it has waited five minutes and nobody has typed in tmux for five minutes, and once more at thirty minutes, saying how long, then never again.
+Answered at the desk before then, it never buzzes, and an agent finishing or a PR merging never does; with no tmux to ask, the server counts you away.
+What already waits when the server starts is not pushed.
+Tapping one opens that tree's chat, or the tree for a PR or a dead agent, in the tree's own workspace, whichever one the phone was showing.
 A notification names the tree and what happened, such as `17 · END-123 fix-login` and `Needs you`, never what the agent wrote, and goes encrypted for your phone through Apple's push service, the one thing the server sends off your tailnet.
 The server keeps its push key and the phones that turned notifications on in `push/` beside the config, readable by you alone; a phone that turns them off in Settings is dropped the next time a push finds it gone.
 
-Inbox, in the tab bar, keeps what the notifications said in one place after you swipe them away.
-It lists the same entries from every workspace, in the same order under the same headings, and its tab counts what you have not opened yet.
-A tap opens an entry as its notification would, the agent's chat or the tree for a PR or an agent that died, switching to its workspace first; swiping one left dismisses it.
-What you open or dismiss is kept in `inbox.json` under `$XDG_STATE_HOME/treetop` (else `~/.local/state/treetop`), with each ask whose chat the desktop opened.
+Waiting, in the tab bar, is what the desktop's banner names, from every workspace, the oldest first with how long each has waited, and its tab counts them.
+Each leaves once it is dealt with, so there is nothing to dismiss; what finished or merged is one line at the foot.
+A tap opens it as its notification would, the agent's chat or the tree for a PR or an agent that died, switching to its workspace first.
 With the server out of reach while it is open, it shows the pool as it last saw it and says so.
 It keeps no copy of itself on the phone, so every open loads the treetop the server runs now; with the server out of reach, it does not open at all.
 If it has not started 8 seconds after opening, it clears anything an older treetop left on the phone and tries once more, and then says it did not start rather than showing a blank screen.
