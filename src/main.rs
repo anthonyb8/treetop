@@ -1122,6 +1122,28 @@ fn run(
                 agent,
                 tree,
             } => open_chat(term, app, &mut chats, &command, agent, tree)?,
+            Outcome::TypeTo {
+                command,
+                agent,
+                tree,
+            } => {
+                open_chat(term, app, &mut chats, &command, agent, tree)?;
+                if chats
+                    .open()
+                    .is_some_and(|c| c.command() == command.as_slice())
+                {
+                    app.insert_in_window();
+                }
+            }
+            Outcome::JumpChat { is_down } => {
+                let size = term.size()?;
+                let area = ui::window_chat_area(app, Rect::new(0, 0, size.width, size.height));
+                if let Some(area) = area
+                    && let Some(open) = chats.open_mut().filter(|c| is_window_chat(c, app))
+                {
+                    open.jump(is_down, area);
+                }
+            }
             Outcome::ScrollChat(lines) => {
                 let size = term.size()?;
                 let area = ui::window_chat_area(app, Rect::new(0, 0, size.width, size.height));
