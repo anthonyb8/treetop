@@ -433,9 +433,12 @@ fn draw_notes(frame: &mut Frame, app: &App) {
     );
     // Under the count, its right edge with the count's, above the bar.
     let main = screen_rows(frame.area()).main;
+    // With nothing counted, where the count would end: inside the table
+    // window's corner.
+    let table = windows(app, main).top;
     let count = count_area(app, main).unwrap_or(Rect {
-        x: main.right().saturating_sub(1),
-        y: main.y,
+        x: table.right().saturating_sub(1),
+        y: table.y,
         width: 0,
         height: 1,
     });
@@ -5978,6 +5981,24 @@ mod count_tests {
             !top.contains("needs action") && !top.contains("done"),
             "{top}"
         );
+    }
+
+    #[test]
+    fn with_nothing_left_the_notifications_stay_where_the_count_was() {
+        let mut app = app();
+        app.notes = Some(0);
+        let corner = |app: &App| {
+            let shown = screen(app, 200, 30);
+            let row = shown
+                .iter()
+                .position(|l| l.contains(" Notifications "))
+                .unwrap();
+            (shown[row].chars().position(|c| c == '┐').unwrap(), shown)
+        };
+        let (with_items, _) = corner(&app);
+        crate::inbox::tests::nothing_waits(&mut app);
+        let (empty, shown) = corner(&app);
+        assert_eq!(empty, with_items, "{}", shown.join("\n"));
     }
 
     #[test]
