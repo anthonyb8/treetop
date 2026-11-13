@@ -13,10 +13,12 @@
 
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -236,6 +238,9 @@ pub struct Chat {
     /// What to write to the chat, in order, for the thread that writes it,
     /// so an agent that stops reading never holds treetop up.
     input: Sender<Vec<u8>>,
+    /// Set once the chat is dropped, so its writer stops waiting on an agent
+    /// that stopped reading and lets the terminal go.
+    is_dropped: Arc<AtomicBool>,
     parser: vt100::Parser,
     output: Receiver<Vec<u8>>,
     child: Option<Child>,
@@ -309,6 +314,34 @@ fn close_on_exec(fd: &OwnedFd) -> Result<()> {
     Ok(())
 }
 
+fn non_blocking(fd: &OwnedFd) -> Result<()> {
+    // SAFETY: fcntl on a descriptor we own, adding only O_NONBLOCK.
+    let set = unsafe {
+        let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
+        flags >= 0 && libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) >= 0
+    };
+    if !set {
+        return Err(std::io::Error::last_os_error()).context("making the terminal non-blocking");
+    }
+    Ok(())
+}
+
+/// How long a chat's reader or writer waits on its terminal before looking
+/// again, which bounds how long a dropped chat's writer holds it.
+const POLL_WAIT: Duration = Duration::from_millis(100);
+
+/// Waits up to POLL_WAIT for `file` to be ready for `events`.
+fn wait_for(file: &File, events: libc::c_short) {
+    let mut fd = libc::pollfd {
+        fd: file.as_raw_fd(),
+        events,
+        revents: 0,
+    };
+    let wait = libc::c_int::try_from(POLL_WAIT.as_millis()).unwrap_or(libc::c_int::MAX);
+    // SAFETY: poll on one pollfd we own, for a bounded time.
+    unsafe { libc::poll(&mut fd, 1, wait) };
+}
+
 impl Chat {
     /// Starts `command` in a new pseudo-terminal of `rows` by `cols`.
     pub fn open(
@@ -365,25 +398,51 @@ impl Chat {
         let child = child_command
             .spawn()
             .with_context(|| format!("running {program}"))?;
+        // Never blocking, so a write waiting on an agent that stopped
+        // reading can give up once the chat is dropped and let the terminal go.
+        non_blocking(&master)?;
         let master = File::from(master);
         let (sender, output) = mpsc::channel();
         let mut reader = master.try_clone().context("reading the chat")?;
         // Ends when the chat exits: reading the master then fails with EIO.
         thread::spawn(move || {
             let mut buffer = [0u8; 8192];
-            while let Ok(read @ 1..) = reader.read(&mut buffer) {
-                if sender.send(buffer[..read].to_vec()).is_err() {
-                    return;
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => return,
+                    Ok(read) => {
+                        if sender.send(buffer[..read].to_vec()).is_err() {
+                            return;
+                        }
+                    }
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                        wait_for(&reader, libc::POLLIN);
+                    }
+                    Err(err) if err.kind() == ErrorKind::Interrupted => {}
+                    Err(_) => return,
                 }
             }
         });
         let (input, to_write) = mpsc::channel::<Vec<u8>>();
         let mut writer = master.try_clone().context("writing to the chat")?;
+        let is_dropped = Arc::new(AtomicBool::new(false));
+        let is_gone = Arc::clone(&is_dropped);
         // Ends when the chat is dropped, or exits and its writes fail.
         thread::spawn(move || {
             for bytes in to_write {
-                if writer.write_all(&bytes).is_err() {
-                    return;
+                let mut rest = &bytes[..];
+                while !rest.is_empty() {
+                    if is_gone.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    match writer.write(rest) {
+                        Ok(written) => rest = &rest[written..],
+                        Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                            wait_for(&writer, libc::POLLOUT);
+                        }
+                        Err(err) if err.kind() == ErrorKind::Interrupted => {}
+                        Err(_) => return,
+                    }
                 }
             }
         });
@@ -393,6 +452,7 @@ impl Chat {
             command: command.to_vec(),
             master,
             input,
+            is_dropped,
             parser: vt100::Parser::new(rows, cols, SCROLLBACK),
             output,
             child: Some(child),
@@ -670,6 +730,7 @@ impl Drop for Chat {
     /// Ends the chat's program and reaps it off the UI thread. Ending a chat
     /// client leaves the agent's session running.
     fn drop(&mut self) {
+        self.is_dropped.store(true, Ordering::Relaxed);
         let Some(mut child) = self.child.take() else {
             return;
         };
@@ -1144,6 +1205,56 @@ mod tests {
             pressed.recv_timeout(Duration::from_secs(2)).is_ok(),
             "pressing h and l waited on the agent to read"
         );
+    }
+
+    /// The descriptors this process holds on pty `index`, by the
+    /// `tty-index` Linux gives each pty master in its fdinfo.
+    fn holding(index: &str) -> usize {
+        std::fs::read_dir("/proc/self/fdinfo")
+            .unwrap()
+            .filter_map(|entry| std::fs::read_to_string(entry.ok()?.path()).ok())
+            .filter(|info| info.lines().any(|line| line == index))
+            .count()
+    }
+
+    /// A chat left holding wheel events for an agent that stopped reading
+    /// lets its terminal go once it is dropped, as its agent goes away.
+    #[test]
+    fn a_dropped_chat_lets_go_of_its_terminal_whatever_it_was_writing() {
+        let command = [
+            "sh".to_string(),
+            "-c".into(),
+            r"stty -echo -icanon; printf '\033[?1000h\033[?1006hready'; exec sleep 30".into(),
+        ];
+        let mut chat = Chat::open(&command, 24, 80, "a".into(), "t".into()).unwrap();
+        let fdinfo = format!("/proc/self/fdinfo/{}", chat.master.as_raw_fd());
+        let index = std::fs::read_to_string(fdinfo)
+            .unwrap()
+            .lines()
+            .find(|line| line.starts_with("tty-index:"))
+            .expect("a pty master names its index")
+            .to_string();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while chat.screen().mouse_protocol_mode() == MouseProtocolMode::None {
+            assert!(
+                Instant::now() < deadline,
+                "the chat never asked for the mouse"
+            );
+            chat.pump();
+            thread::sleep(Duration::from_millis(10));
+        }
+        chat.mode = Mode::Normal;
+        chat.press(
+            key(KeyCode::Char('h'), KeyModifiers::NONE),
+            Rect::new(0, 0, 80, 24),
+        );
+        assert!(holding(&index) > 0);
+        drop(chat);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while holding(&index) > 0 {
+            assert!(Instant::now() < deadline, "the terminal was never let go");
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]
