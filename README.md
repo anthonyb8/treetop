@@ -42,6 +42,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | Key | Does |
 |---|---|
 | Enter | give the keys to the chat of the agent in the tree under the cursor, in the window under the table, in Normal, where Enter again starts Insert, starting a cold one again, else go to the tree itself (see [Agent chats](#agent-chats) and [Entering a tree](#entering-a-tree)); on a group's heading, fold the group or open it again, and on the main checkout's, open the chat of its agent when it has one |
+| `i` | as Enter, but the chat's window gets the keys in Insert, ready to type to the agent at once |
 | Ctrl+Q | (or F13 to F24, such as a Caps Lock remapped to F19) give the keys to the window under the table, in Normal; from Insert, drop to Normal; from Normal, give them back to the table; with two windows, move them round the table, the left window and the right one (see [Normal and Insert](#normal-and-insert)) |
 | Ctrl+P | open the command palette: every action, the tree under the cursor's first, found by typing a few of its words, a tree number or a branch, and run with Enter |
 | Ctrl+F | zoom: on the table, the table over the whole screen; in a window, the windows, with the table folded to their trees' rows; again, back |
@@ -476,6 +477,7 @@ A window with the keys is in one of two modes, as in vim, and says which in the 
 **Normal** gives the keys to treetop.
 `←` and `→` step through the window's tabs, from a chat as from any other.
 `j` and `k` scroll a line and `d` and `u` half a page, on the chat's history as on the diff and the PR, whose other keys work as ever.
+On a chat, `h` jumps to the top of its history and `l` back to the bottom, by scrolling until the chat stops; a chat that has not asked for the mouse, unlike Claude Code, would get that as arrow keys walking its prompt's history, so there they do nothing.
 `i` or Enter on a chat or shell starts Insert.
 Esc, `q` or Ctrl+Q gives the keys back to the table; with two windows, Ctrl+Q moves them on to the other one first.
 
@@ -484,6 +486,7 @@ Esc, `q` or Ctrl+Q gives the keys back to the table; with two windows, Ctrl+Q mo
 F13 to F24 are Ctrl+Q everywhere in treetop, so a Caps Lock remapped to one of them, such as F19 (with keyd on Linux or Karabiner-Elements on a Mac, on the machine whose keyboard you type on, over SSH too), does all Ctrl+Q does in one key, while Esc still interrupts Claude Code.
 Ctrl+\\, Ctrl+F and Ctrl+P keep working as before, and a shell keeps Ctrl+F and Ctrl+P for itself.
 
+`i` on a tree gives its chat's window the keys in Insert at once.
 Ctrl+Q from the table, Enter on a tree and an agent opened with `e` land in Normal, so nothing typed reaches an agent by accident; a second Enter starts Insert, and a click in the chat lands in Insert, ready to type.
 The diff, PR, run and info tabs have nothing to type into, so they are only ever in Normal.
 The bar at the bottom lists the mode's keys while a window has them.
@@ -788,8 +791,8 @@ A Linear source gets all of this; an issue source on another ticket plugin lists
 3. once it runs, the ticket is marked started and assigned to you.
 
 The tree's `treetop.json` records the ticket, so the TICKET column shows it, the filter finds it, and `p` on a ticket already in a tree goes to that tree rather than starting a second agent.
-On the trees, `i` opens the issue the tree under the cursor works on, on the whole screen, and Esc comes back to the trees.
-A tree started without an issue gets one the same way: `i` on it, or `I` on any leased tree to change it, shows the Issues list to choose from, with search and filters, and Enter records the issue in the tree's `treetop.json`, so the TICKET and WORK columns show it at once.
+On the trees, `I` opens the issue the tree under the cursor works on, on the whole screen, and Esc comes back to the trees.
+A tree started without an issue gets one the same way: `I` on it shows the Issues list to choose from, with search and filters, and Enter records the issue in the tree's `treetop.json`, so the TICKET and WORK columns show it at once.
 A step that fails undoes the ones before it, as any start does; marking the ticket started is the exception, and a failure there only shows in the info tab, since the agent is already working.
 `treetop pick END-123` does the same from a shell.
 

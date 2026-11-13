@@ -189,8 +189,8 @@ const TREE_COMMANDS: [(&str, char); 20] = [
     ("Open tree {}'s port in the browser", 'o'),
     ("Share tree {}'s port with the phone", 'p'),
     ("Put tree {}'s port on the internet", 'P'),
-    ("Open tree {}'s issue", 'i'),
-    ("Choose the issue tree {} works on", 'I'),
+    ("Open tree {}'s issue", 'I'),
+    ("Type to tree {}'s agent", 'i'),
 ];
 
 /// The commands on the pool, each with the key that does it, `^` for one
@@ -486,8 +486,20 @@ pub enum Outcome {
         agent: String,
         tree: String,
     },
+    /// Open the chat as `Chat` does, with the keys in Insert, ready to
+    /// type to: `i` on a tree.
+    TypeTo {
+        command: Vec<String>,
+        agent: String,
+        tree: String,
+    },
     /// Scroll the window's chat by this many lines, down when positive.
     ScrollChat(isize),
+    /// Scroll the window's chat to the top of its history, or back to the
+    /// bottom with `is_down`.
+    JumpChat {
+        is_down: bool,
+    },
     /// Type `text` into each agent's chat and submit it.
     Send {
         to: Vec<Recipient>,
@@ -2011,7 +2023,8 @@ impl App {
     /// The keys a window takes in Normal, on a tab with no keys of its own:
     /// Esc or q gives them back to the table, the arrows step through its
     /// tabs, on a chat or shell i or Enter starts Insert while j, k, d
-    /// and u scroll it, and e goes to what waits on you.
+    /// and u scroll it and h and l jump to its top and bottom, and e goes
+    /// to what waits on you.
     fn handle_window_key(&mut self, key: KeyEvent) -> Outcome {
         let is_terminal = matches!(self.shown_tab(), WindowTab::Chat | WindowTab::Shell);
         let half = isize::try_from(self.window_rows / 2).map_or(1, |h| h.max(1));
@@ -2025,6 +2038,8 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up if is_terminal => return Outcome::ScrollChat(-1),
             KeyCode::Char('d') if is_terminal => return Outcome::ScrollChat(half),
             KeyCode::Char('u') if is_terminal => return Outcome::ScrollChat(-half),
+            KeyCode::Char('h') if is_terminal => return Outcome::JumpChat { is_down: false },
+            KeyCode::Char('l') if is_terminal => return Outcome::JumpChat { is_down: true },
             KeyCode::Char('e') => {
                 self.is_window_focused = false;
                 self.notes = Some(0);
@@ -2462,6 +2477,23 @@ impl App {
             return Outcome::Continue;
         };
         Self::chat_of(tree).unwrap_or_else(|| Outcome::Enter(tree.clone()))
+    }
+
+    /// `opened`, what Enter opens, with a chat opened ready to type to, as
+    /// `i` opens it; anything else as it is.
+    fn typing_to(opened: Outcome) -> Outcome {
+        match opened {
+            Outcome::Chat {
+                command,
+                agent,
+                tree,
+            } => Outcome::TypeTo {
+                command,
+                agent,
+                tree,
+            },
+            other => other,
+        }
     }
 
     /// The chat of the tree's leading agent that has one, as Enter opens it.
@@ -4543,14 +4575,18 @@ impl App {
             return Outcome::Scratches;
         }
         // On a heading, Enter folds its group or opens it again; on the main
-        // checkout's, it opens the chat of an agent working there instead.
-        if key.code == KeyCode::Enter
+        // checkout's, it opens the chat of an agent working there instead,
+        // and `i` that chat ready to type to.
+        if matches!(key.code, KeyCode::Enter | KeyCode::Char('i'))
             && let Some(group) = self.current_heading()
         {
-            if let Some(chat) = self.main_under_cursor().and_then(Self::chat_of) {
-                return chat;
+            let chat = self.main_under_cursor().and_then(Self::chat_of);
+            match (key.code, chat) {
+                (KeyCode::Enter, Some(chat)) => return chat,
+                (_, Some(chat)) => return Self::typing_to(chat),
+                (KeyCode::Enter, None) => self.toggle_fold(&group),
+                _ => {}
             }
-            self.toggle_fold(&group);
             return Outcome::Continue;
         }
         match key.code {
@@ -4566,8 +4602,12 @@ impl App {
                 let context = self.cursor_context();
                 self.open_ask(context);
             }
-            KeyCode::Char('i') => self.show_issue(),
-            KeyCode::Char('I') => self.choose_issue(),
+            // The chat Enter opens, ready to type to, as vim's i is.
+            KeyCode::Char('i') => {
+                let opened = self.open_agent();
+                return Self::typing_to(opened);
+            }
+            KeyCode::Char('I') => self.show_issue(),
             KeyCode::Char('e') => self.notes = Some(0),
             KeyCode::Char('m') => self.open_message(),
             KeyCode::Char('q') => return self.quit(),
@@ -4936,20 +4976,20 @@ mod tests {
     }
 
     #[test]
-    fn i_shows_the_issue_a_tree_works_on() {
+    fn capital_i_shows_the_issue_a_tree_works_on() {
         let mut app = app();
         dispatched(&mut app, "/p/8/app", "j1");
         let mut sidecar = *app.trees[2].sidecar.clone().unwrap();
         sidecar.ticket = Some("END-799".into());
         app.apply_sidecars(HashMap::from([(PathBuf::from("/p/8/app"), sidecar)]));
         select(&mut app, "8");
-        press(&mut app, KeyCode::Char('i'));
+        press(&mut app, KeyCode::Char('I'));
         assert!(app.is_issues);
         assert_eq!(app.open_issue.as_deref(), Some("END-799"));
         app.is_issues = false;
         app.open_issue = None;
         select(&mut app, "7");
-        press(&mut app, KeyCode::Char('i'));
+        press(&mut app, KeyCode::Char('I'));
         assert!(!app.is_issues, "an unleased tree works on nothing");
         assert!(app.message.as_deref().unwrap().contains("is not leased"));
     }
@@ -4959,7 +4999,7 @@ mod tests {
         let mut app = app();
         dispatched(&mut app, "/p/8/app", "j1");
         select(&mut app, "8");
-        press(&mut app, KeyCode::Char('i'));
+        press(&mut app, KeyCode::Char('I'));
         assert!(app.is_issues, "a tree on no issue chooses one");
         assert_eq!(app.choose_issue_for.as_deref(), Some("8"));
         let (path, record) = app.attach("END-42".into(), "personal".into()).unwrap();
@@ -4981,13 +5021,13 @@ mod tests {
         );
         press(&mut app, KeyCode::Char('I'));
         assert_eq!(
-            app.choose_issue_for.as_deref(),
-            Some("8"),
-            "I chooses again"
+            app.open_issue.as_deref(),
+            Some("END-42"),
+            "I then shows the issue chosen"
         );
     }
 
-    /// `i` on a tree with no issue, then picking another issue up instead
+    /// `I` on a tree with no issue, then picking another issue up instead
     /// of choosing one, then returning the tree: the next issue chosen
     /// went to that returned tree, now free.
     #[test]
@@ -4996,7 +5036,7 @@ mod tests {
         app.checkout = PathBuf::from("/p/main");
         dispatched(&mut app, "/p/8/app", "j1");
         select(&mut app, "8");
-        press(&mut app, KeyCode::Char('i'));
+        press(&mut app, KeyCode::Char('I'));
         assert_eq!(app.choose_issue_for.as_deref(), Some("8"));
         assert!(matches!(
             app.pick("END-9".into(), "work".into()),
@@ -5380,6 +5420,29 @@ mod tests {
             Outcome::Chat { agent, tree, .. } if agent == "why is the build slow" && tree == "main"
         ));
         assert_eq!(shape(&app)[0], "▾development 2", "left open");
+    }
+
+    #[test]
+    fn i_on_the_main_checkouts_heading_types_to_its_agent_and_never_folds() {
+        let mut app = app_on_main_heading();
+        let main = app.trees.iter().find(|t| t.is_main).unwrap().path.clone();
+        let mut assistant = attachable(assistant::NAME);
+        assistant.status = Some(Status::Idle);
+        app.apply_agents(&HashMap::from([(main.clone(), vec![assistant.clone()])]));
+        assert_eq!(press(&mut app, KeyCode::Char('i')), Outcome::Continue);
+        assert_eq!(
+            shape(&app)[0],
+            "▾development 2",
+            "with no agent of its own to type to, i leaves the group open"
+        );
+        assert!(!app.is_issues, "and opens no issue");
+        let mut own = attachable("why is the build slow");
+        own.status = Some(Status::Busy);
+        app.apply_agents(&HashMap::from([(main, vec![assistant, own])]));
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('i')),
+            Outcome::TypeTo { agent, tree, .. } if agent == "why is the build slow" && tree == "main"
+        ));
     }
 
     #[test]
@@ -5874,6 +5937,34 @@ mod tests {
         assert!(
             App::agents_of(main).is_empty(),
             "nothing live, nothing shown"
+        );
+    }
+
+    #[test]
+    fn i_opens_an_attachable_chat_ready_to_type_else_goes_to_the_tree() {
+        let mut app = app();
+        let attachable = Agent {
+            is_background: true,
+            attach: Some(vec!["claude".into(), "attach".into(), "e6b79280".into()]),
+            ..agent("fix-login")
+        };
+        app.apply_agents(&HashMap::from([(
+            PathBuf::from("/p/4/app"),
+            vec![attachable],
+        )]));
+        assert_eq!(
+            press(&mut app, KeyCode::Char('i')),
+            Outcome::TypeTo {
+                command: vec!["claude".into(), "attach".into(), "e6b79280".into()],
+                agent: "fix-login".into(),
+                tree: "4".into()
+            }
+        );
+        assert!(!app.is_issues, "i no longer shows the issue");
+        select(&mut app, "7");
+        assert!(
+            matches!(press(&mut app, KeyCode::Char('i')), Outcome::Enter(t) if t.name == "7"),
+            "with no chat to type in, i goes to the tree, as Enter does"
         );
     }
 
@@ -7669,6 +7760,14 @@ mod tests {
         assert_eq!(
             press(&mut app, KeyCode::Char('u')),
             Outcome::ScrollChat(-10)
+        );
+        assert_eq!(
+            press(&mut app, KeyCode::Char('h')),
+            Outcome::JumpChat { is_down: false }
+        );
+        assert_eq!(
+            press(&mut app, KeyCode::Char('l')),
+            Outcome::JumpChat { is_down: true }
         );
         press(&mut app, KeyCode::Right);
         assert_eq!(app.shown_tab(), WindowTab::Diff);

@@ -39,8 +39,9 @@ use crate::theme::theme;
 
 /// The bar's keys, most useful first: on a narrow bar the keys at the end
 /// are the ones left out, and `?` lists them all.
-const KEYS: [(&str, &str); 16] = [
+const KEYS: [(&str, &str); 17] = [
     ("Enter", "open"),
+    ("i", "type"),
     ("^Q", "window"),
     ("^P", "commands"),
     ("?", "help"),
@@ -51,7 +52,7 @@ const KEYS: [(&str, &str); 16] = [
     (":", "ask"),
     ("a", "assistant"),
     ("d", "diff"),
-    ("i", "issue"),
+    ("I", "issue"),
     ("r", "return"),
     ("Space", "mark"),
     ("/", "filter"),
@@ -69,6 +70,7 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
         &[
             ("Enter", "open, fold heading"),
             ("^Q", "window, Normal, table"),
+            ("i", "type to agent"),
             ("i Enter", "Insert in window"),
             ("^\\", "two windows, one"),
             ("^F", "zoom table, windows"),
@@ -120,14 +122,7 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
             ("f", "send CI failures"),
         ],
     ),
-    (
-        "Issues",
-        &[
-            ("Tab", "all issues"),
-            ("i", "tree's issue"),
-            ("I", "choose issue"),
-        ],
-    ),
+    ("Issues", &[("Tab", "all issues"), ("I", "tree's issue")]),
     (
         "treetop",
         &[
@@ -148,11 +143,12 @@ const HELP_COLUMNS: [usize; 4] = [1, 2, 2, 2];
 /// The bar's keys while a window has them in Normal, most useful first.
 /// `i` is left out on a tab with nothing to type into, and Ctrl+Q's label
 /// says where it sends the keys.
-const NORMAL_KEYS: [(&str, &str); 7] = [
+const NORMAL_KEYS: [(&str, &str); 8] = [
     ("i", "insert"),
     ("\u{2190}\u{2192}", "tabs"),
     ("j k", "line"),
     ("d u", "half page"),
+    ("h l", "top, bottom"),
     ("^Q", "table"),
     ("^F", "zoom"),
     ("^P", "commands"),
@@ -1373,10 +1369,12 @@ fn bar_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             .iter()
             .copied()
             .filter(|(key, _)| is_terminal || *key != "i")
-            // The run and the info have nothing to scroll.
+            // The run and the info have nothing to scroll, and only a chat
+            // or shell jumps to its top and bottom.
             .filter(|(key, _)| {
                 !matches!(tab, WindowTab::Run | WindowTab::Info) || !matches!(*key, "j k" | "d u")
             })
+            .filter(|(key, _)| is_terminal || *key != "h l")
             .map(|(key, label)| if key == "^Q" { (key, on) } else { (key, label) })
             .collect();
     }
@@ -7713,7 +7711,7 @@ mod window_tests {
         // Its key bar too, with no window for Ctrl+Q to give the keys to.
         assert!(!shown[49].contains("^Q"), "{}", shown[49]);
         assert!(
-            shown[49].starts_with(" Enter  open  ?  help "),
+            shown[49].starts_with(" Enter  open  i  type  ?  help "),
             "{}",
             shown[49]
         );
