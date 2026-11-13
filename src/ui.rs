@@ -3877,8 +3877,14 @@ fn chat_frame(
             .find(|candidate| candidate.name == tree)
             .and_then(|candidate| candidate.branch.clone())
             .unwrap_or_else(|| "(detached)".into());
+        // A tree's chat names its mode in place of "chat", which leaves
+        // room on the bar for Ctrl+Q beside a long branch.
+        let badge = match mode {
+            Mode::Normal => " NORMAL ",
+            Mode::Insert => " chat ",
+        };
         vec![
-            Span::styled(" chat ", t.badge),
+            Span::styled(badge, t.badge),
             Span::styled(
                 format!(" {branch}"),
                 Style::new().add_modifier(Modifier::BOLD),
@@ -3887,14 +3893,16 @@ fn chat_frame(
         ]
     };
     // Keys drop from the end where a long branch leaves too little room
-    // for them all, so the way into Insert and the way out come first.
+    // for them all, so the way out comes first, then the way into Insert.
     let keys: &[(&str, &str)] = match mode {
         Mode::Normal => {
-            title.insert(0, Span::styled(" NORMAL ", t.badge));
-            title.insert(1, Span::raw(" "));
+            if assistant::is_assistant(agent) || tree == SCRATCH {
+                title.insert(0, Span::styled(" NORMAL ", t.badge));
+                title.insert(1, Span::raw(" "));
+            }
             &[
-                ("i", "type"),
                 ("^Q", "back to treetop"),
+                ("i", "type"),
                 ("j k ^D ^U", "scroll"),
                 ("h l", "top, bottom"),
                 ("^\\", "next chat"),
@@ -4892,6 +4900,32 @@ mod inbox_tests {
         assert!(popup::area(stage(&app, screen)).right() <= inbox_starts);
         app.inbox.is_hidden = true;
         assert!(popup::area(stage(&app, screen)).right() > inbox_starts);
+    }
+
+    #[test]
+    fn a_chat_s_bar_keeps_the_way_out_in_either_mode_on_a_laptop_s_width() {
+        let mut app = app();
+        app.trees[0].branch = Some("anthonyb8/i-want-to-chaneg-so-in-the-trees-view".into());
+        let tree = app.trees[0].name.clone();
+        for mode in [Mode::Normal, Mode::Insert] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+            terminal
+                .draw(|frame| {
+                    chat_frame(frame, &app, ("e2e-agent", &tree), None, mode);
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let bar = (0..30)
+                .map(|y| {
+                    (0..120)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .find(|row| row.contains(" chat ") || row.contains(" NORMAL "))
+                .expect("the chat's bar");
+            assert!(bar.contains("back to treetop"), "{mode:?}: {bar}");
+        }
     }
 
     #[test]
