@@ -214,6 +214,7 @@ fn live_session(home: &Path, session: &Session, start: Option<u64>, dir: PathBuf
         background: is_background,
         attach: short.map(|id| attach(home, id)),
         active_at: None,
+        answered_at: None,
         context: None,
         spend: None,
         label: label(home),
@@ -236,10 +237,100 @@ fn last_cwd(tail: &str) -> Option<PathBuf> {
     None
 }
 
+/// When the session last ran a turn, from the end of its transcript: the
+/// time of its own last reply, in seconds since the epoch. Claude Code also
+/// writes its own records there, such as an away summary minutes after a
+/// turn ends, a reply of its own making, and your slash and `!` commands as
+/// messages of yours, all with no turn run, so only a model's reply counts;
+/// nor does the file's own time, which they move. None with no reply in
+/// `tail`.
+fn last_turn(tail: &str) -> Option<u64> {
+    #[derive(Deserialize)]
+    struct Message {
+        model: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Line {
+        #[serde(rename = "type")]
+        kind: String,
+        timestamp: Option<String>,
+        message: Option<Message>,
+    }
+    tail.lines().rev().find_map(|line| {
+        let line: Line = serde_json::from_str(line).ok()?;
+        // Claude Code's own replies, such as "No response requested.", come
+        // from no model and run no turn.
+        let is_synthetic =
+            line.message.as_ref().and_then(|m| m.model.as_deref()) == Some("<synthetic>");
+        (line.kind == "assistant" && !is_synthetic)
+            .then_some(line.timestamp)
+            .flatten()
+            .and_then(|at| crate::reports::unix(&at))
+            .and_then(|secs| u64::try_from(secs).ok())
+    })
+}
+
+/// When a prompt was last typed to the session in `tail`: what answers
+/// whatever it asked. A tool's result, a task's notification, a `!`
+/// command and Claude Code's own records are typed by nobody. None with no
+/// prompt in `tail`.
+fn last_prompt(tail: &str) -> Option<u64> {
+    #[derive(Deserialize)]
+    struct Origin {
+        kind: String,
+    }
+    #[derive(Deserialize)]
+    struct Message {
+        content: Option<Value>,
+    }
+    #[derive(Deserialize)]
+    struct Line {
+        #[serde(rename = "type")]
+        kind: String,
+        timestamp: Option<String>,
+        origin: Option<Origin>,
+        #[serde(rename = "isMeta", default)]
+        is_meta: bool,
+        message: Option<Message>,
+    }
+    tail.lines().rev().find_map(|line| {
+        let line: Line = serde_json::from_str(line).ok()?;
+        let is_human = line.origin.as_ref().is_some_and(|o| o.kind == "human");
+        let text = line
+            .message
+            .and_then(|m| m.content)
+            .and_then(|c| c.as_str().map(str::to_string))
+            .unwrap_or_default();
+        let is_command = text.starts_with("<bash-") || text.starts_with("<local-command");
+        (line.kind == "user" && is_human && !line.is_meta && !is_command)
+            .then_some(line.timestamp)
+            .flatten()
+            .and_then(|at| crate::reports::unix(&at))
+            .and_then(|secs| u64::try_from(secs).ok())
+    })
+}
+
 fn tail(path: &Path) -> Option<String> {
+    tail_of(path, TAIL)
+}
+
+/// How far back a transcript is read for its last reply when the tail has
+/// none: Claude Code can write a snapshot of over 100 KB after one.
+const DEEP_TAIL: u64 = 1024 * 1024;
+
+/// When the session in the transcript at `path` last replied, from its
+/// tail, else further back.
+fn last_turn_in(path: &Path) -> Option<u64> {
+    tail(path)
+        .as_deref()
+        .and_then(last_turn)
+        .or_else(|| tail_of(path, DEEP_TAIL).as_deref().and_then(last_turn))
+}
+
+fn tail_of(path: &Path, bytes: u64) -> Option<String> {
     let mut file = File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
-    file.seek(SeekFrom::Start(len.saturating_sub(TAIL))).ok()?;
+    file.seek(SeekFrom::Start(len.saturating_sub(bytes))).ok()?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).ok()?;
     Some(String::from_utf8_lossy(&bytes).into_owned())
@@ -577,11 +668,10 @@ fn live_sessions(config: &Path) -> Vec<Seen> {
                 .zip(end.as_deref())
                 .and_then(|(path, end)| context(path, end));
             let spend = transcript.as_deref().map(spend);
-            // It last worked when its transcript last grew.
-            let active_at = transcript
-                .and_then(|path| fs::metadata(path).and_then(|m| m.modified()).ok())
-                .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|since| since.as_secs());
+            // It last worked at its last reply, not when its transcript last
+            // grew: Claude Code writes there between turns too.
+            let active_at = transcript.as_deref().and_then(last_turn_in);
+            let answered_at = end.as_deref().and_then(last_prompt);
             live_session(
                 config,
                 &session,
@@ -590,6 +680,7 @@ fn live_sessions(config: &Path) -> Vec<Seen> {
             )
             .map(|seen| Seen {
                 active_at,
+                answered_at,
                 context,
                 spend,
                 ..seen
@@ -625,6 +716,7 @@ fn cold(live: &[Seen]) -> Vec<Seen> {
                 .or(homes.first())?;
             Some(Seen {
                 active_at,
+                answered_at: None,
                 attach: Some(attach(home, &report.job)),
                 label: label(home),
                 id: Some(report.job),
@@ -1385,6 +1477,68 @@ pub fn op(op: &str, args: &Value) -> Result<Value, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reply_behind_a_large_snapshot_still_counts_as_the_last_turn() {
+        // Claude Code can write a snapshot bigger than the tail after a reply.
+        let dir = std::env::temp_dir().join(format!("treetop-turn-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.jsonl");
+        let reply = r#"{"type":"assistant","timestamp":"2026-11-06T16:57:15.149Z","message":{}}"#;
+        let snapshot = format!(
+            r#"{{"type":"attachment","snapshot":"{}"}}"#,
+            "x".repeat(150 * 1024)
+        );
+        fs::write(&path, format!("{reply}\n{snapshot}\n")).unwrap();
+        assert_eq!(last_turn_in(&path), Some(1_793_984_235));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_session_was_answered_at_the_last_prompt_typed_to_it() {
+        // A prompt typed, then what Claude Code writes as user entries that
+        // nobody typed: a tool's result, a task's notification, a `!`
+        // command and a local command's record.
+        let tail = r#"{"type":"user","origin":{"kind":"human"},"timestamp":"2026-11-06T16:57:15.149Z","message":{"content":"Postgres, please"}}
+{"type":"assistant","timestamp":"2026-11-06T16:57:20.000Z","message":{}}
+{"type":"user","timestamp":"2026-11-06T16:58:00.000Z","message":{"content":[{"type":"tool_result","content":"ok"}]}}
+{"type":"user","origin":{"kind":"task-notification"},"timestamp":"2026-11-06T16:59:00.000Z","message":{"content":"<task-notification>"}}
+{"type":"user","origin":{"kind":"human"},"timestamp":"2026-11-06T17:00:00.000Z","message":{"content":"<bash-input>ls</bash-input>"}}
+{"type":"user","origin":{"kind":"human"},"isMeta":true,"timestamp":"2026-11-06T17:01:00.000Z","message":{"content":"<local-command-caveat>"}}"#;
+        assert_eq!(last_prompt(tail), Some(1_793_984_235));
+        assert_eq!(last_prompt(r#"{"type":"assistant","message":{}}"#), None);
+    }
+
+    #[test]
+    fn a_session_last_worked_at_its_last_turn_not_its_bookkeeping() {
+        // Claude Code writes an away summary and its own records into the
+        // transcript minutes after a turn, with no turn run.
+        let tail = r#"{"type":"user","timestamp":"2026-11-06T16:56:40.000Z"}
+{"type":"assistant","timestamp":"2026-11-06T16:57:15.149Z","message":{}}
+{"type":"system","subtype":"away_summary","timestamp":"2026-11-06T17:03:20.644Z"}
+{"type":"permission-mode","permissionMode":"default"}
+{"type":"custom-title","customTitle":"x"}"#;
+        assert_eq!(last_turn(tail), Some(1_793_984_235));
+        // A slash command or a `!` command writes user entries but runs no
+        // turn, so it does not count either.
+        let tail = r#"{"type":"assistant","timestamp":"2026-11-06T16:57:15.149Z","message":{}}
+{"type":"user","isMeta":true,"timestamp":"2026-11-07T09:00:00.000Z","message":{"content":"<local-command-caveat>"}}
+{"type":"user","timestamp":"2026-11-07T09:00:01.000Z","message":{"content":"<command-name>/login</command-name>"}}
+{"type":"user","timestamp":"2026-11-07T09:00:05.000Z","message":{"content":"<bash-input>gh pr comment 766</bash-input>"}}"#;
+        assert_eq!(last_turn(tail), Some(1_793_984_235));
+        // Nor does a reply Claude Code writes itself, with no turn run.
+        let tail = r#"{"type":"assistant","timestamp":"2026-11-06T16:57:15.149Z","message":{"model":"claude-opus-5-5"}}
+{"type":"assistant","timestamp":"2026-11-06T17:57:30.000Z","message":{"model":"<synthetic>","content":[{"type":"text","text":"No response requested."}]}}"#;
+        assert_eq!(last_turn(tail), Some(1_793_984_235));
+        // A tail cut mid-entry, or with no turn in it, says nothing.
+        assert_eq!(
+            last_turn(
+                r#"tamp":"2026"}
+{"type":"system","timestamp":"2026-11-06T17:03:20.644Z"}"#
+            ),
+            None
+        );
+    }
 
     /// The shape of a session file as Claude Code 2.1 writes it.
     const SESSION: &str = r#"{"pid":2263518,"sessionId":"e6b79280-2509-446f-ab75-bf36407bf701",

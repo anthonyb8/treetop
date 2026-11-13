@@ -40,17 +40,40 @@ impl JobState {
     }
 }
 
-/// The state a report goes by: its own, except that an agent sitting at a
-/// question dialog or permission prompt needs you, though its report still
-/// says working.
+/// How long its session may go on writing after a report, as it does to
+/// end the turn the report came in, before the report is taken as overtaken:
+/// an ask's own reply lands within seconds of it, and an answer comes later.
+const REPORT_SLACK: u64 = 30;
+
+/// The state `report` stands for, by what its job's running session says
+/// now: asking, at a prompt, it waits on you; a blocked report its session
+/// has run a turn well past, answered since, goes by the session, idle being
+/// done and busy working; a working report whose session sits idle after
+/// its turn is done.
 pub fn report_state(report: &Report, trees: &[Tree]) -> State {
-    let is_waiting = trees.iter().flat_map(|t| &t.agents).any(|a| {
-        a.job.as_deref() == Some(report.job.as_str()) && a.status == Some(Status::Waiting)
-    });
-    if report.state == State::Working && is_waiting {
-        State::Blocked
-    } else {
-        report.state
+    let Some(agent) = trees
+        .iter()
+        .flat_map(|t| &t.agents)
+        .find(|a| a.job.as_deref() == Some(report.job.as_str()))
+    else {
+        return report.state;
+    };
+    let wrote = report
+        .updated
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    // Past it: a prompt typed to it since, or a reply well after it.
+    let is_past = agent.answered_at.is_some_and(|at| at > wrote)
+        || agent.active_at.is_some_and(|at| at > wrote + REPORT_SLACK);
+    match (report.state, agent.status) {
+        // Asking, whatever it last reported short of dying.
+        (State::Working | State::Blocked | State::Done | State::Stopped, Some(Status::Waiting)) => {
+            State::Blocked
+        }
+        (State::Blocked, Some(Status::Idle)) if is_past => State::Done,
+        (State::Blocked, Some(Status::Busy)) if is_past => State::Working,
+        (State::Working, Some(Status::Idle)) if agent.active_at.is_some() => State::Done,
+        (state, _) => state,
     }
 }
 
@@ -66,7 +89,7 @@ pub struct Item<'a> {
 }
 
 impl<'a> Item<'a> {
-    fn new(report: &'a Report, trees: &'a [Tree]) -> Self {
+    pub fn new(report: &'a Report, trees: &'a [Tree]) -> Self {
         Item {
             report,
             tree: crate::reports::tree_of(report, trees),
@@ -81,7 +104,7 @@ impl<'a> Item<'a> {
     /// Waiting at a prompt in its chat, which only its chat can answer: a
     /// line typed in would land in the dialog, not reach it as a message.
     pub fn is_at_prompt(&self) -> bool {
-        self.state != self.report.state
+        self.state == State::Blocked && self.report.state != State::Blocked
     }
 
     /// What it has to say, as the list shows it.
@@ -172,7 +195,7 @@ const TREE_COMMANDS: [(&str, char); 20] = [
 
 /// The commands on the pool, each with the key that does it, `^` for one
 /// with Ctrl.
-const POOL_COMMANDS: [(&str, &str); 13] = [
+const POOL_COMMANDS: [(&str, &str); 12] = [
     ("New agent in a fresh tree", "N"),
     ("Ask the assistant", ":"),
     ("Open the assistant's chat", "a"),
@@ -180,8 +203,7 @@ const POOL_COMMANDS: [(&str, &str); 13] = [
     ("Switch workspace", "w"),
     ("Scratch chats", "C"),
     ("Filter the trees", "/"),
-    ("Go to what waits on you", "e"),
-    ("While you were away", "E"),
+    ("Notifications", "e"),
     ("Two windows, or one", "^\\"),
     ("Zoom the table or the windows", "^F"),
     ("Every key", "?"),
@@ -477,36 +499,10 @@ pub enum Outcome {
 }
 
 /// What waits on you as treetop last looked, kept across a switch of
-/// workspace: what `e` last went to, so `e` again goes on to the next, and
-/// since when each has waited, so each keeps its age.
+/// workspace: since when each has waited, so each keeps its age.
 #[derive(Debug, Clone, Default)]
 pub struct Watch {
-    went: Option<crate::inbox::About>,
     since: HashMap<crate::inbox::About, std::time::SystemTime>,
-    /// "While you were away", open, closed with Esc, or due at the next
-    /// key, so a sheet that switched workspace comes along.
-    away: Option<Catchup>,
-    closed_away: Option<Catchup>,
-    went_away: Option<Catchup>,
-    /// What had finished or merged at your last key.
-    done_seen: std::collections::HashSet<crate::inbox::About>,
-}
-
-/// How long without a key, in tmux or treetop, counts as away.
-const AWAY: std::time::Duration = std::time::Duration::from_secs(10 * 60);
-
-/// "While you were away": what waits, gone through one at a time, and
-/// what finished or merged meanwhile.
-#[derive(Debug, Clone)]
-pub struct Catchup {
-    /// When you went.
-    pub since: std::time::SystemTime,
-    /// What had finished or merged already, left out of the foot.
-    done_before: std::collections::HashSet<crate::inbox::About>,
-    /// Put off with `s`, in the order put off, after the rest.
-    later: Vec<crate::inbox::About>,
-    /// Opened with Enter: the sheet stands aside until it stops waiting.
-    on: Option<crate::inbox::About>,
 }
 
 #[derive(Default)]
@@ -678,25 +674,21 @@ pub struct App {
     /// The other workspaces' trees with their agents and PRs, as the last
     /// read of each found them, by its checkout.
     pub away_live: HashMap<PathBuf, Vec<Tree>>,
-    /// What waits on you as the last look saw it, and where `e` is in it,
-    /// carried from one workspace to the next.
+    /// What waits on you as the last look saw it, carried from one
+    /// workspace to the next.
     watch: Watch,
     /// This workspace has looked at what waits, so something new rings the
     /// bell once; what already waits when treetop opens or switches here
     /// rings nothing.
     has_looked: bool,
-    /// You have been away since then, and the next key opens what waited
-    /// meanwhile.
-    went_away: Option<Catchup>,
-    /// "While you were away", open; it shows while the table has the keys.
-    pub away: Option<Catchup>,
-    /// The sheet as Esc closed it, for `E` to bring back.
-    closed_away: Option<Catchup>,
-    /// What had finished or merged at your last key, so the sheet's foot
-    /// has all that did while you were away.
-    done_seen: std::collections::HashSet<crate::inbox::About>,
-    /// When treetop last had a key, where tmux cannot say.
-    last_key: Option<std::time::Instant>,
+    /// The notifications, open from the count, with the cursor on the
+    /// item at this place in the list.
+    pub notes: Option<usize>,
+    /// What `x` put away, or opening a Done item did, each until it
+    /// changes, by `inbox::put_away_key`, the newest last.
+    pub put_away: Vec<String>,
+    /// Where `put_away` is kept between runs; None keeps it in memory.
+    pub put_away_file: Option<PathBuf>,
     /// The tab the window under the table shows.
     pub tab: WindowTab,
     /// The window under the table has the keys, in Normal: treetop's keys
@@ -708,6 +700,12 @@ pub struct App {
     /// Rows inside the window under the table, under its tab bar, as last
     /// drawn: what a page of its diff scrolls by.
     pub window_rows: u16,
+    /// How far the Usage column scrolls at most, as last drawn: its lines
+    /// past its foot.
+    pub usage_overflow: u16,
+    /// How far the wheel has scrolled the Usage column, and for which tree:
+    /// another tree under the cursor starts it from the top.
+    usage_scroll: (Option<PathBuf>, u16),
     /// The second window, in a double; None shows one window.
     pub other: Option<OtherWindow>,
     /// What Ctrl+F zoomed, while it is zoomed.
@@ -2027,10 +2025,44 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up if is_terminal => return Outcome::ScrollChat(-1),
             KeyCode::Char('d') if is_terminal => return Outcome::ScrollChat(half),
             KeyCode::Char('u') if is_terminal => return Outcome::ScrollChat(-half),
-            KeyCode::Char('e') => return self.go_waiting(true),
+            KeyCode::Char('e') => {
+                self.is_window_focused = false;
+                self.notes = Some(0);
+            }
             _ => {}
         }
         Outcome::Continue
+    }
+
+    /// The wheel over the Usage column scrolls it, three lines at a time.
+    pub fn wheel_usage(&mut self, is_down: bool) {
+        let at = self.usage_offset();
+        let at = if is_down {
+            at.saturating_add(3).min(self.usage_overflow)
+        } else {
+            at.saturating_sub(3)
+        };
+        self.usage_scroll = (self.window_tree().map(|t| t.path.clone()), at);
+    }
+
+    /// Takes how far the Usage column can scroll as just drawn; with
+    /// another tree under the cursor since the wheel, from the top.
+    pub fn measure_usage(&mut self, overflow: u16) {
+        self.usage_overflow = overflow;
+        let tree = self.window_tree().map(|t| t.path.clone());
+        if self.usage_scroll.0 != tree {
+            self.usage_scroll = (tree, 0);
+        }
+    }
+
+    /// How far the Usage column is scrolled for the tree it shows.
+    pub fn usage_offset(&self) -> u16 {
+        let (tree, at) = &self.usage_scroll;
+        if tree.as_ref() == self.window_tree().map(|t| &t.path) {
+            (*at).min(self.usage_overflow)
+        } else {
+            0
+        }
     }
 
     /// The wheel over the window's diff or PR, with the keys or without:
@@ -2513,9 +2545,11 @@ impl App {
                 agent.status == Some(Status::Waiting)
                     || agent.status != Some(Status::Busy)
                         && agent.job.as_deref().is_some_and(|job| {
-                            self.reports
-                                .iter()
-                                .any(|r| r.job == job && r.state == State::Blocked)
+                            // As its session says now: one answered since is
+                            // no longer an ask.
+                            self.reports.iter().any(|r| {
+                                r.job == job && report_state(r, &self.trees) == State::Blocked
+                            })
                         })
             })
             .filter_map(|(tree, agent)| Some((tree, agent, agent.attach.clone()?)))
@@ -2527,10 +2561,10 @@ impl App {
     fn is_free(&self) -> bool {
         // An ask waits, too, for a start shown in the window, which it
         // would swap out.
-        self.is_on_table() && self.opening.is_none() && !self.is_away_shown()
+        self.is_on_table() && self.opening.is_none() && !self.is_notes_shown()
     }
 
-    /// The table has the keys, with nothing over it but the sheet, or a
+    /// The table has the keys, with nothing over it but the notifications, or a
     /// start shown in the window, which holds none.
     fn is_on_table(&self) -> bool {
         // A window with the keys holds them in Normal too, so an ask never
@@ -2600,6 +2634,12 @@ impl App {
     /// Puts the cursor on the tree at `path`, clearing a filter that hides
     /// it and opening its folded group.
     fn reveal(&mut self, path: PathBuf) {
+        if let Some(main) = self.trees.iter().find(|t| t.is_main && t.path == path) {
+            let name = main.name.clone();
+            self.filter.clear();
+            self.select_tree(&name);
+            return;
+        }
         if !self.visible().iter().any(|t| t.path == path) {
             self.filter.clear();
             let group = self
@@ -2615,14 +2655,16 @@ impl App {
     }
 
     /// The list is on screen with nothing over it but a dialog, and the
-    /// banner over it, so a click can open what it names. Elsewhere the
+    /// count over it, so a click can open what it counts, or the Usage
+    /// column runs past its foot, for the wheel. Elsewhere the
     /// mouse is left to the terminal, so text selects as it always has.
     pub fn wants_mouse(&self) -> bool {
         // A chat or shell read in Normal takes the wheel, to scroll it, and
         // a click, to type to it.
         let is_reading = self.is_window_focused
             && matches!(self.shown_tab(), WindowTab::Chat | WindowTab::Shell);
-        (is_reading || !crate::inbox::waiting(self).is_empty())
+        let (needs, done) = self.notes_list();
+        (is_reading || !needs.is_empty() || !done.is_empty() || self.usage_overflow > 0)
             && !self.is_issues
             && !self.has_keys_on(WindowTab::Diff)
             && !self.has_keys_on(WindowTab::Pr)
@@ -2635,28 +2677,91 @@ impl App {
             && !self.is_help
     }
 
-    /// `e`, or a click on the banner: opens what waits on you, as Enter on
-    /// its tree's row would, switching to its workspace first where that is
-    /// another. `is_next` steps past the one `e` last went to while it
-    /// still waits, so `e` again goes round them all rather than back to
-    /// the same one; one handled since has left, so `e` starts again.
-    pub fn go_waiting(&mut self, is_next: bool) -> Outcome {
-        let waiting = crate::inbox::waiting(self);
-        let at = waiting
-            .iter()
-            .position(|e| Some(&e.about()) == self.watch.went.as_ref())
-            .filter(|_| is_next)
-            .map_or(0, |at| (at + 1) % waiting.len());
-        let Some(entry) = waiting.into_iter().nth(at) else {
-            self.message = Some("nothing is waiting on you".into());
-            return Outcome::Continue;
+    /// `e`, or a click on the count: the notifications, open or closed.
+    pub fn toggle_notes(&mut self) {
+        self.notes = match self.notes {
+            Some(_) => None,
+            None => Some(0),
         };
-        self.go_to(entry)
+    }
+
+    /// The notifications are on screen: open, with the table's keys.
+    pub fn is_notes_shown(&self) -> bool {
+        self.notes.is_some() && self.is_on_table() && !self.is_issues
+    }
+
+    /// What the notifications list, leaving out what is put away: what
+    /// needs action, the oldest first, then what is done, the newest first.
+    pub fn notes_list(&self) -> (Vec<crate::inbox::Entry>, Vec<crate::inbox::Entry>) {
+        let hidden = crate::inbox::put_away(self);
+        let is_shown = |e: &crate::inbox::Entry| !hidden.contains(&e.about());
+        let needs = crate::inbox::needs_action(self)
+            .into_iter()
+            .filter(is_shown)
+            .collect();
+        let mut done: Vec<_> = crate::inbox::done(self)
+            .into_iter()
+            .filter(is_shown)
+            .collect();
+        // A time unknown, as a merge's, sorts last.
+        done.sort_by_key(|e| std::cmp::Reverse(e.at));
+        (needs, done)
+    }
+
+    /// The keys while the notifications are open: ↑↓ pick, Enter opens,
+    /// putting a Done item away, `x` puts one away until it changes, and
+    /// Esc or `e` closes them.
+    fn handle_notes_key(&mut self, key: KeyEvent) -> Outcome {
+        let (needs, done) = self.notes_list();
+        let items: Vec<_> = needs.into_iter().chain(done).collect();
+        let last = items.len().saturating_sub(1);
+        let at = self.notes.unwrap_or(0).min(last);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('e' | 'q') => self.notes = None,
+            KeyCode::Down | KeyCode::Char('j') => self.notes = Some((at + 1).min(last)),
+            KeyCode::Up | KeyCode::Char('k') => self.notes = Some(at.saturating_sub(1)),
+            KeyCode::Enter => {
+                if let Some(entry) = items.into_iter().nth(at) {
+                    self.notes = None;
+                    if matches!(
+                        entry.kind,
+                        crate::inbox::Kind::Done | crate::inbox::Kind::Merged
+                    ) {
+                        self.put_away(&entry);
+                    }
+                    return self.go_to(entry);
+                }
+            }
+            KeyCode::Char('x') => {
+                if let Some(entry) = items.get(at) {
+                    self.put_away(entry);
+                    self.notes = Some(at.min(last.saturating_sub(1)));
+                }
+            }
+            _ => {}
+        }
+        Outcome::Continue
+    }
+
+    /// Takes `entry` out of the notifications until it changes, and keeps
+    /// that for the next run.
+    fn put_away(&mut self, entry: &crate::inbox::Entry) {
+        /// Enough for every item put away for weeks; the oldest go first.
+        const KEPT: usize = 500;
+        let Some(key) = crate::inbox::put_away_key(self, &entry.about()) else {
+            return;
+        };
+        self.put_away.retain(|k| *k != key);
+        self.put_away.push(key);
+        let skip = self.put_away.len().saturating_sub(KEPT);
+        self.put_away.drain(..skip);
+        if let Some(file) = &self.put_away_file {
+            crate::state::write(file, &self.put_away);
+        }
     }
 
     /// Opens `entry`, as Enter on its tree's row would.
     fn go_to(&mut self, entry: crate::inbox::Entry) -> Outcome {
-        self.watch.went = Some(entry.about());
         self.is_window_focused = false;
         self.is_inserting = false;
         if let Some(away) = entry.away {
@@ -2676,49 +2781,34 @@ impl App {
         if !self.is_read() {
             return None;
         }
-        let waiting = crate::inbox::waiting(self);
+        let waiting = crate::inbox::needs_action(self);
         let now = std::time::SystemTime::now();
         let is_new = self.has_looked
             && waiting
                 .iter()
                 .any(|e| !self.watch.since.contains_key(&e.about()));
-        self.back_to_the_sheet(&waiting);
-        if !self.has_looked {
-            // As if a key: what is done already is no news, and away
-            // counts from now outside tmux.
-            self.done_seen = self.done().iter().map(crate::inbox::Entry::about).collect();
-            self.last_key.get_or_insert_with(std::time::Instant::now);
-        }
         self.has_looked = true;
+        let answered = crate::inbox::answered_keys(self);
+        if !answered.is_empty() {
+            self.put_away.retain(|k| !answered.contains(k));
+            if let Some(file) = &self.put_away_file {
+                crate::state::write(file, &self.put_away);
+            }
+        }
         // `waiting` already carries each one's time from the last look, or
-        // its own for one seen first now.
+        // its own for one seen first now; so does what is done, for a merge,
+        // which carries none.
         self.watch.since = waiting
             .iter()
+            .chain(&crate::inbox::done(self))
             .map(|e| (e.about(), e.at.unwrap_or(now)))
             .collect();
-        let waiting = crate::inbox::waiting(self);
+        let waiting = crate::inbox::needs_action(self);
         let line = (!waiting.is_empty()).then(|| {
             let places: Vec<String> = waiting.iter().map(crate::inbox::place_of).collect();
             format!("● {} waiting · {}", waiting.len(), places.join(" "))
         });
         Some((is_new, line))
-    }
-
-    /// What Enter opened from the sheet no longer waits, and its chat or
-    /// tree is still in front of you: the keys come back to the table,
-    /// where the sheet shows again with the next first.
-    fn back_to_the_sheet(&mut self, waiting: &[crate::inbox::Entry]) {
-        let Some(on) = self
-            .away
-            .as_mut()
-            .and_then(|a| a.on.take_if(|on| !waiting.iter().any(|e| e.about() == *on)))
-        else {
-            return;
-        };
-        if self.current().is_some_and(|t| t.path == on.1) {
-            self.is_window_focused = false;
-            self.is_inserting = false;
-        }
     }
 
     /// Since when `about` has waited, as the last look saw it.
@@ -2728,190 +2818,12 @@ impl App {
 
     /// What waits as last looked, for the workspace switched to next.
     pub fn take_watch(&mut self) -> Watch {
-        Watch {
-            away: self.away.take(),
-            closed_away: self.closed_away.take(),
-            went_away: self.went_away.take(),
-            done_seen: std::mem::take(&mut self.done_seen),
-            ..std::mem::take(&mut self.watch)
-        }
+        std::mem::take(&mut self.watch)
     }
 
     /// Takes up what waits as the workspace switched from last looked.
-    pub fn keep_watch(&mut self, mut watch: Watch) {
-        self.away = watch.away.take();
-        self.closed_away = watch.closed_away.take();
-        self.went_away = watch.went_away.take();
-        self.done_seen = std::mem::take(&mut watch.done_seen);
+    pub fn keep_watch(&mut self, watch: Watch) {
         self.watch = watch;
-    }
-
-    /// What has finished or merged, as the sheet's foot counts them.
-    fn done(&self) -> Vec<crate::inbox::Entry> {
-        crate::inbox::entries(self)
-            .into_iter()
-            .filter(|e| {
-                matches!(
-                    e.kind,
-                    crate::inbox::Kind::Done | crate::inbox::Kind::Merged
-                )
-            })
-            .collect()
-    }
-
-    fn away_from(&self, since: std::time::SystemTime) -> Catchup {
-        Catchup {
-            since,
-            done_before: self.done_seen.clone(),
-            later: Vec::new(),
-            on: None,
-        }
-    }
-
-    /// Nothing has been typed, in tmux or here, for `idle`: from AWAY on,
-    /// you are away, and the next key opens what waited meanwhile.
-    pub fn note_idle(&mut self, idle: std::time::Duration) {
-        if idle >= AWAY && self.went_away.is_none() {
-            let since = std::time::SystemTime::now() - idle;
-            self.went_away = Some(self.away_from(since));
-        }
-    }
-
-    /// How long since treetop last had a key, for `note_idle` outside tmux.
-    pub fn since_key(&self) -> std::time::Duration {
-        self.last_key
-            .map_or_else(Default::default, |at| at.elapsed())
-    }
-
-    /// The next key back from away opens the sheet, as `back` would, if
-    /// nothing in front of the table keeps it.
-    pub fn is_due_back(&self) -> bool {
-        self.went_away.is_some() && !crate::inbox::waiting(self).is_empty()
-    }
-
-    /// A key or a paste, wherever it was going. Back from away with
-    /// something waiting, it opens "While you were away" instead, the keys
-    /// back on the table, help closed, and says so, so it goes no further.
-    /// A dialog or a box being typed in keeps it, and the sheet waits for
-    /// the first key once that is gone, since neither is an agent.
-    pub fn back(&mut self) -> bool {
-        self.last_key = Some(std::time::Instant::now());
-        self.done_seen = self.done().iter().map(crate::inbox::Entry::about).collect();
-        let Some(mut away) = self.went_away.take() else {
-            return false;
-        };
-        if crate::inbox::waiting(self).is_empty() {
-            return false;
-        }
-        // The table takes the keys back, from a chat, help or the Issues
-        // screen, unless a dialog or a box being typed in is open, which
-        // keeps the key, with everything left as it was.
-        let was = (
-            self.is_window_focused,
-            self.is_inserting,
-            self.is_help,
-            self.is_issues,
-        );
-        self.is_window_focused = false;
-        self.is_inserting = false;
-        self.is_help = false;
-        self.is_issues = false;
-        if !self.is_on_table() {
-            (
-                self.is_window_focused,
-                self.is_inserting,
-                self.is_help,
-                self.is_issues,
-            ) = was;
-            self.went_away = Some(away);
-            return false;
-        }
-        self.stop_attaching();
-        // Away again with the sheet open: what was put off stays put off.
-        if let Some(open) = self.away.take().or_else(|| self.closed_away.take()) {
-            away.later = open.later;
-        }
-        self.away = Some(away);
-        true
-    }
-
-    /// The sheet is on screen: open, and not stood aside for what Enter
-    /// opened while that still waits and its tree is under the cursor.
-    pub fn is_away_shown(&self) -> bool {
-        let Some(away) = &self.away else {
-            return false;
-        };
-        // Aside while what Enter opened still waits and you are on it.
-        let is_aside = away.on.as_ref().is_some_and(|on| {
-            self.current().is_some_and(|t| t.path == on.1)
-                && crate::inbox::waiting(self).iter().any(|e| &e.about() == on)
-        });
-        !is_aside && self.is_on_table()
-    }
-
-    /// What the sheet lists: what waits, oldest first, what `s` put off
-    /// after the rest.
-    pub fn away_items(&self) -> Vec<crate::inbox::Entry> {
-        let later = self.away.as_ref().map_or(&[][..], |a| &a.later[..]);
-        let mut items = crate::inbox::waiting(self);
-        items.sort_by_key(|e| later.iter().position(|l| *l == e.about()));
-        items
-    }
-
-    /// What finished or merged while you were away, for the sheet's foot.
-    pub fn away_done(&self) -> Vec<crate::inbox::Entry> {
-        let Some(away) = &self.away else {
-            return Vec::new();
-        };
-        // A finish whose time is known counts from when you went; a merge,
-        // which has none, from your last key.
-        self.done()
-            .into_iter()
-            .filter(|e| !away.done_before.contains(&e.about()))
-            .filter(|e| e.at.is_none_or(|at| at >= away.since))
-            .collect()
-    }
-
-    /// The keys while the sheet is on screen: Enter opens the first, `s`
-    /// puts it off till last, Esc closes the sheet; with nothing left,
-    /// any key closes it. Others do nothing, `q` too, since the sheet can
-    /// come back while you are still typing.
-    fn handle_away_key(&mut self, key: KeyEvent) -> Outcome {
-        let items = self.away_items();
-        let Some(first) = items.first().cloned() else {
-            self.away = None;
-            return Outcome::Continue;
-        };
-        let Some(away) = self.away.as_mut() else {
-            return Outcome::Continue;
-        };
-        match key.code {
-            KeyCode::Enter => {
-                away.on = Some(first.about());
-                return self.go_to(first);
-            }
-            KeyCode::Char('s') if items.len() > 1 => {
-                away.later.retain(|l| *l != first.about());
-                away.later.push(first.about());
-            }
-            KeyCode::Esc => {
-                away.on = None;
-                self.closed_away = self.away.take();
-            }
-            _ => {}
-        }
-        Outcome::Continue
-    }
-
-    /// `E`: "While you were away" again, as Esc left it, else what waits
-    /// now.
-    fn open_away(&mut self) {
-        let away = self
-            .closed_away
-            .take()
-            .or_else(|| self.away.take())
-            .unwrap_or_else(|| self.away_from(std::time::SystemTime::now()));
-        self.away = Some(Catchup { on: None, ..away });
     }
 
     /// Puts the cursor on the tree at `path` and opens what an entry
@@ -3070,7 +2982,7 @@ impl App {
     /// Takes the latest reports. Returns what to announce: each job in no
     /// tree, such as the assistant, that has come to need you or finished
     /// since the last read, what needs you first. A tree's, in any
-    /// workspace, waits on you instead, which the banner and the tmux status
+    /// workspace, waits on you instead, which the count and the tmux status
     /// line show.
     pub fn apply_reports(&mut self, reports: Vec<Report>) -> Vec<String> {
         let cursor = self
@@ -3155,7 +3067,7 @@ impl App {
         tree.agents
             .iter()
             .any(|a| a.status == Some(Status::Waiting) && !assistant::is_assistant(&a.name))
-            || self.says(tree).is_some_and(|i| i.state == State::Blocked)
+            || crate::inbox::said(self, tree) == Some(crate::inbox::Said::NeedsYou)
             || tree.ship.as_ref().is_some_and(|s| s.stage.needs_you())
     }
 
@@ -3512,14 +3424,22 @@ impl App {
         self.trees.iter().filter(|t| self.needs_you(t)).count()
     }
 
-    /// Agents outside the pool waiting on you, which have no row to show it.
+    /// Agents outside the pool waiting on you, which have no row to show it:
+    /// another workspace's, as its list has them, and those in no workspace.
     pub fn elsewhere(&self) -> usize {
-        self.items()
+        let away = crate::inbox::needs_action(self)
+            .iter()
+            .filter(|e| e.away.is_some() && e.kind == crate::inbox::Kind::NeedsYou)
+            .count();
+        let nowhere = self
+            .items()
             .iter()
             .filter(|i| i.tree.is_none() && i.state == State::Blocked)
             .filter(|i| !assistant::is_assistant(&i.report.name))
             .filter(|i| !self.is_scratch(i.report.dir.as_deref()))
-            .count()
+            .filter(|i| crate::inbox::place(i.report, &self.pools).is_none())
+            .count();
+        away + nowhere
     }
 
     /// `dir` is a scratch chat's, which is no tree's and nobody's news.
@@ -4441,9 +4361,9 @@ impl App {
         if self.scratch_menu.is_some() {
             return self.handle_scratch_key(key);
         }
-        // The sheet over the table takes its keys, Esc included.
-        if self.is_away_shown() {
-            return self.handle_away_key(key);
+        // The notifications over the table take their keys, Esc included.
+        if self.is_notes_shown() {
+            return self.handle_notes_key(key);
         }
         // A start shown in the window under the table holds no keys: Esc
         // hides it, and the start carries on; the rest work as ever, so a
@@ -4648,8 +4568,7 @@ impl App {
             }
             KeyCode::Char('i') => self.show_issue(),
             KeyCode::Char('I') => self.choose_issue(),
-            KeyCode::Char('e') => return self.go_waiting(true),
-            KeyCode::Char('E') => self.open_away(),
+            KeyCode::Char('e') => self.notes = Some(0),
             KeyCode::Char('m') => self.open_message(),
             KeyCode::Char('q') => return self.quit(),
             KeyCode::Char('U') => return self.restart(),
@@ -4935,6 +4854,7 @@ mod tests {
             job: Some(job.into()),
             plugin: Some("claude".into()),
             active_at: None,
+            answered_at: None,
             context: None,
             spend: None,
             label: None,
@@ -5505,6 +5425,7 @@ mod tests {
         assert_eq!(names(&app), ["8", "4", "7"]);
         let quiet = Agent {
             active_at: Some(1_000),
+            answered_at: None,
             ..agent("quiet")
         };
         app.apply_agents(&HashMap::from([(PathBuf::from("/p/4/app"), vec![quiet])]));
@@ -5869,6 +5790,7 @@ mod tests {
             job: None,
             plugin: None,
             active_at: None,
+            answered_at: None,
             context: None,
             spend: None,
             label: None,
@@ -5880,6 +5802,7 @@ mod tests {
         let with = |name: &str, status, active_at| Agent {
             status: Some(status),
             active_at,
+            answered_at: None,
             ..attachable(name)
         };
         let tree = Tree {

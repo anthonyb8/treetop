@@ -125,17 +125,15 @@ fn chat_size(term: &Term, app: &App) -> Result<(u16, u16)> {
     let screen = Rect::new(0, 0, size.width, size.height);
     Ok(match ui::window_chat_area(app, screen) {
         Some(area) => (area.height.max(1), area.width.max(1)),
-        None => popup_size(term, app)?,
+        None => popup_size(term)?,
     })
 }
 
 /// The size of the terminal a popup chat runs in, the assistant's or a
-/// scratch one: its popup under the bar, less its sidebar, on the screen
-/// under the banner.
-fn popup_size(term: &Term, app: &App) -> Result<(u16, u16)> {
+/// scratch one: its popup, less its sidebar.
+fn popup_size(term: &Term) -> Result<(u16, u16)> {
     let size = term.size()?;
-    let stage = ui::stage(app, Rect::new(0, 0, size.width, size.height));
-    Ok(popup::terminal_size(stage.height, stage.width))
+    Ok(popup::terminal_size(size.height, size.width))
 }
 
 /// A chat takes the keys: one in a popup, or the window's while it has
@@ -184,7 +182,7 @@ fn open_chat(
         }
     }
     let size = if is_popup {
-        popup_size(term, app)?
+        popup_size(term)?
     } else {
         chat_size(term, app)?
     };
@@ -233,22 +231,6 @@ fn show_in_window(
 fn chat_closed(app: &mut App, agent: &str, tree: &str) -> Result<()> {
     app.message = Some(format!("back from {agent} in tree {tree}"));
     leave_window(app)
-}
-
-/// A key or paste: back from away with something waiting, it opens "While
-/// you were away" and goes no further. A popup chat, the assistant's or a
-/// scratch one, holds the keys whatever the table does, so it is put away
-/// for the sheet, as a click on the banner puts it away.
-fn come_back(chats: &mut Chats, app: &mut App) -> Result<bool> {
-    let is_popup = chats.open().is_some_and(ui::is_popup_chat);
-    if is_popup && app.is_due_back() {
-        let open = chats.open().map(|c| (c.agent.clone(), c.tree.clone()));
-        chats.hide();
-        if let Some((agent, tree)) = open {
-            chat_closed(app, &agent, &tree)?;
-        }
-    }
-    Ok(app.back())
 }
 
 /// The window's chat gives the keys back to the table and keeps running
@@ -366,10 +348,6 @@ fn choices() -> Vec<Choice> {
         .collect()
 }
 
-/// How often treetop asks tmux how long since anyone typed, for "While you
-/// were away".
-const IDLE_EVERY: Duration = Duration::from_secs(5);
-
 fn run(
     term: &mut Term,
     app: &mut App,
@@ -393,7 +371,7 @@ fn run(
     let mut drawn_at = Instant::now();
     let mut chats = Chats::default();
     let mut keeper = Keeper::default();
-    // Whether the mouse is captured for an open issue or the banner, apart
+    // Whether the mouse is captured for an open issue or the count, apart
     // from a chat's.
     let mut is_issue_mouse = false;
     // The sizes the chats' terminals were last given: the window's, and the
@@ -423,8 +401,6 @@ fn run(
     let mut updating: Option<mpsc::Receiver<Result<String, String>>> = None;
     // The line tmux's status shows for what waits on you, as last set.
     let mut shown_waiting: Option<Option<String>> = None;
-    // When tmux was last asked how long since anyone typed.
-    let mut idle_read = Instant::now();
     loop {
         while let Ok(update) = refresher.updates.try_recv() {
             is_stale = true;
@@ -591,7 +567,7 @@ fn run(
         }
         was_issues = app.is_issues;
         // An open issue takes the mouse, for its links and the wheel, and
-        // the list does while the banner is up, for a click on it; a chat
+        // the list does while the count shows, for a click on it; a chat
         // captures it on its own, and gives it back when it closes.
         if chat_has_keys(&chats, app) {
             is_issue_mouse = false;
@@ -839,9 +815,9 @@ fn run(
             }
             is_stale = true;
         }
-        // A resize, the banner coming or going, or the windows split or
-        // joined, changes the room a chat has, before it is drawn there.
-        let sizes = (chat_size(term, app)?, popup_size(term, app)?);
+        // A resize, or the windows split or joined, changes the room a chat
+        // has, before it is drawn there.
+        let sizes = (chat_size(term, app)?, popup_size(term)?);
         if chat_sized != Some(sizes) {
             let ((rows, cols), (popup_rows, popup_cols)) = sizes;
             chats.resize(rows, cols);
@@ -855,17 +831,6 @@ fn run(
             }
             chat_sized = Some(sizes);
         }
-        if idle_read.elapsed() >= IDLE_EVERY {
-            idle_read = Instant::now();
-            let idle = if app.is_in_tmux {
-                tmux::idle()
-            } else {
-                Some(app.since_key())
-            };
-            if let Some(idle) = idle {
-                app.note_idle(idle);
-            }
-        }
         if is_stale && let Some((is_new, line)) = app.watch_waiting() {
             if is_new {
                 ring()?;
@@ -876,7 +841,7 @@ fn run(
             }
             let now = SystemTime::now();
             let read: Vec<PathBuf> = app.away_live.keys().cloned().collect();
-            let due = desktop.due(&inbox::waiting(app), &read, now);
+            let due = desktop.due(&inbox::needs_action(app), &read, now);
             if !due.is_empty() {
                 let passthrough = app.is_in_tmux.then(tmux::allow_passthrough);
                 let (bytes, said) = desktop.tell(&due, passthrough.as_deref(), now);
@@ -892,6 +857,10 @@ fn run(
             let size = term.size()?;
             app.window_rows = ui::window_chat_area(app, Rect::new(0, 0, size.width, size.height))
                 .map_or(0, |area| area.height);
+            app.measure_usage(ui::usage_overflow(
+                app,
+                Rect::new(0, 0, size.width, size.height),
+            ));
             let other = app
                 .other_chat()
                 .and_then(|(command, ..)| chats.running(&command));
@@ -909,16 +878,6 @@ fn run(
         // A key or a resize: either way the screen is drawn again.
         is_stale = true;
         let event = chat::as_ctrl_q(event::read()?);
-        // Back from away, the first key or paste opens what waited
-        // meanwhile and goes no further, so it reaches no agent.
-        let is_typed = match &event {
-            Event::Key(key) => key.kind == KeyEventKind::Press,
-            Event::Paste(_) => true,
-            _ => false,
-        };
-        if is_typed && come_back(&mut chats, app)? {
-            continue;
-        }
         // Over the window's chat while the table has the keys, the wheel
         // scrolls it and a click gives it the keys.
         if let &Event::Mouse(mouse) = &event
@@ -1000,11 +959,11 @@ fn run(
                 &Event::Mouse(mouse) => {
                     let size = term.size()?;
                     let screen = Rect::new(0, 0, size.width, size.height);
-                    // A click on the banner over the chat leaves the chat
-                    // for what it names, which the list's own click below
-                    // opens.
+                    // A click on the count over the chat leaves the chat
+                    // for the notifications, which the list's own click
+                    // below opens.
                     let area = if is_popup {
-                        Some(popup::chat(ui::stage(app, screen)))
+                        Some(popup::chat(screen))
                     } else {
                         ui::window_chat_area(app, screen)
                     };
@@ -1012,7 +971,7 @@ fn run(
                     let is_over =
                         area.is_some_and(|a| a.contains(Position::new(mouse.column, mouse.row)));
                     if is_popup {
-                        is_list_click = is_click && ui::is_on_banner(app, screen, mouse);
+                        is_list_click = is_click && ui::is_on_count(app, screen, mouse);
                     } else {
                         // A click outside the window gives the table the
                         // keys, and lands there as a click on the list.
@@ -1051,6 +1010,10 @@ fn run(
                     .is_some_and(|a| a.contains(Position::new(mouse.column, mouse.row)))
             {
                 app.wheel_window(mouse.kind == MouseEventKind::ScrollDown);
+                continue;
+            }
+            if is_wheel && ui::is_on_usage(app, screen, mouse) {
+                app.wheel_usage(mouse.kind == MouseEventKind::ScrollDown);
                 continue;
             }
             match ui::click(app, screen, mouse) {
@@ -1282,6 +1245,10 @@ fn show(
         if let Some(file) = state::layout_file(&checkout) {
             app.keep_layout_in(file);
         }
+        if let Some(file) = state::put_away_file() {
+            app.put_away = state::read(&file);
+            app.put_away_file = Some(file);
+        }
         app.arriving = arriving.take();
         app.pools = inbox::other_pools(&checkout);
         app.ship_plugins = ship::plugins(&checkout).0;
@@ -1379,47 +1346,4 @@ fn restart(workspace: &Path) -> Result<()> {
         .current_dir(workspace)
         .exec();
     Err(err).with_context(|| format!("starting {}", exe.display()))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-
-    #[test]
-    fn back_from_away_the_assistants_popup_gives_way_to_the_sheet() {
-        let mut app = inbox::tests::app();
-        let mut chats = Chats::default();
-        chats
-            .show(
-                &["cat".into()],
-                (20, 60),
-                assistant::NAME.into(),
-                app::SCRATCH.into(),
-                None,
-            )
-            .unwrap();
-        assert!(chat_has_keys(&chats, &app));
-        app.note_idle(Duration::from_secs(10 * 60));
-        assert!(
-            come_back(&mut chats, &mut app).unwrap(),
-            "the key goes no further"
-        );
-        assert!(!chat_has_keys(&chats, &app), "nor do the keys after it");
-        assert!(app.is_away_shown());
-        // Not away, the popup keeps the keys.
-        let mut app = inbox::tests::app();
-        let mut chats = Chats::default();
-        chats
-            .show(
-                &["cat".into()],
-                (20, 60),
-                assistant::NAME.into(),
-                app::SCRATCH.into(),
-                None,
-            )
-            .unwrap();
-        assert!(!come_back(&mut chats, &mut app).unwrap());
-        assert!(chat_has_keys(&chats, &app));
-    }
 }

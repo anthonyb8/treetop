@@ -184,6 +184,7 @@ mod tests {
             job: None,
             plugin: None,
             active_at: None,
+            answered_at: None,
             context: None,
             spend: None,
             label: None,

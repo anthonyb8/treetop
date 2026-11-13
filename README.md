@@ -51,8 +51,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | `n` | start a new agent in the tree under the cursor: a free one is leased for it, on a branch named for the task, and a held one keeps its branch; on the main checkout's heading, start one in the main checkout, for work that needs no tree |
 | `N` | start a new agent in a fresh tree, on a branch named for the task (see [New agents](#new-agents)) |
 | `m` | write a message to the agents in the marked trees, or the tree under the cursor |
-| `e` | go to what waits on you, the one the banner names first, and again to the next, from the table or a chat in Normal (see [What waits on you](#what-waits-on-you)) |
-| `E` | show "While you were away" again, what waits on you to go through one at a time |
+| `e` | open the notifications, what needs action and what is done, from the table or a chat in Normal (see [What waits on you](#what-waits-on-you)) |
 | `:` | ask the assistant about the tree under the cursor, or write `@17 ...` for that tree's agent (see [The assistant](#the-assistant)) |
 | `a` | open the assistant's chat, where it answers, starting it if there is none |
 | `d` | show the side-by-side diff of the tree under the cursor in the window's diff tab, with the keys |
@@ -395,7 +394,7 @@ The tree treetop was started in is never a target, because returning or destroyi
 
 ## Agent chats
 
-The Trees screen is two windows over the bottom bar: the table on top, and under it a window on the tree under the cursor, with the [banner](#what-waits-on-you) across the top while anything waits on you.
+The Trees screen is two windows over the bottom bar: the table on top, and under it a window on the tree under the cursor, with the [count](#what-waits-on-you) at the right of the table's top border while anything needs action or is done.
 The table's window is as tall as its rows, up to just under half the screen; the window under it takes the rest.
 While the window under the table has the keys, the table shrinks to a fifth of the screen, scrolling to keep the cursor's row in view, so the window gets the other four fifths; giving the keys back to the table puts both back.
 The window that has the keys has its border in the title colour, as Neovim marks the window the cursor is in.
@@ -430,13 +429,14 @@ In an agent's chat treetop takes Ctrl+F for this, as it takes Ctrl+Q; a shell ke
 Moving the cursor keeps the tab, so the diff tab shows each tree's diff in turn and the PR tab each tree's PR, once the cursor rests on it; a PR read before shows as it was last read, and `v` reads it afresh.
 A tab the tree under the cursor has not got shows its info instead.
 At the right of the bar, how full the agent's context is and what its session has spent.
-From 180 columns a Usage column down the right of the table and the window has them in full, as the chat popup's sidebar does, for the tree under the cursor: how full its agent's context is and where that comes from, from 75% in a pool tree the hint that `h` hands it off, how much of the plan is used, a bar for each limit with when it resets, which shows even on a tree with no agent, and what the session has spent.
-On a screen too short for all of it, where the context comes from gives way first.
+From 180 columns a Usage column beside the table, as tall as the table's window, has them in full, as the chat popup's sidebar does, for the tree under the cursor: how full its agent's context is and where that comes from, from 75% in a pool tree the hint that `h` hands it off, how much of the plan is used, a bar for each limit with when it resets, which shows even on a tree with no agent, and what the session has spent.
+The window under them spans the full width.
+What does not fit in the column scrolls with the mouse wheel over it, and its last line says how many lines are below, such as `↓ 13 more`; another tree under the cursor starts it from the top.
 Once the cursor has rested on a tree for a moment, the chat tab shows its agent's chat, so moving down the list opens no chat on the way; a tree whose agent is not running says Enter starts it again, since opening it would.
 
 Enter gives the chat's window the keys in Normal and Enter again starts Insert, ready to type to, while a click in the chat goes straight to Insert; Ctrl+Q gives the window the keys in Normal too (see [Normal and Insert](#normal-and-insert)), and a click outside it gives them back to the table, with the chat still running on screen.
 An agent's question counts as seen once its chat has had the keys, not when it only showed in the window.
-The chat's terminal is the size of the inside of the window, under its tab bar, and follows it when the terminal is resized or the banner comes or goes.
+The chat's terminal is the size of the inside of the window, under its tab bar, and follows it when the terminal is resized.
 
 The assistant's chat (`a`) and the scratch chats (`C`) belong to no tree, so they open in a popup over treetop instead, the way `d` opens the diff; so does a tree's chat given the keys over the Issues screen, or on a terminal too short for the window, and one without the keys there stays out of sight.
 The pool stays on screen, dimmed, round the popup's border, so a chat never passes for a Claude Code session of your own; a bar on the popup's first row, inside its border, names the agent, with the keys out at its right.
@@ -459,7 +459,7 @@ A chat you leave keeps running in the background with its screen current, so Ent
 treetop runs the chat in a terminal of its own and draws it, so nothing the chat does to its terminal reaches yours, and treetop keeps refreshing behind it.
 Keys, pastes and the mouse go to the chat: the wheel scrolls back through it, three lines a step, and clicks work as they do in Claude itself.
 Over the window's chat while the table has the keys, the wheel still scrolls it, wherever treetop has the mouse.
-treetop takes the mouse while a chat has the keys, and while the banner is up for its clicks; elsewhere the terminal and tmux keep it.
+treetop takes the mouse while a chat has the keys, while the count shows, for its clicks, and while the Usage column runs past its foot, for the wheel; elsewhere the terminal and tmux keep it.
 From the keyboard, Ctrl+O opens Claude's transcript view, where j/k move a line and Ctrl+u/Ctrl+d half a page; PgUp and PgDn also work where a keyboard has them.
 
 A background Claude Code session (started with `claude --bg`, or backgrounded) opens with `claude attach`, which never starts a second copy.
@@ -487,7 +487,7 @@ Ctrl+\\, Ctrl+F and Ctrl+P keep working as before, and a shell keeps Ctrl+F and 
 Ctrl+Q from the table, Enter on a tree and an agent opened with `e` land in Normal, so nothing typed reaches an agent by accident; a second Enter starts Insert, and a click in the chat lands in Insert, ready to type.
 The diff, PR, run and info tabs have nothing to type into, so they are only ever in Normal.
 The bar at the bottom lists the mode's keys while a window has them.
-The mouse wheel over a window scrolls what it shows, from the table while the banner is up and from Normal on a chat or shell; on a diff or PR with the keys, the terminal keeps the mouse, so text selects there as ever.
+The mouse wheel over a window scrolls what it shows, from the table while the count shows or the Usage column runs past its foot, and from Normal on a chat or shell; on a diff or PR with the keys, the terminal keeps the mouse, so text selects there as ever.
 
 ## The assistant and dispatch
 
@@ -648,26 +648,25 @@ What you have seen is kept per workspace under `$XDG_STATE_HOME/treetop` (else `
 Something waits on you while an agent asks you something or sits at a prompt, a tree's PR has failed its checks, or an agent has died, in this workspace or another.
 It stops waiting once that stops being true: the agent is answered, a new push passes, the agent is resumed with `R`, or the tree is returned.
 An agent still asking is the one ask however often it writes, so it rings once.
-So there is nothing to open or dismiss, and an agent that finished or a PR that merged never waits.
+So there is nothing to dismiss, and an agent that finished or a PR that merged never waits: it is done instead.
+An agent whose turn has ended, its session idle, has finished, though it never wrote a report saying so; and a report that it was waiting on you stops counting once its session has run a turn past it, answered since, so a question answered days ago no longer waits, while one nobody answered still does, however long ago.
 
-While anything waits, a banner runs across the top of the screen, yellow for an ask and red for a failure: the tree, what it waits for, its ticket and branch with the question or failure, how many more wait, and `e`.
+While anything needs action or is done, a count sits at the right of the Trees window's top border, such as `● 2 needs action  ✓ 3 done  e`.
 It never takes the keys, so what you type keeps going where it was, a chat in Insert included, and it stays bright over a popup.
-`e` from the table, or from a chat or shell in Normal, opens the first: an agent's chat, with its question at the bottom; for a PR, the cursor on its tree with its checks in the info tab, where `f` sends a failure to its agent; for a dead agent, the cursor on its tree, where `R` resumes it.
-`e` again goes on to the next, round them all, and says so when nothing waits; a click on the banner opens the one it names.
+`e` from the table, or from a chat or shell in Normal, or a click on the count, opens the notifications under it: Needs action, what is stopped until you act, then Done, what finished or merged and is not working, the newest first.
+Each shows its tree, its ticket and branch, how long ago, and what it is about in full, such as the agent's whole question.
+↑↓ pick one and Enter opens it: an agent's chat, with its question at the bottom; for a PR, the cursor on its tree with its checks in the info tab, where `f` sends a failure to its agent; for a dead agent, the cursor on its tree, where `R` resumes it.
+Needs action leaves once it is dealt with, and Done once you open it.
+`x` puts one away, out of the list and the count, until it changes, such as its agent asking something new or finishing again; what is put away is kept in treetop's state directory, so it stays away after a restart.
+Esc or `e` closes them, and coming back after time away opens nothing by itself.
 The oldest comes first: each is as old as it has waited, from when it happened, or from when treetop first saw it where that is not known, as for a PR.
 
-Inside tmux, the status line of every window shows `● 2 waiting · 17 22` at its right for as long as anything waits, and clears once nothing does or treetop quits.
+Inside tmux, the status line of every window shows `● 2 waiting · 17 22` at its right for as long as anything needs action, what `x` put away included, and clears once nothing does or treetop quits.
 treetop sets it on its session over the global `status-right`, and unsets it again, so your own `status-right` is left as it was.
 When something starts waiting, treetop rings the terminal bell, once, so it is heard from any window; the assistant finishing an answer rings it too, and shows it in the status line for five seconds.
 It shows a desktop notification too, on the machine whose terminal treetop is in, a laptop reaching the server over SSH included: the tree, its ticket and branch, what it waits for and, for an ask, the question.
 It goes as the terminal's own notification escape, OSC 777, which foot, WezTerm, Ghostty, kitty and urxvt show, so nothing more runs on the server; something still waiting at thirty minutes is shown once more, saying how long, and what already waits when treetop opens is not.
 Inside tmux it needs `allow-passthrough` set to `all` (`tmux set -g allow-passthrough all`), since `on` passes it only from the window on screen, and until it is, treetop says so once on its status line.
-
-Back after ten minutes or more with no key typed in any tmux window, or in treetop outside tmux, your first key opens "While you were away", and goes no further, so it reaches no agent; typing in another window meanwhile keeps you present, so it never opens.
-It lists what still waits, the oldest first with how long ago, and at its foot what finished or merged while you were away.
-Enter opens the first, as `e` would, and the sheet stands aside until that one stops waiting, such as once you answer the agent; then the keys come back to the table and the sheet shows again with the next first, until it says you are all caught up.
-`s` puts the first off till last, and Esc closes it.
-`E` shows it again as you left it.
 
 Another workspace's entries carry its name, such as `keel:3`, and opening one switches there first; an agent with no chat, such as `claude` in a tmux pane, is gone to inside tmux, as `t` does.
 Its background agents are placed in their trees by the workspace's last listing; its PRs that failed, and its agents waiting at a prompt in a tmux pane, come from a read of its pool every three minutes, for the workspaces opened in the last week, so they can show a few minutes late.
@@ -911,7 +910,7 @@ Tapping one opens that tree's chat, or the tree for a PR or a dead agent, in the
 A notification names the tree and what happened, such as `17 · END-123 fix-login` and `Needs you`, never what the agent wrote, and goes encrypted for your phone through Apple's push service, the one thing the server sends off your tailnet.
 The server keeps its push key and the phones that turned notifications on in `push/` beside the config, readable by you alone; a phone that turns them off in Settings is dropped the next time a push finds it gone.
 
-Waiting, in the tab bar, is what the desktop's banner names, from every workspace, the oldest first with how long each has waited, and its tab counts them.
+Waiting, in the tab bar, is what the desktop's Needs action lists, from every workspace, the oldest first with how long each has waited, and its tab counts them.
 Each leaves once it is dealt with, so there is nothing to dismiss; what finished or merged is one line at the foot.
 A tap opens it as its notification would, the agent's chat or the tree for a PR or an agent that died, switching to its workspace first.
 With the server out of reach while it is open, it shows the pool as it last saw it and says so.

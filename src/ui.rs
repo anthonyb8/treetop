@@ -44,7 +44,7 @@ const KEYS: [(&str, &str); 16] = [
     ("^Q", "window"),
     ("^P", "commands"),
     ("?", "help"),
-    ("e", "what waits"),
+    ("e", "notifications"),
     ("n", "new here"),
     ("N", "new tree"),
     ("m", "message"),
@@ -81,8 +81,7 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
             ("a", "assistant's chat"),
             ("R", "resume agent"),
             ("h", "hand off work"),
-            ("e", "next that waits"),
-            ("E", "while you were away"),
+            ("e", "notifications"),
         ],
     ),
     (
@@ -222,7 +221,7 @@ pub fn draw(
     match issues.filter(|_| app.is_issues) {
         Some(screen) => screen.draw(frame, frame.area(), &palette(), app),
         None => {
-            let rows = screen_rows(app, frame.area());
+            let rows = screen_rows(frame.area());
             let windows = windows(app, rows.main);
             if is_classic(app) {
                 // Zoomed, the table is the screen treetop had before its
@@ -230,6 +229,10 @@ pub fn draw(
                 let [body, detail] =
                     Layout::vertical([Constraint::Fill(1), Constraint::Length(DETAIL_HEIGHT)])
                         .areas(windows.top);
+                // Unboxed, the table gives the count a row of its own.
+                let count = u16::from(count_area(app, rows.main).is_some());
+                let [_, body] =
+                    Layout::vertical([Constraint::Length(count), Constraint::Fill(1)]).areas(body);
                 draw_table(frame, app, body, false);
                 draw_detail(frame, app, detail);
             } else {
@@ -266,9 +269,6 @@ pub fn draw(
                 draw_usage_column(frame, app, area);
             }
             draw_footer(frame, app, rows.footer);
-            if let Some(area) = rows.banner {
-                draw_banner(frame, app, area);
-            }
         }
     }
     let popup_chat = chat.filter(|c| floats(app, is_popup_chat(c), frame.area()));
@@ -292,15 +292,17 @@ pub fn draw(
         || app.phone.is_some()
         || app.scratch_menu.is_some()
         || app.is_help
-        || app.is_away_shown()
+        || app.is_notes_shown()
     {
-        // The banner stays bright and live; only what the popup sits over
+        // The count stays bright and live; only what the popup sits over
         // dims.
-        let area = stage(app, frame.area());
+        let area = frame.area();
         frame
             .buffer_mut()
             .set_style(area, Style::new().add_modifier(Modifier::DIM));
     }
+    // Drawn over the dimming, so it stays bright under a popup.
+    draw_count(frame, app, screen_rows(frame.area()).main);
     if let Some(chat) = popup_chat {
         draw_chat(frame, app, chat);
     } else if floating_tab {
@@ -310,10 +312,7 @@ pub fn draw(
     } else if let Some(prompt) = &app.prompt {
         draw_prompt(
             frame,
-            form.map_or_else(
-                || stage(app, frame.area()),
-                |area| Block::bordered().inner(area),
-            ),
+            form.map_or_else(|| frame.area(), |area| Block::bordered().inner(area)),
             prompt,
         );
     } else if let Some(picker) = &app.picker {
@@ -334,8 +333,8 @@ pub fn draw(
         draw_confirm(frame, pending);
     } else if app.is_help {
         draw_help(frame, &HELP);
-    } else if app.is_away_shown() {
-        draw_away(frame, app);
+    } else if app.is_notes_shown() {
+        draw_notes(frame, app);
     }
     // The palette opens over whatever is on screen, a chat's popup too.
     if let Some(palette) = &app.palette {
@@ -343,102 +342,132 @@ pub fn draw(
     }
 }
 
-/// The widest "While you were away" gets.
-const AWAY_WIDTH: u16 = 88;
+/// The widest the notifications get.
+const NOTES_WIDTH: u16 = 72;
 
-/// "While you were away": what still waits, the first highlighted for
-/// Enter, each with its tree, ticket, age and what it is about; then what
-/// finished or merged meanwhile; or that you are caught up.
-fn draw_away(frame: &mut Frame, app: &App) {
+/// An entry's mark and its colour: asking, failed or died, or done.
+fn mark_of(kind: Kind) -> (&'static str, Color) {
     let t = theme();
-    let Some(away) = &app.away else {
-        return;
-    };
-    let screen = stage(app, frame.area());
-    let width = screen.width.saturating_sub(4).min(AWAY_WIDTH);
+    match kind {
+        Kind::NeedsYou => ("●", t.warning),
+        Kind::Failed | Kind::Died => ("✗", t.danger),
+        Kind::Done | Kind::Merged => ("✓", t.success),
+    }
+}
+
+/// The notifications, under the count at the top right: what needs action,
+/// then what is done, each with its tree, ticket, age and what it is about
+/// in full, the one under the cursor highlighted for Enter.
+fn draw_notes(frame: &mut Frame, app: &App) {
+    let t = theme();
+    let screen = frame.area();
+    let width = screen.width.saturating_sub(2).min(NOTES_WIDTH);
     let inner_width = usize::from(width.saturating_sub(4));
-    let items = app.away_items();
+    let (needs, done) = app.notes_list();
+    let at = app
+        .notes
+        .unwrap_or(0)
+        .min((needs.len() + done.len()).saturating_sub(1));
     let mut lines: Vec<Line> = Vec::new();
-    if items.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("✓ ", fg(t.success)),
-            Span::raw("All caught up. Nothing is waiting on you."),
-        ]));
-    }
-    for (at, entry) in items.iter().enumerate() {
-        let (mark, colour) = if entry.kind == Kind::NeedsYou {
-            ("●", t.warning)
-        } else {
-            ("✗", t.danger)
-        };
-        let age = entry.at.map(reports::age).unwrap_or_default();
-        let head = format!(
-            "{mark} {} {}",
-            inbox::place_of(entry).replace(':', " "),
-            waits_for(entry.kind)
-        );
-        let title = entry.title.clone().unwrap_or_default();
-        let room = inner_width.saturating_sub(head.chars().count() + age.len() + 2);
-        let title = fit(&title, room);
-        let pad = inner_width
-            .saturating_sub(head.chars().count() + 1 + title.chars().count() + age.len());
-        let style = if at == 0 { t.cursor } else { Style::new() };
-        lines.push(
-            Line::from(vec![
-                Span::styled(head, fg(colour).add_modifier(Modifier::BOLD)),
-                Span::raw(format!(" {title}{}", " ".repeat(pad))),
-                Span::styled(age, fg(t.muted)),
-            ])
-            .style(style),
-        );
-        let what = format!("  {}", fit(&entry.what, inner_width.saturating_sub(2)));
-        let pad = inner_width.saturating_sub(what.chars().count());
-        lines.push(Line::raw(format!("{what}{}", " ".repeat(pad))).style(style));
-    }
-    let done = app.away_done();
-    // On a short screen the list gives way, so the foot still shows.
-    let room = usize::from(screen.height.saturating_sub(2)).saturating_sub(if done.is_empty() {
-        0
-    } else {
-        2
-    });
-    lines.truncate(room);
-    if !done.is_empty() {
-        lines.push(Line::raw(""));
-        let also: Vec<String> = done
-            .iter()
-            .map(|e| {
-                let did = if e.kind == Kind::Merged {
-                    "merged"
-                } else {
-                    "finished"
-                };
-                format!("✓ {} {did}", inbox::place_of(e))
-            })
-            .collect();
+    // Where the item under the cursor starts and ends, to keep it in view.
+    let mut cursor = (0, 0);
+    let mut item = 0;
+    let mut section = |lines: &mut Vec<Line<'static>>,
+                       head: &str,
+                       colour: Color,
+                       entries: &[inbox::Entry],
+                       none: &str| {
         lines.push(Line::styled(
-            fit(&format!("Also: {}", also.join(" · ")), inner_width),
-            fg(t.muted),
+            head.to_string(),
+            fg(colour).add_modifier(Modifier::BOLD),
         ));
-    }
-    let keys: &[(&str, &str)] = if items.is_empty() {
-        &[("any key", "close")]
-    } else if items.len() > 1 {
-        &[("Enter", "go"), ("s", "later"), ("Esc", "close")]
-    } else {
-        &[("Enter", "go"), ("Esc", "close")]
+        if entries.is_empty() {
+            lines.push(Line::styled(none.to_string(), fg(t.muted)));
+        }
+        for entry in entries {
+            let start = lines.len();
+            let (mark, colour) = mark_of(entry.kind);
+            let place = inbox::place_of(entry).replace(':', " ");
+            let age = entry.at.map(reports::age).unwrap_or_default();
+            let head = format!("{mark} {place}");
+            let title = entry.title.clone().unwrap_or_default();
+            let room = inner_width.saturating_sub(head.chars().count() + age.len() + 2);
+            let title = fit(&title, room);
+            let pad = inner_width
+                .saturating_sub(head.chars().count() + 1 + title.chars().count() + age.len());
+            let style = if item == at { t.cursor } else { Style::new() };
+            lines.push(
+                Line::from(vec![
+                    Span::styled(head, fg(colour).add_modifier(Modifier::BOLD)),
+                    Span::raw(format!(" {title}{}", " ".repeat(pad))),
+                    Span::styled(age, fg(t.muted)),
+                ])
+                .style(style),
+            );
+            for row in wrap_spans(vec![Span::raw(format!("  {}", entry.what))], inner_width, 2) {
+                let pad = inner_width.saturating_sub(row.width());
+                let mut row = row;
+                row.spans.push(Span::raw(" ".repeat(pad)));
+                lines.push(row.style(style));
+            }
+            if item == at {
+                cursor = (start, lines.len());
+            }
+            item += 1;
+        }
     };
-    let gone = format!(" gone {} ", reports::age(away.since));
+    section(
+        &mut lines,
+        "NEEDS ACTION · stopped until you act",
+        t.warning,
+        &needs,
+        "Nothing needs you.",
+    );
+    lines.push(Line::raw(""));
+    section(
+        &mut lines,
+        "DONE · finished, not working",
+        t.success,
+        &done,
+        "Nothing finished since you last looked.",
+    );
+    // Under the count, its right edge with the count's, above the bar.
+    let main = screen_rows(frame.area()).main;
+    // With nothing counted, where the count would end: inside the table
+    // window's corner.
+    let table = windows(app, main).top;
+    let count = count_area(app, main).unwrap_or(Rect {
+        x: table.right().saturating_sub(1),
+        y: table.y,
+        width: 0,
+        height: 1,
+    });
+    let top = count.bottom();
     let height = u16::try_from(lines.len())
         .unwrap_or(u16::MAX)
-        .saturating_add(2);
-    let area = popup::centered(screen, width, height.min(screen.height));
+        .saturating_add(2)
+        .min(main.bottom().saturating_sub(top));
+    // Scrolled only as far as keeps the item under the cursor in view.
+    let rows = usize::from(height.saturating_sub(2));
+    let offset = cursor.1.saturating_sub(rows).min(cursor.0);
+    let lines: Vec<Line> = lines.into_iter().skip(offset).collect();
+    let area = Rect {
+        x: count.right().saturating_sub(width).max(screen.x),
+        y: top,
+        width,
+        height,
+    };
+    let keys = [
+        ("↑↓", "pick"),
+        ("Enter", "open"),
+        ("x", "not now"),
+        ("Esc", "close"),
+    ];
     let block = popup_block(Line::styled(
-        " While you were away ",
+        " Notifications ",
         fg(t.title).add_modifier(Modifier::BOLD),
     ))
-    .title_top(Line::styled(gone, fg(t.muted)).right_aligned())
-    .title_bottom(Line::from(fitting_keys(keys, width.saturating_sub(2))))
+    .title_bottom(Line::from(fitting_keys(&keys, width.saturating_sub(2))))
     .padding(Padding::horizontal(1));
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
@@ -746,15 +775,30 @@ fn agent_style(status: Option<Status>) -> (&'static str, Style) {
 /// one to check on. The main checkout with none is simply blank.
 fn agent_cell(app: &App, tree: &Tree) -> Cell<'static> {
     let agents = App::agents_of(tree);
-    let Some(first) = agents.first() else {
+    let said = inbox::said(app, tree);
+    // The main checkout hides its cold agents, unless the lists have one
+    // in them: then its newest stands for it, with their mark.
+    let newest_cold = || {
+        tree.agents
+            .iter()
+            .filter(|a| !assistant::is_assistant(&a.name))
+            .max_by_key(|a| a.active_at)
+    };
+    let Some(first) = agents.first().copied().or_else(|| {
+        said.filter(|s| *s != inbox::Said::Other)
+            .and_then(|_| newest_cold())
+    }) else {
         return if tree.is_held() && !tree.is_main && app.is_agents_read {
             Cell::from("no agent").style(fg(theme().muted))
         } else {
             Cell::from("")
         };
     };
-    let (glyph, style) = match app.says(tree).map(|item| item.state) {
-        Some(state @ (State::Blocked | State::Done | State::Failed)) => state_style(state),
+    // As the lists have it, so the row and the count agree.
+    let (glyph, style) = match said {
+        Some(inbox::Said::NeedsYou) => state_style(State::Blocked),
+        Some(inbox::Said::Done) => state_style(State::Done),
+        Some(inbox::Said::Died) => state_style(State::Failed),
         _ => agent_style(first.status),
     };
     let live = agents
@@ -1409,7 +1453,7 @@ const WINDOW_MIN: u16 = 5;
 /// Columns the column beside the table takes, its border included.
 const USAGE_WIDTH: u16 = 38;
 
-/// The narrowest screen the column runs down the right of: the table's
+/// The narrowest screen the column sits beside the table on: the table's
 /// fixed columns take about a hundred, so this leaves BRANCH and AGENT room
 /// to read. Below it the bar keeps its one line of context and spend.
 const USAGE_FROM: u16 = 180;
@@ -1418,57 +1462,62 @@ const USAGE_FROM: u16 = 180;
 struct Windows {
     /// The table.
     top: Rect,
-    /// Down the right of the table and the window, how full the window
-    /// agent's context is, how much of the plan is used and what its session
-    /// has spent.
+    /// Beside the table, as tall as it, how full the window agent's
+    /// context is, how much of the plan is used and what its session has
+    /// spent.
     usage: Option<Rect>,
     /// The window under them, showing the tree under the cursor.
     window: Option<Rect>,
 }
 
-/// The table's window is as tall as its rows, between TABLE_MIN and
-/// TABLE_SHARE of `main`, or TABLE_SHARE_IN_WINDOW while the window has the
-/// keys; the window under it takes the rest. From USAGE_FROM the column
-/// runs down the right of both, its full height.
+/// The table's window, the column beside it and the window under both,
+/// on `main`.
 fn windows(app: &App, main: Rect) -> Windows {
-    let (main, usage) = if main.width >= USAGE_FROM {
-        let [left, usage] =
-            Layout::horizontal([Constraint::Fill(1), Constraint::Length(USAGE_WIDTH)]).areas(main);
-        (left, Some(usage))
-    } else {
-        (main, None)
-    };
+    let laid = lay_out(app, main);
+    // From USAGE_FROM the column sits beside the table, its height, but
+    // not beside the table folded to the windows' rows.
+    let is_folded = app.zoom == Some(Zoom::Windows) && folds(app, main);
+    if laid.top.width >= USAGE_FROM && !is_folded {
+        let [top, usage] =
+            Layout::horizontal([Constraint::Fill(1), Constraint::Length(USAGE_WIDTH)])
+                .areas(laid.top);
+        return Windows {
+            top,
+            usage: Some(usage),
+            ..laid
+        };
+    }
+    laid
+}
+
+/// The table's window and the window under it, before the column: the
+/// table as tall as its rows, between TABLE_MIN and TABLE_SHARE of `main`,
+/// or TABLE_SHARE_IN_WINDOW while the window has the keys; the window
+/// under it takes the rest, the whole width.
+fn lay_out(app: &App, main: Rect) -> Windows {
     match app.zoom {
         // The table over the whole screen, as treetop was before windows.
         Some(Zoom::Table) => {
             return Windows {
                 top: main,
-                usage,
+                usage: None,
                 window: None,
             };
         }
-        // The windows, under the rows of their trees and the header, the
-        // column set aside for them.
-        Some(Zoom::Windows) => {
+        // The windows, under the rows of their trees and the header.
+        Some(Zoom::Windows) if folds(app, main) => {
             let height = u16::try_from(zoomed_rows(app).len())
                 .unwrap_or(u16::MAX)
                 .saturating_add(3);
-            let whole = Rect {
-                width: main.width + usage.map_or(0, |u| u.width),
-                ..main
+            let [top, window] =
+                Layout::vertical([Constraint::Length(height), Constraint::Fill(1)]).areas(main);
+            return Windows {
+                top,
+                usage: None,
+                window: Some(window),
             };
-            if folds(app, whole) {
-                let [top, window] =
-                    Layout::vertical([Constraint::Length(height), Constraint::Fill(1)])
-                        .areas(whole);
-                return Windows {
-                    top,
-                    usage: None,
-                    window: Some(window),
-                };
-            }
         }
-        None => {}
+        _ => {}
     }
     let rows = app.rows();
     // Each heading after the first has a blank line above it.
@@ -1490,7 +1539,7 @@ fn windows(app: &App, main: Rect) -> Windows {
     if main.height < height + WINDOW_MIN {
         return Windows {
             top: main,
-            usage,
+            usage: None,
             window: None,
         };
     }
@@ -1498,29 +1547,21 @@ fn windows(app: &App, main: Rect) -> Windows {
         Layout::vertical([Constraint::Length(height), Constraint::Fill(1)]).areas(main);
     Windows {
         top,
-        usage,
+        usage: None,
         window: Some(window),
     }
 }
 
-/// The column's lines for `tree`, `width` wide and at most `rows` tall
-/// where it can: its agent's context and spend, and the plan's usage, which
-/// shows even with no agent. Too tall, the estimate of where the context
-/// comes from gives way first, so the plan and the spend still show.
-fn column_lines(app: &App, tree: Option<&Tree>, width: u16, rows: u16) -> Vec<Line<'static>> {
+/// The column's lines for the window's tree, `width` wide: its agent's
+/// context and spend, and the plan's usage, which shows even with no agent.
+/// What does not fit scrolls.
+fn column_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    let tree = app.window_tree();
     let now = std::time::SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_secs());
     let agent = tree.and_then(App::chat_agent);
-    let lines = agent_lines(agent, tree, app.usage.as_ref(), now, width);
-    if lines.len() <= usize::from(rows) {
-        return lines;
-    }
-    let mut brief = agent.cloned();
-    if let Some(context) = brief.as_mut().and_then(|a| a.context.as_mut()) {
-        context.parts.clear();
-    }
-    agent_lines(brief.as_ref(), tree, app.usage.as_ref(), now, width)
+    agent_lines(agent, tree, app.usage.as_ref(), now, width)
 }
 
 /// The column's box, titled as the windows are.
@@ -1533,114 +1574,122 @@ fn usage_block() -> Block<'static> {
 
 /// The column beside the table, for the window's tree.
 fn draw_usage_column(frame: &mut Frame, app: &App, area: Rect) {
+    let t = theme();
     let block = usage_block();
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    frame.render_widget(
-        Paragraph::new(column_lines(
-            app,
-            app.window_tree(),
-            inner.width,
-            inner.height,
-        )),
-        inner,
-    );
+    let lines = column_lines(app, inner.width);
+    let rows = usize::from(inner.height);
+    let offset = usize::from(app.usage_offset());
+    let mut shown: Vec<Line> = lines.iter().skip(offset).cloned().collect();
+    // More below than fits: the last row says how many, for the wheel.
+    if shown.len() > rows {
+        shown.truncate(rows.saturating_sub(1));
+        let more = lines.len() - offset - shown.len();
+        shown.push(Line::styled(format!("↓ {more} more"), fg(t.muted)).right_aligned());
+    }
+    frame.render_widget(Paragraph::new(shown), inner);
 }
 
-/// The Trees screen's rows on `screen`: the banner, while anything waits
-/// on you, then the screen above the bar, then the bar.
+/// How many of the column's lines go past its foot on `screen`, unscrolled:
+/// how far the wheel can scroll it. None without the column.
+pub fn usage_overflow(app: &App, screen: Rect) -> u16 {
+    if app.is_issues {
+        return 0;
+    }
+    let Some(area) = windows(app, screen_rows(screen).main).usage else {
+        return 0;
+    };
+    let inner = usage_block().inner(area);
+    let lines = column_lines(app, inner.width);
+    u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_sub(inner.height)
+}
+
+/// The column is under `mouse`, for its wheel.
+pub fn is_on_usage(app: &App, screen: Rect, mouse: ratatui::crossterm::event::MouseEvent) -> bool {
+    !app.is_issues
+        && windows(app, screen_rows(screen).main)
+            .usage
+            .is_some_and(|u| u.contains(Position::new(mouse.column, mouse.row)))
+}
+
+/// The Trees screen's rows on `screen`: the screen above the bar, then the
+/// bar.
 struct ScreenRows {
-    banner: Option<Rect>,
     main: Rect,
     footer: Rect,
 }
 
-fn screen_rows(app: &App, screen: Rect) -> ScreenRows {
-    let [rest, footer] =
+fn screen_rows(screen: Rect) -> ScreenRows {
+    let [main, footer] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(screen);
-    let is_waiting = !app.is_issues && !inbox::waiting(app).is_empty();
-    let [banner, main] = Layout::vertical([
-        Constraint::Length(u16::from(is_waiting)),
-        Constraint::Fill(1),
-    ])
-    .areas(rest);
-    ScreenRows {
-        banner: is_waiting.then_some(banner),
-        main,
-        footer,
-    }
+    ScreenRows { main, footer }
 }
 
-/// What a waiting entry is, in the banner's words.
+/// The count's words: what needs action and what is done, and the key
+/// that opens them. None with neither.
+fn notes_count(app: &App) -> Option<Vec<Span<'static>>> {
+    let t = theme();
+    let (needs, done) = app.notes_list();
+    if needs.is_empty() && done.is_empty() {
+        return None;
+    }
+    let bold = Modifier::BOLD;
+    let mut spans = vec![Span::raw(" ")];
+    if !needs.is_empty() {
+        spans.push(Span::styled(
+            format!("● {}", needs.len()),
+            fg(t.warning).add_modifier(bold),
+        ));
+        spans.push(Span::raw(" needs action  "));
+    }
+    if !done.is_empty() {
+        spans.push(Span::styled(
+            format!("✓ {}", done.len()),
+            fg(t.success).add_modifier(bold),
+        ));
+        spans.push(Span::raw(" done  "));
+    }
+    spans.push(Span::styled("e ", fg(t.muted)));
+    Some(spans)
+}
+
+/// Where the count sits on `main`, the screen above the bar: the Trees
+/// window's top row, at its right, inside the corner.
+fn count_area(app: &App, main: Rect) -> Option<Rect> {
+    if app.is_issues {
+        return None;
+    }
+    let top = windows(app, main).top;
+    let width = u16::try_from(Line::from(notes_count(app)?).width()).unwrap_or(u16::MAX);
+    let width = width.min(top.width.saturating_sub(2));
+    Some(Rect {
+        x: top.right().saturating_sub(width + 1),
+        y: top.y,
+        width,
+        height: 1,
+    })
+}
+
+/// The count at the top right while anything needs action or is done. It
+/// never takes the keys: `e` or a click opens what it counts.
+fn draw_count(frame: &mut Frame, app: &App, main: Rect) {
+    let (Some(area), Some(spans)) = (count_area(app, main), notes_count(app)) else {
+        return;
+    };
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// What a waiting entry is, in a notification's words.
 pub fn waits_for(kind: Kind) -> &'static str {
     match kind {
         Kind::Failed => "checks failed",
         Kind::Died => "agent died",
         _ => "needs you",
     }
-}
-
-/// The banner across the top while anything waits on you: the first of
-/// it, its ticket and what it is about, how many more there are, and the
-/// key that goes to it. It never takes the keys, so whatever has them
-/// keeps them.
-fn draw_banner(frame: &mut Frame, app: &App, area: Rect) {
-    let t = theme();
-    let waiting = inbox::waiting(app);
-    let Some(first) = waiting.first() else {
-        return;
-    };
-    let colour = if first.kind == Kind::NeedsYou {
-        t.warning
-    } else {
-        t.danger
-    };
-    let mark = if first.kind == Kind::NeedsYou {
-        "●"
-    } else {
-        "✗"
-    };
-    let head = format!(
-        " {mark} {} {} ",
-        inbox::place_of(first).replace(':', " "),
-        waits_for(first.kind)
-    );
-    let more = match waiting.len() - 1 {
-        0 => String::new(),
-        n => format!(" +{n} more "),
-    };
-    let key = " e go ";
-    let about = match &first.title {
-        Some(title) => format!("{title}: {}", first.what),
-        None => first.what.clone(),
-    };
-    let width = usize::from(area.width);
-    let room = width.saturating_sub(
-        Line::raw(head.as_str()).width() + more.chars().count() + key.chars().count() + 1,
-    );
-    let about = format!(" {}", fit(&about, room.saturating_sub(1)));
-    let pad = room.saturating_sub(Line::raw(about.as_str()).width());
-    // Dark text on the colour, as the true-colour badges have it; the
-    // ANSI badges' white would not read on yellow.
-    let dark = match t.badge.fg {
-        Some(colour @ Color::Rgb(..)) => colour,
-        _ => Color::Black,
-    };
-    let on = Style::new().bg(colour).fg(dark);
-    let line = Line::from(vec![
-        Span::styled(head, on.add_modifier(Modifier::BOLD)),
-        Span::styled(about, on),
-        Span::styled(" ".repeat(pad + 1), on),
-        Span::styled(more, on),
-        Span::styled(
-            key,
-            Style::new()
-                .bg(dark)
-                .fg(colour)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
 }
 
 /// Zoomed to the table: the screen treetop had before its windows.
@@ -1728,7 +1777,7 @@ fn window_areas(area: Rect) -> [Rect; 2] {
 /// Where the chat in the window under the table goes on `screen`, for
 /// sizing its terminal and placing its mouse events.
 pub fn window_chat_area(app: &App, screen: Rect) -> Option<Rect> {
-    let main = screen_rows(app, screen).main;
+    let main = screen_rows(screen).main;
     let window = windows(app, main).window?;
     Some(window_areas(pane_areas(app, window).0)[1])
 }
@@ -1772,7 +1821,7 @@ fn window_form(app: &App, screen: Rect) -> Option<Rect> {
     if app.is_issues {
         return None;
     }
-    let main = screen_rows(app, screen).main;
+    let main = screen_rows(screen).main;
     let (cursor, other) = pane_areas(app, windows(app, main).window?);
     if app.prompt.as_ref().is_some_and(Prompt::starts_agent) {
         return Some(cursor);
@@ -2212,7 +2261,7 @@ fn draw_floating_tab(frame: &mut Frame, app: &App) {
     let Some(tree) = app.window_tree() else {
         return;
     };
-    let area = popup::area(stage(app, frame.area()));
+    let area = popup::area(frame.area());
     frame.render_widget(Clear, area);
     let block = Block::bordered()
         .border_style(fg(theme().accent))
@@ -2223,30 +2272,14 @@ fn draw_floating_tab(frame: &mut Frame, app: &App) {
     draw_review_tab(frame, app, tree, app.shown_tab(), true, inner);
 }
 
-/// Where a popup goes on the list's screen `screen`: all of it but the
-/// banner, so what waits on you stays bright and in view over a chat, a
-/// diff or the compose box. On the Issues screen, the whole screen.
-pub fn stage(app: &App, screen: Rect) -> Rect {
-    if app.is_issues {
-        return screen;
-    }
-    let main = screen_rows(app, screen).main;
-    Rect {
-        y: main.y,
-        height: screen.bottom() - main.y,
-        ..screen
-    }
+/// The count is under `mouse`.
+pub fn is_on_count(app: &App, screen: Rect, mouse: ratatui::crossterm::event::MouseEvent) -> bool {
+    count_area(app, screen_rows(screen).main)
+        .is_some_and(|count| count.contains(Position::new(mouse.column, mouse.row)))
 }
 
-/// The banner naming what waits on you is under `mouse`.
-pub fn is_on_banner(app: &App, screen: Rect, mouse: ratatui::crossterm::event::MouseEvent) -> bool {
-    screen_rows(app, screen)
-        .banner
-        .is_some_and(|banner| banner.contains(Position::new(mouse.column, mouse.row)))
-}
-
-/// What a click on the list's screen does: on the banner, opens what it
-/// names; on a window's tab, shows it. None for anywhere else.
+/// What a click on the list's screen does: on the count, opens or closes
+/// the notifications; on a window's tab, shows it. None for anywhere else.
 pub fn click(
     app: &mut App,
     screen: Rect,
@@ -2256,10 +2289,12 @@ pub fn click(
     if mouse.kind != MouseEventKind::Down(MouseButton::Left) || !app.wants_mouse() {
         return None;
     }
-    let rows = screen_rows(app, screen);
+    let rows = screen_rows(screen);
     let at = Position::new(mouse.column, mouse.row);
-    if rows.banner.is_some_and(|banner| banner.contains(at)) {
-        return Some(app.go_waiting(false));
+    if count_area(app, rows.main).is_some_and(|count| count.contains(at)) {
+        app.is_window_focused = false;
+        app.toggle_notes();
+        return Some(Outcome::Continue);
     }
     let windows = windows(app, rows.main);
     // A tab in the window's bar shows that tab.
@@ -2467,7 +2502,7 @@ fn draw_picker(frame: &mut Frame, app: &App, picker: &Picker) {
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
-    let waiting = inbox::waiting(app);
+    let waiting = inbox::needs_action(app);
     let rows: Vec<Row> = picker
         .choices
         .iter()
@@ -4795,7 +4830,7 @@ fn chat_frame(frame: &mut Frame, app: &App, agent: &str, tree: &str, seen: Optio
         ]
     };
     let keys = key_bar(&[("^Q", "back to treetop"), ("^\\", "next chat")]);
-    let screen = stage(app, frame.area());
+    let screen = frame.area();
     bar_popup(frame, screen, title, keys);
     if let Some(side) = popup::sidebar(screen) {
         let block = Block::new()
@@ -5203,8 +5238,21 @@ fn draw_screen(screen: &vt100::Screen, buffer: &mut Buffer, area: Rect) -> Optio
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
+
+    /// The Trees screen as drawn at `width` by `height`, line by line.
+    pub fn screen_lines(app: &App, width: u16, height: u16) -> Vec<String> {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, app, None, None, None))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect()
+    }
 
     #[test]
     fn wraps_at_words_and_cuts_a_word_too_long_for_a_row() {
@@ -5354,6 +5402,7 @@ mod sidebar_tests {
     use crate::plugin::{Limit, Part};
     use crate::pool::Process;
     use crate::ship::Ship;
+    use ratatui::crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
 
     const NOW: u64 = 1_793_052_000;
 
@@ -5368,6 +5417,7 @@ mod sidebar_tests {
             job: None,
             plugin: None,
             active_at: None,
+            answered_at: None,
             context: Some(Context {
                 used: 260_000,
                 window: 1_000_000,
@@ -5493,11 +5543,28 @@ mod sidebar_tests {
         (lines, column)
     }
 
+    /// Everything the column shows at `width` by `height`, scrolled with the
+    /// wheel from its top to its foot.
+    fn scrolled(app: &mut App, width: u16, height: u16) -> String {
+        app.measure_usage(usage_overflow(app, Rect::new(0, 0, width, height)));
+        let mut seen = Vec::new();
+        // A turn of the wheel moves at least a line, so this many reach the
+        // foot; a wheel that sticks fails here rather than spinning.
+        for _ in 0..=app.usage_overflow {
+            let (_, column) = drawn_at(app, width, height);
+            seen.extend(column);
+            if app.usage_offset() == app.usage_overflow {
+                return seen.join("\n");
+            }
+            app.wheel_usage(true);
+        }
+        panic!("the wheel did not reach the column's foot");
+    }
+
     #[test]
     fn the_column_beside_the_table_shows_the_agent_s_context_the_plan_and_the_session() {
-        let app = pool_on("4");
-        let (_, column) = drawn(&app, 200);
-        let text = column.join("\n");
+        let mut app = pool_on("4");
+        let text = scrolled(&mut app, 200, 80);
         for part in [
             "Context",
             "260k of 1M",
@@ -5526,8 +5593,7 @@ mod sidebar_tests {
             .unwrap()
             .agents
             .clear();
-        let (_, column) = drawn(&app, 200);
-        let text = column.join("\n");
+        let text = scrolled(&mut app, 200, 80);
         assert!(
             text.contains("Context") && text.contains("not known for this agent"),
             "{text}"
@@ -5542,11 +5608,9 @@ mod sidebar_tests {
     #[test]
     fn from_75_percent_context_the_column_says_how_to_hand_off() {
         let hint = "Ctrl+Q, then h hands off";
-        let (_, column) = drawn(&with_context(pool_on("4"), 750_000), 200);
-        let text = column.join("\n");
+        let text = scrolled(&mut with_context(pool_on("4"), 750_000), 200, 80);
         assert!(text.contains(hint), "{text}");
-        let (_, column) = drawn(&with_context(pool_on("4"), 740_000), 200);
-        let text = column.join("\n");
+        let text = scrolled(&mut with_context(pool_on("4"), 740_000), 200, 80);
         assert!(!text.contains(hint), "{text}");
     }
 
@@ -5561,7 +5625,44 @@ mod sidebar_tests {
     }
 
     #[test]
-    fn at_ordinary_heights_the_column_shows_the_plan_and_the_session_in_full() {
+    fn the_column_is_as_tall_as_the_table_and_the_window_spans_under_both() {
+        let app = pool_on("4");
+        for (width, height) in [(180, 24), (200, 50), (250, 40)] {
+            let (lines, _) = drawn_at(&app, width, height);
+            let shown = lines.join("\n");
+            let window = lines
+                .iter()
+                .position(|l| l.starts_with("┌ Tree 4 "))
+                .unwrap_or_else(|| panic!("{width}x{height}:\n{shown}"));
+            // The table and the column both end on the row over the window.
+            let over = &lines[window - 1];
+            let column: String = over
+                .chars()
+                .skip(usize::from(width - USAGE_WIDTH))
+                .collect();
+            assert!(over.starts_with('└'), "{width}x{height}:\n{shown}");
+            assert!(
+                column.starts_with('└') && column.ends_with('┘'),
+                "{width}x{height}:\n{shown}"
+            );
+            assert!(lines[0].contains("┐┌ Usage "), "{width}x{height}:\n{shown}");
+            // The window takes the whole width, to the bar.
+            assert!(lines[window].ends_with('┐'), "{width}x{height}:\n{shown}");
+            assert!(
+                lines[usize::from(height) - 2].starts_with('└')
+                    && lines[usize::from(height) - 2].ends_with('┘'),
+                "{shown}"
+            );
+            assert_eq!(
+                lines[usize::from(height) - 2].matches('┘').count(),
+                1,
+                "one box under both:\n{shown}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_column_says_what_is_below_and_the_wheel_scrolls_to_it() {
         // An agent near its compaction, its context split four ways as
         // Claude Code's are.
         let mut app = with_context(pool_on("4"), 760_000);
@@ -5574,33 +5675,69 @@ mod sidebar_tests {
                     tokens: 100_000,
                 })
                 .collect();
-        for (width, height) in [(180, 40), (200, 50)] {
-            let (_, column) = drawn_at(&app, width, height);
-            let text = column.join("\n");
-            for part in [
-                "memory files",
-                "hands off",
-                "weekly Fable",
-                "resets in 3d",
-                "output",
-            ] {
-                assert!(text.contains(part), "{part} at {width}x{height}:\n{text}");
+        // Nothing in the notifications, so only the column wants the mouse.
+        crate::inbox::tests::nothing_waits(&mut app);
+        let screen = Rect::new(0, 0, 200, 50);
+        app.measure_usage(usage_overflow(&app, screen));
+        assert!(app.usage_overflow > 0);
+        assert!(app.wants_mouse(), "for the wheel");
+        let foot = |app: &App| {
+            let (lines, column) = drawn_at(app, 200, 50);
+            let window = lines
+                .iter()
+                .position(|l| l.starts_with("┌ Tree 4 "))
+                .unwrap();
+            column[window - 2].clone()
+        };
+        let more = usize::from(app.usage_overflow) + 1;
+        assert!(
+            foot(&app).contains(&format!("↓ {more} more")),
+            "{}",
+            foot(&app)
+        );
+        // The wheel over the column, three lines a turn.
+        let (lines, _) = drawn_at(&app, 200, 50);
+        let row = lines.iter().position(|l| l.contains("┌ Usage ")).unwrap() + 2;
+        let wheel = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 190,
+            row: u16::try_from(row).unwrap(),
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(is_on_usage(&app, screen, wheel));
+        assert!(!is_on_usage(
+            &app,
+            screen,
+            MouseEvent {
+                column: 10,
+                ..wheel
             }
+        ));
+        app.wheel_usage(true);
+        assert!(
+            foot(&app).contains(&format!("↓ {} more", more - 3)),
+            "{}",
+            foot(&app)
+        );
+        let text = scrolled(&mut app, 200, 50);
+        for part in ["hands off", "weekly Fable", "resets in 3d", "output"] {
+            assert!(text.contains(part), "{part}:\n{text}");
         }
-        // Too short for it all, the split gives way and the rest shows.
-        let (_, column) = drawn_at(&app, 180, 22);
-        let text = column.join("\n");
-        assert!(!text.contains("Estimated split"), "{text}");
-        for part in ["hands off", "weekly Fable", "output"] {
-            assert!(text.contains(part), "{part} at 180x22:\n{text}");
-        }
+        assert!(!foot(&app).contains("more"), "at its foot: {}", foot(&app));
+        // Another tree under the cursor starts from the top.
+        app.select_tree("2");
+        app.measure_usage(usage_overflow(&app, screen));
+        assert_eq!(app.usage_offset(), 0);
+        app.select_tree("4");
+        app.measure_usage(usage_overflow(&app, screen));
+        assert_eq!(app.usage_offset(), 0, "back on tree 4, from the top");
     }
 
     #[test]
     fn below_180_columns_the_column_is_left_out() {
         let (lines, _) = drawn(&pool_on("4"), 179);
         let text = lines.join("\n");
-        assert!(!text.contains("This session"), "{text}");
+        assert!(!text.contains("┌ Usage "), "{text}");
         assert!(
             text.contains("context 26% of 1M"),
             "the bar keeps its line:\n{text}"
@@ -5785,7 +5922,7 @@ mod sidebar_tests {
 }
 
 #[cfg(test)]
-mod banner_tests {
+mod count_tests {
     use super::*;
     use crate::inbox::tests::app;
     use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -5821,52 +5958,127 @@ mod banner_tests {
     }
 
     #[test]
-    fn the_banner_names_the_first_that_waits_and_how_many_more() {
+    fn the_count_at_the_top_right_reads_what_needs_action_and_what_is_done() {
         let mut app = app();
         let top = &screen(&app, 200, 30)[0];
-        for part in [
-            "✗ 9 agent died",
-            "port-menu",
-            "R resumes it",
-            "+3 more",
-            "e go",
-        ] {
-            assert!(top.contains(part), "{part} in {top}");
-        }
-        assert_eq!(cells(&app, 200, 30)[(1, 0)].bg, theme().danger, "red");
-        // Resumed, the oldest left is the other workspace's ask, in yellow.
-        app.reports.retain(|r| r.job != "j9");
-        let top = &screen(&app, 200, 30)[0];
-        for part in [
-            "● endodeals-web 12 needs you",
-            "Reseed the rates?",
-            "+2 more",
-        ] {
-            assert!(top.contains(part), "{part} in {top}");
-        }
-        assert_eq!(cells(&app, 200, 30)[(1, 0)].bg, theme().warning, "yellow");
-    }
-
-    #[test]
-    fn a_click_on_the_banner_opens_what_it_names() {
-        let mut app = app();
-        // `e` has gone to tree 9, which the banner still names, so a click
-        // opens it again rather than going on to the next as `e` would.
-        app.go_waiting(true);
-        app.select_tree("2");
-        assert_eq!(
-            click_on(&mut app, 200, 30, "9 agent died"),
-            Some(Outcome::Continue)
+        assert!(
+            top.starts_with("┌ Trees"),
+            "no banner over the table: {top}"
         );
-        assert_eq!(app.current().map(|t| t.name.as_str()), Some("9"));
-    }
-
-    #[test]
-    fn the_banner_goes_once_nothing_waits_and_the_table_takes_its_row() {
-        let mut app = app();
+        assert!(
+            top.contains("─ ● 4 needs action  ✓ 1 done  e ┐┌ Usage"),
+            "at the right of the table's window: {top}"
+        );
+        let at = top.chars().position(|c| c == '●').unwrap();
+        assert_eq!(
+            cells(&app, 200, 30)[(u16::try_from(at).unwrap(), 0)].fg,
+            theme().warning
+        );
+        // With nothing to count, the table's top border is whole.
         crate::inbox::tests::nothing_waits(&mut app);
         let top = &screen(&app, 200, 30)[0];
-        assert!(top.starts_with('┌'), "the table's window at the top: {top}");
+        assert!(
+            !top.contains("needs action") && !top.contains("done"),
+            "{top}"
+        );
+    }
+
+    #[test]
+    fn with_nothing_left_the_notifications_stay_where_the_count_was() {
+        let mut app = app();
+        app.notes = Some(0);
+        let corner = |app: &App| {
+            let shown = screen(app, 200, 30);
+            let row = shown
+                .iter()
+                .position(|l| l.contains(" Notifications "))
+                .unwrap();
+            (shown[row].chars().position(|c| c == '┐').unwrap(), shown)
+        };
+        let (with_items, _) = corner(&app);
+        crate::inbox::tests::nothing_waits(&mut app);
+        let (empty, shown) = corner(&app);
+        assert_eq!(empty, with_items, "{}", shown.join("\n"));
+    }
+
+    #[test]
+    fn a_click_on_the_count_opens_the_notifications_and_another_closes_them() {
+        let mut app = app();
+        assert_eq!(
+            click_on(&mut app, 200, 30, "needs action"),
+            Some(Outcome::Continue)
+        );
+        assert!(app.is_notes_shown());
+        click_on(&mut app, 200, 30, "needs action");
+        assert!(!app.is_notes_shown());
+    }
+
+    #[test]
+    fn the_notifications_list_needs_action_then_done_with_each_in_full() {
+        let mut app = app();
+        let mut reports = app.reports.clone();
+        reports[0] = crate::inbox::tests::report(
+            "j4",
+            "/pool/4/app",
+            crate::reports::State::Blocked,
+            "Where should the inbox sit, beside the table or under it? It needs a yes or no before it carries on with the rest of the layout.",
+            120,
+        );
+        app.apply_reports(reports);
+        app.notes = Some(0);
+        let shown = screen(&app, 200, 40);
+        let text = shown.join("\n");
+        let at = |part: &str| {
+            shown
+                .iter()
+                .position(|l| l.contains(part))
+                .unwrap_or_else(|| panic!("{part} in\n{text}"))
+        };
+        assert!(
+            shown[0].contains("● 4 needs action"),
+            "the count stays: {}",
+            shown[0]
+        );
+        assert_eq!(at(" Notifications "), 1, "under the count");
+        // The oldest first, a PR's failure, with no time, last; then done.
+        assert!(at("NEEDS ACTION") < at("✗ 9 port-menu"));
+        assert!(at("✗ 9 port-menu") < at("● endodeals-web 12"));
+        assert!(at("● endodeals-web 12") < at("● 4 ANB-41 inbox-rail"));
+        assert!(at("● 4 ANB-41 inbox-rail") < at("✗ 7 fix-login"));
+        assert!(at("✗ 7 fix-login") < at("DONE"));
+        assert!(at("DONE") < at("✓ 2 help-columns"));
+        assert!(shown[at("✓ 2 help-columns") + 1].contains("Done: opened PR #31"));
+        // Each with its ticket and how long it has waited: tree 4 asked 120s ago.
+        let four = &shown[at("● 4 ANB-41 inbox-rail")];
+        assert!(four.contains(" 2m │"), "{four}");
+        // The question in full, wrapped, not cut.
+        assert!(text.contains("Where should the inbox sit"), "{text}");
+        assert!(text.contains("the rest of the layout."), "{text}");
+        assert!(
+            text.contains("Enter  open  x  not now  Esc  close"),
+            "{text}"
+        );
+        // The first is under the cursor.
+        let row = u16::try_from(at("✗ 9 port-menu")).unwrap();
+        let x = u16::try_from(
+            shown[usize::from(row)]
+                .chars()
+                .position(|c| c == '✗')
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            cells(&app, 200, 40)[(x + 4, row)].bg,
+            theme().cursor.bg.unwrap()
+        );
+        // With nothing at all, it says so.
+        crate::inbox::tests::nothing_waits(&mut app);
+        let text = screen(&app, 200, 40).join("\n");
+        assert!(text.contains("Nothing needs you."), "{text}");
+        assert!(
+            text.contains("Nothing finished since you last looked."),
+            "{text}"
+        );
     }
 
     #[test]
@@ -5911,7 +6123,7 @@ mod banner_tests {
     }
 
     #[test]
-    fn a_popup_dims_the_list_but_leaves_the_banner_bright_over_it() {
+    fn a_popup_dims_the_list_but_leaves_the_count_bright_over_it() {
         let mut app = app();
         app.picker = Some(Picker {
             choices: Vec::new(),
@@ -5920,63 +6132,18 @@ mod banner_tests {
         let drawn = cells(&app, 200, 30);
         let lines = screen(&app, 200, 30);
         let row = lines.iter().position(|l| l.contains("BRANCH")).unwrap();
+        let at = lines[0].chars().position(|c| c == '●').unwrap();
         assert!(
-            !drawn[(4, 0)].modifier.contains(Modifier::DIM),
-            "the banner stays bright"
+            !drawn[(u16::try_from(at).unwrap(), 0)]
+                .modifier
+                .contains(Modifier::DIM),
+            "the count stays bright"
         );
         assert!(
             drawn[(4, u16::try_from(row).unwrap())]
                 .modifier
                 .contains(Modifier::DIM),
             "the list under the popup dims"
-        );
-    }
-
-    #[test]
-    fn while_you_were_away_lists_what_waits_then_what_finished() {
-        let mut app = app();
-        // Treetop's first look, as it takes once the pool is read.
-        app.watch_waiting();
-        app.note_idle(std::time::Duration::from_secs(47 * 60));
-        // Tree 4's agent finishes while you are away.
-        let mut reports = app.reports.clone();
-        reports[0] = crate::inbox::tests::report(
-            "j4",
-            "/pool/4/app",
-            crate::reports::State::Done,
-            "Done: it sits right",
-            30,
-        );
-        app.apply_reports(reports);
-        assert!(app.back());
-        let shown = screen(&app, 120, 30);
-        let text = shown.join("\n");
-        let at = |part: &str| {
-            shown
-                .iter()
-                .position(|l| l.contains(part))
-                .unwrap_or_else(|| panic!("{part} in\n{text}"))
-        };
-        assert!(shown[at("While you were away")].contains("gone 47m"));
-        // The oldest first, and tree 2, finished before you went, nowhere.
-        assert!(at("9 agent died") < at("endodeals-web 12 needs you"));
-        assert!(at("endodeals-web 12 needs you") < at("7 checks failed"));
-        assert!(shown[at("Also:")].contains("✓ 4 finished"));
-        assert!(
-            !shown[at("Also:")].contains(" 2 "),
-            "{}",
-            shown[at("Also:")]
-        );
-        assert!(text.contains("Enter  go  s  later  Esc  close"), "{text}");
-        // On a short screen the list gives way to the foot.
-        let short = screen(&app, 80, 10).join("\n");
-        assert!(short.contains("Also: ✓ 4 finished"), "{short}");
-        // Nothing left: caught up.
-        crate::inbox::tests::nothing_waits(&mut app);
-        assert!(
-            screen(&app, 120, 30)
-                .iter()
-                .any(|l| l.contains("All caught up. Nothing is waiting on you."))
         );
     }
 
@@ -7097,20 +7264,14 @@ mod window_tests {
             shown.join("\n")
         );
         assert!(shown[48].starts_with('└'), "{}", shown.join("\n"));
-        // Wide enough for the column, the table is as tall as ever, and the
-        // column runs down the right of it and the window both, to the bar.
+        // Wide enough for the column beside it, the table is as tall as
+        // ever, so the window under it keeps its height.
         let wide = lines(&drawn(&app, 200, 50));
         let below = wide
             .iter()
             .position(|l| l.starts_with("┌ Tree 4 "))
             .unwrap();
         assert_eq!(below, window, "{}", wide.join("\n"));
-        assert!(
-            wide[1].ends_with("┌ Usage ─────────────────────────────┐"),
-            "{}",
-            wide[1]
-        );
-        assert!(wide[48].ends_with('┘'), "{}", wide[48]);
         // Too short for both, the table takes the screen, and a tree's chat
         // floats in a popup instead.
         let short = lines(&drawn(&app, 200, 12));
@@ -7141,10 +7302,10 @@ mod window_tests {
                 .unwrap()
         };
         let table = top(&app);
-        // Given the keys, the window grows to four fifths of the 48 rows
-        // between the banner and the bar, and the table keeps the rest.
+        // Given the keys, the window grows to four fifths of the 49 rows
+        // above the bar, and the table keeps the rest.
         app.is_window_focused = true;
-        assert_eq!(top(&app), 10);
+        assert_eq!(top(&app), 9);
         // Back on the table, the window is the size it was.
         app.is_window_focused = false;
         assert_eq!(top(&app), table);
@@ -7252,7 +7413,7 @@ mod window_tests {
         );
         press(&mut app, 'q');
         press(&mut app, 'v');
-        // A row more than the diff, for the banner tree 4's ask puts over it.
+        // A row more than the diff.
         let shown = lines(&drawn(&app, 100, 10)).join("\n");
         assert!(
             shown.contains("reading the PR..."),
@@ -7500,21 +7661,20 @@ mod window_tests {
         let mut app = on("4");
         // Zoomed to the windows, the table keeps only the window's tree.
         app.zoom = Some(Zoom::Windows);
-        // Under the banner, which tree 4's ask puts on the first row.
         let shown = lines(&drawn(&app, 200, 50));
         assert!(
-            shown[1].starts_with("┌ Trees · ^F shows them all "),
+            shown[0].starts_with("┌ Trees · ^F shows them all "),
             "{}",
-            shown[1]
+            shown[0]
         );
         assert!(
-            shown[3].contains("me/anb-41-inbox-rail"),
+            shown[2].contains("me/anb-41-inbox-rail"),
             "{}",
             shown.join("\n")
         );
-        assert!(shown[4].starts_with('└'), "one row: {}", shown.join("\n"));
+        assert!(shown[3].starts_with('└'), "one row: {}", shown.join("\n"));
         assert!(
-            shown[5].starts_with("┌ Tree 4 "),
+            shown[4].starts_with("┌ Tree 4 "),
             "the window takes the rest"
         );
         // In a double, both windows' trees, however far apart in the list.
@@ -7525,12 +7685,12 @@ mod window_tests {
         app.side = 0;
         let shown = lines(&drawn(&app, 200, 50));
         assert!(
-            shown[3].contains("me/anb-41-inbox-rail"),
+            shown[2].contains("me/anb-41-inbox-rail"),
             "{}",
             shown.join("\n")
         );
-        assert!(shown[4].contains("me/port-menu"), "{}", shown.join("\n"));
-        assert!(shown[5].starts_with('└'), "{}", shown.join("\n"));
+        assert!(shown[3].contains("me/port-menu"), "{}", shown.join("\n"));
+        assert!(shown[4].starts_with('└'), "{}", shown.join("\n"));
     }
 
     #[test]
@@ -7538,8 +7698,13 @@ mod window_tests {
         let mut app = on("4");
         app.zoom = Some(Zoom::Table);
         let shown = lines(&drawn(&app, 200, 50));
-        // The table's header on the first row under the banner, unboxed, as
-        // it always was.
+        // The count on a row of its own at the top, then the table's header,
+        // unboxed, as it always was.
+        assert!(
+            shown[0].starts_with(' ') && shown[0].contains("● 4 needs action  ✓ 1 done  e"),
+            "{}",
+            shown[0]
+        );
         assert!(shown[1].starts_with("  #    STATUS"), "{}", shown[1]);
         // The detail pane boxed under it, its last 12 rows above the bar.
         assert!(shown[37].starts_with('┌'), "{}", shown.join("\n"));
@@ -7657,7 +7822,7 @@ mod window_tests {
     #[test]
     fn the_table_is_not_marked_while_a_form_or_the_palette_has_the_keys() {
         let mut app = on("4");
-        // The table's corner, under the banner.
+        // The table's corner.
         let table = |app: &App| {
             let buffer = drawn(app, 200, 50);
             buffer[(0, 1)].fg

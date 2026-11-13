@@ -269,7 +269,7 @@ impl Reader {
 
 /// Seconds since the epoch of an RFC 3339 stamp in UTC, as Claude Code writes
 /// them (`2026-10-14T00:28:12.336Z`). Anything else is None.
-fn unix(stamp: &str) -> Option<i64> {
+pub fn unix(stamp: &str) -> Option<i64> {
     let stamp = stamp.strip_suffix('Z')?;
     let (date, time) = stamp.split_once('T')?;
     let mut date = date.splitn(3, '-').map(|p| p.parse::<i64>().ok());

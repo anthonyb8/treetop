@@ -6,8 +6,8 @@
 //! of what happened, so an agent already waiting when treetop opens is in it.
 //!
 //! Of those, what is waiting on you, an agent asking, a PR whose checks
-//! failed and an agent that died, is what the banner and the tmux status
-//! line show until it stops being true. What counts is decided here for the
+//! failed and an agent that died, is what the count, its notifications
+//! and the tmux status line show until it stops being true. What counts is decided here for the
 //! phone's pushes too, so the desktop and the phone never disagree.
 
 use std::collections::HashMap;
@@ -31,22 +31,111 @@ pub enum Said {
     Other,
 }
 
-/// What the tree's agent last came to: waiting on you, at a prompt or with
-/// a question; finished; its process dead; else nothing worth saying. None
-/// when no report places an agent in it.
+/// What the tree's agents last came to, by the reports placed in it and
+/// its agents' running sessions: waiting on you, at a prompt or with a
+/// question; finished; its process dead; else nothing worth saying. None
+/// when neither a report nor a finished turn speaks for it. The same rules
+/// as for another workspace's tree, through `judge`.
 pub fn said(app: &App, tree: &Tree) -> Option<Said> {
-    let waiting = tree
-        .agents
+    judge(&placed(app, tree), tree, &app.trees).0
+}
+
+/// The reports placed in `tree`, one of this workspace's, the assistant's
+/// left out.
+fn placed<'a>(app: &'a App, tree: &Tree) -> Vec<&'a Report> {
+    app.reports
         .iter()
-        .any(|a| a.status == Some(Status::Waiting) && !assistant::is_assistant(&a.name));
-    match app.says(tree).map(|i| i.state) {
-        Some(State::Blocked) => Some(Said::NeedsYou),
-        _ if waiting => Some(Said::NeedsYou),
-        Some(State::Done) => Some(Said::Done),
-        Some(State::Failed) => Some(Said::Died),
-        Some(_) => Some(Said::Other),
-        None => None,
+        .filter(|r| !assistant::is_assistant(&r.name))
+        .filter(|r| crate::reports::tree_of(r, &app.trees).is_some_and(|t| t.path == tree.path))
+        .collect()
+}
+
+/// What `tree` comes to from `reports`, the ones placed in it, and its
+/// agents, each report read by the running sessions in `live`; with the
+/// report that speaks for it, where one does. Each agent's newest report is
+/// its word. In order: an agent asking, by its report or at a prompt, needs
+/// you; else one whose report says it died is dead; else a busy lead keeps
+/// the tree working, whatever another agent reported; else a done report,
+/// or a lead idle after its turn, is done.
+fn judge<'a>(
+    reports: &[&'a Report],
+    tree: &Tree,
+    live: &[Tree],
+) -> (Option<Said>, Option<&'a Report>) {
+    let mut newest: Vec<(&Report, State)> = Vec::new();
+    for report in reports {
+        match newest.iter_mut().find(|(r, _)| r.job == report.job) {
+            Some(kept) if kept.0.updated >= report.updated => {}
+            Some(kept) => *kept = (report, crate::app::report_state(report, live)),
+            None => newest.push((report, crate::app::report_state(report, live))),
+        }
     }
+    let newest_in = |state: State| {
+        newest
+            .iter()
+            .filter(|(_, s)| *s == state)
+            .max_by_key(|(r, _)| r.updated)
+            .map(|(r, _)| *r)
+    };
+    if let Some(report) = newest_in(State::Blocked) {
+        return (Some(Said::NeedsYou), Some(report));
+    }
+    let agents = || {
+        tree.agents
+            .iter()
+            .filter(|a| !assistant::is_assistant(&a.name))
+    };
+    if agents().any(|a| a.status == Some(Status::Waiting)) {
+        return (Some(Said::NeedsYou), None);
+    }
+    if let Some(report) = newest_in(State::Failed) {
+        return (Some(Said::Died), Some(report));
+    }
+    // Claude Code marks a finished turn idle; one agent still busy leads.
+    let lead = App::agents_of(tree).into_iter().next();
+    if lead.is_some_and(|a| a.status == Some(Status::Busy)) {
+        return (Some(Said::Other), None);
+    }
+    let latest = newest.iter().max_by_key(|(r, _)| r.updated);
+    if let Some((report, State::Done)) = latest {
+        return (Some(Said::Done), Some(*report));
+    }
+    if lead.is_some_and(|a| a.status == Some(Status::Idle) && a.active_at.is_some()) {
+        return (Some(Said::Done), None);
+    }
+    (latest.map(|_| Said::Other), None)
+}
+
+/// An entry's line and time for what `judge` said of a tree, from the
+/// report that speaks for it, else what its agents show.
+fn judged_entry(
+    said: Said,
+    report: Option<&Report>,
+    tree: &Tree,
+    live: &[Tree],
+) -> Option<(Kind, String, Option<SystemTime>)> {
+    let agent_at = || {
+        App::agents_of(tree)
+            .first()
+            .and_then(|a| a.active_at)
+            .map(|at| UNIX_EPOCH + Duration::from_secs(at))
+    };
+    let text = |report: &Report| first_line(crate::app::Item::new(report, live).text());
+    Some(match said {
+        Said::NeedsYou => (
+            Kind::NeedsYou,
+            // The same words from any workspace, so what `x` put away stays away.
+            report.map_or_else(|| AT_A_PROMPT.into(), text),
+            report.map(|r| r.updated).or_else(agent_at),
+        ),
+        Said::Died => (Kind::Died, DIED.into(), report.map(|r| r.updated)),
+        Said::Done => (
+            Kind::Done,
+            report.map_or_else(|| "finished its turn".into(), text),
+            report.map(|r| r.updated).or_else(agent_at),
+        ),
+        Said::Other => return None,
+    })
 }
 
 /// The PR stages worth telling you about: its checks failed, or it merged.
@@ -171,7 +260,7 @@ pub fn spawn_reader(here: PathBuf) -> Reader<HashMap<PathBuf, Vec<Tree>>> {
         due(crate::workspaces::list(), &here, secs(SystemTime::now()))
             .into_iter()
             .filter_map(|w| {
-                let mut trees = crate::cache::read(&w.checkout)?;
+                let mut trees = with_main(&w.checkout, crate::cache::read(&w.checkout)?);
                 crate::cli::read_agents(&mut trees);
                 crate::cli::read_ship(&w.checkout, &mut trees);
                 Some((w.checkout, trees))
@@ -180,13 +269,21 @@ pub fn spawn_reader(here: PathBuf) -> Reader<HashMap<PathBuf, Vec<Tree>>> {
     })
 }
 
+/// A workspace's trees as its cache lists them, with its main checkout at
+/// `checkout` first, as the workspace on screen has it, since an agent can
+/// work there too.
+pub fn with_main(checkout: &Path, mut trees: Vec<Tree>) -> Vec<Tree> {
+    trees.insert(0, crate::pool::main_tree(checkout));
+    trees
+}
+
 /// The other workspaces' pools, from their caches.
 pub fn other_pools(here: &Path) -> Vec<Pool> {
     crate::workspaces::list()
         .into_iter()
         .filter(|w| w.checkout != here)
         .filter_map(|w| {
-            let trees = crate::cache::read(&w.checkout)?;
+            let trees = with_main(&w.checkout, crate::cache::read(&w.checkout)?);
             Some(Pool {
                 sidecars: crate::sidecar::read_all(&trees),
                 trees,
@@ -226,29 +323,11 @@ const DIED: &str = "its agent died; R resumes it";
 /// agents placed in their trees.
 pub fn entries(app: &App) -> Vec<Entry> {
     let mut entries = Vec::new();
-    for tree in app.trees.iter().filter(|t| t.is_held() && !t.is_main) {
-        let item = app.says(tree);
-        let kind = match said(app, tree) {
-            Some(Said::NeedsYou) => Some(Kind::NeedsYou),
-            Some(Said::Done) => Some(Kind::Done),
-            Some(Said::Died) => Some(Kind::Died),
-            _ => None,
-        };
-        if let Some(kind) = kind {
-            let what = match kind {
-                Kind::NeedsYou => item
-                    .as_ref()
-                    .filter(|i| i.state == State::Blocked)
-                    .map_or_else(
-                        || "waiting at a prompt in its chat".into(),
-                        |i| first_line(i.text()),
-                    ),
-                Kind::Died => DIED.into(),
-                _ => item
-                    .as_ref()
-                    .map_or_else(String::new, |i| first_line(i.text())),
-            };
-            let at = item.as_ref().map(|i| i.report.updated);
+    for tree in app.trees.iter().filter(|t| t.is_held()) {
+        let (said, report) = judge(&placed(app, tree), tree, &app.trees);
+        if let Some((kind, what, at)) =
+            said.and_then(|said| judged_entry(said, report, tree, &app.trees))
+        {
             entries.push(Entry {
                 kind,
                 away: None,
@@ -288,12 +367,60 @@ impl Entry {
     }
 }
 
+/// What `x` keeps of the entry `about` is, to put it away until it changes:
+/// its kind, tree and the time it happened, which a new question, a new
+/// finish or a rewritten report moves; a PR, with no time, by its line. The
+/// same from any workspace. None once gone.
+pub fn put_away_key(app: &App, about: &About) -> Option<String> {
+    entries(app)
+        .into_iter()
+        .find(|e| e.about() == *about)
+        .map(|e| key_of(&e))
+}
+
+fn key_of(entry: &Entry) -> String {
+    let what = entry
+        .at
+        .map_or_else(|| entry.what.clone(), |at| secs(at).to_string());
+    key(entry.kind, &entry.path, &what)
+}
+
+fn key(kind: Kind, path: &Path, what: &str) -> String {
+    format!("{kind:?} {} {what}", path.display())
+}
+
+/// What an ask at a prompt says where no report speaks for it.
+const AT_A_PROMPT: &str = "waiting at a prompt";
+
+/// The keys put away of asks at a prompt with no time, whose tree, as last
+/// read, no longer has an agent waiting: answered, so the next ask there is
+/// a new one, though nothing else would tell the two apart.
+pub fn answered_keys(app: &App) -> Vec<String> {
+    let read = app.trees.iter().chain(app.away_live.values().flatten());
+    read.filter(|t| !t.agents.iter().any(|a| a.status == Some(Status::Waiting)))
+        .map(|t| key(Kind::NeedsYou, &t.path, AT_A_PROMPT))
+        .filter(|k| app.put_away.contains(k))
+        .collect()
+}
+
+/// The entries put away as they stand, which leave the notifications.
+pub fn put_away(app: &App) -> std::collections::HashSet<About> {
+    if app.put_away.is_empty() {
+        return Default::default();
+    }
+    entries(app)
+        .into_iter()
+        .filter(|e| app.put_away.contains(&key_of(e)))
+        .map(|e| e.about())
+        .collect()
+}
+
 /// What waits on you, across every workspace read: agents asking, PRs
 /// whose checks failed and agents that died, the oldest first. Each is as
 /// old as it has waited: since treetop first saw it, or since it happened
 /// where that was earlier. Each leaves once it stops being true, so there
 /// is nothing to dismiss.
-pub fn waiting(app: &App) -> Vec<Entry> {
+pub fn needs_action(app: &App) -> Vec<Entry> {
     let mut waiting: Vec<Entry> = entries(app)
         .into_iter()
         .filter(|e| matches!(e.kind, Kind::NeedsYou | Kind::Failed | Kind::Died))
@@ -313,6 +440,19 @@ pub fn waiting(app: &App) -> Vec<Entry> {
     waiting
 }
 
+/// What is done: agents that finished, by their report or idle after a
+/// turn, and PRs that merged. None of it waits on you.
+pub fn done(app: &App) -> Vec<Entry> {
+    entries(app)
+        .into_iter()
+        .filter(|e| matches!(e.kind, Kind::Done | Kind::Merged))
+        .map(|mut e| {
+            e.at = e.at.or_else(|| app.waiting_since(&e.about()));
+            e
+        })
+        .collect()
+}
+
 /// Where an entry's tree is, for a line naming several: its number, after
 /// its workspace's name when that is another.
 pub fn place_of(entry: &Entry) -> String {
@@ -322,93 +462,67 @@ pub fn place_of(entry: &Entry) -> String {
     }
 }
 
-/// The other workspaces' entries: their background agents that need you,
-/// died or finished, each placed in the tree its report says it works in;
-/// then, from the last read of each pool, its PRs that failed or merged and
-/// its agents waiting on you that no report speaks for.
+/// The other workspaces' entries, each tree judged as one here is: by the
+/// reports placed in it and, from the last read of its pool, its agents
+/// and its PR. Until a pool is read, its reports alone speak.
 fn away_entries(app: &App) -> Vec<Entry> {
-    let mut entries = reported_away(app);
+    let mut entries = Vec::new();
     for pool in &app.pools {
-        let Some(live) = app.away_live.get(&pool.away.checkout) else {
-            continue;
-        };
-        for tree in pool.trees.iter().filter(|t| t.is_held() && !t.is_main) {
-            let title = title_of(tree, pool.sidecars.get(&tree.path));
-            let entry = |kind: Kind, what: String| Entry {
+        let live = app.away_live.get(&pool.away.checkout);
+        let live = live.map_or(&[][..], Vec::as_slice);
+        for tree in pool.trees.iter().filter(|t| t.is_held()) {
+            let entry = |kind: Kind, what: String, at: Option<SystemTime>| Entry {
                 kind,
                 away: Some(pool.away.clone()),
                 tree: tree.name.clone(),
                 path: tree.path.clone(),
-                title: title.clone(),
+                title: title_of(tree, pool.sidecars.get(&tree.path)),
                 what,
-                at: None,
+                at,
             };
             let read = live.iter().find(|t| t.path == tree.path);
+            let reports: Vec<&Report> = app
+                .reports
+                .iter()
+                .filter(|r| !assistant::is_assistant(&r.name))
+                .filter(|r| {
+                    place(r, std::slice::from_ref(pool)).is_some_and(|(_, t)| t.path == tree.path)
+                })
+                .collect();
+            // Its agents as the read found them; unread, none are known.
+            let unread = Tree {
+                agents: Vec::new(),
+                ..tree.clone()
+            };
+            let agents = read.unwrap_or(&unread);
+            let (said, report) = judge(&reports, agents, live);
+            if let Some((kind, what, at)) =
+                said.and_then(|said| judged_entry(said, report, agents, live))
+            {
+                entries.push(entry(kind, what, at));
+            }
             if let Some(ship) = read.and_then(|t| t.ship.as_deref())
                 && let Some(kind) = pr_kind(ship.stage)
             {
-                entries.push(entry(kind, ship.label.clone()));
-            }
-            let is_asking = entries
-                .iter()
-                .any(|e| e.kind == Kind::NeedsYou && e.path == tree.path);
-            let waiting = read
-                .into_iter()
-                .flat_map(|t| &t.agents)
-                .find(|a| a.status == Some(Status::Waiting) && !assistant::is_assistant(&a.name));
-            if let Some(agent) = waiting.filter(|_| !is_asking) {
-                let mut waits = entry(Kind::NeedsYou, "waiting at a prompt in its pane".into());
-                waits.at = agent
-                    .active_at
-                    .map(|at| UNIX_EPOCH + Duration::from_secs(at));
-                entries.push(waits);
+                entries.push(entry(kind, ship.label.clone(), None));
             }
         }
     }
     entries
 }
 
-/// The other workspaces' background agents that need you, died or
-/// finished, each placed in the tree its report says it works in.
-fn reported_away(app: &App) -> Vec<Entry> {
-    app.reports
-        .iter()
-        .filter(|r| !assistant::is_assistant(&r.name))
-        .filter_map(|report| {
-            let kind = match report.state {
-                State::Blocked => Kind::NeedsYou,
-                State::Done => Kind::Done,
-                State::Failed => Kind::Died,
-                State::Working | State::Stopped => return None,
-            };
-            let (pool, tree) = place(report, &app.pools)?;
-            Some(Entry {
-                kind,
-                away: Some(pool.away.clone()),
-                tree: tree.name.clone(),
-                path: tree.path.clone(),
-                title: title_of(tree, pool.sidecars.get(&tree.path)),
-                what: if kind == Kind::Died {
-                    DIED.into()
-                } else {
-                    first_line(&report.text)
-                },
-                at: Some(report.updated),
-            })
-        })
-        .collect()
-}
-
 /// The other workspace's held tree `report`'s agent works in: the one its
 /// directory is in, as agents are placed: one whose sidecar names a job only
 /// for that job, else only if it wrote since that tree's lease began, since
-/// a tree returned and handed out again is not still the old agent's.
+/// a tree returned and handed out again is not still the old agent's. Its
+/// main checkout, never leased, takes what no tree does.
 pub fn place<'a>(report: &Report, pools: &'a [Pool]) -> Option<(&'a Pool, &'a Tree)> {
     let dir = report.dir.as_deref()?;
     let wrote = secs(report.updated);
     pools.iter().find_map(|pool| {
+        let is_in = |t: &Tree| t.is_held() && dir.starts_with(&t.path);
         let tree = pool.trees.iter().find(|t| {
-            if !t.is_held() || !dir.starts_with(&t.path) {
+            if t.is_main || !is_in(t) {
                 return false;
             }
             // A tree whose sidecar names a job is that job's alone.
@@ -420,7 +534,12 @@ pub fn place<'a>(report: &Report, pools: &'a [Pool]) -> Option<(&'a Pool, &'a Tr
                     .and_then(crate::pool::seconds)
                     .is_some_and(|began| wrote >= began),
             }
-        })?;
+        });
+        let tree = match tree {
+            Some(tree) => tree,
+            None if pool.trees.iter().any(|t| !t.is_main && is_in(t)) => return None,
+            None => pool.trees.iter().find(|t| t.is_main && is_in(t))?,
+        };
         Some((pool, tree))
     })
 }
@@ -446,6 +565,7 @@ pub mod tests {
             job: Some(job.into()),
             plugin: None,
             active_at: None,
+            answered_at: None,
             context: None,
             label: None,
             spend: None,
@@ -572,11 +692,14 @@ pub mod tests {
         app.reports.clear();
         app.trees.retain(|t| t.name != "7");
         app.pools.clear();
-        assert!(waiting(app).is_empty(), "{:?}", waiting(app));
+        assert!(needs_action(app).is_empty(), "{:?}", needs_action(app));
     }
 
     fn order(app: &App) -> Vec<(Kind, String)> {
-        waiting(app).into_iter().map(|e| (e.kind, e.tree)).collect()
+        needs_action(app)
+            .into_iter()
+            .map(|e| (e.kind, e.tree))
+            .collect()
     }
 
     fn press(app: &mut App, code: KeyCode) -> Outcome {
@@ -596,7 +719,7 @@ pub mod tests {
             ],
             "tree 2's finished agent is not among them"
         );
-        let away = &waiting(&app)[1];
+        let away = &needs_action(&app)[1];
         assert_eq!(
             away.away.as_ref().map(|a| a.name.as_str()),
             Some("endodeals-web")
@@ -604,31 +727,40 @@ pub mod tests {
         assert_eq!(away.title.as_deref(), Some("END-88 checkout-tax"));
     }
 
-    /// Presses `e` until it does what `wanted` looks for, at most once
-    /// round everything waiting.
-    fn press_e_until(app: &mut App, wanted: impl Fn(&App, &Outcome) -> bool) -> Outcome {
-        for _ in 0..=waiting(app).len() {
-            let outcome = press(app, KeyCode::Char('e'));
+    /// Opens the notifications with `e` and the `at`th item with Enter.
+    fn open_nth(app: &mut App, at: usize) -> Outcome {
+        press(app, KeyCode::Char('e'));
+        for _ in 0..at {
+            press(app, KeyCode::Down);
+        }
+        press(app, KeyCode::Enter)
+    }
+
+    /// Opens each item that needs action in turn until one does what
+    /// `wanted` looks for.
+    fn open_until(app: &mut App, wanted: impl Fn(&App, &Outcome) -> bool) -> Outcome {
+        for at in 0..needs_action(app).len() {
+            let outcome = open_nth(app, at);
             if wanted(app, &outcome) {
                 return outcome;
             }
         }
-        panic!("e never got there: {:?}", order(app));
+        panic!("never got there: {:?}", order(app));
     }
 
     #[test]
-    fn e_goes_to_the_oldest_that_waits_and_again_round_the_rest() {
+    fn enter_opens_each_that_needs_action_where_it_waits() {
         let mut app = app();
         // Tree 9's agent died 1,900s ago, the oldest.
-        assert_eq!(press(&mut app, KeyCode::Char('e')), Outcome::Continue);
+        assert_eq!(open_nth(&mut app, 0), Outcome::Continue);
         assert_eq!(app.current().map(|t| t.name.as_str()), Some("9"));
         assert!(app.message.as_deref().unwrap().contains("R resumes"));
         assert!(
-            matches!(press(&mut app, KeyCode::Char('e')), Outcome::SwitchTo { ref tree, .. } if tree == Path::new("/other/12/web")),
+            matches!(open_nth(&mut app, 1), Outcome::SwitchTo { ref tree, .. } if tree == Path::new("/other/12/web")),
             "then the ask of 360s ago, in another workspace"
         );
         assert_eq!(
-            press(&mut app, KeyCode::Char('e')),
+            open_nth(&mut app, 2),
             Outcome::Chat {
                 command: vec!["claude".into(), "attach".into(), "j4".into()],
                 agent: "inbox-rail".into(),
@@ -637,14 +769,14 @@ pub mod tests {
             "then the ask of 120s ago here"
         );
         assert_eq!(app.current().map(|t| t.name.as_str()), Some("4"));
-        assert_eq!(press(&mut app, KeyCode::Char('e')), Outcome::Continue);
+        assert_eq!(open_nth(&mut app, 3), Outcome::Continue);
         assert_eq!(app.current().map(|t| t.name.as_str()), Some("7"));
         assert!(app.message.as_deref().unwrap().contains("f sends"));
-        assert_eq!(press(&mut app, KeyCode::Char('e')), Outcome::Continue);
+        assert_eq!(open_nth(&mut app, 0), Outcome::Continue);
         assert_eq!(
             app.current().map(|t| t.name.as_str()),
             Some("9"),
-            "and round again"
+            "opened again"
         );
     }
 
@@ -652,7 +784,7 @@ pub mod tests {
     fn another_workspaces_entry_switches_there_and_opens_its_agent() {
         let mut app = app();
         assert_eq!(
-            press_e_until(&mut app, |_, o| matches!(o, Outcome::SwitchTo { .. })),
+            open_until(&mut app, |_, o| matches!(o, Outcome::SwitchTo { .. })),
             Outcome::SwitchTo {
                 checkout: "/code/endodeals-web".into(),
                 tree: "/other/12/web".into(),
@@ -720,7 +852,10 @@ pub mod tests {
             },
         )]
         .into();
-        let away = waiting(&app).into_iter().find(|e| e.tree == "12").unwrap();
+        let away = needs_action(&app)
+            .into_iter()
+            .find(|e| e.tree == "12")
+            .unwrap();
         assert_eq!(away.title.as_deref(), Some("END-88 checkout-tax"));
     }
 
@@ -742,6 +877,7 @@ pub mod tests {
             job: None,
             is_background: false,
             active_at: Some(1_793_900_000),
+            answered_at: None,
             ..agent("claude", "", Status::Waiting)
         };
         let waiting = tree("/other/5/web", "5", "me/seo-meta", vec![pane]);
@@ -752,7 +888,7 @@ pub mod tests {
     }
 
     fn entry_of(app: &App, tree: &str) -> Entry {
-        waiting(app)
+        needs_action(app)
             .into_iter()
             .find(|e| e.tree == tree && e.away.is_some())
             .unwrap_or_else(|| panic!("no entry for {tree} in {:?}", order(app)))
@@ -770,7 +906,7 @@ pub mod tests {
         assert_eq!(failed.title.as_deref(), Some("END-91 fix-login"));
 
         assert_eq!(
-            press_e_until(&mut app, |_, o| {
+            open_until(&mut app, |_, o| {
                 matches!(
                     o,
                     Outcome::SwitchTo {
@@ -807,7 +943,7 @@ pub mod tests {
         let waiting = entry_of(&app, "5");
         assert_eq!(
             (waiting.kind, waiting.what.as_str()),
-            (Kind::NeedsYou, "waiting at a prompt in its pane")
+            (Kind::NeedsYou, "waiting at a prompt")
         );
         // Tree 12's agent asks through its report; a pane waiting there too
         // is the same ask, not a second entry.
@@ -936,291 +1072,799 @@ pub mod tests {
     }
 
     #[test]
-    fn e_keeps_its_place_across_a_switch_of_workspace() {
+    fn enter_opens_the_item_under_the_cursor_and_an_opened_done_one_leaves() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('e'));
+        assert!(app.is_notes_shown());
+        // Down past the dead agent to the other workspace's ask.
+        press(&mut app, KeyCode::Char('j'));
+        assert!(
+            matches!(press(&mut app, KeyCode::Enter), Outcome::SwitchTo { ref tree, .. } if tree == Path::new("/other/12/web"))
+        );
+        assert!(!app.is_notes_shown(), "closed on the way");
+        // The last is tree 2's finish: opened, it leaves Done.
+        press(&mut app, KeyCode::Char('e'));
+        for _ in 0..10 {
+            press(&mut app, KeyCode::Down);
+        }
+        assert!(
+            matches!(press(&mut app, KeyCode::Enter), Outcome::Chat { ref tree, .. } if tree == "2")
+        );
+        let (needs, done) = app.notes_list();
+        assert_eq!((needs.len(), done.len()), (4, 0), "what needs action stays");
+        // Esc closes.
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.is_notes_shown());
+    }
+
+    #[test]
+    fn x_puts_one_away_until_it_changes_across_a_restart() {
+        let dir = std::env::temp_dir().join(format!("treetop-put-away-{}", std::process::id()));
+        let file = dir.join("put-away.json");
+        let mut first = app();
+        first.put_away_file = Some(file.clone());
+        let one = &mut first;
+        press(one, KeyCode::Char('e'));
+        // Tree 9's dead agent, the first.
+        press(one, KeyCode::Char('x'));
+        let (needs, _) = one.notes_list();
+        assert!(!needs.iter().any(|e| e.tree == "9"), "{needs:?}");
+        assert_eq!(needs.len(), 3, "out of the count too");
+        assert!(one.is_notes_shown(), "the rest still open");
+        // Started again, it is still away.
+        let mut again = app();
+        again.put_away = crate::state::read(&file);
+        assert!(!again.notes_list().0.iter().any(|e| e.tree == "9"));
+        // Its agent resumed and died again: a new item, back in the list.
+        let mut reports = again.reports.clone();
+        let nine = reports.iter_mut().find(|r| r.job == "j9").unwrap();
+        nine.updated = SystemTime::now();
+        again.apply_reports(reports);
+        assert!(again.notes_list().0.iter().any(|e| e.tree == "9"));
+        // An ask put away comes back once the agent asks something new.
+        press(&mut again, KeyCode::Char('e'));
+        let four = again
+            .notes_list()
+            .0
+            .iter()
+            .position(|e| e.tree == "4")
+            .unwrap();
+        for _ in 0..four {
+            press(&mut again, KeyCode::Char('j'));
+        }
+        press(&mut again, KeyCode::Char('x'));
+        assert!(!again.notes_list().0.iter().any(|e| e.tree == "4"));
+        let mut reports = again.reports.clone();
+        reports[0] = report("j4", "/pool/4/app", State::Blocked, "And the colour?", 10);
+        again.apply_reports(reports);
+        assert!(again.notes_list().0.iter().any(|e| e.tree == "4"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_ask_put_away_from_another_workspace_stays_away_there() {
+        // Tree 12's agent sits at a prompt in its tmux pane, no report, its
+        // last reply known, or not, as for an agent read from a holder file.
+        for replied in [Some(secs_ago(60)), None] {
+            put_away_there(|| Agent {
+                active_at: replied,
+                answered_at: None,
+                ..agent("checkout-tax", "j12", Status::Waiting)
+            });
+        }
+    }
+
+    /// Puts away tree 12's ask from another workspace, `asking` its agent,
+    /// and checks it is away in tree 12's own workspace too.
+    fn put_away_there(asking: impl Fn() -> Agent) {
         let mut here = app();
+        here.reports.retain(|r| r.job != "j12");
+        let mut there = here.pools[0].trees[0].clone();
+        there.agents = vec![asking()];
+        here.away_live = [("/code/endodeals-web".into(), vec![there])].into();
         press(&mut here, KeyCode::Char('e'));
-        assert!(matches!(
-            press(&mut here, KeyCode::Char('e')),
-            Outcome::SwitchTo { .. }
-        ));
-        // The switch starts the next workspace afresh, with what `e` had
-        // been through carried over; here the same trees, read from there.
-        let mut there = app();
-        there.keep_watch(here.take_watch());
-        assert!(
-            matches!(press(&mut there, KeyCode::Char('e')), Outcome::Chat { ref tree, .. } if tree == "4"),
-            "on to the one after tree 12, not back to the first"
-        );
-        assert_eq!(
-            there.watch_waiting().map(|(is_new, _)| is_new),
-            Some(false),
-            "and the switch rings nothing"
-        );
-    }
-
-    fn ten_minutes() -> Duration {
-        Duration::from_secs(10 * 60)
-    }
-
-    #[test]
-    fn the_first_key_back_from_away_opens_what_waited_and_goes_no_further() {
-        let mut app = app();
-        app.select_tree("2");
-        app.tab = crate::app::WindowTab::Chat;
-        app.insert_in_window();
-        assert!(app.is_inserting(), "typing in tree 2's chat");
-        app.note_idle(Duration::from_secs(9 * 60));
-        assert!(!app.back(), "nine minutes is not away");
-        app.note_idle(ten_minutes());
-        assert!(app.back(), "the key is swallowed");
-        assert!(!app.is_inserting(), "and the chat no longer has the keys");
-        assert!(app.is_away_shown());
-        assert!(!app.back(), "only the first key");
-        // Away with nothing waiting opens nothing.
-        let mut idle = self::app();
-        nothing_waits(&mut idle);
-        idle.note_idle(ten_minutes());
-        assert!(!idle.back());
-        assert!(!idle.is_away_shown());
-    }
-
-    #[test]
-    fn enter_works_through_what_waited_and_s_puts_one_off() {
-        let mut app = app();
-        app.note_idle(ten_minutes());
-        app.back();
-        let first = |app: &App| app.away_items().first().map(|e| e.tree.clone());
-        assert_eq!(first(&app).as_deref(), Some("9"));
-        // `s` puts tree 9 off till last.
-        press(&mut app, KeyCode::Char('s'));
-        assert_eq!(first(&app).as_deref(), Some("12"));
-        assert_eq!(app.away_items().last().map(|e| e.tree.as_str()), Some("9"));
-        press(&mut app, KeyCode::Char('s'));
-        assert_eq!(first(&app).as_deref(), Some("4"));
-        // Enter opens tree 4's chat, and the sheet stands aside while it asks.
-        let Outcome::Chat { tree, .. } = press(&mut app, KeyCode::Enter) else {
-            panic!("Enter opens tree 4's chat");
-        };
-        assert_eq!(tree, "4");
-        assert!(!app.is_away_shown(), "out of the way of tree 4's chat");
-        // Answered, tree 4 no longer asks: the sheet is back, the next first,
-        // 9 and 12 still put off.
-        let mut reports = app.reports.clone();
-        for r in reports.iter_mut().filter(|r| r.job == "j4") {
-            r.state = State::Working;
+        let at = here
+            .notes_list()
+            .0
+            .iter()
+            .position(|e| e.tree == "12")
+            .unwrap();
+        for _ in 0..at {
+            press(&mut here, KeyCode::Down);
         }
-        app.apply_reports(reports);
-        assert!(app.is_away_shown());
-        assert_eq!(first(&app).as_deref(), Some("7"));
-        // Esc closes it; `E` brings it back as it was, 9 and 12 still last.
-        press(&mut app, KeyCode::Esc);
-        assert!(!app.is_away_shown());
-        press(&mut app, KeyCode::Char('E'));
-        assert!(app.is_away_shown());
-        assert_eq!(first(&app).as_deref(), Some("7"));
-        // Caught up, any key closes it.
-        nothing_waits(&mut app);
-        press(&mut app, KeyCode::Char('x'));
-        assert!(!app.is_away_shown() && app.away.is_none());
-    }
-
-    #[test]
-    fn what_finished_after_your_last_key_is_in_the_foot_though_you_were_not_yet_away() {
-        let mut app = app();
-        app.watch_waiting();
-        app.back();
-        // Tree 4's agent finishes a minute after your last key, nine before
-        // treetop counts you away.
-        let mut reports = app.reports.clone();
-        reports[0] = report("j4", "/pool/4/app", State::Done, "Done", 60);
-        app.apply_reports(reports);
-        app.note_idle(ten_minutes());
-        assert!(app.back());
-        let done: Vec<String> = app.away_done().into_iter().map(|e| e.tree).collect();
-        assert_eq!(done, ["4"], "and tree 2, done before you went, is not");
-    }
-
-    #[test]
-    fn the_sheet_comes_along_when_enter_switches_workspace() {
-        let mut here = app();
-        here.note_idle(ten_minutes());
-        here.back();
-        press(&mut here, KeyCode::Char('s'));
-        assert!(matches!(
-            press(&mut here, KeyCode::Enter),
-            Outcome::SwitchTo { .. }
-        ));
-        // The other workspace, as the switch opens it.
+        press(&mut here, KeyCode::Char('x'));
+        assert!(!here.notes_list().0.iter().any(|e| e.tree == "12"));
+        // Switched there, the same ask, now in its own workspace.
         let mut there = app();
-        there.keep_watch(here.take_watch());
-        assert!(there.away.is_some(), "the sheet came along");
         there.reports.retain(|r| r.job != "j12");
-        assert!(there.is_away_shown(), "back once it is answered");
-        assert_eq!(
-            there.away_items().first().map(|e| e.tree.as_str()),
-            Some("4"),
-            "with the next first"
-        );
-    }
-
-    #[test]
-    fn answering_in_the_chat_enter_opened_brings_the_sheet_back() {
-        let mut app = app();
-        app.watch_waiting();
-        app.note_idle(ten_minutes());
-        app.back();
-        press(&mut app, KeyCode::Char('s'));
-        press(&mut app, KeyCode::Char('s'));
-        assert!(matches!(
-            press(&mut app, KeyCode::Enter),
-            Outcome::Chat { ref tree, .. } if tree == "4"
+        there.pools.clear();
+        there.trees.push(tree(
+            "/other/12/web",
+            "12",
+            "me/END-88-checkout-tax",
+            vec![asking()],
         ));
-        // The chat opens in the window with the keys, and you answer there.
-        app.insert_in_window();
-        let mut reports = app.reports.clone();
-        reports[0].state = State::Working;
-        app.apply_reports(reports);
-        app.watch_waiting();
-        assert!(!app.is_inserting(), "the keys come back to the table");
-        assert!(app.is_away_shown());
-        assert_eq!(app.away_items().first().map(|e| e.tree.as_str()), Some("7"));
-    }
-
-    #[test]
-    fn what_finished_before_you_went_is_not_in_the_foot() {
-        let mut app = app();
-        app.watch_waiting();
-        // Tree 4's agent finished an hour ago, while you typed elsewhere.
-        let mut reports = app.reports.clone();
-        reports[0] = report("j4", "/pool/4/app", State::Done, "Done", 3_600);
-        app.apply_reports(reports);
-        app.note_idle(ten_minutes());
-        app.back();
-        assert!(app.away_done().is_empty(), "{:?}", app.away_done());
-    }
-
-    #[test]
-    fn away_again_from_a_chat_the_sheet_opened_opens_it_again() {
-        let mut app = app();
-        app.note_idle(ten_minutes());
-        app.back();
-        press(&mut app, KeyCode::Char('s'));
-        press(&mut app, KeyCode::Char('s'));
-        press(&mut app, KeyCode::Enter);
-        app.insert_in_window();
-        // You leave with tree 4's chat open and its ask unanswered.
-        app.note_idle(Duration::from_secs(60 * 60));
-        assert!(app.back(), "the first key back goes to no agent");
-        assert!(!app.is_inserting());
-        assert!(app.is_away_shown());
-        assert_eq!(
-            app.away_items().last().map(|e| e.tree.as_str()),
-            Some("12"),
-            "what was put off stays put off"
-        );
-    }
-
-    #[test]
-    fn with_help_open_the_first_key_back_shows_the_sheet() {
-        let mut app = app();
-        app.is_help = true;
-        app.note_idle(ten_minutes());
-        assert!(app.back());
-        assert!(app.is_away_shown(), "help gives way to the sheet");
-        // The palette, being typed in, keeps the first key back.
-        let mut app = self::app();
-        app.open_palette();
-        app.note_idle(ten_minutes());
-        assert!(!app.back(), "the key goes to the palette");
-        assert!(!app.is_away_shown());
-    }
-
-    #[test]
-    fn a_start_shown_in_the_window_does_not_keep_the_sheet_shut() {
-        let mut app = app();
-        press(&mut app, KeyCode::Char('N'));
-        for c in "fix login".chars() {
-            press(&mut app, KeyCode::Char(c));
-        }
-        press(&mut app, KeyCode::Enter);
+        assert!(there.notes_list().0.iter().any(|e| e.tree == "12"));
+        there.put_away = here.put_away.clone();
         assert!(
-            app.window_start().is_some(),
-            "the start shows in the window"
+            !there.notes_list().0.iter().any(|e| e.tree == "12"),
+            "{:?}",
+            there.put_away
         );
-        app.note_idle(ten_minutes());
-        assert!(app.back());
-        assert!(app.is_away_shown());
-        // Esc closes the sheet, and the start stays shown.
-        press(&mut app, KeyCode::Esc);
-        assert!(!app.is_away_shown());
-        assert!(app.window_start().is_some());
-        // A stray `q` on the sheet quits nothing.
-        press(&mut app, KeyCode::Char('E'));
-        assert_eq!(press(&mut app, KeyCode::Char('q')), Outcome::Continue);
     }
 
     #[test]
-    fn leaving_the_tree_enter_put_you_on_brings_the_sheet_back() {
+    fn an_ask_with_no_time_put_away_comes_back_once_asked_again() {
+        // Tree 2's agent, from a holder file, sits at a prompt; no report,
+        // and no time for its last reply.
         let mut app = app();
-        app.note_idle(ten_minutes());
-        app.back();
-        // Tree 9's dead agent, first: Enter puts the cursor on it.
-        assert_eq!(press(&mut app, KeyCode::Enter), Outcome::Continue);
-        assert!(!app.is_away_shown(), "aside while you are on tree 9");
-        app.select_tree("2");
-        assert!(app.is_away_shown(), "back once you move off it");
-        assert_eq!(app.away_items().first().map(|e| e.tree.as_str()), Some("9"));
+        app.reports.retain(|r| r.job != "j2");
+        let set = |app: &mut App, status: Status| {
+            let two = app.trees.iter_mut().find(|t| t.name == "2").unwrap();
+            two.agents[0].status = Some(status);
+            app.watch_waiting();
+        };
+        let shown = |app: &App| app.notes_list().0.iter().any(|e| e.tree == "2");
+        set(&mut app, Status::Waiting);
+        app.notes = Some(0);
+        let at = app
+            .notes_list()
+            .0
+            .iter()
+            .position(|e| e.tree == "2")
+            .unwrap();
+        app.notes = Some(at);
+        press(&mut app, KeyCode::Char('x'));
+        assert!(!shown(&app), "put away");
+        set(&mut app, Status::Waiting);
+        assert!(!shown(&app), "still the same ask");
+        // Answered, it works; then it asks again.
+        set(&mut app, Status::Busy);
+        set(&mut app, Status::Waiting);
+        assert!(shown(&app), "a new ask");
+    }
+
+    /// Seconds since the epoch, `ago` seconds back.
+    fn secs_ago(ago: u64) -> u64 {
+        secs(SystemTime::now()) - ago
+    }
+
+    /// Whether tree `name` is in Needs action, and whether in Done.
+    fn listed(app: &App, name: &str) -> (bool, bool) {
+        let is_in = |list: Vec<Entry>| list.iter().any(|e| e.tree == name);
+        (is_in(needs_action(app)), is_in(done(app)))
     }
 
     #[test]
-    fn back_from_away_over_the_issues_screen_the_sheet_shows_on_the_trees() {
+    fn a_blocked_report_holds_until_its_session_works_past_it() {
+        // Tree 4's agent asked ten minutes ago.
         let mut app = app();
-        app.select_tree("2");
-        app.tab = crate::app::WindowTab::Chat;
-        app.is_issues = true;
-        app.insert_in_window();
-        app.note_idle(ten_minutes());
-        assert!(app.back(), "the key reaches neither the agent nor Issues");
-        assert!(!app.is_issues && app.is_away_shown());
-        // A box being typed in keeps the key, and the keys stay where they
-        // were.
+        let mut reports = app.reports.clone();
+        reports[0] = report("j4", "/pool/4/app", State::Blocked, "Which DB?", 600);
+        app.apply_reports(reports);
+        let mut now = |status: Status, active_ago: u64| {
+            let four = &mut app.trees[0].agents[0];
+            four.status = Some(status);
+            four.active_at = Some(secs_ago(active_ago));
+            listed(&app, "4")
+        };
+        assert_eq!(
+            now(Status::Idle, 590),
+            (true, false),
+            "its turn ended a moment after it asked: it still waits"
+        );
+        assert_eq!(
+            now(Status::Idle, 60),
+            (false, true),
+            "answered, it worked well past the report and stopped: done"
+        );
+        assert_eq!(
+            now(Status::Idle, 500),
+            (false, true),
+            "answered at once, a short turn and stopped: done"
+        );
+        assert_eq!(now(Status::Busy, 5), (false, false), "working on it");
+        assert_eq!(
+            now(Status::Waiting, 5),
+            (true, false),
+            "asking again, however late, it waits"
+        );
+        // Answered seconds after it asked, and done as quick: the answer,
+        // not the time, tells it from the ask's own turn.
+        let four = &mut app.trees[0].agents[0];
+        four.status = Some(Status::Idle);
+        four.active_at = Some(secs_ago(590));
+        assert_eq!(listed(&app, "4"), (true, false), "not yet answered");
+        app.trees[0].agents[0].answered_at = Some(secs_ago(595));
+        assert_eq!(listed(&app, "4"), (false, true), "answered, and finished");
+    }
+
+    #[test]
+    fn what_finished_says_what_it_said_not_that_it_waits_at_a_prompt() {
+        // Tree 4 asked ten minutes ago, was answered, and its session has
+        // since worked and gone idle.
+        let mut app = app();
+        let mut reports = app.reports.clone();
+        reports[0] = report(
+            "j4",
+            "/pool/4/app",
+            State::Blocked,
+            "Where should the inbox sit?",
+            600,
+        );
+        app.apply_reports(reports);
+        let four = app.trees.iter_mut().find(|t| t.name == "4").unwrap();
+        four.agents[0].active_at = Some(secs_ago(30));
+        let four = done(&app).into_iter().find(|e| e.tree == "4").unwrap();
+        assert_eq!(four.what, "Where should the inbox sit?");
+    }
+
+    #[test]
+    fn another_workspaces_stale_ask_no_longer_needs_you() {
+        let mut app = app();
+        assert!(needs_action(&app).iter().any(|e| e.tree == "12"));
+        // endodeals-web's read: tree 12's session has worked past its ask
+        // and sits idle.
+        let mut answered = agent("checkout-tax", "j12", Status::Idle);
+        answered.active_at = Some(secs_ago(30));
+        app.away_live = [(
+            "/code/endodeals-web".into(),
+            vec![tree(
+                "/other/12/web",
+                "12",
+                "me/END-88-checkout-tax",
+                vec![answered],
+            )],
+        )]
+        .into();
+        assert!(
+            !needs_action(&app).iter().any(|e| e.tree == "12"),
+            "{:?}",
+            needs_action(&app)
+        );
+        assert!(
+            done(&app)
+                .iter()
+                .any(|e| e.tree == "12" && e.away.is_some())
+        );
+    }
+
+    #[test]
+    fn a_tree_with_an_agent_still_busy_is_not_done() {
+        let mut app = app();
+        app.reports.retain(|r| r.job != "j2");
+        let two = app.trees.iter_mut().find(|t| t.name == "2").unwrap();
+        two.agents[0].active_at = Some(secs_ago(30));
+        let mut busy = agent("helper", "jx", Status::Busy);
+        busy.active_at = Some(secs_ago(5));
+        two.agents.push(busy);
+        assert_eq!(listed(&app, "2"), (false, false));
+        // So with a report saying it is done.
+        let mut reports = app.reports.clone();
+        reports.push(report("j2", "/pool/2/app", State::Done, "Done", 60));
+        app.apply_reports(reports);
+        assert_eq!(listed(&app, "2"), (false, false));
+    }
+
+    #[test]
+    fn an_agent_asking_after_its_report_said_done_needs_action_only() {
+        let mut app = app();
+        // Tree 2's report here says done, and its agent has since asked.
+        let two = app.trees.iter_mut().find(|t| t.name == "2").unwrap();
+        two.agents[0].status = Some(Status::Waiting);
+        assert_eq!(listed(&app, "2"), (true, false));
+        // The same in another workspace: tree 12's report says done, and
+        // that workspace's read finds its agent asking.
+        let mut reports = app.reports.clone();
+        reports[3] = report("j12", "/other/12/web/src", State::Done, "Seeded.", 360);
+        app.apply_reports(reports);
+        let asking = agent("checkout-tax", "j12", Status::Waiting);
+        app.away_live = [(
+            "/code/endodeals-web".into(),
+            vec![tree(
+                "/other/12/web",
+                "12",
+                "me/END-88-checkout-tax",
+                vec![asking],
+            )],
+        )]
+        .into();
+        assert_eq!(listed(&app, "12"), (true, false));
+    }
+
+    #[test]
+    fn an_answered_ask_no_longer_opens_its_chat_by_itself() {
+        let mut app = app();
+        let mut reports = app.reports.clone();
+        reports[0] = report(
+            "j4",
+            "/pool/4/app",
+            State::Blocked,
+            "Where should the inbox sit?",
+            600,
+        );
+        app.apply_reports(reports);
+        assert!(app.next_ask().is_some(), "an ask waiting opens its chat");
         let mut app = self::app();
-        app.select_tree("2");
-        app.tab = crate::app::WindowTab::Chat;
-        app.insert_in_window();
-        app.open_palette();
-        app.note_idle(ten_minutes());
-        assert!(!app.back());
-        assert!(app.is_window_focused, "left as it was");
+        let mut reports = app.reports.clone();
+        reports[0] = report(
+            "j4",
+            "/pool/4/app",
+            State::Blocked,
+            "Where should the inbox sit?",
+            600,
+        );
+        app.apply_reports(reports);
+        // Answered: its session has run a turn since and sits idle.
+        let four = app.trees.iter_mut().find(|t| t.name == "4").unwrap();
+        four.agents[0].active_at = Some(secs_ago(30));
+        assert!(app.next_ask().is_none(), "{:?}", app.next_ask());
     }
 
     #[test]
-    fn e_from_a_chat_in_normal_leaves_it_for_what_waits() {
+    fn another_workspaces_tree_with_an_agent_still_busy_is_not_done() {
+        let mut app = app();
+        let mut reports = app.reports.clone();
+        reports[3] = report("j12", "/other/12/web/src", State::Done, "Seeded.", 360);
+        app.apply_reports(reports);
+        let mut done = agent("checkout-tax", "j12", Status::Idle);
+        done.active_at = Some(secs_ago(300));
+        let mut busy = agent("helper", "jx", Status::Busy);
+        busy.active_at = Some(secs_ago(5));
+        app.away_live = [(
+            "/code/endodeals-web".into(),
+            vec![tree(
+                "/other/12/web",
+                "12",
+                "me/END-88-checkout-tax",
+                vec![done, busy],
+            )],
+        )]
+        .into();
+        assert_eq!(listed(&app, "12"), (false, false));
+    }
+
+    #[test]
+    fn the_table_does_not_mark_a_tree_done_while_its_lead_is_busy() {
+        let mut app = app();
+        let two = app.trees.iter_mut().find(|t| t.name == "2").unwrap();
+        let mut busy = agent("helper", "jx", Status::Busy);
+        busy.active_at = Some(secs_ago(5));
+        two.agents.push(busy);
+        let row = crate::ui::tests::screen_lines(&app, 200, 40)
+            .into_iter()
+            .find(|l| l.contains("me/help-columns"))
+            .unwrap();
+        assert!(!row.contains("✓ helper"), "{row}");
+        assert!(row.contains("helper"), "{row}");
+    }
+
+    #[test]
+    fn another_workspace_follows_the_same_rules_as_this_one() {
+        let in_away = |app: &App, tree: &str| {
+            let is_in = |list: Vec<Entry>| list.iter().any(|e| e.tree == tree && e.away.is_some());
+            (is_in(needs_action(app)), is_in(done(app)))
+        };
+        let read = |app: &mut App, agents: Vec<Agent>| {
+            app.away_live = [(
+                "/code/endodeals-web".into(),
+                vec![tree(
+                    "/other/12/web",
+                    "12",
+                    "me/END-88-checkout-tax",
+                    agents,
+                )],
+            )]
+            .into();
+        };
+        // A done report beside another agent asking: Needs action only.
+        let mut app = app();
+        let mut reports = app.reports.clone();
+        reports[3] = report("j12", "/other/12/web/src", State::Done, "Seeded.", 360);
+        app.apply_reports(reports);
+        let mut done = agent("checkout-tax", "j12", Status::Idle);
+        done.active_at = Some(secs_ago(300));
+        read(&mut app, vec![done, agent("helper", "jx", Status::Waiting)]);
+        assert_eq!(in_away(&app, "12"), (true, false));
+        // An agent idle after its turn, with no report: Done.
+        let mut app = self::app();
+        app.reports.retain(|r| r.job != "j12");
+        let mut finished = agent("checkout-tax", "j12", Status::Idle);
+        finished.active_at = Some(secs_ago(60));
+        read(&mut app, vec![finished]);
+        assert_eq!(in_away(&app, "12"), (false, true));
+    }
+
+    #[test]
+    fn an_ask_in_a_tree_holds_though_another_agent_there_reports_done_later() {
+        // Tree 4: agent j4 asked, and a second agent there reported done
+        // after it.
+        let mut app = app();
+        let mut reports = app.reports.clone();
+        reports.push(report("j4b", "/pool/4/app/sub", State::Done, "Tidied.", 30));
+        app.apply_reports(reports);
+        let four = app.trees.iter_mut().find(|t| t.name == "4").unwrap();
+        four.agents.push(agent("tidy", "j4b", Status::Idle));
+        assert_eq!(listed(&app, "4"), (true, false));
+        // The same in another workspace: tree 12's agent asked, a second
+        // one there reported done.
+        let mut reports = app.reports.clone();
+        reports.push(report(
+            "j12b",
+            "/other/12/web/lib",
+            State::Done,
+            "Seeded.",
+            30,
+        ));
+        app.apply_reports(reports);
+        app.pools[0].sidecars.clear();
+        let is_in = |list: Vec<Entry>| list.iter().filter(|e| e.tree == "12").count();
+        assert_eq!((is_in(needs_action(&app)), is_in(done(&app))), (1, 0));
+    }
+
+    #[test]
+    fn an_ask_beside_a_newer_done_report_shows_as_needing_you_everywhere() {
+        let mut app = app();
+        let mut reports = app.reports.clone();
+        reports.push(report("j4b", "/pool/4/app/sub", State::Done, "Tidied.", 30));
+        app.apply_reports(reports);
+        let four = app.trees.iter_mut().find(|t| t.name == "4").unwrap();
+        four.agents.push(agent("tidy", "j4b", Status::Idle));
+        let four = app.trees.iter().find(|t| t.name == "4").unwrap();
+        assert!(
+            app.needs_you(four),
+            "the header count and the phone count it"
+        );
+        let row = crate::ui::tests::screen_lines(&app, 200, 40)
+            .into_iter()
+            .find(|l| l.contains("me/anb-41-inbox-rail"))
+            .unwrap();
+        assert!(row.contains("● inbox-rail"), "{row}");
+    }
+
+    #[test]
+    fn another_workspaces_tree_with_a_dead_agent_and_one_asking_has_one_entry() {
+        let mut app = app();
+        let mut reports = app.reports.clone();
+        reports[3] = report("j12", "/other/12/web/src", State::Failed, "", 360);
+        app.apply_reports(reports);
+        app.away_live = [(
+            "/code/endodeals-web".into(),
+            vec![tree(
+                "/other/12/web",
+                "12",
+                "me/END-88-checkout-tax",
+                vec![agent("helper", "jx", Status::Waiting)],
+            )],
+        )]
+        .into();
+        let twelve: Vec<Kind> = needs_action(&app)
+            .into_iter()
+            .filter(|e| e.tree == "12")
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(twelve, [Kind::NeedsYou]);
+    }
+
+    #[test]
+    fn the_table_marks_a_tree_as_its_lists_have_it() {
+        let row = |status: Status, tree: &str, branch: &str| {
+            let mut app = app();
+            let t = app.trees.iter_mut().find(|t| t.name == tree).unwrap();
+            t.agents.push(agent("helper", "jx", status));
+            crate::ui::tests::screen_lines(&app, 200, 40)
+                .into_iter()
+                .find(|l| l.contains(branch))
+                .unwrap()
+        };
+        let asking = row(Status::Waiting, "2", "me/help-columns");
+        assert!(asking.contains("● helper"), "{asking}");
+        let over_death = row(Status::Waiting, "9", "me/port-menu");
+        assert!(over_death.contains("● helper"), "{over_death}");
+    }
+
+    #[test]
+    fn the_main_checkouts_heading_marks_what_its_cold_agent_left() {
+        let heading = |state: State| {
+            let mut app = app();
+            let mut main = tree(
+                "/repo/app",
+                "main",
+                "trunk",
+                vec![agent("on-main", "jm", Status::Cold)],
+            );
+            main.is_main = true;
+            main.status = "checkout".into();
+            app.trees.insert(0, main);
+            let mut reports = app.reports.clone();
+            reports.push(report("jm", "/repo/app", state, "Which?", 60));
+            app.apply_reports(reports);
+            crate::ui::tests::screen_lines(&app, 200, 40)
+                .into_iter()
+                .find(|l| l.contains("main checkout"))
+                .unwrap()
+        };
+        let died = heading(State::Failed);
+        assert!(died.contains("✗ on-main"), "{died}");
+        let asking = heading(State::Blocked);
+        assert!(asking.contains("● on-main"), "{asking}");
+    }
+
+    #[test]
+    fn a_stale_ask_in_another_workspace_is_not_counted_as_needing_you() {
+        // Tree 12's agent asked six minutes ago and has run a turn since.
+        let mut app = app();
+        let mut there = app.pools[0].trees[0].clone();
+        there.agents = vec![Agent {
+            active_at: Some(secs_ago(30)),
+            answered_at: None,
+            ..agent("checkout-tax", "j12", Status::Idle)
+        }];
+        app.away_live = [("/code/endodeals-web".into(), vec![there])].into();
+        assert_eq!(listed(&app, "12"), (false, true));
+        assert_eq!(app.elsewhere(), 0, "the header counts what the list has");
+    }
+
+    #[test]
+    fn the_main_checkouts_heading_shows_no_cold_agent_with_nothing_to_say() {
+        let mut app = app();
+        let mut main = tree(
+            "/repo/app",
+            "main",
+            "trunk",
+            vec![agent("on-main", "jm", Status::Cold)],
+        );
+        main.is_main = true;
+        main.status = "checkout".into();
+        app.trees.insert(0, main);
+        let mut reports = app.reports.clone();
+        reports.push(report("jm", "/repo/app", State::Working, "Building", 60));
+        app.apply_reports(reports);
+        let heading = crate::ui::tests::screen_lines(&app, 200, 40)
+            .into_iter()
+            .find(|l| l.contains("main checkout"))
+            .unwrap();
+        assert!(!heading.contains("on-main"), "{heading}");
+    }
+
+    /// Tree 2 here and tree 12 in endodeals-web, each with `agents` and
+    /// the reports `reports` gives for a tree's directory, judged: (needs
+    /// action, done) for each, which the same rules make the same.
+    fn here_and_away(
+        agents: impl Fn(&str) -> Vec<Agent>,
+        reports: impl Fn(&str) -> Vec<Report>,
+    ) -> ((bool, bool), (bool, bool)) {
+        let mut app = app();
+        app.reports
+            .retain(|r| !["j2", "j12"].contains(&r.job.as_str()));
+        let mut all = app.reports.clone();
+        all.extend(reports("/pool/2/app"));
+        all.extend(reports("/other/12/web/src").into_iter().map(|r| Report {
+            job: format!("{}-away", r.job),
+            ..r
+        }));
+        app.apply_reports(all);
+        let two = app.trees.iter_mut().find(|t| t.name == "2").unwrap();
+        two.agents = agents("");
+        app.away_live = [(
+            "/code/endodeals-web".into(),
+            vec![tree(
+                "/other/12/web",
+                "12",
+                "me/END-88-checkout-tax",
+                agents("-away"),
+            )],
+        )]
+        .into();
+        let away = |list: Vec<Entry>| list.iter().any(|e| e.tree == "12" && e.away.is_some());
+        (
+            listed(&app, "2"),
+            (away(needs_action(&app)), away(done(&app))),
+        )
+    }
+
+    #[test]
+    fn a_tree_comes_to_the_same_here_and_in_another_workspace() {
+        let with = |name: &str, job: &str, status: Status, ago: Option<u64>| {
+            let mut a = agent(name, job, status);
+            a.active_at = ago.map(secs_ago);
+            a
+        };
+        // A died report beside a busy agent's newer working one: dead.
+        let (here, away) = here_and_away(
+            |s| {
+                vec![
+                    with("a", &format!("ja{s}"), Status::Cold, None),
+                    with("b", &format!("jb{s}"), Status::Busy, Some(5)),
+                ]
+            },
+            |dir| {
+                vec![
+                    report("ja", dir, State::Failed, "", 600),
+                    report("jb", dir, State::Working, "Building", 30),
+                ]
+            },
+        );
+        assert_eq!((here, away), ((true, false), (true, false)), "died");
+        // A stopped report, its session idle after a turn: done.
+        let (here, away) = here_and_away(
+            |s| vec![with("a", &format!("ja{s}"), Status::Idle, Some(20))],
+            |dir| vec![report("ja", dir, State::Stopped, "", 30)],
+        );
+        assert_eq!((here, away), ((false, true), (false, true)), "stopped");
+        // A newer stopped report over an older done one, idle: done.
+        let (here, away) = here_and_away(
+            |s| {
+                vec![
+                    with("a", &format!("ja{s}"), Status::Idle, Some(20)),
+                    with("b", &format!("jb{s}"), Status::Idle, Some(20)),
+                ]
+            },
+            |dir| {
+                vec![
+                    report("ja", dir, State::Done, "Done", 300),
+                    report("jb", dir, State::Stopped, "", 30),
+                ]
+            },
+        );
+        assert_eq!(
+            (here, away),
+            ((false, true), (false, true)),
+            "done then stopped"
+        );
+    }
+
+    #[test]
+    fn a_session_idle_after_a_turn_is_done_not_needing_you() {
+        // Tree 2's agent sits idle with no report.
+        let mut app = app();
+        app.reports.retain(|r| r.job != "j2");
+        assert_eq!(listed(&app, "2"), (false, false), "no turn yet");
+        app.trees[1].agents[0].active_at = Some(secs_ago(30));
+        assert_eq!(listed(&app, "2"), (false, true), "idle after a turn");
+        // A background job left on working whose session went idle is done.
+        let mut reports = app.reports.clone();
+        reports.push(report(
+            "j2",
+            "/pool/2/app",
+            State::Working,
+            "Running the tests",
+            300,
+        ));
+        app.apply_reports(reports);
+        assert_eq!(listed(&app, "2"), (false, true), "its turn over");
+        app.trees[1].agents[0].status = Some(Status::Busy);
+        assert_eq!(listed(&app, "2"), (false, false), "still working");
+    }
+
+    #[test]
+    fn an_agent_asking_in_the_main_checkout_needs_action() {
+        // An agent started on the main heading, as `n` there starts one.
+        let mut app = app();
+        let mut main = tree(
+            "/repo/app",
+            "main",
+            "main",
+            vec![agent("on-main", "jm", Status::Waiting)],
+        );
+        main.is_main = true;
+        main.status = "checkout".into();
+        app.trees.push(main);
+        assert_eq!(listed(&app, "main"), (true, false), "at a prompt");
+        let main = app.trees.last().unwrap().clone();
+        assert!(app.needs_you(&main), "the header counts what the list has");
+        app.trees.last_mut().unwrap().agents[0].status = Some(Status::Idle);
+        app.trees.last_mut().unwrap().agents[0].active_at = Some(secs_ago(30));
+        assert_eq!(listed(&app, "main"), (false, true), "idle after its turn");
+    }
+
+    #[test]
+    fn opening_what_waits_in_the_main_checkout_lands_on_it() {
+        // Its agent died, which opens no chat: the cursor still goes there.
+        let mut app = app();
+        let mut main = tree(
+            "/repo/app",
+            "main",
+            "main",
+            vec![agent("on-main", "jm", Status::Cold)],
+        );
+        main.is_main = true;
+        main.status = "checkout".into();
+        app.trees.insert(0, main);
+        let mut reports = app.reports.clone();
+        reports.push(report("jm", "/repo/app", State::Failed, "", 60));
+        app.apply_reports(reports);
+        nothing_else_waits(&mut app, "main");
+        app.select_tree("2");
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.window_tree().map(|t| t.name.as_str()), Some("main"));
+    }
+
+    #[test]
+    fn an_agent_asking_in_another_workspaces_main_checkout_needs_action() {
+        let mut app = app();
+        let pool = &mut app.pools[0];
+        pool.trees = with_main(&pool.away.checkout, std::mem::take(&mut pool.trees));
+        let mut reports = app.reports.clone();
+        reports.push(report(
+            "jw",
+            "/code/endodeals-web/src",
+            State::Blocked,
+            "Which rates?",
+            60,
+        ));
+        app.apply_reports(reports);
+        assert!(
+            needs_action(&app)
+                .iter()
+                .any(|e| e.tree == "main" && e.away.is_some() && e.what == "Which rates?"),
+            "{:?}",
+            needs_action(&app)
+        );
+        // A report from one of its trees is still that tree's.
+        assert_eq!(listed(&app, "12"), (true, false));
+    }
+
+    /// Clears all that waits in `app` but what is in tree `name`.
+    fn nothing_else_waits(app: &mut App, name: &str) {
+        let path = app
+            .trees
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap()
+            .path
+            .clone();
+        app.reports
+            .retain(|r| r.dir.as_deref().is_some_and(|d| d.starts_with(&path)));
+        app.trees.retain(|t| t.name != "7");
+        app.pools.clear();
+    }
+
+    #[test]
+    fn a_merged_pr_is_done_and_a_failed_one_needs_action() {
+        let mut app = app();
+        assert_eq!(listed(&app, "7"), (true, false), "its checks failed");
+        app.trees[2].ship.as_mut().unwrap().stage = Stage::Merged;
+        assert_eq!(listed(&app, "7"), (false, true), "merged");
+        // A merge carries no time: it is as old as treetop has seen it.
+        app.watch_waiting();
+        let merged = done(&app).into_iter().find(|e| e.tree == "7").unwrap();
+        assert!(merged.at.is_some(), "{merged:?}");
+    }
+
+    #[test]
+    fn e_from_a_chat_in_normal_opens_the_notifications_over_the_table() {
         let mut app = app();
         app.select_tree("2");
         app.tab = crate::app::WindowTab::Chat;
         app.is_window_focused = true;
         assert_eq!(press(&mut app, KeyCode::Char('e')), Outcome::Continue);
+        assert!(!app.is_window_focused, "the window gives the keys up");
+        assert!(app.is_notes_shown());
+        assert_eq!(press(&mut app, KeyCode::Enter), Outcome::Continue);
         assert_eq!(
             app.current().map(|t| t.name.as_str()),
             Some("9"),
             "the oldest, tree 9's dead agent"
         );
-        assert!(!app.is_window_focused, "the window gives the keys up");
     }
 
     #[test]
-    fn e_with_nothing_waiting_says_so() {
+    fn enter_with_nothing_listed_opens_nothing() {
         let mut app = app();
         nothing_waits(&mut app);
-        assert_eq!(press(&mut app, KeyCode::Char('e')), Outcome::Continue);
-        assert_eq!(app.message.as_deref(), Some("nothing is waiting on you"));
+        press(&mut app, KeyCode::Char('e'));
+        assert!(app.is_notes_shown(), "open, saying there is nothing");
+        assert_eq!(press(&mut app, KeyCode::Enter), Outcome::Continue);
+        assert!(app.is_notes_shown());
     }
 
     #[test]
-    fn the_banner_takes_the_mouse_only_while_something_waits() {
+    fn the_count_takes_the_mouse_only_while_it_shows() {
         let mut app = app();
-        assert!(app.wants_mouse(), "for a click on the banner");
+        assert!(app.wants_mouse(), "for a click on the count");
         nothing_waits(&mut app);
         assert!(!app.wants_mouse(), "text selects in the terminal as ever");
     }

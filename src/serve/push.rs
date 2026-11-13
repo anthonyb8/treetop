@@ -409,7 +409,7 @@ impl Schedule {
         now: SystemTime,
         workspace: &str,
     ) -> Vec<Notice> {
-        let waiting: Vec<crate::inbox::Entry> = crate::inbox::waiting(app)
+        let waiting: Vec<crate::inbox::Entry> = crate::inbox::needs_action(app)
             .into_iter()
             .filter(|e| e.away.is_none())
             .collect();
@@ -659,6 +659,7 @@ mod tests {
             job: Some(job.into()),
             plugin: None,
             active_at: None,
+            answered_at: None,
             context: None,
             spend: None,
             label: None,
@@ -789,7 +790,16 @@ mod tests {
         assert!(due(&mut app, 3).is_empty());
         // Answered at the desk before five minutes are up.
         app.apply_reports(vec![report("j14", "/pool/14", State::Working, start)]);
-        assert!(due(&mut app, 10).is_empty());
+        // 14's turn then ends, its session idle: done, which never pushes.
+        let fourteen = app.trees.iter_mut().find(|t| t.name == "14").unwrap();
+        fourteen.agents[0].status = Some(Status::Idle);
+        fourteen.agents[0].active_at = Some(
+            at(4)
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        );
+        assert!(due(&mut app, 10).is_empty(), "a finished turn never pushes");
         // 17 finishes and its PR merges, each seen at once and long ago by
         // the time it is asked about.
         app.apply_reports(vec![report("j17", "/pool/17", State::Done, start)]);

@@ -3,6 +3,7 @@
 //! card carrying what its row shows. Built from the screen's own `App`, so
 //! the marks, order and grouping are the list's, not a second reading.
 
+use crate::inbox::Said;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
@@ -10,7 +11,6 @@ use serde_json::{Value, json};
 use crate::agents::Status;
 use crate::app::{App, Group};
 use crate::pool::Tree;
-use crate::reports::State;
 use crate::sidecar::Shelf;
 
 /// The whole Pool screen.
@@ -83,10 +83,11 @@ fn members<'a>(app: &'a App, group: &Group) -> Vec<&'a Tree> {
 pub fn card(app: &App, tree: &Tree, now: u64) -> Value {
     let agents = App::agents_of(tree);
     let says = app.says(tree);
-    let mark = match (says.as_ref().map(|i| i.state), agents.first()) {
-        (Some(State::Blocked), _) => "waiting",
-        (Some(State::Done), _) => "done",
-        (Some(State::Failed), _) => "failed",
+    // As the lists have it, so the card and its section agree.
+    let mark = match (crate::inbox::said(app, tree), agents.first()) {
+        (Some(Said::NeedsYou), _) => "waiting",
+        (Some(Said::Done), _) => "done",
+        (Some(Said::Died), _) => "failed",
         (_, Some(agent)) => match agent.status {
             Some(Status::Waiting) => "waiting",
             Some(Status::Busy) => "busy",
@@ -193,6 +194,7 @@ fn leading_ticket(segment: &str) -> Option<String> {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    use crate::reports::State;
 
     #[test]
     fn a_card_is_headed_by_its_ticket_and_slug() {
@@ -268,6 +270,7 @@ pub(super) mod tests {
             job: Some(format!("job-{name}")),
             plugin: Some("claude".into()),
             active_at: Some(active_at),
+            answered_at: None,
             context: None,
             spend: None,
             label: None,
@@ -340,7 +343,8 @@ pub(super) mod tests {
             .iter()
             .map(|c| c["mark"].as_str().unwrap())
             .collect();
-        assert_eq!(marks, ["busy", "idle", "no-agent"]);
+        // Tree 12's agent sits idle after its turn: done, not just idle.
+        assert_eq!(marks, ["busy", "done", "no-agent"]);
         assert_eq!(json["free"], 1);
     }
 
@@ -363,6 +367,37 @@ pub(super) mod tests {
 
     pub fn keys(value: &Value) -> BTreeSet<String> {
         value.as_object().unwrap().keys().cloned().collect()
+    }
+
+    #[test]
+    fn a_card_marks_a_tree_as_its_lists_have_it() {
+        use crate::agents::{Agent, Source};
+        let helper = |status: Status| Agent {
+            name: "helper".into(),
+            pid: Some(1),
+            status: Some(status),
+            source: Source::Plugin,
+            is_background: true,
+            attach: None,
+            job: Some("jx".into()),
+            plugin: None,
+            active_at: Some(now() - 5),
+            answered_at: None,
+            context: None,
+            spend: None,
+            label: None,
+        };
+        let mark = |status: Status, tree: &str| {
+            let mut app = crate::inbox::tests::app();
+            let t = app.trees.iter_mut().find(|t| t.name == tree).unwrap();
+            t.agents.push(helper(status));
+            let t = app.trees.iter().find(|t| t.name == tree).unwrap();
+            card(&app, t, now())["mark"].as_str().unwrap().to_string()
+        };
+        // Tree 2's report says done; tree 9's that its agent died.
+        assert_eq!(mark(Status::Waiting, "2"), "waiting", "an agent asking");
+        assert_eq!(mark(Status::Waiting, "9"), "waiting", "over a death");
+        assert_eq!(mark(Status::Busy, "2"), "busy", "a busy lead");
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! What waits on you, for the phone's Waiting tab: the same as the
-//! desktop's banner, built by `crate::inbox` from the workspace's `App`, so
+//! desktop's notifications, built by `crate::inbox` from the workspace's `App`, so
 //! the two never disagree, with what finished or merged under it.
 
 use std::sync::PoisonError;
@@ -41,7 +41,7 @@ fn kind_name(kind: Kind) -> &'static str {
     }
 }
 
-/// What waits in every workspace, as the desktop's banner orders it, and
+/// What waits in every workspace, as the desktop's notifications order it, and
 /// what has finished or merged, as workspace `here`'s phone draws them as
 /// of `now`; `is_reading` while the pools are still being read, so the
 /// phone does not take what is not read yet for nothing waiting. Each names
@@ -54,7 +54,7 @@ pub fn waiting_json(app: &App, here: &str, now: SystemTime, is_reading: bool) ->
             .as_ref()
             .map_or_else(|| here.to_string(), |a| a.name.clone())
     };
-    let entries: Vec<Value> = inbox::waiting(app)
+    let entries: Vec<Value> = inbox::needs_action(app)
         .into_iter()
         .map(|entry| {
             json!({
@@ -70,9 +70,8 @@ pub fn waiting_json(app: &App, here: &str, now: SystemTime, is_reading: bool) ->
             })
         })
         .collect();
-    let also: Vec<Value> = inbox::entries(app)
+    let also: Vec<Value> = inbox::done(app)
         .into_iter()
-        .filter(|e| matches!(e.kind, Kind::Done | Kind::Merged))
         .map(|entry| {
             json!({
                 "kind": kind_name(entry.kind),
@@ -102,7 +101,10 @@ mod tests {
             .iter()
             .map(|e| e["tree"].as_str().unwrap())
             .collect();
-        let desktop: Vec<String> = inbox::waiting(&app).into_iter().map(|e| e.tree).collect();
+        let desktop: Vec<String> = inbox::needs_action(&app)
+            .into_iter()
+            .map(|e| e.tree)
+            .collect();
         assert_eq!(trees, desktop);
         let also = json["also"].as_array().unwrap();
         assert_eq!(keys(&also[0]), declared("Finished"));

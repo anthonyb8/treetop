@@ -313,6 +313,10 @@ pub struct Seen {
     /// tree's lease began.
     #[serde(default)]
     pub active_at: Option<u64>,
+    /// When it was last given a prompt typed to it, in seconds since the
+    /// epoch, where the plugin can tell: what answers what it asked.
+    #[serde(default)]
+    pub answered_at: Option<u64>,
     /// How full its context window is, where the plugin can tell.
     #[serde(default)]
     pub context: Option<Context>,
