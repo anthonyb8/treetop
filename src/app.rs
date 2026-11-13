@@ -2796,9 +2796,11 @@ impl App {
             }
         }
         // `waiting` already carries each one's time from the last look, or
-        // its own for one seen first now.
+        // its own for one seen first now; so does what is done, for a merge,
+        // which carries none.
         self.watch.since = waiting
             .iter()
+            .chain(&crate::inbox::done(self))
             .map(|e| (e.about(), e.at.unwrap_or(now)))
             .collect();
         let waiting = crate::inbox::needs_action(self);

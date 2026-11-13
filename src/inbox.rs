@@ -446,6 +446,10 @@ pub fn done(app: &App) -> Vec<Entry> {
     entries(app)
         .into_iter()
         .filter(|e| matches!(e.kind, Kind::Done | Kind::Merged))
+        .map(|mut e| {
+            e.at = e.at.or_else(|| app.waiting_since(&e.about()));
+            e
+        })
         .collect()
 }
 
@@ -1824,6 +1828,10 @@ pub mod tests {
         assert_eq!(listed(&app, "7"), (true, false), "its checks failed");
         app.trees[2].ship.as_mut().unwrap().stage = Stage::Merged;
         assert_eq!(listed(&app, "7"), (false, true), "merged");
+        // A merge carries no time: it is as old as treetop has seen it.
+        app.watch_waiting();
+        let merged = done(&app).into_iter().find(|e| e.tree == "7").unwrap();
+        assert!(merged.at.is_some(), "{merged:?}");
     }
 
     #[test]
