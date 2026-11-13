@@ -6065,10 +6065,11 @@ mod count_tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(
-            cells(&app, 200, 40)[(x + 4, row)].bg,
-            theme().cursor.bg.unwrap()
-        );
+        // The cursor as the theme draws it: a background in truecolor,
+        // reversed in plain ANSI, where it has none.
+        let cell = &cells(&app, 200, 40)[(x + 4, row)];
+        assert_eq!(cell.bg, theme().cursor.bg.unwrap_or_default());
+        assert!(cell.modifier.contains(theme().cursor.add_modifier));
         // With nothing at all, it says so.
         crate::inbox::tests::nothing_waits(&mut app);
         let text = screen(&app, 200, 40).join("\n");
