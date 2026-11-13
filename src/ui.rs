@@ -3886,17 +3886,17 @@ fn chat_frame(
             Span::raw(format!("  tree {tree}  {agent} ")),
         ]
     };
-    // Normal mode's keys come first, and the chat's own drop from the end
-    // where a long branch leaves too little room for them all.
+    // Keys drop from the end where a long branch leaves too little room
+    // for them all, so the way into Insert and the way out come first.
     let keys: &[(&str, &str)] = match mode {
         Mode::Normal => {
             title.insert(0, Span::styled(" NORMAL ", t.badge));
             title.insert(1, Span::raw(" "));
             &[
                 ("i", "type"),
+                ("^Q", "back to treetop"),
                 ("j k ^D ^U", "scroll"),
                 ("h l", "top, bottom"),
-                ("^Q", "back to treetop"),
                 ("^\\", "next chat"),
             ]
         }

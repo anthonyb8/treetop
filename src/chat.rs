@@ -17,7 +17,7 @@ use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -233,6 +233,9 @@ pub struct Chat {
     /// command again shows this chat.
     command: Vec<String>,
     master: File,
+    /// What to write to the chat, in order, for the thread that writes it,
+    /// so an agent that stops reading never holds treetop up.
+    input: Sender<Vec<u8>>,
     parser: vt100::Parser,
     output: Receiver<Vec<u8>>,
     child: Option<Child>,
@@ -374,11 +377,22 @@ impl Chat {
                 }
             }
         });
+        let (input, to_write) = mpsc::channel::<Vec<u8>>();
+        let mut writer = master.try_clone().context("writing to the chat")?;
+        // Ends when the chat is dropped, or exits and its writes fail.
+        thread::spawn(move || {
+            for bytes in to_write {
+                if writer.write_all(&bytes).is_err() {
+                    return;
+                }
+            }
+        });
         Ok(Chat {
             agent,
             tree,
             command: command.to_vec(),
             master,
+            input,
             parser: vt100::Parser::new(rows, cols, SCROLLBACK),
             output,
             child: Some(child),
@@ -455,7 +469,7 @@ impl Chat {
 
     fn write(&mut self, bytes: &[u8]) {
         // A chat that has just exited cannot take input; the next pump ends it.
-        let _ = self.master.write_all(bytes);
+        let _ = self.input.send(bytes.to_vec());
     }
 
     /// Passes a key on, except ← in an empty input box of a chat that
@@ -1094,6 +1108,43 @@ mod tests {
          ✻ fix   Done · tests green\n\
          ────────────────────────────────────────\n❯ describe a task for a new session\n\
          ────────────────────────────────────────\n  enter to return · space to reply · ctrl+x to delete\n";
+
+    /// An agent that asks for the mouse, takes raw input as Claude Code does,
+    /// and then stops reading it
+    /// fills the terminal's buffer long before a jump's worth of wheel
+    /// events is written, and treetop must not wait on it, or Ctrl+Q dies.
+    #[test]
+    fn a_jump_never_blocks_on_an_agent_that_stops_reading() {
+        let command = [
+            "sh".to_string(),
+            "-c".into(),
+            r"stty -echo -icanon; printf '\033[?1000h\033[?1006hready'; exec sleep 30".into(),
+        ];
+        let mut chat = Chat::open(&command, 24, 80, "a".into(), "t".into()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while chat.screen().mouse_protocol_mode() == MouseProtocolMode::None {
+            assert!(
+                Instant::now() < deadline,
+                "the chat never asked for the mouse"
+            );
+            chat.pump();
+            thread::sleep(Duration::from_millis(10));
+        }
+        chat.mode = Mode::Normal;
+        let (done, pressed) = mpsc::channel();
+        thread::spawn(move || {
+            let area = Rect::new(0, 0, 80, 24);
+            chat.press(key(KeyCode::Char('h'), KeyModifiers::NONE), area);
+            chat.press(key(KeyCode::Char('l'), KeyModifiers::NONE), area);
+            let _ = done.send(());
+            // Kept until the test ends, so the agent is not hung up on.
+            thread::sleep(Duration::from_secs(30));
+        });
+        assert!(
+            pressed.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "pressing h and l waited on the agent to read"
+        );
+    }
 
     #[test]
     fn normal_mode_scrolls_and_keeps_every_other_key_from_the_agent() {
