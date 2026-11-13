@@ -1252,6 +1252,11 @@ pub mod tests {
             (false, true),
             "answered, it worked well past the report and stopped: done"
         );
+        assert_eq!(
+            now(Status::Idle, 500),
+            (false, true),
+            "answered at once, a short turn and stopped: done"
+        );
         assert_eq!(now(Status::Busy, 5), (false, false), "working on it");
         assert_eq!(
             now(Status::Waiting, 5),

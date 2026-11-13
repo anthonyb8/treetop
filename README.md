@@ -649,7 +649,7 @@ Something waits on you while an agent asks you something or sits at a prompt, a 
 It stops waiting once that stops being true: the agent is answered, a new push passes, the agent is resumed with `R`, or the tree is returned.
 An agent still asking is the one ask however often it writes, so it rings once.
 So there is nothing to dismiss, and an agent that finished or a PR that merged never waits: it is done instead.
-An agent whose turn has ended, its session idle, has finished, though it never wrote a report saying so; and a report that it was waiting on you stops counting once its session has run a turn well past it, answered since, so a question answered days ago no longer waits, while one nobody answered still does, however long ago.
+An agent whose turn has ended, its session idle, has finished, though it never wrote a report saying so; and a report that it was waiting on you stops counting once its session has run a turn past it, answered since, so a question answered days ago no longer waits, while one nobody answered still does, however long ago.
 
 While anything needs action or is done, a count sits at the right of the Trees window's top border, such as `● 2 needs action  ✓ 3 done  e`.
 It never takes the keys, so what you type keeps going where it was, a chat in Insert included, and it stays bright over a popup.

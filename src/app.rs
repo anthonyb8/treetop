@@ -41,8 +41,9 @@ impl JobState {
 }
 
 /// How long its session may go on writing after a report, as it does to
-/// end the turn the report came in, before the report is taken as overtaken.
-const REPORT_SLACK: u64 = 120;
+/// end the turn the report came in, before the report is taken as overtaken:
+/// an ask's own reply lands within seconds of it, and an answer comes later.
+const REPORT_SLACK: u64 = 30;
 
 /// The state `report` stands for, by what its job's running session says
 /// now: asking, at a prompt, it waits on you; a blocked report its session
