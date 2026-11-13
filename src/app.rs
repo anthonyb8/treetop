@@ -62,7 +62,9 @@ pub fn report_state(report: &Report, trees: &[Tree]) -> State {
         .updated
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_secs());
-    let is_past = agent.active_at.is_some_and(|at| at > wrote + REPORT_SLACK);
+    // Past it: a prompt typed to it since, or a reply well after it.
+    let is_past = agent.answered_at.is_some_and(|at| at > wrote)
+        || agent.active_at.is_some_and(|at| at > wrote + REPORT_SLACK);
     match (report.state, agent.status) {
         // Asking, whatever it last reported short of dying.
         (State::Working | State::Blocked | State::Done | State::Stopped, Some(Status::Waiting)) => {
@@ -4850,6 +4852,7 @@ mod tests {
             job: Some(job.into()),
             plugin: Some("claude".into()),
             active_at: None,
+            answered_at: None,
             context: None,
             spend: None,
             label: None,
@@ -5420,6 +5423,7 @@ mod tests {
         assert_eq!(names(&app), ["8", "4", "7"]);
         let quiet = Agent {
             active_at: Some(1_000),
+            answered_at: None,
             ..agent("quiet")
         };
         app.apply_agents(&HashMap::from([(PathBuf::from("/p/4/app"), vec![quiet])]));
@@ -5784,6 +5788,7 @@ mod tests {
             job: None,
             plugin: None,
             active_at: None,
+            answered_at: None,
             context: None,
             spend: None,
             label: None,
@@ -5795,6 +5800,7 @@ mod tests {
         let with = |name: &str, status, active_at| Agent {
             status: Some(status),
             active_at,
+            answered_at: None,
             ..attachable(name)
         };
         let tree = Tree {

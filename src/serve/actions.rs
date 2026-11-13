@@ -431,6 +431,7 @@ mod tests {
             job: Some("j".into()),
             plugin: Some("claude".into()),
             active_at: None,
+            answered_at: None,
             context: None,
             spend: None,
             label: None,

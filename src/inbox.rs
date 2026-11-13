@@ -561,6 +561,7 @@ pub mod tests {
             job: Some(job.into()),
             plugin: None,
             active_at: None,
+            answered_at: None,
             context: None,
             label: None,
             spend: None,
@@ -872,6 +873,7 @@ pub mod tests {
             job: None,
             is_background: false,
             active_at: Some(1_793_900_000),
+            answered_at: None,
             ..agent("claude", "", Status::Waiting)
         };
         let waiting = tree("/other/5/web", "5", "me/seo-meta", vec![pane]);
@@ -1143,6 +1145,7 @@ pub mod tests {
         for replied in [Some(secs_ago(60)), None] {
             put_away_there(|| Agent {
                 active_at: replied,
+                answered_at: None,
                 ..agent("checkout-tax", "j12", Status::Waiting)
             });
         }
@@ -1263,6 +1266,14 @@ pub mod tests {
             (true, false),
             "asking again, however late, it waits"
         );
+        // Answered seconds after it asked, and done as quick: the answer,
+        // not the time, tells it from the ask's own turn.
+        let four = &mut app.trees[0].agents[0];
+        four.status = Some(Status::Idle);
+        four.active_at = Some(secs_ago(590));
+        assert_eq!(listed(&app, "4"), (true, false), "not yet answered");
+        app.trees[0].agents[0].answered_at = Some(secs_ago(595));
+        assert_eq!(listed(&app, "4"), (false, true), "answered, and finished");
     }
 
     #[test]
@@ -1583,6 +1594,7 @@ pub mod tests {
         let mut there = app.pools[0].trees[0].clone();
         there.agents = vec![Agent {
             active_at: Some(secs_ago(30)),
+            answered_at: None,
             ..agent("checkout-tax", "j12", Status::Idle)
         }];
         app.away_live = [("/code/endodeals-web".into(), vec![there])].into();

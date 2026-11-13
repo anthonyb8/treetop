@@ -214,6 +214,7 @@ fn live_session(home: &Path, session: &Session, start: Option<u64>, dir: PathBuf
         background: is_background,
         attach: short.map(|id| attach(home, id)),
         active_at: None,
+        answered_at: None,
         context: None,
         spend: None,
         label: label(home),
@@ -262,6 +263,46 @@ fn last_turn(tail: &str) -> Option<u64> {
         let is_synthetic =
             line.message.as_ref().and_then(|m| m.model.as_deref()) == Some("<synthetic>");
         (line.kind == "assistant" && !is_synthetic)
+            .then_some(line.timestamp)
+            .flatten()
+            .and_then(|at| crate::reports::unix(&at))
+            .and_then(|secs| u64::try_from(secs).ok())
+    })
+}
+
+/// When a prompt was last typed to the session in `tail`: what answers
+/// whatever it asked. A tool's result, a task's notification, a `!`
+/// command and Claude Code's own records are typed by nobody. None with no
+/// prompt in `tail`.
+fn last_prompt(tail: &str) -> Option<u64> {
+    #[derive(Deserialize)]
+    struct Origin {
+        kind: String,
+    }
+    #[derive(Deserialize)]
+    struct Message {
+        content: Option<Value>,
+    }
+    #[derive(Deserialize)]
+    struct Line {
+        #[serde(rename = "type")]
+        kind: String,
+        timestamp: Option<String>,
+        origin: Option<Origin>,
+        #[serde(rename = "isMeta", default)]
+        is_meta: bool,
+        message: Option<Message>,
+    }
+    tail.lines().rev().find_map(|line| {
+        let line: Line = serde_json::from_str(line).ok()?;
+        let is_human = line.origin.as_ref().is_some_and(|o| o.kind == "human");
+        let text = line
+            .message
+            .and_then(|m| m.content)
+            .and_then(|c| c.as_str().map(str::to_string))
+            .unwrap_or_default();
+        let is_command = text.starts_with("<bash-") || text.starts_with("<local-command");
+        (line.kind == "user" && is_human && !line.is_meta && !is_command)
             .then_some(line.timestamp)
             .flatten()
             .and_then(|at| crate::reports::unix(&at))
@@ -630,6 +671,7 @@ fn live_sessions(config: &Path) -> Vec<Seen> {
             // It last worked at its last reply, not when its transcript last
             // grew: Claude Code writes there between turns too.
             let active_at = transcript.as_deref().and_then(last_turn_in);
+            let answered_at = end.as_deref().and_then(last_prompt);
             live_session(
                 config,
                 &session,
@@ -638,6 +680,7 @@ fn live_sessions(config: &Path) -> Vec<Seen> {
             )
             .map(|seen| Seen {
                 active_at,
+                answered_at,
                 context,
                 spend,
                 ..seen
@@ -673,6 +716,7 @@ fn cold(live: &[Seen]) -> Vec<Seen> {
                 .or(homes.first())?;
             Some(Seen {
                 active_at,
+                answered_at: None,
                 attach: Some(attach(home, &report.job)),
                 label: label(home),
                 id: Some(report.job),
@@ -1448,6 +1492,21 @@ mod tests {
         fs::write(&path, format!("{reply}\n{snapshot}\n")).unwrap();
         assert_eq!(last_turn_in(&path), Some(1_793_984_235));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_session_was_answered_at_the_last_prompt_typed_to_it() {
+        // A prompt typed, then what Claude Code writes as user entries that
+        // nobody typed: a tool's result, a task's notification, a `!`
+        // command and a local command's record.
+        let tail = r#"{"type":"user","origin":{"kind":"human"},"timestamp":"2026-11-06T16:57:15.149Z","message":{"content":"Postgres, please"}}
+{"type":"assistant","timestamp":"2026-11-06T16:57:20.000Z","message":{}}
+{"type":"user","timestamp":"2026-11-06T16:58:00.000Z","message":{"content":[{"type":"tool_result","content":"ok"}]}}
+{"type":"user","origin":{"kind":"task-notification"},"timestamp":"2026-11-06T16:59:00.000Z","message":{"content":"<task-notification>"}}
+{"type":"user","origin":{"kind":"human"},"timestamp":"2026-11-06T17:00:00.000Z","message":{"content":"<bash-input>ls</bash-input>"}}
+{"type":"user","origin":{"kind":"human"},"isMeta":true,"timestamp":"2026-11-06T17:01:00.000Z","message":{"content":"<local-command-caveat>"}}"#;
+        assert_eq!(last_prompt(tail), Some(1_793_984_235));
+        assert_eq!(last_prompt(r#"{"type":"assistant","message":{}}"#), None);
     }
 
     #[test]

@@ -5414,6 +5414,7 @@ mod sidebar_tests {
             job: None,
             plugin: None,
             active_at: None,
+            answered_at: None,
             context: Some(Context {
                 used: 260_000,
                 window: 1_000_000,

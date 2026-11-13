@@ -99,6 +99,9 @@ pub struct Agent {
     /// When it last worked, in seconds since the epoch, where its source
     /// can tell.
     pub active_at: Option<u64>,
+    /// When it was last given a prompt typed to it, in seconds since the
+    /// epoch, where that is known: what answers what it asked.
+    pub answered_at: Option<u64>,
     /// How full its context window is, where its source can tell.
     pub context: Option<Context>,
     /// The tokens its session has spent, where its source can tell.
@@ -132,6 +135,7 @@ fn from_plugin(plugin: &str, seen: Seen) -> Sighting {
         job: seen.id,
         plugin: Some(plugin.to_string()),
         active_at: seen.active_at,
+        answered_at: seen.answered_at,
         context: seen.context,
         spend: seen.spend,
         label: seen.label,
@@ -294,6 +298,7 @@ mod tests {
             job: None,
             plugin: None,
             active_at: None,
+            answered_at: None,
             context: None,
             spend: None,
             label: None,
@@ -363,6 +368,7 @@ mod tests {
                     background: true,
                     attach: None,
                     active_at: None,
+                    answered_at: None,
                     context: None,
                     spend: None,
                     label: None,
@@ -414,6 +420,7 @@ mod tests {
                     background: true,
                     attach: None,
                     active_at: None,
+                    answered_at: None,
                     context: None,
                     spend: None,
                     label: None,
@@ -470,6 +477,7 @@ mod tests {
                     background: true,
                     attach: None,
                     active_at: None,
+                    answered_at: None,
                     context: None,
                     spend: None,
                     label: None,
@@ -531,6 +539,7 @@ mod tests {
                 background: true,
                 attach: None,
                 active_at: None,
+                answered_at: None,
                 context: None,
                 spend: None,
                 label: None,

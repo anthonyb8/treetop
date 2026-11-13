@@ -659,6 +659,7 @@ mod tests {
             job: Some(job.into()),
             plugin: None,
             active_at: None,
+            answered_at: None,
             context: None,
             spend: None,
             label: None,
