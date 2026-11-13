@@ -2835,11 +2835,18 @@ impl App {
             .chain(&crate::inbox::done(self))
             .map(|e| (e.about(), e.at.unwrap_or(now)))
             .collect();
-        let waiting = crate::inbox::needs_action(self);
-        let line = (!waiting.is_empty()).then(|| {
-            let places: Vec<String> = waiting.iter().map(crate::inbox::place_of).collect();
-            format!("● {} waiting · {}", waiting.len(), places.join(" "))
-        });
+        // The counts alone, as the count in the table's corner has them.
+        let (needs, done) = self.notes_list();
+        let counts = [
+            (needs.len(), "●", "needs action"),
+            (done.len(), "✓", "done"),
+        ];
+        let parts: Vec<String> = counts
+            .iter()
+            .filter(|(n, ..)| *n > 0)
+            .map(|(n, mark, what)| format!("{mark} {n} {what}"))
+            .collect();
+        let line = (!parts.is_empty()).then(|| parts.join("  "));
         Some((is_new, line))
     }
 

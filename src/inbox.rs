@@ -1039,8 +1039,8 @@ pub mod tests {
         assert!(!is_new);
         assert_eq!(
             line.as_deref(),
-            Some("● 4 waiting · 9 endodeals-web:12 4 7"),
-            "the oldest first; tree 7's failed PR since treetop saw it"
+            Some("● 4 needs action  ✓ 1 done"),
+            "the counts alone, as the count in the table's corner has them"
         );
         assert_eq!(app.watch_waiting(), Some((false, line)), "nor again");
         // Tree 4's agent, still asking, writes its report again: the same
@@ -1063,8 +1063,8 @@ pub mod tests {
         assert!(is_new, "a new ask rings");
         assert_eq!(
             line.as_deref(),
-            Some("● 5 waiting · 9 endodeals-web:12 4 2 7"),
-            "the oldest first"
+            Some("● 5 needs action"),
+            "tree 2 asking now, not done"
         );
         // Once nothing waits, the status line clears.
         nothing_waits(&mut app);

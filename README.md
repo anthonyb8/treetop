@@ -664,7 +664,7 @@ Needs action leaves once it is dealt with, and Done once you open it.
 Esc or `e` closes them, and coming back after time away opens nothing by itself.
 The oldest comes first: each is as old as it has waited, from when it happened, or from when treetop first saw it where that is not known, as for a PR.
 
-Inside tmux, the status line of every window shows `● 2 waiting · 17 22` at its right for as long as anything needs action, what `x` put away included, and clears once nothing does or treetop quits.
+Inside tmux, the status line of every window shows the same counts as the count in treetop, such as `● 2 needs action  ✓ 3 done`, at the right before your own `status-right`, what needs action in yellow and what is done plain, and clears once there is nothing to count or treetop quits; what `x` put away leaves it too.
 treetop sets it on its session over the global `status-right`, and unsets it again, so your own `status-right` is left as it was.
 When something starts waiting, treetop rings the terminal bell, once, so it is heard from any window; the assistant finishing an answer rings it too, and shows it in the status line for five seconds.
 It shows a desktop notification too, on the machine whose terminal treetop is in, a laptop reaching the server over SSH included: the tree, its ticket and branch, what it waits for and, for an ask, the question.
