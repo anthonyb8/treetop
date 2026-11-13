@@ -150,10 +150,6 @@ fn option(scope: &str, name: &str) -> String {
         .to_string()
 }
 
-/// Puts `line`, the counts of what needs action and what is done, at the
-/// left of this session's status-right, what needs action in the warning
-/// colours, where every window shows it until it is cleared; None clears
-/// it, putting back what the session had.
 /// `line` before `right`, the status-right it goes in front of: what needs
 /// action as a badge in the warning colours, what is done plain beside it.
 fn status_text(line: &str, right: &str) -> String {
@@ -163,14 +159,21 @@ fn status_text(line: &str, right: &str) -> String {
         _ if line.starts_with('●') => (line.as_str(), ""),
         _ => ("", line.as_str()),
     };
-    let badge = if needs.is_empty() {
-        String::new()
-    } else {
-        format!("#[fg=black,bg=yellow,bold] {needs} #[default]")
-    };
-    format!("{badge} {done} {right}")
+    let badge =
+        (!needs.is_empty()).then(|| format!("#[fg=black,bg=yellow,bold] {needs} #[default]"));
+    // One space between each part shown, so it takes no more room than
+    // `show_waiting` keeps for it.
+    [badge.as_deref().unwrap_or(""), done, right]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
+/// Puts `line`, the counts of what needs action and what is done, at the
+/// left of this session's status-right, what needs action in the warning
+/// colours, where every window shows it until it is cleared; None clears
+/// it, putting back what the session had.
 pub fn show_waiting(line: Option<&str>) {
     let Some(line) = line else {
         if option("-qv", "@treetop-kept").is_empty() {
@@ -277,10 +280,19 @@ mod tests {
         );
         assert_eq!(
             status_text("● 2 needs action", right),
-            "#[fg=black,bg=yellow,bold] ● 2 needs action #[default]  %Y-%m-%d"
+            "#[fg=black,bg=yellow,bold] ● 2 needs action #[default] %Y-%m-%d"
         );
         // Only what is done: no badge, nothing loud.
-        assert_eq!(status_text("✓ 3 done", right), " ✓ 3 done %Y-%m-%d");
+        assert_eq!(status_text("✓ 3 done", right), "✓ 3 done %Y-%m-%d");
+        // Never wider than the line and the three columns kept for it.
+        let shown = |text: String| {
+            text.replace("#[fg=black,bg=yellow,bold]", "")
+                .replace("#[default]", "")
+        };
+        for line in ["● 2 needs action  ✓ 3 done", "● 2 needs action", "✓ 3 done"] {
+            let width = shown(status_text(line, right)).chars().count();
+            assert!(width <= line.chars().count() + 3 + right.len(), "{line}");
+        }
     }
     use crate::pool::parse;
 
