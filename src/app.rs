@@ -2479,6 +2479,23 @@ impl App {
         Self::chat_of(tree).unwrap_or_else(|| Outcome::Enter(tree.clone()))
     }
 
+    /// `opened`, what Enter opens, with a chat opened ready to type to, as
+    /// `i` opens it; anything else as it is.
+    fn typing_to(opened: Outcome) -> Outcome {
+        match opened {
+            Outcome::Chat {
+                command,
+                agent,
+                tree,
+            } => Outcome::TypeTo {
+                command,
+                agent,
+                tree,
+            },
+            other => other,
+        }
+    }
+
     /// The chat of the tree's leading agent that has one, as Enter opens it.
     fn chat_of(tree: &Tree) -> Option<Outcome> {
         Self::agents_of(tree).into_iter().find_map(|agent| {
@@ -4558,14 +4575,18 @@ impl App {
             return Outcome::Scratches;
         }
         // On a heading, Enter folds its group or opens it again; on the main
-        // checkout's, it opens the chat of an agent working there instead.
-        if key.code == KeyCode::Enter
+        // checkout's, it opens the chat of an agent working there instead,
+        // and `i` that chat ready to type to.
+        if matches!(key.code, KeyCode::Enter | KeyCode::Char('i'))
             && let Some(group) = self.current_heading()
         {
-            if let Some(chat) = self.main_under_cursor().and_then(Self::chat_of) {
-                return chat;
+            let chat = self.main_under_cursor().and_then(Self::chat_of);
+            match (key.code, chat) {
+                (KeyCode::Enter, Some(chat)) => return chat,
+                (_, Some(chat)) => return Self::typing_to(chat),
+                (KeyCode::Enter, None) => self.toggle_fold(&group),
+                _ => {}
             }
-            self.toggle_fold(&group);
             return Outcome::Continue;
         }
         match key.code {
@@ -4583,18 +4604,8 @@ impl App {
             }
             // The chat Enter opens, ready to type to, as vim's i is.
             KeyCode::Char('i') => {
-                return match self.open_agent() {
-                    Outcome::Chat {
-                        command,
-                        agent,
-                        tree,
-                    } => Outcome::TypeTo {
-                        command,
-                        agent,
-                        tree,
-                    },
-                    other => other,
-                };
+                let opened = self.open_agent();
+                return Self::typing_to(opened);
             }
             KeyCode::Char('I') => self.show_issue(),
             KeyCode::Char('e') => self.notes = Some(0),
@@ -5409,6 +5420,29 @@ mod tests {
             Outcome::Chat { agent, tree, .. } if agent == "why is the build slow" && tree == "main"
         ));
         assert_eq!(shape(&app)[0], "▾development 2", "left open");
+    }
+
+    #[test]
+    fn i_on_the_main_checkouts_heading_types_to_its_agent_and_never_folds() {
+        let mut app = app_on_main_heading();
+        let main = app.trees.iter().find(|t| t.is_main).unwrap().path.clone();
+        let mut assistant = attachable(assistant::NAME);
+        assistant.status = Some(Status::Idle);
+        app.apply_agents(&HashMap::from([(main.clone(), vec![assistant.clone()])]));
+        assert_eq!(press(&mut app, KeyCode::Char('i')), Outcome::Continue);
+        assert_eq!(
+            shape(&app)[0],
+            "▾development 2",
+            "with no agent of its own to type to, i leaves the group open"
+        );
+        assert!(!app.is_issues, "and opens no issue");
+        let mut own = attachable("why is the build slow");
+        own.status = Some(Status::Busy);
+        app.apply_agents(&HashMap::from([(main, vec![assistant, own])]));
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('i')),
+            Outcome::TypeTo { agent, tree, .. } if agent == "why is the build slow" && tree == "main"
+        ));
     }
 
     #[test]
