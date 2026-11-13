@@ -21,7 +21,7 @@ use crate::app::{
     Picker, PortMenu, Reach, Review, SCRATCH, ScratchMenu, Shipping,
 };
 use crate::assistant;
-use crate::chat::Chat;
+use crate::chat::{Chat, Mode};
 use crate::coderabbit;
 use crate::diff::{Change, FileDiff, Layout as DiffLayout, Row as DiffRow, Side, ViewRow};
 use crate::dispatch::{Prompt, Purpose, Target};
@@ -39,8 +39,9 @@ use crate::theme::theme;
 
 /// The bar's keys, most useful first: on a narrow bar the keys at the end
 /// are the ones left out, and `?` lists them all.
-const KEYS: [(&str, &str); 14] = [
-    ("Enter", "open"),
+const KEYS: [(&str, &str); 15] = [
+    ("Enter", "read"),
+    ("i", "type"),
     ("?", "help"),
     ("e", "inbox"),
     ("n", "new here"),
@@ -49,7 +50,7 @@ const KEYS: [(&str, &str); 14] = [
     (":", "ask"),
     ("a", "assistant"),
     ("d", "diff"),
-    ("i", "issue"),
+    ("I", "issue"),
     ("r", "return"),
     ("Space", "mark"),
     ("/", "filter"),
@@ -65,7 +66,8 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
     (
         "Agents",
         &[
-            ("Enter", "open, fold heading"),
+            ("Enter", "read chat, fold"),
+            ("i", "type in chat"),
             ("n", "new agent here"),
             ("N", "agent in new tree"),
             ("m", "message agents"),
@@ -112,14 +114,7 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
             ("f", "send CI failures"),
         ],
     ),
-    (
-        "Issues",
-        &[
-            ("Tab", "all issues"),
-            ("i", "tree's issue"),
-            ("I", "choose issue"),
-        ],
-    ),
+    ("Issues", &[("Tab", "all issues"), ("I", "tree's issue")]),
     (
         "treetop",
         &[
@@ -3811,14 +3806,18 @@ fn pr_findings(pr: &PrView, popup: &PrPopup, width: usize) -> (Vec<Line<'static>
 /// tree and agent, with the keys out at the right of the same line. The
 /// branch comes from the latest listing, so it follows the agent if it
 /// switches branches.
+/// In Normal mode the bar says so and the cursor is hidden, since keys
+/// scroll the chat rather than type into it.
 fn draw_chat(frame: &mut Frame, app: &App, chat: &Chat) {
     let agent = agent_of(app, Some(chat.command()), &chat.agent, &chat.tree);
-    let body = chat_frame(frame, app, &chat.agent, &chat.tree, agent);
+    let body = chat_frame(frame, app, (&chat.agent, &chat.tree), agent, chat.mode);
     if !chat.is_ready() {
         draw_note(frame, body, &opening_note(&chat.agent));
         return;
     }
-    if let Some(cursor) = draw_screen(chat.screen(), frame.buffer_mut(), body) {
+    if let Some(cursor) = draw_screen(chat.screen(), frame.buffer_mut(), body)
+        && chat.mode == Mode::Insert
+    {
         frame.set_cursor_position(cursor);
     }
 }
@@ -3827,7 +3826,13 @@ fn draw_chat(frame: &mut Frame, app: &App, chat: &Chat) {
 /// so the hand-over from the compose box to the chat never leaves the popup.
 fn draw_opening(frame: &mut Frame, app: &App, opening: &Opening) {
     let agent = agent_of(app, None, &opening.agent, &opening.tree);
-    let body = chat_frame(frame, app, &opening.agent, &opening.tree, agent);
+    let body = chat_frame(
+        frame,
+        app,
+        (&opening.agent, &opening.tree),
+        agent,
+        Mode::Insert,
+    );
     let note = if opening.tree == "new" {
         "leasing a tree for the agent...".to_string()
     } else {
@@ -3844,12 +3849,18 @@ fn opening_note(agent: &str) -> String {
     }
 }
 
-/// A chat's popup: its frame and bar, cleared, with the keys out at the
-/// right of the bar, and its sidebar where there is room for one. Returns
-/// where the chat's screen goes.
-fn chat_frame(frame: &mut Frame, app: &App, agent: &str, tree: &str, seen: Option<&Agent>) -> Rect {
+/// A chat's popup: its frame and bar, cleared, with the keys of its `mode`
+/// out at the right of the bar, and its sidebar where there is room for
+/// one. Returns where the chat's screen goes.
+fn chat_frame(
+    frame: &mut Frame,
+    app: &App,
+    (agent, tree): (&str, &str),
+    seen: Option<&Agent>,
+    mode: Mode,
+) -> Rect {
     let t = theme();
-    let title = if assistant::is_assistant(agent) {
+    let mut title = if assistant::is_assistant(agent) {
         vec![Span::styled(" assistant ", t.badge)]
     } else if tree == SCRATCH {
         vec![
@@ -3875,8 +3886,26 @@ fn chat_frame(frame: &mut Frame, app: &App, agent: &str, tree: &str, seen: Optio
             Span::raw(format!("  tree {tree}  {agent} ")),
         ]
     };
-    let keys = key_bar(&[("^Q", "back to treetop"), ("^\\", "next chat")]);
+    // Normal mode's keys come first, and the chat's own drop from the end
+    // where a long branch leaves too little room for them all.
+    let keys: &[(&str, &str)] = match mode {
+        Mode::Normal => {
+            title.insert(0, Span::styled(" NORMAL ", t.badge));
+            title.insert(1, Span::raw(" "));
+            &[
+                ("i", "type"),
+                ("j k ^D ^U", "scroll"),
+                ("h l", "top, bottom"),
+                ("^Q", "back to treetop"),
+                ("^\\", "next chat"),
+            ]
+        }
+        Mode::Insert => &[("^Q", "back to treetop"), ("^\\", "next chat")],
+    };
     let screen = stage(app, frame.area());
+    let title_width: usize = title.iter().map(Span::width).sum();
+    let room = usize::from(popup::bar(screen).width).saturating_sub(title_width);
+    let keys = fitting_keys(keys, u16::try_from(room).unwrap_or(u16::MAX));
     bar_popup(frame, screen, title, keys);
     if let Some(side) = popup::sidebar(screen) {
         let block = Block::new()

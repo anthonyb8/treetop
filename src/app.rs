@@ -10,6 +10,7 @@ use ratatui::layout::Rect;
 
 use crate::agents::{Agent, Status};
 use crate::assistant;
+use crate::chat::Mode;
 use crate::diff::Layout;
 use crate::dispatch::{Edit, Prompt, Purpose, Recipient, Target};
 use crate::handoff;
@@ -309,11 +310,13 @@ pub enum Outcome {
         record: Sidecar,
     },
     /// Open `command`, agent `agent`'s chat in tree `tree`, in a popup over
-    /// treetop until Ctrl+Q or until it exits.
+    /// treetop until Ctrl+Q or until it exits, its keys going where `mode`
+    /// sends them.
     Chat {
         command: Vec<String>,
         agent: String,
         tree: String,
+        mode: Mode,
     },
     /// Type `text` into each agent's chat and submit it.
     Send {
@@ -1123,6 +1126,7 @@ impl App {
                         command,
                         agent: opening.agent.clone(),
                         tree: job.tree.name.clone(),
+                        mode: Mode::Insert,
                     });
                 }
                 (Some(opening), None) => {
@@ -1144,6 +1148,7 @@ impl App {
                         command,
                         agent: plugin.to_string(),
                         tree: job.tree.name.clone(),
+                        mode: Mode::Insert,
                     });
                 }
                 None => {
@@ -1593,20 +1598,22 @@ impl App {
     /// that offers one, in a popup, which starts a cold one again; else the
     /// tree itself, which inside tmux is the pane its agent runs in, or a
     /// window, and outside tmux a shell.
-    fn open_agent(&mut self) -> Outcome {
+    fn open_agent(&mut self, mode: Mode) -> Outcome {
         let Some(tree) = self.current() else {
             return Outcome::Continue;
         };
-        Self::chat_of(tree).unwrap_or_else(|| Outcome::Enter(tree.clone()))
+        Self::chat_of(tree, mode).unwrap_or_else(|| Outcome::Enter(tree.clone()))
     }
 
-    /// The chat of the tree's leading agent that has one, as Enter opens it.
-    fn chat_of(tree: &Tree) -> Option<Outcome> {
+    /// The chat of the tree's leading agent that has one, in `mode`, as
+    /// Enter and `i` open it.
+    fn chat_of(tree: &Tree, mode: Mode) -> Option<Outcome> {
         Self::agents_of(tree).into_iter().find_map(|agent| {
             Some(Outcome::Chat {
                 command: agent.attach.clone()?,
                 agent: agent.name.clone(),
                 tree: tree.name.clone(),
+                mode,
             })
         })
     }
@@ -1635,6 +1642,7 @@ impl App {
                 command,
                 agent,
                 tree,
+                mode: Mode::Insert,
             });
         }
         if awaiting.since.elapsed() >= AWAIT_CHAT {
@@ -1741,6 +1749,7 @@ impl App {
             command,
             agent,
             tree,
+            mode: Mode::Insert,
         })
     }
 
@@ -1871,7 +1880,7 @@ impl App {
                 self.message = Some(format!("tree {}'s PR merged; r returns it", tree.name));
                 Outcome::Continue
             }
-            _ => Self::chat_of(tree).unwrap_or_else(|| Outcome::Enter(tree.clone())),
+            _ => Self::chat_of(tree, Mode::Insert).unwrap_or_else(|| Outcome::Enter(tree.clone())),
         }
     }
 
@@ -2008,6 +2017,7 @@ impl App {
             command,
             agent,
             tree,
+            mode: Mode::Insert,
         })
     }
 
@@ -2532,6 +2542,7 @@ impl App {
                     command: chat.attach(),
                     agent: chat.name,
                     tree: SCRATCH.into(),
+                    mode: Mode::Insert,
                 };
             }
             KeyCode::Char('x') if menu.selected > 0 && is_deleting => {
@@ -2934,6 +2945,7 @@ impl App {
                     command: to.command,
                     agent: to.agent,
                     tree: to.tree,
+                    mode: Mode::Insert,
                 };
             }
             self.message = Some("sending to the assistant...".into());
@@ -3498,19 +3510,30 @@ impl App {
         if key.code == KeyCode::Char('C') {
             return Outcome::Scratches;
         }
+        // Enter opens an agent's chat in Normal mode, to read it, and `i` in
+        // Insert, to type to it, as vim's keys do.
+        let mode = match key.code {
+            KeyCode::Enter => Mode::Normal,
+            _ => Mode::Insert,
+        };
         // On a heading, Enter folds its group or opens it again; on the main
-        // checkout's, it opens the chat of an agent working there instead.
-        if key.code == KeyCode::Enter
+        // checkout's, it and `i` open the chat of an agent working there.
+        if matches!(key.code, KeyCode::Enter | KeyCode::Char('i'))
             && let Some(group) = self.current_heading()
         {
-            if let Some(chat) = self.main_under_cursor().and_then(Self::chat_of) {
+            if let Some(chat) = self
+                .main_under_cursor()
+                .and_then(|main| Self::chat_of(main, mode))
+            {
                 return chat;
             }
-            self.toggle_fold(&group);
+            if key.code == KeyCode::Enter {
+                self.toggle_fold(&group);
+            }
             return Outcome::Continue;
         }
         match key.code {
-            KeyCode::Enter => return self.open_agent(),
+            KeyCode::Enter | KeyCode::Char('i') => return self.open_agent(mode),
             // The tree itself, even where Enter would open its agent's chat.
             KeyCode::Char('t') => {
                 if let Some(tree) = self.current() {
@@ -3522,8 +3545,7 @@ impl App {
                 let context = self.cursor_context();
                 self.open_ask(context);
             }
-            KeyCode::Char('i') => self.show_issue(),
-            KeyCode::Char('I') => self.choose_issue(),
+            KeyCode::Char('I') => self.show_issue(),
             KeyCode::Char('e') => self.rail = Some(0),
             KeyCode::Char('E') => self.toggle_inbox(),
             KeyCode::Char('m') => self.open_message(),
@@ -3886,20 +3908,20 @@ mod tests {
     }
 
     #[test]
-    fn i_shows_the_issue_a_tree_works_on() {
+    fn capital_i_shows_the_issue_a_tree_works_on() {
         let mut app = app();
         dispatched(&mut app, "/p/8/app", "j1");
         let mut sidecar = *app.trees[2].sidecar.clone().unwrap();
         sidecar.ticket = Some("END-799".into());
         app.apply_sidecars(HashMap::from([(PathBuf::from("/p/8/app"), sidecar)]));
         select(&mut app, "8");
-        press(&mut app, KeyCode::Char('i'));
+        press(&mut app, KeyCode::Char('I'));
         assert!(app.is_issues);
         assert_eq!(app.open_issue.as_deref(), Some("END-799"));
         app.is_issues = false;
         app.open_issue = None;
         select(&mut app, "7");
-        press(&mut app, KeyCode::Char('i'));
+        press(&mut app, KeyCode::Char('I'));
         assert!(!app.is_issues, "an unleased tree works on nothing");
         assert!(app.message.as_deref().unwrap().contains("is not leased"));
     }
@@ -3909,7 +3931,7 @@ mod tests {
         let mut app = app();
         dispatched(&mut app, "/p/8/app", "j1");
         select(&mut app, "8");
-        press(&mut app, KeyCode::Char('i'));
+        press(&mut app, KeyCode::Char('I'));
         assert!(app.is_issues, "a tree on no issue chooses one");
         assert_eq!(app.choose_issue_for.as_deref(), Some("8"));
         let (path, record) = app.attach("END-42".into(), "personal".into()).unwrap();
@@ -3931,13 +3953,13 @@ mod tests {
         );
         press(&mut app, KeyCode::Char('I'));
         assert_eq!(
-            app.choose_issue_for.as_deref(),
-            Some("8"),
-            "I chooses again"
+            app.open_issue.as_deref(),
+            Some("END-42"),
+            "I then shows the issue chosen"
         );
     }
 
-    /// `i` on a tree with no issue, then picking another issue up instead
+    /// `I` on a tree with no issue, then picking another issue up instead
     /// of choosing one, then returning the tree: the next issue chosen
     /// went to that returned tree, now free.
     #[test]
@@ -3946,7 +3968,7 @@ mod tests {
         app.checkout = PathBuf::from("/p/main");
         dispatched(&mut app, "/p/8/app", "j1");
         select(&mut app, "8");
-        press(&mut app, KeyCode::Char('i'));
+        press(&mut app, KeyCode::Char('I'));
         assert_eq!(app.choose_issue_for.as_deref(), Some("8"));
         assert!(matches!(
             app.pick("END-9".into(), "work".into()),
@@ -4612,6 +4634,7 @@ mod tests {
                 command: ["claude", "attach", "bbbb"].map(String::from).into(),
                 agent: "scratch 2".into(),
                 tree: SCRATCH.into(),
+                mode: Mode::Insert,
             }
         );
     }
@@ -4798,7 +4821,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_opens_an_attachable_chat_else_goes_to_the_tree() {
+    fn enter_opens_a_chat_to_read_and_i_one_to_type_in() {
         let mut app = app();
         let attachable = Agent {
             is_background: true,
@@ -4809,16 +4832,21 @@ mod tests {
             (PathBuf::from("/p/4/app"), vec![agent("codex"), attachable]),
             (PathBuf::from("/p/8/app"), vec![agent("codex")]),
         ]));
-        assert_eq!(
-            press(&mut app, KeyCode::Enter),
-            Outcome::Chat {
-                command: vec!["claude".into(), "attach".into(), "e6b79280".into()],
-                agent: "fix-login".into(),
-                tree: "4".into()
-            }
-        );
+        let chat = |mode| Outcome::Chat {
+            command: vec!["claude".into(), "attach".into(), "e6b79280".into()],
+            agent: "fix-login".into(),
+            tree: "4".into(),
+            mode,
+        };
+        assert_eq!(press(&mut app, KeyCode::Enter), chat(Mode::Normal));
+        assert_eq!(press(&mut app, KeyCode::Char('i')), chat(Mode::Insert));
+        assert!(!app.is_issues, "i no longer shows the issue");
         select(&mut app, "7");
         assert!(matches!(press(&mut app, KeyCode::Enter), Outcome::Enter(t) if t.name == "7"));
+        assert!(
+            matches!(press(&mut app, KeyCode::Char('i')), Outcome::Enter(t) if t.name == "7"),
+            "with no chat to type in, i goes to the tree, as Enter does"
+        );
         select(&mut app, "8");
         assert!(
             matches!(press(&mut app, KeyCode::Enter), Outcome::Enter(t) if t.name == "8"),
@@ -5118,7 +5146,8 @@ mod tests {
             Some(Outcome::Chat {
                 command: vec!["claude".into(), "attach".into(), "1234abcd".into()],
                 agent: "new-session".into(),
-                tree: "4".into()
+                tree: "4".into(),
+                mode: Mode::Insert,
             })
         );
         assert_eq!(app.ready_chat(), None, "opened once");
@@ -5142,7 +5171,8 @@ mod tests {
             Some(Outcome::Chat {
                 command: vec!["claude".into(), "attach".into(), "cbcfd8c8".into()],
                 agent: assistant::NAME.into(),
-                tree: "main".into()
+                tree: "main".into(),
+                mode: Mode::Insert,
             })
         );
         assert!(app.opening.is_none() && app.ready_chat().is_none());

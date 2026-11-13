@@ -6,6 +6,10 @@
 //!
 //! A chat left with Ctrl+Q keeps running in the background, its screen kept
 //! current, so opening it again is instant.
+//!
+//! A chat opens in one of two modes, as vim does: in Insert, keys go to its
+//! agent; in Normal, treetop keeps them to scroll the chat, and `i` goes to
+//! Insert.
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -25,6 +29,54 @@ use ratatui::layout::{Position, Rect};
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
 use crate::plugin::Screen;
+
+/// Where an open chat's keys go.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mode {
+    /// Treetop keeps them: j and k scroll the chat, h and l jump to its top
+    /// and bottom, `i` goes to Insert.
+    Normal,
+    /// They go to the agent, all but Ctrl+Q and Ctrl+\\.
+    #[default]
+    Insert,
+}
+
+/// What a key does to a chat in Normal mode.
+#[derive(Debug, PartialEq, Eq)]
+enum Normal {
+    /// Go to Insert.
+    Insert,
+    /// Scroll the chat this many wheel steps, up or down.
+    Scroll(MouseEventKind, u16),
+    /// Scroll the chat as far as it goes, up or down.
+    Jump(MouseEventKind),
+    /// Nothing: the key is not Normal mode's, and never reaches the agent.
+    Ignore,
+}
+
+/// Wheel steps a jump scrolls: past the top of any transcript a chat keeps,
+/// where it stops, since treetop cannot see how far that is.
+const JUMP_STEPS: u16 = 1000;
+
+/// What `key` does in Normal mode, on a chat `rows` high: `i` goes to
+/// Insert, j and k (or ↓ and ↑) scroll a wheel step, Ctrl+D and Ctrl+U half
+/// the chat, and h and l jump to its top and bottom.
+fn normal(key: KeyEvent, rows: u16) -> Normal {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let half = (rows / 2 / WHEEL_LINES as u16).max(1);
+    match key.code {
+        KeyCode::Char('i') if !ctrl => Normal::Insert,
+        KeyCode::Char('j') | KeyCode::Down if !ctrl => {
+            Normal::Scroll(MouseEventKind::ScrollDown, 1)
+        }
+        KeyCode::Char('k') | KeyCode::Up if !ctrl => Normal::Scroll(MouseEventKind::ScrollUp, 1),
+        KeyCode::Char('d') if ctrl => Normal::Scroll(MouseEventKind::ScrollDown, half),
+        KeyCode::Char('u') if ctrl => Normal::Scroll(MouseEventKind::ScrollUp, half),
+        KeyCode::Char('h') if !ctrl => Normal::Jump(MouseEventKind::ScrollUp),
+        KeyCode::Char('l') if !ctrl => Normal::Jump(MouseEventKind::ScrollDown),
+        _ => Normal::Ignore,
+    }
+}
 
 /// Lines of scrollback kept; the chat draws its own history, so none.
 const SCROLLBACK: usize = 0;
@@ -197,6 +249,8 @@ pub struct Chat {
     outbox: VecDeque<Outgoing>,
     /// How its screen shows it takes a message; None types on a timer.
     hints: Option<Screen>,
+    /// Where its keys go while it is on screen.
+    pub mode: Mode,
 }
 
 /// Whether `key` on a chat showing `text` would leave its agent: ← with no
@@ -336,6 +390,7 @@ impl Chat {
             ready_at: None,
             outbox: VecDeque::new(),
             hints: None,
+            mode: Mode::default(),
         })
     }
 
@@ -417,6 +472,40 @@ impl Chat {
         self.write(&bytes);
     }
 
+    /// Handles a key in the chat's mode: in Insert it goes to the agent, as
+    /// `send_key` sends it; in Normal treetop keeps it, to scroll the chat
+    /// the way the wheel does, or to go to Insert. `area` is where the chat
+    /// is drawn on screen, inside its popup.
+    pub fn press(&mut self, key: KeyEvent, area: Rect) {
+        if self.mode == Mode::Insert {
+            self.send_key(key);
+            return;
+        }
+        let (kind, steps) = match normal(key, area.height) {
+            Normal::Insert => {
+                self.mode = Mode::Insert;
+                return;
+            }
+            Normal::Scroll(kind, steps) => (kind, steps),
+            // A chat that has not asked for the mouse gets the wheel as
+            // arrows, and a jump's worth would walk its prompt's history.
+            Normal::Jump(_) if self.screen().mouse_protocol_mode() == MouseProtocolMode::None => {
+                return;
+            }
+            Normal::Jump(kind) => (kind, JUMP_STEPS),
+            Normal::Ignore => return,
+        };
+        let wheel = MouseEvent {
+            kind,
+            column: area.x,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        for _ in 0..steps {
+            self.send_mouse(wheel, area);
+        }
+    }
+
     /// The chat has left its agent for a screen of other sessions.
     fn is_away(&self) -> bool {
         self.hints
@@ -441,8 +530,10 @@ impl Chat {
     }
 
     /// Pastes `text`, wrapped in bracketed-paste markers when the chat asked
-    /// for them, so it arrives as one paste rather than as typed keys.
+    /// for them, so it arrives as one paste rather than as typed keys. A
+    /// paste in Normal mode is meant for the agent, so it goes to Insert.
     pub fn paste(&mut self, text: &str) {
+        self.mode = Mode::Insert;
         if self.screen().bracketed_paste() {
             self.write(format!("\x1b[200~{text}\x1b[201~").as_bytes());
         } else {
@@ -612,16 +703,16 @@ impl Chats {
         self.open.is_some()
     }
 
-    /// Shows the chat running `command`: the one left running for it if
-    /// there is one, at once, else a new one. `hints` say how its screen
-    /// shows that it takes a message, or has left its agent.
+    /// Shows the chat running `command` in `mode`: the one left running for
+    /// it if there is one, at once, else a new one. `hints` say how its
+    /// screen shows that it takes a message, or has left its agent.
     pub fn show(
         &mut self,
         command: &[String],
         (rows, cols): (u16, u16),
-        agent: String,
-        tree: String,
+        (agent, tree): (String, String),
         hints: Option<Screen>,
+        mode: Mode,
     ) -> Result<()> {
         let mut chat = match self.background.iter().position(|c| c.command == command) {
             Some(index) => {
@@ -634,6 +725,7 @@ impl Chats {
             None => Chat::open(command, rows, cols, agent, tree)?,
         };
         chat.hints = chat.hints.take().or(hints);
+        chat.mode = mode;
         self.open = Some(chat);
         Ok(())
     }
@@ -1002,6 +1094,41 @@ mod tests {
          ✻ fix   Done · tests green\n\
          ────────────────────────────────────────\n❯ describe a task for a new session\n\
          ────────────────────────────────────────\n  enter to return · space to reply · ctrl+x to delete\n";
+
+    #[test]
+    fn normal_mode_scrolls_and_keeps_every_other_key_from_the_agent() {
+        let plain = |code| key(code, KeyModifiers::NONE);
+        let ctrl = |c| key(KeyCode::Char(c), KeyModifiers::CONTROL);
+        assert_eq!(normal(plain(KeyCode::Char('i')), 40), Normal::Insert);
+        assert_eq!(
+            normal(plain(KeyCode::Char('j')), 40),
+            Normal::Scroll(MouseEventKind::ScrollDown, 1)
+        );
+        assert_eq!(
+            normal(plain(KeyCode::Char('k')), 40),
+            Normal::Scroll(MouseEventKind::ScrollUp, 1)
+        );
+        assert_eq!(
+            normal(ctrl('d'), 40),
+            Normal::Scroll(MouseEventKind::ScrollDown, 6),
+            "half of 40 rows, three lines a step"
+        );
+        assert_eq!(
+            normal(ctrl('u'), 4),
+            Normal::Scroll(MouseEventKind::ScrollUp, 1)
+        );
+        assert_eq!(
+            normal(plain(KeyCode::Char('h')), 40),
+            Normal::Jump(MouseEventKind::ScrollUp)
+        );
+        assert_eq!(
+            normal(plain(KeyCode::Char('l')), 40),
+            Normal::Jump(MouseEventKind::ScrollDown)
+        );
+        for code in [KeyCode::Enter, KeyCode::Esc, KeyCode::Char('x')] {
+            assert_eq!(normal(plain(code), 40), Normal::Ignore, "{code:?}");
+        }
+    }
 
     #[test]
     fn the_agent_view_is_away_and_the_chat_is_not() {

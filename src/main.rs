@@ -73,7 +73,7 @@ use ratatui::crossterm::terminal::{
 use ratatui::layout::Rect;
 
 use crate::app::{App, Choice, Opening, Outcome};
-use crate::chat::Chats;
+use crate::chat::{Chats, Mode};
 use crate::dispatch::Recipient;
 use crate::jobs::{Kind, Worker};
 use crate::keeper::Keeper;
@@ -124,8 +124,8 @@ fn open_chat(
     app: &mut App,
     chats: &mut Chats,
     command: &[String],
-    agent: String,
-    tree: String,
+    (agent, tree): (String, String),
+    mode: Mode,
 ) -> Result<()> {
     let size = chat_size(term, app)?;
     let hints = app
@@ -135,7 +135,7 @@ fn open_chat(
         .find(|a| a.attach.as_deref() == Some(command))
         .and_then(|a| a.plugin.as_deref())
         .and_then(plugin::screen_of);
-    match chats.show(command, size, agent, tree, hints) {
+    match chats.show(command, size, (agent, tree), hints, mode) {
         // The mouse is captured only while a chat is open, so the wheel
         // scrolls it; on the list, the terminal keeps the mouse to itself.
         Ok(()) => execute!(io::stdout(), EnableMouseCapture)?,
@@ -494,8 +494,8 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                         app,
                         &mut chats,
                         &chat.attach(),
-                        chat.name,
-                        app::SCRATCH.into(),
+                        (chat.name, app::SCRATCH.into()),
+                        Mode::Insert,
                     )?;
                 }
                 // Said in the list it was asked from, whole, since the bar
@@ -569,9 +569,10 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                 command,
                 agent,
                 tree,
+                mode,
             }) = app.ready_chat()
         {
-            open_chat(term, app, &mut chats, &command, agent, tree)?;
+            open_chat(term, app, &mut chats, &command, (agent, tree), mode)?;
             is_stale = true;
         }
         // An inbox entry from another workspace opens its agent here once
@@ -582,8 +583,9 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                     command,
                     agent,
                     tree,
+                    mode,
                 }) => {
-                    open_chat(term, app, &mut chats, &command, agent, tree)?;
+                    open_chat(term, app, &mut chats, &command, (agent, tree), mode)?;
                     is_stale = true;
                 }
                 // An agent with no chat here runs in a tmux pane, which
@@ -610,9 +612,10 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                     command,
                     agent,
                     tree,
+                    mode,
                 }) = app.next_ask()
                 {
-                    open_chat(term, app, &mut chats, &command, agent, tree)?;
+                    open_chat(term, app, &mut chats, &command, (agent, tree), mode)?;
                     is_stale = true;
                 }
             }
@@ -671,17 +674,22 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                         chat_closed(app, &agent, &tree)?;
                     } else if chat::is_next(key) {
                         let from = open.tree.clone();
+                        // The next chat opens in the mode this one is in.
+                        let in_mode = open.mode;
                         if let Some(Outcome::Chat {
                             command,
                             agent,
                             tree,
+                            mode: _,
                         }) = app.next_chat(&from)
                         {
                             chats.hide();
-                            open_chat(term, app, &mut chats, &command, agent, tree)?;
+                            open_chat(term, app, &mut chats, &command, (agent, tree), in_mode)?;
                         }
                     } else {
-                        open.send_key(key);
+                        let size = term.size()?;
+                        let screen = Rect::new(0, 0, size.width, size.height);
+                        open.press(key, popup::chat(ui::stage(app, screen)));
                     }
                 }
                 Event::Paste(text) => open.paste(text),
@@ -815,7 +823,8 @@ fn run(term: &mut Term, app: &mut App, checkout: &Path) -> Result<Exit> {
                 command,
                 agent,
                 tree,
-            } => open_chat(term, app, &mut chats, &command, agent, tree)?,
+                mode,
+            } => open_chat(term, app, &mut chats, &command, (agent, tree), mode)?,
             Outcome::Record { path, record } => {
                 if let Err(err) = sidecar::write(&path, &record) {
                     app.message = Some(format!("could not record it: {err}"));

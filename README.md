@@ -41,7 +41,8 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 
 | Key | Does |
 |---|---|
-| Enter | open the agent of the tree under the cursor: its chat in a popup, starting a cold one again, else the tree itself (see [Agent chats](#agent-chats) and [Entering a tree](#entering-a-tree)); on a group's heading, fold the group or open it again, and on the main checkout's, open the chat of its agent when it has one |
+| Enter | open the agent of the tree under the cursor: its chat in a popup in Normal mode, to read it, starting a cold one again, else the tree itself (see [Agent chats](#agent-chats) and [Entering a tree](#entering-a-tree)); on a group's heading, fold the group or open it again, and on the main checkout's, open the chat of its agent when it has one |
+| `i` | as Enter, but the chat opens in Insert mode, to type to the agent at once |
 | `t` | go to the tree itself, even when its agent has a chat: its tmux pane or a window in it, else a shell there (see [Entering a tree](#entering-a-tree)) |
 | `n` | start a new agent in the tree under the cursor: a free one is leased for it, on a branch named for the task, and a held one keeps its branch; on the main checkout's heading, start one in the main checkout, for work that needs no tree |
 | `N` | start a new agent in a fresh tree, on a branch named for the task (see [New agents](#new-agents)) |
@@ -70,6 +71,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | `w` | switch to another workspace: the pool of another repository treetop has been opened in |
 | `C` | scratch chats, tied to no tree: start one, open one, or delete one (see [Scratch chats](#scratch-chats)) |
 | Tab | switch to the Issues screen, and back (see [Issues](#issues)) |
+| `I` | open the issue the tree under the cursor works on, or choose one for a tree with none (see [Issues](#issues)) |
 | `j` `k` / arrows, `g` `G` | move |
 | Esc | clear the filter, then the marks |
 | `U` | install a newer treetop release and restart on it, or restart on one installed from outside (see [Install](#install)) |
@@ -391,6 +393,11 @@ The tree treetop was started in is never a target, because returning or destroyi
 ## Agent chats
 
 Enter opens the chat of the agent in the tree under the cursor in a popup over treetop, the way `d` opens the diff.
+It opens in Normal mode, as vim does: treetop keeps the keys, `j`/`k` scroll the chat a wheel step, Ctrl+D/Ctrl+U half the chat, and `h`/`l` jump to the top of its transcript and back to the bottom, and any other key is dropped, so nothing reaches the agent by accident.
+A jump scrolls the wheel until the chat stops, so it needs a chat that takes the mouse, as Claude Code does; in one that does not, `h`/`l` do nothing, since the wheel reaches it as arrow keys that would walk its prompt's history.
+`i` there goes to Insert mode, where keys go to the agent; `i` on the list opens the chat in Insert mode at once.
+The bar shows NORMAL while it lasts, and the cursor is hidden.
+Insert mode lasts until the chat is left, since Esc belongs to Claude Code; a paste goes to Insert too, and Ctrl+\\ opens the next chat in the mode this one is in.
 The pool stays on screen, dimmed, round the popup's border, so a chat never passes for a Claude Code session of your own; a bar on the popup's first row, inside its border, names the tree, branch and agent, with the keys out at its right.
 The chat's terminal is the size of the inside of the popup, and follows it when the terminal is resized.
 Where the popup is at least 100 columns wide, a sidebar at its right takes 30 of them and shows how full the agent's context is: tokens used, the window, and a bar that turns to warning colours from 75%, as the agent nears compacting it.
@@ -410,7 +417,7 @@ A chat shows "opening" until its first screen has finished drawing, and is drawn
 A chat you leave keeps running in the background with its screen current, so Enter on it again is instant; treetop keeps the 8 most recently left, and ends them when their agent goes away or treetop quits.
 
 treetop runs the chat in a terminal of its own and draws it, so nothing the chat does to its terminal reaches yours, and treetop keeps refreshing behind it.
-Keys, pastes and the mouse go to the chat: the wheel scrolls back through it, three lines a step, and clicks work as they do in Claude itself.
+In Insert mode, keys, pastes and the mouse go to the chat, and in Normal mode the mouse still does: the wheel scrolls back through it, three lines a step, and clicks work as they do in Claude itself.
 treetop takes the mouse only while a chat is open; on the list, the terminal and tmux keep it.
 From the keyboard, Ctrl+O opens Claude's transcript view, where j/k move a line and Ctrl+u/Ctrl+d half a page; PgUp and PgDn also work where a keyboard has them.
 
@@ -712,8 +719,8 @@ A Linear source gets all of this; an issue source on another ticket plugin lists
 3. once it runs, the ticket is marked started and assigned to you.
 
 The tree's `treetop.json` records the ticket, so the TICKET column shows it, the filter finds it, and `p` on a ticket already in a tree goes to that tree rather than starting a second agent.
-On the trees, `i` opens the issue the tree under the cursor works on, on the whole screen, and Esc comes back to the trees.
-A tree started without an issue gets one the same way: `i` on it, or `I` on any leased tree to change it, shows the Issues list to choose from, with search and filters, and Enter records the issue in the tree's `treetop.json`, so the TICKET and WORK columns show it at once.
+On the trees, `I` opens the issue the tree under the cursor works on, on the whole screen, and Esc comes back to the trees.
+A tree started without an issue gets one the same way: `I` on it shows the Issues list to choose from, with search and filters, and Enter records the issue in the tree's `treetop.json`, so the TICKET and WORK columns show it at once.
 A step that fails undoes the ones before it, as any start does; marking the ticket started is the exception, and a failure there only shows in the detail pane, since the agent is already working.
 `treetop pick END-123` does the same from a shell.
 

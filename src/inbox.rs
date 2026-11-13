@@ -544,6 +544,7 @@ pub mod tests {
     use super::*;
     use crate::agents::{Agent, Source};
     use crate::app::Outcome;
+    use crate::chat::Mode;
     use crate::ship::Ship;
     use crate::sidecar::Sidecar;
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
@@ -725,6 +726,7 @@ pub mod tests {
                 command: vec!["claude".into(), "attach".into(), "j4".into()],
                 agent: "inbox-rail".into(),
                 tree: "4".into(),
+                mode: Mode::Insert,
             }
         );
         assert_eq!(app.rail, None, "the list has the keys back");
@@ -833,6 +835,7 @@ pub mod tests {
                 command: vec!["claude".into(), "attach".into(), "j12".into()],
                 agent: "checkout-tax".into(),
                 tree: "12".into(),
+                mode: Mode::Insert,
             })
         );
         assert_eq!(there.current().map(|t| t.name.as_str()), Some("12"));
