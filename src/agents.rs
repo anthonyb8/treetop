@@ -29,7 +29,8 @@ use crate::sidecar::Sidecar;
 pub enum Status {
     Busy,
     Idle,
-    /// Waiting on you: a question, a permission prompt, a finished turn.
+    /// Waiting on you: a question or a permission prompt. A finished turn
+    /// reads idle.
     Waiting,
     /// Not running: its session ended, and opening it starts it again.
     Cold,

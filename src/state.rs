@@ -29,6 +29,12 @@ pub fn layout_file(checkout: &Path) -> Option<PathBuf> {
     Some(dir()?.join(format!("layout-{}.json", crate::cache::key(checkout))))
 }
 
+/// The file what the notifications put away is kept in, for every
+/// workspace, since one lists them all.
+pub fn put_away_file() -> Option<PathBuf> {
+    Some(dir()?.join("put-away.json"))
+}
+
 /// What `file` holds, else the empty value, such as the seen asks.
 pub fn read<T: serde::de::DeserializeOwned + Default>(file: &Path) -> T {
     fs::read_to_string(file)

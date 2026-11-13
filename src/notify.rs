@@ -197,7 +197,7 @@ pub fn escape(title: &str, body: &str, is_in_tmux: bool) -> Vec<u8> {
 
 /// tmux's `allow-passthrough`, as tmux gives it, lets an escape through to
 /// the terminal whichever window is on screen. `on` passes it only from the
-/// window on screen, which is when the banner says it already, not while
+/// window on screen, which is when the count says it already, not while
 /// you are in another window or away.
 fn is_passed(allow_passthrough: &str) -> bool {
     allow_passthrough.trim() == "all"
@@ -318,7 +318,7 @@ mod tests {
         let due = [(entry("22", Kind::NeedsYou, Some(now)), false)];
         let mut desktop = Desktop::default();
         // `on` passes it only while treetop's window is on screen, which is
-        // when the banner says it already.
+        // when the count says it already.
         let (bytes, said) = desktop.tell(&due, Some("on"), now);
         assert!(bytes.is_empty());
         assert!(said.unwrap().contains("allow-passthrough all"));
