@@ -542,18 +542,6 @@ impl Chat {
         }
     }
 
-    /// Scrolls to the top of the chat's history, or back to the bottom with
-    /// `is_down`: JUMP_LINES of wheel, where the chat stops, since treetop
-    /// cannot see how far that is. A chat that has not asked for the mouse
-    /// would get them as arrows walking its prompt's history, so it gets
-    /// nothing.
-    pub fn jump(&mut self, is_down: bool, area: Rect) {
-        if self.screen().mouse_protocol_mode() == MouseProtocolMode::None {
-            return;
-        }
-        self.scroll(if is_down { JUMP_LINES } else { -JUMP_LINES }, area);
-    }
-
     /// Pastes `text`, wrapped in bracketed-paste markers when the chat asked
     /// for them, so it arrives as one paste rather than as typed keys.
     pub fn paste(&mut self, text: &str) {
@@ -963,10 +951,6 @@ impl Chats {
 /// scrollback; a chat that has not asked for the mouse gets as many arrows.
 const WHEEL_LINES: usize = 3;
 
-/// Lines a jump to the top or bottom of a chat scrolls: past the start of
-/// any history it keeps.
-const JUMP_LINES: isize = 3000;
-
 /// The bytes a terminal sends for a mouse event, when the chat's `mode`
 /// asks for that kind of event, in its `encoding`. Rows are shifted by
 /// the corner of `area`, where the chat is drawn; events outside it, on the
@@ -1228,28 +1212,28 @@ mod tests {
             .count()
     }
 
-    /// An agent that stops reading fills the terminal's buffer long before
-    /// a jump's worth of wheel events is written, and treetop must not wait
-    /// on it, or Ctrl+Q dies with it.
+    /// A paste bigger than the terminal's buffer, for an agent that has
+    /// stopped reading: treetop must not wait on it, or Ctrl+Q dies with it.
+    fn big_paste() -> String {
+        "x".repeat(1 << 20)
+    }
+
     #[test]
-    fn a_jump_never_blocks_on_an_agent_that_stops_reading() {
+    fn a_big_paste_never_blocks_on_an_agent_that_stops_reading() {
         let mut chat = running(STALLED);
-        let (done, jumped) = mpsc::channel();
+        let (done, pasted) = mpsc::channel();
         thread::spawn(move || {
-            let area = Rect::new(0, 0, 80, 24);
-            chat.jump(false, area);
-            chat.jump(true, area);
+            chat.paste(&big_paste());
+            chat.paste(&big_paste());
             let _ = done.send(());
-            // Kept until the test ends, so the agent is not hung up on.
-            thread::sleep(Duration::from_secs(30));
         });
         assert!(
-            jumped.recv_timeout(Duration::from_secs(2)).is_ok(),
-            "jumping waited on the agent to read"
+            pasted.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "pasting waited on the agent to read"
         );
     }
 
-    /// A chat left holding wheel events for an agent that stopped reading
+    /// A chat left holding a paste for an agent that stopped reading
     /// lets its terminal go once it is dropped, as its agent goes away.
     #[test]
     fn a_dropped_chat_lets_go_of_its_terminal_whatever_it_was_writing() {
@@ -1261,14 +1245,14 @@ mod tests {
             .find(|line| line.starts_with("tty-index:"))
             .expect("a pty master names its index")
             .to_string();
-        let (back, jumped) = mpsc::channel();
+        let (back, pasted) = mpsc::channel();
         thread::spawn(move || {
-            chat.jump(false, Rect::new(0, 0, 80, 24));
+            chat.paste(&big_paste());
             let _ = back.send(chat);
         });
-        let chat = jumped
+        let chat = pasted
             .recv_timeout(Duration::from_secs(2))
-            .expect("jumping waited on the agent to read");
+            .expect("pasting waited on the agent to read");
         assert!(holding(&index) > 0);
         drop(chat);
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -1276,27 +1260,6 @@ mod tests {
             assert!(Instant::now() < deadline, "the terminal was never let go");
             thread::sleep(Duration::from_millis(20));
         }
-    }
-
-    /// A chat that has not asked for the mouse gets the wheel as arrows, and
-    /// a jump's worth would walk its prompt's history, so it gets nothing.
-    #[test]
-    fn a_jump_sends_nothing_to_a_chat_without_the_mouse() {
-        let out = std::env::temp_dir().join(format!("treetop-jump-{}", std::process::id()));
-        let script = format!(
-            "stty -echo -icanon; printf ready; exec cat > {}",
-            out.display()
-        );
-        let mut chat = running(&script);
-        chat.jump(false, Rect::new(0, 0, 80, 24));
-        chat.send_key(KeyEvent::from(KeyCode::Char('x')));
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while std::fs::read(&out).unwrap_or_default().is_empty() {
-            assert!(Instant::now() < deadline, "x never arrived");
-            thread::sleep(Duration::from_millis(20));
-        }
-        assert_eq!(std::fs::read(&out).unwrap(), b"x");
-        let _ = std::fs::remove_file(&out);
     }
 
     #[test]

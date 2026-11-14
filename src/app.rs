@@ -180,7 +180,7 @@ const TREE_COMMANDS: [(&str, char); 20] = [
     ("Send tree {}'s failure to its agent", 'f'),
     ("Start a ship run of tree {}", 's'),
     ("Resume tree {}'s agent", 'R'),
-    ("Hand tree {}'s work to a new agent", 'h'),
+    ("Hand tree {}'s work to a new agent", 'H'),
     ("Go to tree {} itself", 't'),
     ("Rename the branch of tree {}", 'b'),
     ("Park tree {}", 'z'),
@@ -495,11 +495,6 @@ pub enum Outcome {
     },
     /// Scroll the window's chat by this many lines, down when positive.
     ScrollChat(isize),
-    /// Scroll the window's chat to the top of its history, or back to the
-    /// bottom with `is_down`.
-    JumpChat {
-        is_down: bool,
-    },
     /// Type `text` into each agent's chat and submit it.
     Send {
         to: Vec<Recipient>,
@@ -1433,6 +1428,25 @@ impl App {
         self.sync_window();
     }
 
+    /// Ctrl+J, K, H and L, as vim's Ctrl+W moves between its windows: down
+    /// from the table into the window under it, in Normal, as Ctrl+Q goes;
+    /// up from a window to the table; and to the left or right window of
+    /// two. Zoomed to the table there is no window to go to.
+    fn move_keys(&mut self, to: char) {
+        if self.zoom == Some(Zoom::Table) {
+            return;
+        }
+        match to {
+            'j' if !self.is_window_focused => self.cycle_keys(),
+            'k' => {
+                self.is_window_focused = false;
+                self.is_inserting = false;
+            }
+            'h' | 'l' if self.other_window().is_some() => self.focus_side(usize::from(to == 'l')),
+            _ => {}
+        }
+    }
+
     /// Ctrl+Q: with one window, gives it the keys where it has something to
     /// take them, else gives them back to the table; with two, moves them
     /// on round the table, the left window and the right one.
@@ -2023,8 +2037,7 @@ impl App {
     /// The keys a window takes in Normal, on a tab with no keys of its own:
     /// Esc or q gives them back to the table, the arrows step through its
     /// tabs, on a chat or shell i or Enter starts Insert while j, k, d
-    /// and u scroll it and h and l jump to its top and bottom, and e goes
-    /// to what waits on you.
+    /// and u scroll it, and e goes to what waits on you.
     fn handle_window_key(&mut self, key: KeyEvent) -> Outcome {
         let is_terminal = matches!(self.shown_tab(), WindowTab::Chat | WindowTab::Shell);
         let half = isize::try_from(self.window_rows / 2).map_or(1, |h| h.max(1));
@@ -2038,8 +2051,6 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up if is_terminal => return Outcome::ScrollChat(-1),
             KeyCode::Char('d') if is_terminal => return Outcome::ScrollChat(half),
             KeyCode::Char('u') if is_terminal => return Outcome::ScrollChat(-half),
-            KeyCode::Char('h') if is_terminal => return Outcome::JumpChat { is_down: false },
-            KeyCode::Char('l') if is_terminal => return Outcome::JumpChat { is_down: true },
             KeyCode::Char('e') => {
                 self.is_window_focused = false;
                 self.notes = Some(0);
@@ -2217,6 +2228,7 @@ impl App {
                 KeyCode::Char('c') => return Outcome::Quit,
                 KeyCode::Char('r') => self.read_pr(path),
                 KeyCode::Char('q' | 'Q') => self.cycle_keys(),
+                KeyCode::Char(to @ ('h' | 'j' | 'k' | 'l')) => self.move_keys(to),
                 KeyCode::Char('f' | 'F') => self.toggle_zoom(Zoom::Windows),
                 KeyCode::Char('p' | 'P') => self.open_palette(),
                 _ => {}
@@ -2362,6 +2374,7 @@ impl App {
                     self.diffs.remove(&path);
                 }
                 KeyCode::Char('q' | 'Q') => self.cycle_keys(),
+                KeyCode::Char(to @ ('h' | 'j' | 'k' | 'l')) => self.move_keys(to),
                 KeyCode::Char('f' | 'F') => self.toggle_zoom(Zoom::Windows),
                 KeyCode::Char('p' | 'P') => self.open_palette(),
                 _ => {}
@@ -2749,10 +2762,10 @@ impl App {
         let last = items.len().saturating_sub(1);
         let at = self.notes.unwrap_or(0).min(last);
         match key.code {
-            KeyCode::Esc | KeyCode::Char('e' | 'q') => self.notes = None,
+            KeyCode::Esc | KeyCode::Char('e' | 'q' | 'h') => self.notes = None,
             KeyCode::Down | KeyCode::Char('j') => self.notes = Some((at + 1).min(last)),
             KeyCode::Up | KeyCode::Char('k') => self.notes = Some(at.saturating_sub(1)),
-            KeyCode::Enter => {
+            KeyCode::Enter | KeyCode::Char('l') => {
                 if let Some(entry) = items.into_iter().nth(at) {
                     self.notes = None;
                     if matches!(
@@ -3223,11 +3236,11 @@ impl App {
         Outcome::Continue
     }
 
-    /// `h`: asks the agent in the tree under the cursor to write a handoff,
+    /// `H`: asks the agent in the tree under the cursor to write a handoff,
     /// the prompt of a new agent to take its work over in the same tree,
     /// for when its context has filled. Once written, the handoff opens in
     /// the compose box to be read over before the new agent starts on it.
-    /// `h` again while it is written stops waiting.
+    /// `H` again while it is written stops waiting.
     fn hand_off(&mut self) -> Outcome {
         let Some(tree) = self.current() else {
             return Outcome::Continue;
@@ -3519,11 +3532,11 @@ impl App {
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => menu.selected = (menu.selected + 1).min(last),
             KeyCode::Up | KeyCode::Char('k') => menu.selected = menu.selected.saturating_sub(1),
-            KeyCode::Enter if menu.selected == 0 => {
+            KeyCode::Enter | KeyCode::Char('l') if menu.selected == 0 => {
                 self.scratch_menu = None;
                 return Outcome::NewScratch;
             }
-            KeyCode::Enter => {
+            KeyCode::Enter | KeyCode::Char('l') => {
                 let chat = menu.chats[menu.selected - 1].clone();
                 self.scratch_menu = None;
                 return Outcome::Chat {
@@ -3539,7 +3552,7 @@ impl App {
                 return Outcome::RemoveScratch(chat);
             }
             KeyCode::Char('x') if menu.selected > 0 => menu.is_deleting = true,
-            KeyCode::Esc | KeyCode::Char('q' | 'C') => self.scratch_menu = None,
+            KeyCode::Esc | KeyCode::Char('q' | 'h' | 'C') => self.scratch_menu = None,
             _ => {}
         }
         Outcome::Continue
@@ -4067,7 +4080,7 @@ impl App {
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => picker.selected = (picker.selected + 1).min(last),
             KeyCode::Up | KeyCode::Char('k') => picker.selected = picker.selected.saturating_sub(1),
-            KeyCode::Enter => {
+            KeyCode::Enter | KeyCode::Char('l') => {
                 let chosen = picker
                     .choices
                     .get(picker.selected)
@@ -4085,7 +4098,7 @@ impl App {
                     None => {}
                 }
             }
-            KeyCode::Esc | KeyCode::Char('q' | 'w') => self.picker = None,
+            KeyCode::Esc | KeyCode::Char('q' | 'h' | 'w') => self.picker = None,
             _ => {}
         }
         Outcome::Continue
@@ -4313,7 +4326,7 @@ impl App {
                 menu.selected = menu.selected.saturating_sub(1);
                 return Outcome::Continue;
             }
-            KeyCode::Enter => menu.selected,
+            KeyCode::Enter | KeyCode::Char('l') => menu.selected,
             KeyCode::Char(c @ '1'..='9') => {
                 let at = usize::from(c as u8 - b'1');
                 if at > last {
@@ -4321,7 +4334,7 @@ impl App {
                 }
                 at
             }
-            KeyCode::Esc | KeyCode::Char('q' | 'o' | 'p' | 'P' | 'Q') => {
+            KeyCode::Esc | KeyCode::Char('q' | 'h' | 'o' | 'p' | 'P' | 'Q') => {
                 self.port_menu = None;
                 return Outcome::Continue;
             }
@@ -4448,6 +4461,19 @@ impl App {
                     // keys to, as before treetop had windows.
                     if is_free && self.zoom != Some(Zoom::Table) {
                         self.cycle_keys();
+                    }
+                    Outcome::Continue
+                }
+                // Ctrl+H, J, K and L move the keys between the table and
+                // the windows, once nothing else on screen waits on them.
+                KeyCode::Char(to @ ('h' | 'j' | 'k' | 'l')) => {
+                    let is_free = self.reviews.is_empty()
+                        && self.pending.is_none()
+                        && self.shipping.is_none()
+                        && !self.is_help
+                        && !self.is_filtering;
+                    if is_free {
+                        self.move_keys(to);
                     }
                     Outcome::Continue
                 }
@@ -4645,7 +4671,7 @@ impl App {
             KeyCode::Char('O') => return self.open_pr(),
             KeyCode::Char('f') => return self.read_failure(),
             KeyCode::Char('R') => return self.resume(),
-            KeyCode::Char('h') => return self.hand_off(),
+            KeyCode::Char('H') => return self.hand_off(),
             KeyCode::Char('s') => return self.ship(),
             KeyCode::Char('z') => return self.toggle_shelf(Shelf::Parked),
             KeyCode::Char('x') => return self.toggle_shelf(Shelf::Backburner),
@@ -5740,6 +5766,27 @@ mod tests {
     }
 
     #[test]
+    fn in_the_scratch_chats_l_opens_as_enter_does_and_h_closes_as_esc_does() {
+        let mut app = app();
+        app.open_scratch_menu(vec![scratch("aaaa", "scratch 1")]);
+        assert_eq!(press(&mut app, KeyCode::Char('l')), Outcome::NewScratch);
+        assert!(app.scratch_menu.is_none());
+        app.open_scratch_menu(vec![scratch("aaaa", "scratch 1")]);
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(
+            press(&mut app, KeyCode::Char('l')),
+            Outcome::Chat {
+                command: ["claude", "attach", "aaaa"].map(String::from).into(),
+                agent: "scratch 1".into(),
+                tree: SCRATCH.into(),
+            }
+        );
+        app.open_scratch_menu(vec![scratch("aaaa", "scratch 1")]);
+        assert_eq!(press(&mut app, KeyCode::Char('h')), Outcome::Continue);
+        assert!(app.scratch_menu.is_none(), "h closes");
+    }
+
+    #[test]
     fn a_scratch_chat_asking_something_is_nobodys_news() {
         let mut app = app();
         app.scratch_root = Some(PathBuf::from("/state/scratch"));
@@ -6081,6 +6128,36 @@ mod tests {
         assert_eq!(press(&mut app, KeyCode::Char('9')), Outcome::Continue);
         press(&mut app, KeyCode::Esc);
         assert!(app.port_menu.is_none(), "Esc closes it");
+    }
+
+    #[test]
+    fn in_the_port_menu_l_opens_as_enter_does_and_h_closes_as_esc_does() {
+        let mut app = app();
+        let process = |pid, name: &str, ports| Process {
+            pid,
+            name: name.into(),
+            ports,
+        };
+        app.apply_processes(&HashMap::from([(
+            PathBuf::from("/p/4/app"),
+            vec![
+                process(1, "uvicorn", vec![8000]),
+                process(2, "node", vec![5173]),
+            ],
+        )]));
+        press(&mut app, KeyCode::Char('o'));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(
+            press(&mut app, KeyCode::Char('l')),
+            Outcome::Browse {
+                port: 8000,
+                tree: "4".into(),
+            }
+        );
+        assert!(app.port_menu.is_none());
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(press(&mut app, KeyCode::Char('h')), Outcome::Continue);
+        assert!(app.port_menu.is_none(), "h closes");
     }
 
     #[test]
@@ -6626,6 +6703,27 @@ mod tests {
     }
 
     #[test]
+    fn in_the_picker_l_switches_as_enter_does_and_h_closes_as_esc_does() {
+        let mut app = app_with_main();
+        app.checkout = PathBuf::from("/repo");
+        let open = |app: &mut App| {
+            app.open_picker(vec![
+                choice("/repo", None),
+                choice("/home/me/harness", None),
+            ]);
+        };
+        open(&mut app);
+        assert_eq!(
+            press(&mut app, KeyCode::Char('l')),
+            Outcome::Switch(PathBuf::from("/home/me/harness"))
+        );
+        assert!(app.picker.is_none());
+        open(&mut app);
+        assert_eq!(press(&mut app, KeyCode::Char('h')), Outcome::Continue);
+        assert!(app.picker.is_none(), "h closes");
+    }
+
+    #[test]
     fn the_picker_closes_on_esc_stays_put_on_this_workspace_and_says_when_alone() {
         let mut app = app_with_main();
         app.checkout = PathBuf::from("/repo");
@@ -7146,7 +7244,7 @@ mod tests {
     }
 
     #[test]
-    fn h_asks_the_agent_for_a_handoff_shows_it_once_written_and_hands_its_tree_on() {
+    fn shift_h_asks_the_agent_for_a_handoff_shows_it_once_written_and_hands_its_tree_on() {
         let mut app = app();
         app.apply_sidecars(HashMap::from([(
             PathBuf::from("/p/4/app"),
@@ -7163,7 +7261,13 @@ mod tests {
             vec![working(Status::Idle)],
         )]));
         select(&mut app, "4");
-        let Outcome::Send { to, text } = press(&mut app, KeyCode::Char('h')) else {
+        assert_eq!(
+            press(&mut app, KeyCode::Char('h')),
+            Outcome::Continue,
+            "h on the table hands nothing off"
+        );
+        assert!(!app.is_handing_off(&PathBuf::from("/p/4/app")));
+        let Outcome::Send { to, text } = press(&mut app, KeyCode::Char('H')) else {
             panic!("expected the agent to be asked");
         };
         assert_eq!(to[0].agent, "fix login");
@@ -7231,7 +7335,7 @@ mod tests {
         };
         app.apply_agents(&HashMap::from([(PathBuf::from("/p/4/app"), vec![idle])]));
         select(&mut app, "4");
-        press(&mut app, KeyCode::Char('h'));
+        press(&mut app, KeyCode::Char('H'));
         app.handoff_unsent("someone else", "4");
         assert!(
             app.is_handing_off(&PathBuf::from("/p/4/app")),
@@ -7768,14 +7872,6 @@ mod tests {
             press(&mut app, KeyCode::Char('u')),
             Outcome::ScrollChat(-10)
         );
-        assert_eq!(
-            press(&mut app, KeyCode::Char('h')),
-            Outcome::JumpChat { is_down: false }
-        );
-        assert_eq!(
-            press(&mut app, KeyCode::Char('l')),
-            Outcome::JumpChat { is_down: true }
-        );
         press(&mut app, KeyCode::Right);
         assert_eq!(app.shown_tab(), WindowTab::Diff);
         assert!(app.is_window_focused, "the window keeps the keys");
@@ -7806,6 +7902,79 @@ mod tests {
         assert!(!app.is_window_focused);
         app.handle_key(ctrl_q);
         assert!(app.is_window_focused && !app.is_inserting());
+    }
+
+    #[test]
+    fn ctrl_j_gives_the_window_the_keys_in_normal_and_ctrl_k_gives_them_back() {
+        let mut app = with_chat(Status::Idle);
+        app.window_rows = 20;
+        ctrl(&mut app, 'j');
+        assert!(
+            app.is_window_focused && !app.is_inserting(),
+            "Ctrl+J: Normal"
+        );
+        ctrl(&mut app, 'j');
+        assert!(app.is_window_focused, "Ctrl+J in the window stays there");
+        ctrl(&mut app, 'k');
+        assert!(!app.is_window_focused, "Ctrl+K: the table");
+        ctrl(&mut app, 'k');
+        assert!(!app.is_window_focused, "Ctrl+K on the table stays there");
+        // With one window, Ctrl+H and L have nowhere to go.
+        ctrl(&mut app, 'l');
+        assert!(!app.is_window_focused);
+        // Plain h and l move nothing: l on the table, h in the window.
+        assert_eq!(press(&mut app, KeyCode::Char('l')), Outcome::Continue);
+        assert!(!app.is_window_focused);
+        ctrl(&mut app, 'j');
+        assert_eq!(press(&mut app, KeyCode::Char('h')), Outcome::Continue);
+        assert!(app.is_window_focused, "h keeps the keys in the window");
+        // From a diff with the keys, Ctrl+K is the table too.
+        press(&mut app, KeyCode::Char('d'));
+        ctrl(&mut app, 'k');
+        press(&mut app, KeyCode::Char('d'));
+        assert!(app.has_keys_on(WindowTab::Diff));
+        ctrl(&mut app, 'k');
+        assert!(!app.is_window_focused, "Ctrl+K from the diff: the table");
+        // Where the tree has no chat, Ctrl+J keeps the keys on the table, as
+        // Ctrl+Q does.
+        let mut app = with_chat(Status::Idle);
+        select(&mut app, "8");
+        ctrl(&mut app, 'j');
+        assert!(
+            !app.is_window_focused,
+            "tree 8 has no chat to take the keys"
+        );
+    }
+
+    #[test]
+    fn with_two_windows_ctrl_h_and_ctrl_l_go_to_the_left_and_right_one() {
+        let mut app = with_chat(Status::Busy);
+        app.window_rows = 20;
+        ctrl(&mut app, '\\');
+        ctrl(&mut app, 'l');
+        assert!(app.is_window_focused);
+        assert_eq!((app.side, cursor_on(&app).as_str()), (1, "8"), "the right");
+        ctrl(&mut app, 'h');
+        assert_eq!((app.side, cursor_on(&app).as_str()), (0, "4"), "the left");
+        assert!(!app.is_inserting());
+        ctrl(&mut app, 'h');
+        assert_eq!(app.side, 0, "nothing further left");
+        ctrl(&mut app, 'k');
+        assert!(!app.is_window_focused, "Ctrl+K: the table");
+        ctrl(&mut app, 'j');
+        assert!(app.is_window_focused);
+        assert_eq!(app.side, 0, "Ctrl+J: the left window, as Ctrl+Q goes");
+    }
+
+    #[test]
+    fn zoomed_to_the_table_ctrl_j_gives_no_hidden_window_the_keys() {
+        let mut app = with_chat(Status::Busy);
+        ctrl(&mut app, '\\');
+        ctrl(&mut app, 'f');
+        for c in ['j', 'h', 'l'] {
+            ctrl(&mut app, c);
+            assert!(!app.is_window_focused, "Ctrl+{c}");
+        }
     }
 
     #[test]
@@ -8243,6 +8412,35 @@ mod tests {
         type_into_palette(&mut app, "issue");
         let first = app.commands().into_iter().next().unwrap();
         assert_eq!(first.label, "Issues");
+    }
+
+    #[test]
+    fn the_palette_hands_off_as_shift_h_does() {
+        let mut app = app();
+        app.apply_sidecars(HashMap::from([(
+            PathBuf::from("/p/4/app"),
+            Sidecar::leased_now(),
+        )]));
+        let idle = Agent {
+            job: Some("0000aaaa".into()),
+            plugin: Some("claude".into()),
+            status: Some(Status::Idle),
+            ..attachable("fix login")
+        };
+        app.apply_agents(&HashMap::from([(PathBuf::from("/p/4/app"), vec![idle])]));
+        select(&mut app, "4");
+        ctrl(&mut app, 'p');
+        type_into_palette(&mut app, "hand");
+        let first = app.commands().into_iter().next().unwrap();
+        assert_eq!(
+            (first.label.as_str(), first.key.as_str()),
+            ("Hand tree 4's work to a new agent", "H")
+        );
+        assert!(matches!(
+            press(&mut app, KeyCode::Enter),
+            Outcome::Send { .. }
+        ));
+        assert!(app.is_handing_off(&PathBuf::from("/p/4/app")));
     }
 
     #[test]

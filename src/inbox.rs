@@ -1099,6 +1099,20 @@ pub mod tests {
     }
 
     #[test]
+    fn l_opens_the_item_under_the_cursor_as_enter_does_and_h_closes_as_esc_does() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Char('j'));
+        assert!(
+            matches!(press(&mut app, KeyCode::Char('l')), Outcome::SwitchTo { ref tree, .. } if tree == Path::new("/other/12/web"))
+        );
+        assert!(!app.is_notes_shown(), "closed on the way");
+        press(&mut app, KeyCode::Char('e'));
+        assert_eq!(press(&mut app, KeyCode::Char('h')), Outcome::Continue);
+        assert!(!app.is_notes_shown(), "h closes");
+    }
+
+    #[test]
     fn x_puts_one_away_until_it_changes_across_a_restart() {
         let dir = std::env::temp_dir().join(format!("treetop-put-away-{}", std::process::id()));
         let file = dir.join("put-away.json");

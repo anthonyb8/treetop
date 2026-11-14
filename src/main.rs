@@ -1135,15 +1135,6 @@ fn run(
                     app.insert_in_window();
                 }
             }
-            Outcome::JumpChat { is_down } => {
-                let size = term.size()?;
-                let area = ui::window_chat_area(app, Rect::new(0, 0, size.width, size.height));
-                if let Some(area) = area
-                    && let Some(open) = chats.open_mut().filter(|c| is_window_chat(c, app))
-                {
-                    open.jump(is_down, area);
-                }
-            }
             Outcome::ScrollChat(lines) => {
                 let size = term.size()?;
                 let area = ui::window_chat_area(app, Rect::new(0, 0, size.width, size.height));
