@@ -49,7 +49,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | Ctrl+P | open the command palette: every action, the tree under the cursor's first, found by typing a few of its words, a tree number or a branch, and run with Enter |
 | Ctrl+F | zoom: on the table, the table over the whole screen; in a window, the windows, with the table folded to their trees' rows; again, back |
 | Ctrl+\\ | show two windows under the table, the tree under the cursor on the left and the next tree down on the right, or one again |
-| `a` `s` `d` `f` | as Alt+H, J, K and L, unmodified on the left hand, from the table: `a` gives the keys to the left window, `s` to the window under the table, `d` keeps them on the table, `f` gives them to the right window |
+| `a` `s` `d` `f` | as Alt+H, J, K and L, unmodified on the left hand, from the table: `a` gives the keys to the left window, `s` to the window under the table, `d` keeps them on the table, `f` gives them to the Usage column where it shows, else to the right window; with two windows, `a` and `f` move between them from a window in Normal too, except `f` on the PR tab, which sends |
 | `[` `]` | step through the window's tabs: chat, diff, PR, run, shell and info, from the table or from the window in Normal, where `←` `→` do too |
 | `t` | go to the tree itself, even when its agent has a chat: its tmux pane or a window in it, else a shell there (see [Entering a tree](#entering-a-tree)) |
 | `n` | start a new agent in the tree under the cursor: a free one is leased for it, on a branch named for the task, and a held one keeps its branch; on the main checkout's heading, start one in the main checkout, for work that needs no tree |
@@ -434,6 +434,8 @@ Moving the cursor keeps the tab, so the diff tab shows each tree's diff in turn 
 A tab the tree under the cursor has not got shows its info instead.
 At the right of the bar, how full the agent's context is and what its session has spent.
 From 180 columns a Usage column beside the table, as tall as the table's window, has them in full, as the chat popup's sidebar does, for the tree under the cursor: how full its agent's context is and where that comes from, from 75% in a pool tree the hint that `H` hands it off, how much of the plan is used, a bar for each limit with when it resets, which shows even on a tree with no agent, and what the session has spent.
+`f` or Alt+L on the table gives the column the keys, in Normal, its border green, as does a click on it: `j` and `k` scroll it a line, `g` and `G` to its top and foot, `a`, `q`, Esc or Alt+H give the keys back to the table, and `s` or Alt+J go down to the window.
+Without the column, on a narrower terminal, `f` goes to the right window of two instead.
 The window under them spans the full width.
 What does not fit in the column scrolls with the mouse wheel over it, and its last line says how many lines are below, such as `↓ 13 more`; another tree under the cursor starts it from the top.
 Once the cursor has rested on a tree for a moment, the chat tab shows its agent's chat, so moving down the list opens no chat on the way; a tree whose agent is not running says Enter starts it again, since opening it would.
@@ -486,6 +488,7 @@ The bar lists no keys: `?` shows them all.
 `w` opens the workspaces from any tab, giving the keys back to the table.
 Esc, `q`, Alt+K or Ctrl+Q gives the keys back to the table; with two windows, Ctrl+Q moves them on to the other one first.
 Alt+H, Alt+J, Alt+K and Alt+L move the keys as vim's Ctrl+W does between its windows: Alt+K up to the table, Alt+J from the table down into the window, and with two windows Alt+H and Alt+L to the left one and the right one.
+With two windows, `a` and `f` in a window's Normal go to the left and right one too, as on the table; on the PR tab `f` sends the selected item instead, and `a` still goes left.
 Inside tmux, a `bind -n M-h` and its like take these keys before treetop sees them, so let treetop's pane have them:
 
 ```tmux
@@ -672,6 +675,7 @@ An agent whose turn has ended, its session idle, has finished, though it never w
 While anything needs action or is done, a count sits at the right of the Trees window's top border, such as `● 2 needs action  ✓ 3 done  e`.
 It never takes the keys, so what you type keeps going where it was, a chat in Insert included, and it stays bright over a popup.
 `e` from the table, or from a chat or shell in Normal, or a click on the count, opens the notifications under it: Needs action, what is stopped until you act, then Done, what finished or merged and is not working, the newest first.
+They keep to the right of the screen, over the Usage column where it shows, so a wider terminal never moves them.
 Each shows its tree, its ticket and branch, how long ago, and what it is about in full, such as the agent's whole question.
 ↑↓ pick one and Enter or `l` opens it: an agent's chat, with its question at the bottom; for a PR, the cursor on its tree with its checks in the info tab, where `F` sends a failure to its agent; for a dead agent, the cursor on its tree, where `R` resumes it.
 Needs action leaves once it is dealt with, and Done once you open it.

@@ -51,6 +51,7 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
             ("M-j M-k", "window, table"),
             ("M-h M-l", "left, right window"),
             ("a s d f", "left, down, up, right"),
+            ("f", "Usage, from the table"),
             ("i", "type to agent"),
             ("i Enter", "Insert in window"),
             ("^\\", "two windows, next agent"),
@@ -202,8 +203,10 @@ pub fn draw(
                 };
                 // Marked only while nothing else takes the keys: a window,
                 // a compose box or the palette.
-                let has_keys =
-                    !app.is_window_focused && app.prompt.is_none() && app.palette.is_none();
+                let has_keys = !app.is_window_focused
+                    && !app.has_usage_keys()
+                    && app.prompt.is_none()
+                    && app.palette.is_none();
                 let block = window_block(has_keys.then_some(Mode::Table)).title(title);
                 let body = block.inner(windows.top);
                 frame.render_widget(block, windows.top);
@@ -388,7 +391,9 @@ fn draw_notes(frame: &mut Frame, app: &App) {
         &done,
         "Nothing finished since you last looked.",
     );
-    // Under the count, its right edge with the count's, above the bar.
+    // Under the count, above the bar, its right edge as far in from the
+    // screen's as the count's is from the table's, so the Usage column
+    // beside the table never moves it.
     let main = screen_rows(frame.area()).main;
     // With nothing counted, where the count would end: inside the table
     // window's corner.
@@ -409,7 +414,11 @@ fn draw_notes(frame: &mut Frame, app: &App) {
     let offset = cursor.1.saturating_sub(rows).min(cursor.0);
     let lines: Vec<Line> = lines.into_iter().skip(offset).collect();
     let area = Rect {
-        x: count.right().saturating_sub(width).max(screen.x),
+        x: main
+            .right()
+            .saturating_sub(table.right().saturating_sub(count.right()))
+            .saturating_sub(width)
+            .max(screen.x),
         y: top,
         width,
         height,
@@ -1287,7 +1296,7 @@ impl Mode {
     fn of(app: &App) -> Self {
         if app.is_inserting() || app.prompt.is_some() {
             Self::Insert
-        } else if app.is_window_focused {
+        } else if app.is_window_focused || app.has_usage_keys() {
             Self::Normal
         } else {
             Self::Table
@@ -1514,18 +1523,25 @@ fn column_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     agent_lines(agent, tree, app.usage.as_ref(), now, width)
 }
 
-/// The column's box, titled as the windows are.
-fn usage_block() -> Block<'static> {
+/// The column's box, titled as the windows are, its border in Normal's
+/// colour while it has the keys.
+fn usage_block(has_keys: bool) -> Block<'static> {
+    let color = if has_keys {
+        Mode::Normal.color()
+    } else {
+        theme().border
+    };
     Block::bordered()
         .title(" Usage ")
-        .border_style(fg(theme().border))
+        .border_style(fg(color))
+        .title_style(Style::new().add_modifier(Modifier::BOLD))
         .padding(Padding::horizontal(1))
 }
 
 /// The column beside the table, for the window's tree.
 fn draw_usage_column(frame: &mut Frame, app: &App, area: Rect) {
     let t = theme();
-    let block = usage_block();
+    let block = usage_block(app.has_usage_keys());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let lines = column_lines(app, inner.width);
@@ -1550,14 +1566,32 @@ pub fn usage_overflow(app: &App, screen: Rect) -> u16 {
     let Some(area) = windows(app, screen_rows(screen).main).usage else {
         return 0;
     };
-    let inner = usage_block().inner(area);
+    let inner = usage_block(false).inner(area);
     let lines = column_lines(app, inner.width);
     u16::try_from(lines.len())
         .unwrap_or(u16::MAX)
         .saturating_sub(inner.height)
 }
 
-/// The column is under `mouse`, for its wheel.
+/// The Usage column is on `screen` beside the table, for its keys.
+pub fn has_usage_column(app: &App, screen: Rect) -> bool {
+    !app.is_issues && windows(app, screen_rows(screen).main).usage.is_some()
+}
+
+/// Something floats over the Trees screen and takes a click: a dialog,
+/// a menu, the palette, the help or the notifications.
+pub fn is_floating(app: &App) -> bool {
+    app.prompt.is_some()
+        || app.picker.is_some()
+        || app.port_menu.is_some()
+        || app.palette.is_some()
+        || app.phone.is_some()
+        || app.scratch_menu.is_some()
+        || app.is_help
+        || app.is_notes_shown()
+}
+
+/// The column is under `mouse`, for its wheel and a click.
 pub fn is_on_usage(app: &App, screen: Rect, mouse: ratatui::crossterm::event::MouseEvent) -> bool {
     !app.is_issues
         && windows(app, screen_rows(screen).main)
@@ -5940,6 +5974,57 @@ mod count_tests {
         assert!(app.is_notes_shown());
         click_on(&mut app, 200, 30, "needs action");
         assert!(!app.is_notes_shown());
+    }
+
+    #[test]
+    fn the_notifications_keep_to_the_right_with_the_usage_column_or_without() {
+        let mut app = app();
+        app.notes = Some(0);
+        // Columns from the popup's top-right corner to the screen's edge.
+        let gap = |width: u16| {
+            let shown = screen(&app, width, 40);
+            let row = shown
+                .iter()
+                .find(|l| l.contains(" Notifications "))
+                .unwrap_or_else(|| panic!("{width}: {}", shown.join("\n")));
+            let chars: Vec<char> = row.chars().collect();
+            let title = row[..row.find(" Notifications ").unwrap()].chars().count();
+            let corner = (title..chars.len()).find(|&i| chars[i] == '┐').unwrap();
+            usize::from(width) - corner
+        };
+        assert!(has_usage_column(&app, Rect::new(0, 0, 200, 40)));
+        assert!(!has_usage_column(&app, Rect::new(0, 0, 170, 40)));
+        assert_eq!(gap(200), gap(170), "the Usage column moves it no way");
+    }
+
+    #[test]
+    fn the_usage_column_with_the_keys_has_its_border_in_normals_colour() {
+        let mut app = app();
+        let screen = Rect::new(0, 0, 200, 40);
+        app.show_usage(has_usage_column(&app, screen));
+        let colours = |app: &App| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(200, 40)).unwrap();
+            terminal
+                .draw(|frame| draw(frame, app, None, None, None))
+                .unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            // The two boxes' corners on the top row: the table's, then the
+            // column's.
+            let corners: Vec<u16> = (0..200)
+                .filter(|&x| buffer[(x, 0)].symbol() == "┌")
+                .collect();
+            assert_eq!(corners.len(), 2, "the table and the column");
+            let bar: String = (0..200).map(|x| buffer[(x, 39)].symbol()).collect();
+            (buffer[(corners[0], 0)].fg, buffer[(corners[1], 0)].fg, bar)
+        };
+        let (table, usage, bar) = colours(&app);
+        assert_eq!((table, usage), (Mode::Table.color(), theme().border));
+        assert!(bar.starts_with(" TABLE "), "{bar}");
+        app.is_usage_focused = true;
+        let (table, usage, bar) = colours(&app);
+        assert_eq!((table, usage), (theme().border, Mode::Normal.color()));
+        assert!(bar.starts_with(" NORMAL "), "{bar}");
     }
 
     #[test]
