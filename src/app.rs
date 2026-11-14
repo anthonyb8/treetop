@@ -1480,6 +1480,16 @@ impl App {
         self.is_usage_focused && self.is_usage_shown && !self.is_window_focused
     }
 
+    /// A left click: on the Usage column it gives the column the keys, from
+    /// the table or a window; anywhere else it takes them from the column.
+    pub fn click_usage(&mut self, is_on: bool) {
+        if is_on {
+            self.is_window_focused = false;
+            self.is_inserting = false;
+        }
+        self.is_usage_focused = is_on;
+    }
+
     /// Takes whether the Usage column is on screen as just drawn; gone, it
     /// gives up the keys to the table.
     pub fn show_usage(&mut self, is_shown: bool) {
@@ -8411,6 +8421,26 @@ mod tests {
         press(&mut app, KeyCode::Char('f'));
         app.show_usage(false);
         assert!(!app.has_usage_keys());
+        // A click on the column takes the keys from a window too, and the
+        // next q gives them to the table, not back to the column.
+        press(&mut app, KeyCode::Char('s'));
+        assert!(app.is_window_focused);
+        app.show_usage(true);
+        app.click_usage(true);
+        assert!(
+            app.has_usage_keys() && !app.is_window_focused,
+            "click: Usage"
+        );
+        press(&mut app, KeyCode::Char('q'));
+        assert!(
+            !app.has_usage_keys() && !app.is_window_focused,
+            "q: the table"
+        );
+        // A click elsewhere takes them from the column.
+        app.click_usage(true);
+        app.click_usage(false);
+        assert!(!app.has_usage_keys());
+        app.show_usage(false);
         // With no column, f goes to the right window of two, as before.
         ctrl(&mut app, '\\');
         press(&mut app, KeyCode::Char('f'));

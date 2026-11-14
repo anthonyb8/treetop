@@ -1023,8 +1023,9 @@ fn run(
             // A click on the Usage column gives it the keys, and a click
             // anywhere else takes them from it, once nothing floats over it.
             if mouse.kind == MouseEventKind::Down(MouseButton::Left) && !ui::is_floating(app) {
-                app.is_usage_focused = ui::is_on_usage(app, screen, mouse);
-                if app.is_usage_focused {
+                let is_on = ui::is_on_usage(app, screen, mouse);
+                app.click_usage(is_on);
+                if is_on {
                     continue;
                 }
             }
