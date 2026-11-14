@@ -202,12 +202,13 @@ pub fn draw(
                     " Trees "
                 };
                 // Marked only while nothing else takes the keys: a window,
-                // a compose box or the palette.
+                // a compose box or the palette. In Normal's green, as a
+                // window and the Usage column are with the keys.
                 let has_keys = !app.is_window_focused
                     && !app.has_usage_keys()
                     && app.prompt.is_none()
                     && app.palette.is_none();
-                let block = window_block(has_keys.then_some(Mode::Table)).title(title);
+                let block = window_block(has_keys.then_some(Mode::Normal)).title(title);
                 let body = block.inner(windows.top);
                 frame.render_widget(block, windows.top);
                 draw_table(frame, app, body, fold);
@@ -6019,7 +6020,7 @@ mod count_tests {
             (buffer[(corners[0], 0)].fg, buffer[(corners[1], 0)].fg, bar)
         };
         let (table, usage, bar) = colours(&app);
-        assert_eq!((table, usage), (Mode::Table.color(), theme().border));
+        assert_eq!((table, usage), (Mode::Normal.color(), theme().border));
         assert!(bar.starts_with(" TABLE "), "{bar}");
         app.is_usage_focused = true;
         let (table, usage, bar) = colours(&app);
@@ -7175,7 +7176,7 @@ mod window_tests {
     }
 
     #[test]
-    fn what_has_the_keys_has_its_border_in_its_modes_colour() {
+    fn what_has_the_keys_has_its_border_in_normals_colour_or_inserts() {
         let mut app = on("4");
         app.tab = WindowTab::Chat;
         app.window_rows = window_chat_area(&app, Rect::new(0, 0, 200, 50))
@@ -7196,7 +7197,7 @@ mod window_tests {
         );
         assert!(table != normal && normal != insert && insert != table);
         assert_ne!(normal, theme().title, "no orange");
-        assert_eq!(corner(&app, "┌ Trees "), table);
+        assert_eq!(corner(&app, "┌ Trees "), normal, "the table's is green too");
         assert_eq!(corner(&app, "┌ Tree 4 "), theme().border);
         app.is_window_focused = true;
         assert_eq!(corner(&app, "┌ Trees "), theme().border);
@@ -7872,7 +7873,7 @@ mod window_tests {
             let buffer = drawn(app, 200, 50);
             buffer[(0, 1)].fg
         };
-        assert_eq!(table(&app), Mode::Table.color(), "the table has the keys");
+        assert_eq!(table(&app), Mode::Normal.color(), "the table has the keys");
         app.handle_key(ratatui::crossterm::event::KeyEvent::from(
             ratatui::crossterm::event::KeyCode::Char('N'),
         ));

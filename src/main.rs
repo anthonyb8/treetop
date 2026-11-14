@@ -353,6 +353,7 @@ fn run(
     app: &mut App,
     checkout: &Path,
     desktop: &mut notify::Desktop,
+    chats: &mut Chats,
 ) -> Result<Exit> {
     let refresher = Refresher::spawn(checkout.to_path_buf(), app.trees.clone());
     let worker = Worker::spawn();
@@ -369,7 +370,6 @@ fn run(
     // table ten times a second is most of what treetop costs while idle.
     let mut is_stale = true;
     let mut drawn_at = Instant::now();
-    let mut chats = Chats::default();
     let mut keeper = Keeper::default();
     // Whether the mouse is captured for an open issue or the count, apart
     // from a chat's.
@@ -489,12 +489,12 @@ fn run(
             snapshot::write(checkout, &status);
         }
         if let Some(Outcome::Send { to, text }) = app.ready_failure() {
-            send(term, app, &mut chats, &worker, to, &text)?;
+            send(term, app, chats, &worker, to, &text)?;
             refresher.refresh_ship();
         }
         // A handoff is read once its agent has written it and stopped, and
         // taken out of the tree, so the new agent never finds it there.
-        if !chat_has_keys(&chats, app)
+        if !chat_has_keys(chats, app)
             && let Some(file) = app.wanted_handoff()
             && let Ok(text) = std::fs::read_to_string(&file)
         {
@@ -569,7 +569,7 @@ fn run(
         // An open issue takes the mouse, for its links and the wheel, and
         // the list does while the count shows, for a click on it; a chat
         // captures it on its own, and gives it back when it closes.
-        if chat_has_keys(&chats, app) {
+        if chat_has_keys(chats, app) {
             is_issue_mouse = false;
         } else {
             let wants = if app.is_issues {
@@ -602,7 +602,7 @@ fn run(
                     open_chat(
                         term,
                         app,
-                        &mut chats,
+                        chats,
                         &chat.attach(),
                         chat.name,
                         app::SCRATCH.into(),
@@ -674,26 +674,26 @@ fn run(
             Err(mpsc::TryRecvError::Empty) => true,
             Err(mpsc::TryRecvError::Disconnected) => false,
         });
-        if !chat_has_keys(&chats, app)
+        if !chat_has_keys(chats, app)
             && let Some(Outcome::Chat {
                 command,
                 agent,
                 tree,
             }) = app.ready_chat()
         {
-            open_chat(term, app, &mut chats, &command, agent, tree)?;
+            open_chat(term, app, chats, &command, agent, tree)?;
             is_stale = true;
         }
         // What waits in another workspace, gone to from here, opens its
         // agent once the pool is read, before any ask takes the screen.
-        if !chat_has_keys(&chats, app) {
+        if !chat_has_keys(chats, app) {
             match app.arrival() {
                 Some(Outcome::Chat {
                     command,
                     agent,
                     tree,
                 }) => {
-                    open_chat(term, app, &mut chats, &command, agent, tree)?;
+                    open_chat(term, app, chats, &command, agent, tree)?;
                     is_stale = true;
                 }
                 // An agent with no chat here runs in a tmux pane, which
@@ -716,7 +716,7 @@ fn run(
         match chats.open() {
             // A chat read in Normal counts as seen, as one typed to does.
             Some(open)
-                if chat_has_keys(&chats, app)
+                if chat_has_keys(chats, app)
                     || app.is_window_focused && is_window_chat(open, app) =>
             {
                 app.saw_chat(open.command())
@@ -728,7 +728,7 @@ fn run(
                     tree,
                 }) = app.next_ask()
                 {
-                    open_chat(term, app, &mut chats, &command, agent, tree)?;
+                    open_chat(term, app, chats, &command, agent, tree)?;
                     is_stale = true;
                 }
             }
@@ -764,7 +764,7 @@ fn run(
                     is_stale = true;
                 }
                 if let Some(wanted) = wanted.filter(|_| is_rested) {
-                    show_in_window(term, app, &mut chats, wanted)?;
+                    show_in_window(term, app, chats, wanted)?;
                     is_stale = true;
                 }
             }
@@ -872,7 +872,7 @@ fn run(
             is_stale = false;
             drawn_at = Instant::now();
         }
-        if !event::poll(if chat_has_keys(&chats, app) {
+        if !event::poll(if chat_has_keys(chats, app) {
             CHAT_TICK
         } else {
             TICK
@@ -885,7 +885,7 @@ fn run(
         // Over the window's chat while the table has the keys, the wheel
         // scrolls it and a click gives it the keys.
         if let &Event::Mouse(mouse) = &event
-            && !chat_has_keys(&chats, app)
+            && !chat_has_keys(chats, app)
             && let Some(open) = chats.open_mut()
         {
             let size = term.size()?;
@@ -905,7 +905,7 @@ fn run(
                 continue;
             }
         }
-        if chat_has_keys(&chats, app)
+        if chat_has_keys(chats, app)
             && let Some(open) = chats.open_mut()
         {
             let size = term.size()?;
@@ -953,7 +953,7 @@ fn run(
                         }) = app.next_chat(&from)
                         {
                             chats.hide();
-                            open_chat(term, app, &mut chats, &command, agent, tree)?;
+                            open_chat(term, app, chats, &command, agent, tree)?;
                         }
                     } else {
                         open.send_key(key);
@@ -1134,13 +1134,13 @@ fn run(
                 command,
                 agent,
                 tree,
-            } => open_chat(term, app, &mut chats, &command, agent, tree)?,
+            } => open_chat(term, app, chats, &command, agent, tree)?,
             Outcome::TypeTo {
                 command,
                 agent,
                 tree,
             } => {
-                open_chat(term, app, &mut chats, &command, agent, tree)?;
+                open_chat(term, app, chats, &command, agent, tree)?;
                 if chats
                     .open()
                     .is_some_and(|c| c.command() == command.as_slice())
@@ -1199,7 +1199,7 @@ fn run(
                 *term = enter_screen()?;
                 refresher.refresh();
             }
-            Outcome::Send { to, text } => send(term, app, &mut chats, &worker, to, &text)?,
+            Outcome::Send { to, text } => send(term, app, chats, &worker, to, &text)?,
             Outcome::Editor => {
                 let text = app
                     .prompt
@@ -1239,9 +1239,10 @@ fn checkout_for(start: &Path, is_screen: bool) -> Result<PathBuf> {
 
 /// Shows the pool of `checkout`, and of each workspace `w` switches to,
 /// until treetop quits, opening on the Issues screen when `is_issues`. Each
-/// switch starts the pool's clocks, worker and chats afresh; ending the old
-/// pool's chat clients leaves its agents running. Returns the workspace to
-/// restart on, when `U` asked for the newer treetop.
+/// switch starts the pool's clocks and worker afresh; ending the old pool's
+/// chat clients leaves its agents running, and its shells keep running for
+/// coming back. Returns the workspace to restart on, when `U` asked for the
+/// newer treetop.
 fn show(
     term: &mut Term,
     start: PathBuf,
@@ -1256,6 +1257,7 @@ fn show(
     let mut desktop = notify::Desktop::default();
     let mut is_issues = is_issues;
     let mut arriving = None;
+    let mut chats = Chats::default();
     loop {
         std::env::set_current_dir(&checkout)?;
         workspaces::record(&checkout);
@@ -1283,7 +1285,7 @@ fn show(
             cached.insert(0, pool::main_tree(&checkout));
             app.set_cached(cached);
         }
-        let exit = run(term, &mut app, &checkout, &mut desktop);
+        let exit = run(term, &mut app, &checkout, &mut desktop, &mut chats);
         desktop.switched();
         watch = app.take_watch();
         // Leaving treetop takes what waits off tmux's status line; a switch
@@ -1294,6 +1296,7 @@ fn show(
         match exit? {
             Exit::Quit => return Ok(None),
             Exit::Switch(next, tree) => {
+                chats.switch(&checkout, &next);
                 checkout = next;
                 arriving = tree;
             }

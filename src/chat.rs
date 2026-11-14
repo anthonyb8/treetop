@@ -12,6 +12,7 @@ use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +27,7 @@ use ratatui::crossterm::event::{
 use ratatui::layout::{Position, Rect};
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
+use crate::app::SHELL;
 use crate::plugin::Screen;
 
 /// Lines of scrollback kept; the chat draws its own history, so none.
@@ -699,15 +701,37 @@ pub struct Pumped {
     pub failed: Vec<(String, String, String)>,
 }
 
-/// The chat on screen, if one is, and the ones left running behind it.
+/// The chat on screen, if one is, the ones left running behind it, and the
+/// shells of the workspaces switched away from.
 #[derive(Default)]
 pub struct Chats {
     open: Option<Chat>,
     /// Left with Ctrl+Q, oldest first.
     background: Vec<Chat>,
+    /// The shells of other workspaces, by their checkout, kept running for
+    /// coming back: a shell has no session to attach to again, as an agent
+    /// does, so ending it loses what it ran.
+    away: Vec<(PathBuf, Chat)>,
 }
 
 impl Chats {
+    /// Leaves the workspace checked out at `from` for the one at `to`. Its
+    /// shells keep running, away, and `to`'s come back behind the screen;
+    /// its agents' chat clients end, which leaves the agents running.
+    pub fn switch(&mut self, from: &Path, to: &Path) {
+        self.hide();
+        for chat in std::mem::take(&mut self.background) {
+            if chat.agent == SHELL {
+                self.away.push((from.to_path_buf(), chat));
+            }
+        }
+        let (back, away) = std::mem::take(&mut self.away)
+            .into_iter()
+            .partition(|(checkout, _)| checkout == to);
+        self.away = away;
+        self.background = back.into_iter().map(|(_, chat)| chat).collect();
+    }
+
     pub fn open(&self) -> Option<&Chat> {
         self.open.as_ref()
     }
@@ -844,6 +868,12 @@ impl Chats {
             chat.pump();
             chat.flush_into(&mut delivered, &mut failed);
         }
+        // Read while away too, so what a shell prints meanwhile is parsed
+        // as it comes rather than piling up until its workspace is back.
+        for (_, chat) in &mut self.away {
+            chat.pump();
+        }
+        self.away.retain(|(_, chat)| !chat.is_ended());
         let ended = |chat: &Chat| {
             (
                 chat.agent.clone(),
@@ -940,7 +970,8 @@ impl Chats {
 
     /// Resizes every chat, so one opened later is already the right size.
     pub fn resize(&mut self, rows: u16, cols: u16) {
-        for chat in self.open.iter_mut().chain(&mut self.background) {
+        let away = self.away.iter_mut().map(|(_, chat)| chat);
+        for chat in self.open.iter_mut().chain(&mut self.background).chain(away) {
             chat.resize(rows, cols);
         }
     }
@@ -1393,6 +1424,46 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn a_shell_left_for_another_workspace_is_the_same_shell_on_coming_back() {
+        // Each start prints its own process id, so a shell started again in
+        // its place shows a different one.
+        let shell = [
+            "sh".to_string(),
+            "-c".to_string(),
+            "echo started $$; sleep 30".to_string(),
+        ];
+        let agent = ["sh".to_string(), "-c".to_string(), "sleep 30".to_string()];
+        let (here, there) = (Path::new("/repo/here"), Path::new("/repo/there"));
+        let mut chats = Chats::default();
+        chats
+            .run_behind(&agent, (24, 80), ("claude".into(), "1".into()), None)
+            .unwrap();
+        let show = |chats: &mut Chats| {
+            chats
+                .show(&shell, (24, 80), SHELL.into(), "1".into(), None)
+                .unwrap();
+        };
+        show(&mut chats);
+        let first = shown(&mut chats, "started");
+
+        chats.switch(here, there);
+        assert!(chats.open().is_none());
+        assert!(
+            chats.running(&shell).is_none(),
+            "another workspace's tree 1 is not this one's"
+        );
+        assert!(
+            chats.running(&agent).is_none(),
+            "an agent's chat client ends"
+        );
+
+        chats.switch(there, here);
+        show(&mut chats);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(shown(&mut chats, "started"), first);
     }
 
     #[test]
