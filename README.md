@@ -479,7 +479,7 @@ A window with the keys is in one of two modes, as in vim, and says which in the 
 `j` and `k` scroll a line and `d` and `u` half a page, on the chat's history as on the diff and the PR, whose other keys work as ever.
 On a chat, `h` jumps to the top of its history and `l` back to the bottom, by scrolling until the chat stops; a chat that has not asked for the mouse, unlike Claude Code, would get that as arrow keys walking its prompt's history, so there they do nothing.
 `i` or Enter on a chat or shell starts Insert.
-`e` opens the notifications and `w` the workspaces, giving the keys back to the table.
+`w` opens the workspaces from any tab, giving the keys back to the table.
 Esc, `q` or Ctrl+Q gives the keys back to the table; with two windows, Ctrl+Q moves them on to the other one first.
 
 **Insert** gives every key to the chat or shell, Esc too, which interrupts Claude Code.

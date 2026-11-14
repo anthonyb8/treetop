@@ -2238,6 +2238,11 @@ impl App {
             self.is_window_focused = false;
             return Outcome::Continue;
         }
+        // w goes to the other workspaces, as on every tab in Normal.
+        if key.code == KeyCode::Char('w') {
+            self.is_window_focused = false;
+            return Outcome::Workspaces;
+        }
         let pr = self.prs.get(&path).and_then(|r| r.pr.clone()?.ok()?);
         let Some(pr) = pr else {
             return Outcome::Continue;
@@ -2382,6 +2387,11 @@ impl App {
         if matches!(key.code, KeyCode::Esc | KeyCode::Tab | KeyCode::Char('q')) {
             self.is_window_focused = false;
             return Outcome::Continue;
+        }
+        // w goes to the other workspaces, as on every tab in Normal.
+        if key.code == KeyCode::Char('w') {
+            self.is_window_focused = false;
+            return Outcome::Workspaces;
         }
         let (len, starts) = match self.diffs.get(&path).map(|d| &d.layout) {
             Some(Ok(layout)) => (layout.rows.len(), layout.file_starts.clone()),
@@ -7788,6 +7798,19 @@ mod tests {
         assert!(app.is_window_focused && !app.is_inserting(), "Normal");
         assert_eq!(press(&mut app, KeyCode::Char('w')), Outcome::Workspaces);
         assert!(!app.is_window_focused, "the table has the keys again");
+        for (open, tab) in [('d', WindowTab::Diff), ('v', WindowTab::Pr)] {
+            press(&mut app, KeyCode::Char(open));
+            assert!(
+                app.is_window_focused && app.shown_tab() == tab,
+                "{tab:?} in Normal"
+            );
+            assert_eq!(
+                press(&mut app, KeyCode::Char('w')),
+                Outcome::Workspaces,
+                "{tab:?}"
+            );
+            assert!(!app.is_window_focused, "{tab:?} gives the keys back");
+        }
     }
 
     #[test]
