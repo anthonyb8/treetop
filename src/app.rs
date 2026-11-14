@@ -725,6 +725,11 @@ pub struct App {
     /// How far the wheel has scrolled the Usage column, and for which tree:
     /// another tree under the cursor starts it from the top.
     usage_scroll: (Option<PathBuf>, u16),
+    /// The Usage column is on screen beside the table, as last drawn.
+    pub is_usage_shown: bool,
+    /// The Usage column has the keys, in Normal, to scroll it; a window
+    /// given the keys takes them from it.
+    pub is_usage_focused: bool,
     /// The second window, in a double; None shows one window.
     pub other: Option<OtherWindow>,
     /// What Ctrl+F zoomed, while it is zoomed.
@@ -1453,10 +1458,64 @@ impl App {
             'k' => {
                 self.is_window_focused = false;
                 self.is_inserting = false;
+                self.is_usage_focused = false;
             }
-            'h' | 'l' if self.other_window().is_some() => self.focus_side(usize::from(to == 'l')),
+            // Left of the Usage column is the table.
+            'h' if self.has_usage_keys() => self.is_usage_focused = false,
+            // Right of the table is the Usage column, where it shows.
+            'l' if !self.is_window_focused && !self.is_usage_focused && self.is_usage_shown => {
+                self.is_usage_focused = true;
+                self.is_inserting = false;
+            }
+            'h' | 'l' if self.other_window().is_some() && !self.is_usage_focused => {
+                self.focus_side(usize::from(to == 'l'))
+            }
             _ => {}
         }
+    }
+
+    /// The Usage column has the keys: it is on screen and no window has
+    /// taken them since it was given them.
+    pub fn has_usage_keys(&self) -> bool {
+        self.is_usage_focused && self.is_usage_shown && !self.is_window_focused
+    }
+
+    /// Takes whether the Usage column is on screen as just drawn; gone, it
+    /// gives up the keys to the table.
+    pub fn show_usage(&mut self, is_shown: bool) {
+        self.is_usage_shown = is_shown;
+        if !is_shown {
+            self.is_usage_focused = false;
+        }
+    }
+
+    /// The keys the Usage column takes while it has them: j and k scroll it
+    /// a line, g and G to its top and foot, a, q or Esc give them back to
+    /// the table, s goes down to the window, and e, w and ? work as on the
+    /// table.
+    fn handle_usage_key(&mut self, key: KeyEvent) -> Outcome {
+        match key.code {
+            KeyCode::Char('j') => self.scroll_usage(1),
+            KeyCode::Char('k') => self.scroll_usage(-1),
+            KeyCode::Char('g') => self.scroll_usage(isize::MIN),
+            KeyCode::Char('G') => self.scroll_usage(isize::MAX),
+            KeyCode::Char('a' | 'q') | KeyCode::Esc => self.is_usage_focused = false,
+            KeyCode::Char('s') => {
+                self.is_usage_focused = false;
+                self.move_keys('j');
+            }
+            KeyCode::Char('e') => {
+                self.is_usage_focused = false;
+                self.notes = Some(0);
+            }
+            KeyCode::Char('w') => {
+                self.is_usage_focused = false;
+                return Outcome::Workspaces;
+            }
+            KeyCode::Char('?') => self.is_help = true,
+            _ => {}
+        }
+        Outcome::Continue
     }
 
     /// Ctrl+Q: with one window, gives it the keys where it has something to
@@ -1464,6 +1523,7 @@ impl App {
     /// on round the table, the left window and the right one.
     pub fn cycle_keys(&mut self) {
         self.is_inserting = false;
+        self.is_usage_focused = false;
         if self.other_window().is_some() {
             match (self.is_window_focused, self.side) {
                 (false, _) => self.focus_side(0),
@@ -2049,8 +2109,8 @@ impl App {
     /// The keys a window takes in Normal, on a tab with no keys of its own:
     /// Esc or q gives them back to the table, the arrows, [ and ] step its
     /// tabs, on a chat or shell i or Enter starts Insert while j, k, d
-    /// and u scroll it, e goes to what waits on you, and w to the other
-    /// workspaces.
+    /// and u scroll it, a and f go to the left or right window of two, e
+    /// goes to what waits on you, and w to the other workspaces.
     fn handle_window_key(&mut self, key: KeyEvent) -> Outcome {
         let is_terminal = matches!(self.shown_tab(), WindowTab::Chat | WindowTab::Shell);
         let half = isize::try_from(self.window_rows / 2).map_or(1, |h| h.max(1));
@@ -2058,6 +2118,9 @@ impl App {
             KeyCode::Esc | KeyCode::Char('q') => self.is_window_focused = false,
             KeyCode::Left | KeyCode::Right => self.step_tab(key.code == KeyCode::Right),
             KeyCode::Char('[' | ']') => self.step_tab(key.code == KeyCode::Char(']')),
+            // a and f go to the left or right window, as from the table.
+            KeyCode::Char('a') => self.move_keys('h'),
+            KeyCode::Char('f') => self.move_keys('l'),
             KeyCode::Char('i') | KeyCode::Enter if is_terminal => {
                 self.is_inserting = self.window_chat().is_some();
             }
@@ -2080,12 +2143,16 @@ impl App {
 
     /// The wheel over the Usage column scrolls it, three lines at a time.
     pub fn wheel_usage(&mut self, is_down: bool) {
-        let at = self.usage_offset();
-        let at = if is_down {
-            at.saturating_add(3).min(self.usage_overflow)
-        } else {
-            at.saturating_sub(3)
-        };
+        self.scroll_usage(if is_down { 3 } else { -3 });
+    }
+
+    /// Scrolls the Usage column by `lines`, down for more, within its lines.
+    fn scroll_usage(&mut self, lines: isize) {
+        let lines = i64::try_from(lines).unwrap_or(if lines < 0 { i64::MIN } else { i64::MAX });
+        let at = i64::from(self.usage_offset())
+            .saturating_add(lines)
+            .clamp(0, i64::from(self.usage_overflow));
+        let at = u16::try_from(at).unwrap_or(self.usage_overflow);
         self.usage_scroll = (self.window_tree().map(|t| t.path.clone()), at);
     }
 
@@ -2275,6 +2342,11 @@ impl App {
             self.is_window_focused = false;
             return Outcome::Workspaces;
         }
+        // a goes to the left window, as from the table; f sends here.
+        if key.code == KeyCode::Char('a') {
+            self.move_keys('h');
+            return Outcome::Continue;
+        }
         let pr = self.prs.get(&path).and_then(|r| r.pr.clone()?.ok()?);
         let Some(pr) = pr else {
             return Outcome::Continue;
@@ -2431,6 +2503,15 @@ impl App {
         if key.code == KeyCode::Char('w') {
             self.is_window_focused = false;
             return Outcome::Workspaces;
+        }
+        // a and f go to the left or right window, as from the table.
+        if key.code == KeyCode::Char('a') {
+            self.move_keys('h');
+            return Outcome::Continue;
+        }
+        if key.code == KeyCode::Char('f') {
+            self.move_keys('l');
+            return Outcome::Continue;
         }
         let (len, starts) = match self.diffs.get(&path).map(|d| &d.layout) {
             Some(Ok(layout)) => (layout.rows.len(), layout.file_starts.clone()),
@@ -4558,6 +4639,9 @@ impl App {
         // for it never runs a table command.
         if self.is_window_focused {
             return self.handle_window_key(key);
+        }
+        if self.has_usage_keys() {
+            return self.handle_usage_key(key);
         }
         if let Some(review) = self.reviews.front_mut() {
             match key.code {
@@ -8277,6 +8361,94 @@ mod tests {
         assert!(app.keeps_shell("4"));
         assert!(!app.keeps_shell("7"), "a returned tree's shell ends");
         assert!(!app.keeps_shell("12"), "so does a destroyed one's");
+    }
+
+    #[test]
+    fn f_on_the_table_gives_the_usage_column_the_keys_to_scroll_it() {
+        let mut app = with_chat(Status::Busy);
+        app.window_rows = 20;
+        app.show_usage(true);
+        app.usage_overflow = 10;
+        press(&mut app, KeyCode::Char('f'));
+        assert!(app.has_usage_keys() && !app.is_window_focused, "f: Usage");
+        // j and k scroll it, g and G to its top and foot.
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.usage_offset(), 2);
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.usage_offset(), 1);
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(app.usage_offset(), 10);
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.usage_offset(), 0);
+        // The table's keys do nothing while it has them.
+        let row = app.selected;
+        press(&mut app, KeyCode::Char('r'));
+        assert!(app.pending.is_none(), "r returns nothing from Usage");
+        assert_eq!(app.selected, row, "j moved no cursor");
+        // a, q, Esc and Alt+H go back to the table.
+        for back in [KeyCode::Char('a'), KeyCode::Char('q'), KeyCode::Esc] {
+            press(&mut app, KeyCode::Char('f'));
+            assert!(app.has_usage_keys());
+            press(&mut app, back);
+            assert!(!app.has_usage_keys() && !app.is_window_focused, "{back:?}");
+        }
+        alt(&mut app, 'l');
+        assert!(app.has_usage_keys(), "Alt+L: Usage");
+        alt(&mut app, 'h');
+        assert!(!app.has_usage_keys(), "Alt+H: the table");
+        // s goes down to the window.
+        press(&mut app, KeyCode::Char('f'));
+        press(&mut app, KeyCode::Char('s'));
+        assert!(
+            app.is_window_focused && !app.has_usage_keys(),
+            "s: the window"
+        );
+        // Back on the table, the keys are the table's, not Usage's.
+        press(&mut app, KeyCode::Char('q'));
+        assert!(!app.has_usage_keys());
+        // Gone from the screen, the column gives the keys back.
+        press(&mut app, KeyCode::Char('f'));
+        app.show_usage(false);
+        assert!(!app.has_usage_keys());
+        // With no column, f goes to the right window of two, as before.
+        ctrl(&mut app, '\\');
+        press(&mut app, KeyCode::Char('f'));
+        assert_eq!((app.is_window_focused, app.side), (true, 1), "f: the right");
+    }
+
+    #[test]
+    fn with_two_windows_a_and_f_in_a_window_go_to_the_left_and_right_one() {
+        let mut app = with_chat(Status::Busy);
+        app.window_rows = 20;
+        ctrl(&mut app, '\\');
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!((app.is_window_focused, app.side), (true, 0), "s: the left");
+        // From the chat in Normal, as from the table.
+        press(&mut app, KeyCode::Char('f'));
+        assert_eq!(
+            (app.side, cursor_on(&app).as_str()),
+            (1, "8"),
+            "f: the right"
+        );
+        assert!(app.is_window_focused && !app.is_inserting());
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(
+            (app.side, cursor_on(&app).as_str()),
+            (0, "4"),
+            "a: the left"
+        );
+        // From the diff with its keys too.
+        press(&mut app, KeyCode::Char(']'));
+        assert!(app.has_keys_on(WindowTab::Diff));
+        press(&mut app, KeyCode::Char('f'));
+        assert_eq!(app.side, 1, "f from the diff: the right");
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.side, 0, "a from the diff: the left");
+        // d and u still scroll in the window.
+        app.tab = WindowTab::Chat;
+        assert_eq!(press(&mut app, KeyCode::Char('d')), Outcome::ScrollChat(10));
+        assert!(app.is_window_focused, "d keeps the keys in the window");
     }
 
     #[test]

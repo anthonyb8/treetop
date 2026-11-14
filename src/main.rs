@@ -861,6 +861,10 @@ fn run(
                 app,
                 Rect::new(0, 0, size.width, size.height),
             ));
+            app.show_usage(ui::has_usage_column(
+                app,
+                Rect::new(0, 0, size.width, size.height),
+            ));
             let other = app
                 .other_chat()
                 .and_then(|(command, ..)| chats.running(&command));
@@ -1015,6 +1019,14 @@ fn run(
             if is_wheel && ui::is_on_usage(app, screen, mouse) {
                 app.wheel_usage(mouse.kind == MouseEventKind::ScrollDown);
                 continue;
+            }
+            // A click on the Usage column gives it the keys, and a click
+            // anywhere else takes them from it, once nothing floats over it.
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left) && !ui::is_floating(app) {
+                app.is_usage_focused = ui::is_on_usage(app, screen, mouse);
+                if app.is_usage_focused {
+                    continue;
+                }
             }
             match ui::click(app, screen, mouse) {
                 Some(outcome) => outcome,
