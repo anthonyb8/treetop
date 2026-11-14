@@ -3687,7 +3687,7 @@ fn draw_pr_view(frame: &mut Frame, app: &App, popup: &PrPopup, area: Rect) {
             Some(Ok(_)) => vec![
                 Line::raw(format!("No pull request for {branch} yet.")),
                 Line::styled(
-                    "Esc, then s, starts a ship run, which pushes the branch and opens one.",
+                    "Esc, then S, starts a ship run, which pushes the branch and opens one.",
                     fg(t.muted),
                 ),
             ],
@@ -6255,7 +6255,7 @@ mod pr_view_tests {
         let shown = screen(&app, 200, 40);
         assert!(
             shown.contains("No pull request for me/anb-41-inbox-rail yet.")
-                && shown.contains("Esc, then s, starts a ship run"),
+                && shown.contains("Esc, then S, starts a ship run"),
             "{shown}"
         );
         app.pr_loaded(
