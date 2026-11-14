@@ -1847,7 +1847,7 @@ impl App {
             self.jobs
                 .insert(path.clone(), JobState::Done(job.kind, Instant::now()));
             self.message = Some(if is_assistant {
-                "the assistant started on your message; a opens its chat".to_string()
+                "the assistant started on your message; A opens its chat".to_string()
             } else if job.tree.is_main {
                 "dispatched to the main checkout; Enter on it opens its chat".to_string()
             } else {
@@ -1877,7 +1877,7 @@ impl App {
             match (self.opening.as_mut().filter(|_| owns), job.attach.clone()) {
                 (None, _) => {
                     self.message = Some(if is_assistant {
-                        "the assistant started; a opens its chat".to_string()
+                        "the assistant started; A opens its chat".to_string()
                     } else {
                         format!(
                             "agent started in tree {}; Enter on it opens its chat",
@@ -1915,7 +1915,7 @@ impl App {
                 }
                 None => {
                     self.message = Some(format!(
-                        "{plugin} started a run on tree {}; s on it shows the run",
+                        "{plugin} started a run on tree {}; S on it shows the run",
                         job.tree.name
                     ));
                 }
@@ -2929,7 +2929,7 @@ impl App {
         match kind {
             crate::inbox::Kind::Failed => {
                 self.message = Some(format!(
-                    "tree {}'s PR failed its checks; f sends the failure to its agent",
+                    "tree {}'s PR failed its checks; F sends the failure to its agent",
                     tree.name
                 ));
                 Outcome::Continue
@@ -6488,7 +6488,7 @@ mod tests {
         assert!(app.opening.is_none());
         app.job_finished(started(job), true, String::new());
         assert_eq!(app.ready_chat(), None, "dismissed, it opens only with a");
-        assert!(app.message.as_deref().unwrap().contains("a opens its chat"));
+        assert!(app.message.as_deref().unwrap().contains("A opens its chat"));
         let job = queued(press(&mut app, KeyCode::Char('A'))).remove(0);
         app.job_finished(job, false, "claude: not found".into());
         assert!(app.opening.is_none());
@@ -7059,7 +7059,7 @@ mod tests {
         assert!(app.opening.is_none(), "no chat opens");
         assert!(
             matches!(press(&mut app, KeyCode::Char('A')), Outcome::Chat { agent, .. } if agent == assistant::NAME),
-            "a opens its chat"
+            "A opens its chat"
         );
     }
 
@@ -7904,6 +7904,13 @@ mod tests {
             app.ready_chat(),
             Some(Outcome::Chat { agent, tree, .. }) if agent == "no-mistakes" && tree == "4"
         ));
+        // A run with nothing to attach to says the key that shows it, S,
+        // since s on the table now moves the keys.
+        let mut app = app_on_a_run();
+        let job = queued(press(&mut app, KeyCode::Char('S'))).remove(0);
+        app.job_finished(job, true, String::new());
+        let message = app.message.clone().unwrap_or_default();
+        assert!(message.contains("; S on it shows the run"), "{message}");
     }
 
     /// Tree 4 with a no-mistakes run waiting at a gate.

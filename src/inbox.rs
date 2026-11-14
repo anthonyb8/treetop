@@ -771,7 +771,7 @@ pub mod tests {
         assert_eq!(app.current().map(|t| t.name.as_str()), Some("4"));
         assert_eq!(open_nth(&mut app, 3), Outcome::Continue);
         assert_eq!(app.current().map(|t| t.name.as_str()), Some("7"));
-        assert!(app.message.as_deref().unwrap().contains("f sends"));
+        assert!(app.message.as_deref().unwrap().contains("F sends"));
         assert_eq!(open_nth(&mut app, 0), Outcome::Continue);
         assert_eq!(
             app.current().map(|t| t.name.as_str()),
@@ -930,7 +930,7 @@ pub mod tests {
         assert_eq!(there.arrival(), None, "no chat opens for a PR");
         assert_eq!(there.current().map(|t| t.name.as_str()), Some("7"));
         assert!(
-            there.message.as_deref().unwrap().contains("f sends"),
+            there.message.as_deref().unwrap().contains("F sends"),
             "{:?}",
             there.message
         );
