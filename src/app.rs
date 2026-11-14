@@ -174,11 +174,11 @@ const TREE_COMMANDS: [(&str, char); 20] = [
     ("Return tree {} to the pool", 'r'),
     ("New agent in tree {}", 'n'),
     ("Write to tree {}'s agent", 'm'),
-    ("Show the diff of tree {}", 'd'),
+    ("Show the diff of tree {}", 'D'),
     ("Show the PR of tree {}", 'v'),
     ("Open tree {}'s PR on GitHub", 'O'),
-    ("Send tree {}'s failure to its agent", 'f'),
-    ("Start a ship run of tree {}", 's'),
+    ("Send tree {}'s failure to its agent", 'F'),
+    ("Start a ship run of tree {}", 'S'),
     ("Resume tree {}'s agent", 'R'),
     ("Hand tree {}'s work to a new agent", 'H'),
     ("Go to tree {} itself", 't'),
@@ -198,7 +198,7 @@ const TREE_COMMANDS: [(&str, char); 20] = [
 const POOL_COMMANDS: [(&str, &str); 12] = [
     ("New agent in a fresh tree", "N"),
     ("Ask the assistant", ":"),
-    ("Open the assistant's chat", "a"),
+    ("Open the assistant's chat", "A"),
     ("Issues", "Tab"),
     ("Switch workspace", "w"),
     ("Scratch chats", "C"),
@@ -397,7 +397,7 @@ pub enum WindowTab {
     /// Its agent's chat, live.
     #[default]
     Chat,
-    /// Its diff against its base, as `d` shows it.
+    /// Its diff against its base, as `D` shows it.
     Diff,
     /// Its PR: checks, review threads and CodeRabbit, as `v` shows it.
     Pr,
@@ -1202,7 +1202,7 @@ impl App {
         if Self::chat_agent(tree).is_some() {
             tabs.push(WindowTab::Chat);
         }
-        // The main checkout's heading stands for it, and `d` and `v` work
+        // The main checkout's heading stands for it, and `D` and `v` work
         // only on a tree's own row.
         if tree.is_held() && !tree.is_main {
             tabs.extend([WindowTab::Diff, WindowTab::Pr]);
@@ -1847,7 +1847,7 @@ impl App {
             self.jobs
                 .insert(path.clone(), JobState::Done(job.kind, Instant::now()));
             self.message = Some(if is_assistant {
-                "the assistant started on your message; a opens its chat".to_string()
+                "the assistant started on your message; A opens its chat".to_string()
             } else if job.tree.is_main {
                 "dispatched to the main checkout; Enter on it opens its chat".to_string()
             } else {
@@ -1860,7 +1860,7 @@ impl App {
             self.jobs
                 .insert(path.clone(), JobState::Done(job.kind, Instant::now()));
             // Its chat opens only while its popup still stands in for it; Esc
-            // on the popup means it is opened later, with `a`.
+            // on the popup means it is opened later, with `A`.
             let known = self
                 .trees
                 .iter()
@@ -1877,7 +1877,7 @@ impl App {
             match (self.opening.as_mut().filter(|_| owns), job.attach.clone()) {
                 (None, _) => {
                     self.message = Some(if is_assistant {
-                        "the assistant started; a opens its chat".to_string()
+                        "the assistant started; A opens its chat".to_string()
                     } else {
                         format!(
                             "agent started in tree {}; Enter on it opens its chat",
@@ -1915,7 +1915,7 @@ impl App {
                 }
                 None => {
                     self.message = Some(format!(
-                        "{plugin} started a run on tree {}; s on it shows the run",
+                        "{plugin} started a run on tree {}; S on it shows the run",
                         job.tree.name
                     ));
                 }
@@ -2047,7 +2047,7 @@ impl App {
     }
 
     /// The keys a window takes in Normal, on a tab with no keys of its own:
-    /// Esc or q gives them back to the table, the arrows step through its
+    /// Esc or q gives them back to the table, the arrows, [ and ] step its
     /// tabs, on a chat or shell i or Enter starts Insert while j, k, d
     /// and u scroll it, e goes to what waits on you, and w to the other
     /// workspaces.
@@ -2057,6 +2057,7 @@ impl App {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.is_window_focused = false,
             KeyCode::Left | KeyCode::Right => self.step_tab(key.code == KeyCode::Right),
+            KeyCode::Char('[' | ']') => self.step_tab(key.code == KeyCode::Char(']')),
             KeyCode::Char('i') | KeyCode::Enter if is_terminal => {
                 self.is_inserting = self.window_chat().is_some();
             }
@@ -2255,10 +2256,13 @@ impl App {
             self.move_keys(to);
             return Outcome::Continue;
         }
-        // The arrows step the window's tabs, as on every tab in Normal; h
+        // The arrows, [ and ] step the window's tabs, as on every tab in Normal; h
         // and l step the PR's own.
-        if matches!(key.code, KeyCode::Left | KeyCode::Right) {
-            self.step_tab(key.code == KeyCode::Right);
+        if matches!(
+            key.code,
+            KeyCode::Left | KeyCode::Right | KeyCode::Char('[' | ']')
+        ) {
+            self.step_tab(matches!(key.code, KeyCode::Right | KeyCode::Char(']')));
             return Outcome::Continue;
         }
         // Esc gives the keys back to the table; the PR stays in its tab.
@@ -2409,10 +2413,13 @@ impl App {
             self.move_keys(to);
             return Outcome::Continue;
         }
-        // The arrows step the window's tabs, as on every tab in Normal; h
+        // The arrows, [ and ] step the window's tabs, as on every tab in Normal; h
         // and l scroll the diff sideways.
-        if matches!(key.code, KeyCode::Left | KeyCode::Right) {
-            self.step_tab(key.code == KeyCode::Right);
+        if matches!(
+            key.code,
+            KeyCode::Left | KeyCode::Right | KeyCode::Char('[' | ']')
+        ) {
+            self.step_tab(matches!(key.code, KeyCode::Right | KeyCode::Char(']')));
             return Outcome::Continue;
         }
         // Esc gives the keys back to the table; the diff stays in its tab.
@@ -2922,7 +2929,7 @@ impl App {
         match kind {
             crate::inbox::Kind::Failed => {
                 self.message = Some(format!(
-                    "tree {}'s PR failed its checks; f sends the failure to its agent",
+                    "tree {}'s PR failed its checks; F sends the failure to its agent",
                     tree.name
                 ));
                 Outcome::Continue
@@ -3424,7 +3431,7 @@ impl App {
         !self.ship_plugins.is_empty()
     }
 
-    /// `s`: shows the ship run under way on the tree under the cursor, or
+    /// `S`: shows the ship run under way on the tree under the cursor, or
     /// asks to start one.
     fn ship(&mut self) -> Outcome {
         let Some(tree) = self.current() else {
@@ -4633,8 +4640,10 @@ impl App {
         if key.code == KeyCode::Char('w') {
             return Outcome::Workspaces;
         }
-        if matches!(key.code, KeyCode::Left | KeyCode::Right) {
-            self.step_tab(key.code == KeyCode::Right);
+        // The arrows do nothing on the table, so the hands stay on j and k;
+        // [ and ] step the window's tabs.
+        if matches!(key.code, KeyCode::Char('[' | ']')) {
+            self.step_tab(key.code == KeyCode::Char(']'));
             return Outcome::Continue;
         }
         if key.code == KeyCode::Char('C') {
@@ -4684,8 +4693,15 @@ impl App {
                 self.selected = self.first_tree_row();
             }
             KeyCode::Esc => self.marked.clear(),
-            KeyCode::Down | KeyCode::Char('j') => self.move_by(1),
-            KeyCode::Up | KeyCode::Char('k') => self.move_by(-1),
+            KeyCode::Char('j') => self.move_by(1),
+            KeyCode::Char('k') => self.move_by(-1),
+            // a, s, d and f move the keys as Alt+H, J, K and L do, on the
+            // left hand: the left window, down to the window, up to the
+            // table, the right window.
+            KeyCode::Char('a') => self.move_keys('h'),
+            KeyCode::Char('s') => self.move_keys('j'),
+            KeyCode::Char('d') => self.move_keys('k'),
+            KeyCode::Char('f') => self.move_keys('l'),
             KeyCode::Home | KeyCode::Char('g') => self.move_by(isize::MIN),
             KeyCode::End | KeyCode::Char('G') => self.move_by(isize::MAX),
             KeyCode::Char('/') => self.is_filtering = true,
@@ -4702,10 +4718,10 @@ impl App {
             KeyCode::Char('P') => return self.choose_port(Reach::Public),
             KeyCode::Char('Q') => return self.choose_port(Reach::Code),
             KeyCode::Char('O') => return self.open_pr(),
-            KeyCode::Char('f') => return self.read_failure(),
+            KeyCode::Char('F') => return self.read_failure(),
             KeyCode::Char('R') => return self.resume(),
             KeyCode::Char('H') => return self.hand_off(),
-            KeyCode::Char('s') => return self.ship(),
+            KeyCode::Char('S') => return self.ship(),
             KeyCode::Char('z') => return self.toggle_shelf(Shelf::Parked),
             KeyCode::Char('x') => return self.toggle_shelf(Shelf::Backburner),
             KeyCode::Char('X') => {
@@ -4719,10 +4735,10 @@ impl App {
                 self.selected = self.selected.min(last);
             }
             // The assistant's chat, where it answers.
-            KeyCode::Char('a') => return self.converse(String::new()),
+            KeyCode::Char('A') => return self.converse(String::new()),
             KeyCode::Char('n') => self.open_start(),
             KeyCode::Char('N') => self.open_dispatch(),
-            KeyCode::Char('d') => {
+            KeyCode::Char('D') => {
                 self.open_diff();
                 self.show_tab(WindowTab::Diff);
             }
@@ -5275,7 +5291,7 @@ mod tests {
         let mut app = app();
         with_work(&mut app, 1);
         assert_eq!(app.wanted_diff(), None, "no view, nothing to read");
-        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('D'));
         assert_eq!(app.view.as_ref().unwrap().path, PathBuf::from("/p/4/app"));
         assert_eq!(app.wanted_diff(), Some((PathBuf::from("/p/4/app"), None)));
         assert_eq!(app.wanted_diff(), None, "in flight");
@@ -5286,7 +5302,7 @@ mod tests {
         assert!(!app.is_window_focused);
         assert!(app.view.is_some());
         with_work(&mut app, 2);
-        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('D'));
         assert_eq!(
             app.wanted_diff(),
             Some((PathBuf::from("/p/4/app"), None)),
@@ -5299,12 +5315,12 @@ mod tests {
         let mut app = app();
         with_work(&mut app, 1);
         let path = PathBuf::from("/p/4/app");
-        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('D'));
         app.wanted_diff();
         app.diff_loaded(path.clone(), two_files());
         app.diff_loaded(path.clone(), two_files());
         press(&mut app, KeyCode::Esc);
-        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('D'));
         assert_eq!(
             app.wanted_diff(),
             None,
@@ -5338,7 +5354,7 @@ mod tests {
         );
         app.reselect(Some(PathBuf::from("/p/8/app")));
         with_work(&mut app, 1);
-        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('D'));
         assert_eq!(
             app.wanted_diff(),
             Some((PathBuf::from("/p/8/app"), Some("main".into())))
@@ -5402,7 +5418,7 @@ mod tests {
             Some("8"),
             "the cursor starts on a tree"
         );
-        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char('j'));
         assert_eq!(app.current(), None, "on main's heading");
         press(&mut app, KeyCode::Enter);
         assert_eq!(
@@ -5868,7 +5884,7 @@ mod tests {
     fn d_on_an_available_tree_says_there_is_nothing_to_diff() {
         let mut app = app();
         select(&mut app, "7");
-        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('D'));
         assert!(app.view.is_none());
         assert_eq!(
             app.message.as_deref(),
@@ -5880,7 +5896,7 @@ mod tests {
     fn the_view_scrolls_jumps_between_files_and_stays_in_bounds() {
         let mut app = app();
         app.window_rows = 6;
-        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('D'));
         app.wanted_diff();
         app.diff_loaded(PathBuf::from("/p/4/app"), two_files());
         let scroll = |app: &App| app.view.as_ref().unwrap().scroll;
@@ -6444,7 +6460,7 @@ mod tests {
     #[test]
     fn a_started_chat_opens_from_the_command_its_start_gave_without_waiting_to_see_it() {
         let mut app = app_with_main();
-        let job = queued(press(&mut app, KeyCode::Char('a'))).remove(0);
+        let job = queued(press(&mut app, KeyCode::Char('A'))).remove(0);
         assert_eq!(app.opening.as_ref().unwrap().agent, assistant::NAME);
         app.job_finished(started(job), true, String::new());
         assert_eq!(
@@ -6461,7 +6477,7 @@ mod tests {
     #[test]
     fn esc_on_a_chat_on_its_way_stops_waiting_and_a_failed_start_ends_it() {
         let mut app = app_with_main();
-        let job = queued(press(&mut app, KeyCode::Char('a'))).remove(0);
+        let job = queued(press(&mut app, KeyCode::Char('A'))).remove(0);
         assert!(app.opening.is_some());
         assert_eq!(
             press(&mut app, KeyCode::Char('q')),
@@ -6472,8 +6488,8 @@ mod tests {
         assert!(app.opening.is_none());
         app.job_finished(started(job), true, String::new());
         assert_eq!(app.ready_chat(), None, "dismissed, it opens only with a");
-        assert!(app.message.as_deref().unwrap().contains("a opens its chat"));
-        let job = queued(press(&mut app, KeyCode::Char('a'))).remove(0);
+        assert!(app.message.as_deref().unwrap().contains("A opens its chat"));
+        let job = queued(press(&mut app, KeyCode::Char('A'))).remove(0);
         app.job_finished(job, false, "claude: not found".into());
         assert!(app.opening.is_none());
     }
@@ -6604,7 +6620,7 @@ mod tests {
         let mut app = app_with_main();
         assert!(app.visible().iter().all(|t| !t.is_main));
         for _ in 0..8 {
-            press(&mut app, KeyCode::Up);
+            press(&mut app, KeyCode::Char('k'));
             assert_ne!(app.current().map(|t| t.is_main), Some(true));
         }
     }
@@ -7042,8 +7058,8 @@ mod tests {
         }
         assert!(app.opening.is_none(), "no chat opens");
         assert!(
-            matches!(press(&mut app, KeyCode::Char('a')), Outcome::Chat { agent, .. } if agent == assistant::NAME),
-            "a opens its chat"
+            matches!(press(&mut app, KeyCode::Char('A')), Outcome::Chat { agent, .. } if agent == assistant::NAME),
+            "A opens its chat"
         );
     }
 
@@ -7056,7 +7072,7 @@ mod tests {
         };
         app.apply_reports(vec![stopped("old", 50), stopped("latest", 5)]);
         assert!(matches!(
-            press(&mut app, KeyCode::Char('a')),
+            press(&mut app, KeyCode::Char('A')),
             Outcome::Chat { command, .. } if command == ["claude", "attach", "latest"]
         ));
     }
@@ -7593,14 +7609,14 @@ mod tests {
     #[test]
     fn f_reads_a_failure_and_sends_it_to_the_trees_agent() {
         let mut app = app();
-        assert_eq!(press(&mut app, KeyCode::Char('f')), Outcome::Continue);
+        assert_eq!(press(&mut app, KeyCode::Char('F')), Outcome::Continue);
         assert_eq!(
             app.message.as_deref(),
             Some("nothing has failed on tree 4's PR")
         );
         let failing = ship("feature/end-1-a", Stage::CiFailed, "#12 ✗ ci");
         app.apply_ship(ships(&[("/p/4/app", failing)]));
-        press(&mut app, KeyCode::Char('f'));
+        press(&mut app, KeyCode::Char('F'));
         assert_eq!(
             app.message.as_deref(),
             Some("no agent in tree 4 to send the failure to")
@@ -7609,10 +7625,10 @@ mod tests {
             PathBuf::from("/p/4/app"),
             vec![attachable("0908e7f3")],
         )]));
-        let job = queued(press(&mut app, KeyCode::Char('f'))).remove(0);
+        let job = queued(press(&mut app, KeyCode::Char('F'))).remove(0);
         assert_eq!((job.kind, job.tree.name.as_str()), (Kind::Fix, "4"));
         assert_eq!(
-            press(&mut app, KeyCode::Char('f')),
+            press(&mut app, KeyCode::Char('F')),
             Outcome::Continue,
             "one read at a time"
         );
@@ -7838,7 +7854,7 @@ mod tests {
         let mut app = app();
         app.checkout = PathBuf::from("/p/main");
         app.ship_plugins = vec![Plugin::Builtin("github")];
-        press(&mut app, KeyCode::Char('s'));
+        press(&mut app, KeyCode::Char('S'));
         assert!(app.shipping.is_none());
         assert!(
             app.message
@@ -7847,7 +7863,7 @@ mod tests {
                 .starts_with("no ship plugin here starts a run (github)")
         );
         app.ship_plugins = vec![Plugin::Builtin("no-mistakes"), Plugin::Builtin("github")];
-        press(&mut app, KeyCode::Char('s'));
+        press(&mut app, KeyCode::Char('S'));
         assert_eq!(
             app.message.as_deref(),
             Some("tree 4 has neither a ticket nor a task to give a run as its intent")
@@ -7855,7 +7871,7 @@ mod tests {
         let mut record = Sidecar::leased_now();
         record.task = Some("fix the login redirect".into());
         app.apply_sidecars(HashMap::from([(PathBuf::from("/p/4/app"), record)]));
-        press(&mut app, KeyCode::Char('s'));
+        press(&mut app, KeyCode::Char('S'));
         let shipping = app.shipping.clone().unwrap();
         assert_eq!(
             (shipping.plugin.as_str(), shipping.intent.as_str()),
@@ -7863,7 +7879,7 @@ mod tests {
         );
         assert_eq!(press(&mut app, KeyCode::Char('n')), Outcome::Continue);
         assert!(app.shipping.is_none() && app.jobs.is_empty(), "n cancels");
-        press(&mut app, KeyCode::Char('s'));
+        press(&mut app, KeyCode::Char('S'));
         let job = queued(press(&mut app, KeyCode::Char('y'))).remove(0);
         assert_eq!(job.kind, Kind::Ship);
         assert_eq!(
@@ -7874,7 +7890,7 @@ mod tests {
         );
 
         let mut app = app_on_a_run();
-        let job = queued(press(&mut app, KeyCode::Char('s'))).remove(0);
+        let job = queued(press(&mut app, KeyCode::Char('S'))).remove(0);
         assert_eq!(job.shipping.as_ref().unwrap().action, ShipAction::Attach);
         let mut job = job;
         job.attach = Some(vec![
@@ -7888,6 +7904,13 @@ mod tests {
             app.ready_chat(),
             Some(Outcome::Chat { agent, tree, .. }) if agent == "no-mistakes" && tree == "4"
         ));
+        // A run with nothing to attach to says the key that shows it, S,
+        // since s on the table now moves the keys.
+        let mut app = app_on_a_run();
+        let job = queued(press(&mut app, KeyCode::Char('S'))).remove(0);
+        app.job_finished(job, true, String::new());
+        let message = app.message.clone().unwrap_or_default();
+        assert!(message.contains("; S on it shows the run"), "{message}");
     }
 
     /// Tree 4 with a no-mistakes run waiting at a gate.
@@ -7926,12 +7949,12 @@ mod tests {
         // Attaching to a cold agent starts it again, so the window leaves it
         // to Enter.
         assert_eq!(with_chat(Status::Cold).window_chat(), None);
-        // Left from the chat wraps round to the info tab, which opens no chat.
+        // [ from the chat wraps round to the info tab, which opens no chat.
         let mut on_info = with_chat(Status::Busy);
-        press(&mut on_info, KeyCode::Left);
+        press(&mut on_info, KeyCode::Char('['));
         assert_eq!(on_info.tab, WindowTab::Info);
         assert_eq!(on_info.window_chat(), None, "the info tab opens no chat");
-        press(&mut on_info, KeyCode::Right);
+        press(&mut on_info, KeyCode::Char(']'));
         assert_eq!(on_info.tab, WindowTab::Chat);
     }
 
@@ -7958,7 +7981,7 @@ mod tests {
         assert!(app.is_window_focused && !app.is_inserting(), "Normal");
         assert_eq!(press(&mut app, KeyCode::Char('w')), Outcome::Workspaces);
         assert!(!app.is_window_focused, "the table has the keys again");
-        for (open, tab) in [('d', WindowTab::Diff), ('v', WindowTab::Pr)] {
+        for (open, tab) in [('D', WindowTab::Diff), ('v', WindowTab::Pr)] {
             press(&mut app, KeyCode::Char(open));
             assert!(
                 app.is_window_focused && app.shown_tab() == tab,
@@ -8047,7 +8070,7 @@ mod tests {
         // From a diff with the keys, Alt+K is the table too.
         press(&mut app, KeyCode::Char('d'));
         alt(&mut app, 'k');
-        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('D'));
         assert!(app.has_keys_on(WindowTab::Diff));
         alt(&mut app, 'k');
         assert!(!app.is_window_focused, "Alt+K from the diff: the table");
@@ -8149,7 +8172,7 @@ mod tests {
         app.runs.insert("/p/4/app".into(), run_in("/p/4/app"));
         assert_eq!(app.window_tabs(), [Chat, Diff, Pr, Run, Shell, Info]);
         for wanted in [Diff, Pr, Run, Shell, Info, Chat] {
-            press(&mut app, KeyCode::Right);
+            press(&mut app, KeyCode::Char(']'));
             assert_eq!(app.shown_tab(), wanted);
         }
         // A free tree has nothing to diff, no PR and no agent, and no shell
@@ -8190,7 +8213,7 @@ mod tests {
     #[test]
     fn the_diff_and_pr_tabs_follow_the_cursor_and_a_pr_read_once_is_not_read_again() {
         let mut app = app();
-        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('D'));
         assert!(app.is_window_focused, "d gives the diff the keys");
         press(&mut app, KeyCode::Esc);
         select(&mut app, "8");
@@ -8256,6 +8279,76 @@ mod tests {
         assert!(!app.keeps_shell("12"), "so does a destroyed one's");
     }
 
+    #[test]
+    fn a_s_d_f_on_the_table_move_the_keys_as_alt_h_j_k_l_do() {
+        let mut app = with_chat(Status::Busy);
+        app.window_rows = 20;
+        press(&mut app, KeyCode::Char('s'));
+        assert!(
+            app.is_window_focused && !app.is_inserting(),
+            "s: the window, in Normal"
+        );
+        alt(&mut app, 'k');
+        press(&mut app, KeyCode::Char('d'));
+        assert!(!app.is_window_focused, "d keeps the keys on the table");
+        assert!(app.view.is_none(), "and opens no diff, which D does");
+        ctrl(&mut app, '\\');
+        press(&mut app, KeyCode::Char('f'));
+        assert!(app.is_window_focused);
+        assert_eq!(
+            (app.side, cursor_on(&app).as_str()),
+            (1, "8"),
+            "f: the right"
+        );
+        alt(&mut app, 'k');
+        press(&mut app, KeyCode::Char('a'));
+        assert!(app.is_window_focused);
+        assert_eq!(
+            (app.side, cursor_on(&app).as_str()),
+            (0, "4"),
+            "a: the left"
+        );
+        // In the window they keep their own: d scrolls the chat.
+        assert_eq!(press(&mut app, KeyCode::Char('d')), Outcome::ScrollChat(10));
+        assert!(app.is_window_focused);
+    }
+
+    #[test]
+    fn the_arrows_do_nothing_on_the_table_where_brackets_step_the_tabs() {
+        let mut app = with_chat(Status::Idle);
+        app.window_rows = 20;
+        let row = app.selected;
+        let tab = app.shown_tab();
+        for arrow in [KeyCode::Down, KeyCode::Up, KeyCode::Left, KeyCode::Right] {
+            press(&mut app, arrow);
+            assert_eq!((app.selected, app.shown_tab()), (row, tab), "{arrow:?}");
+        }
+        press(&mut app, KeyCode::Char(']'));
+        assert_eq!(app.shown_tab(), WindowTab::Diff, "] from the chat");
+        assert!(!app.is_window_focused, "the table keeps the keys");
+        press(&mut app, KeyCode::Char('['));
+        assert_eq!(app.shown_tab(), WindowTab::Chat, "[ back");
+        // In the window, the brackets step the tabs on every one, the diff
+        // and the PR with their own keys too, as the arrows still do there.
+        press(&mut app, KeyCode::Char('s'));
+        press(&mut app, KeyCode::Char('['));
+        assert_eq!(app.shown_tab(), WindowTab::Info, "[ from the chat wraps");
+        press(&mut app, KeyCode::Char(']'));
+        press(&mut app, KeyCode::Char(']'));
+        assert_eq!(app.shown_tab(), WindowTab::Diff);
+        press(&mut app, KeyCode::Char(']'));
+        assert_eq!(app.shown_tab(), WindowTab::Pr);
+        press(&mut app, KeyCode::Char('['));
+        assert_eq!(app.shown_tab(), WindowTab::Diff);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(
+            app.shown_tab(),
+            WindowTab::Pr,
+            "→ still steps in the window"
+        );
+        assert!(app.is_window_focused);
+    }
+
     fn ctrl(app: &mut App, c: char) {
         app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
     }
@@ -8286,8 +8379,8 @@ mod tests {
         assert_eq!((cursor_on(&app).as_str(), app.side), ("8", 1));
         // Moving the cursor to tree 7, past the available group's heading,
         // changes only the window it drives.
-        press(&mut app, KeyCode::Down);
-        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
         assert_eq!(cursor_on(&app), "7");
         assert_eq!(other_on(&app).as_deref(), Some("4"));
         // Without the terminal's extended keys, Ctrl+\ comes as Ctrl+4.
@@ -8465,7 +8558,7 @@ mod tests {
         ctrl(&mut app, 'f');
         assert_eq!(app.zoom, None, "again zooms back out");
         // From a diff with the keys, the windows.
-        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('D'));
         assert!(app.is_window_focused);
         ctrl(&mut app, 'f');
         assert_eq!(app.zoom, Some(Zoom::Windows));
@@ -8594,7 +8687,7 @@ mod tests {
     fn the_palette_takes_the_keys_over_a_diff_and_waits_out_a_dialog() {
         // Opened from a diff with the keys, the palette takes what is typed.
         let mut app = with_chat(Status::Busy);
-        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('D'));
         assert!(app.has_keys_on(WindowTab::Diff));
         ctrl(&mut app, 'p');
         type_into_palette(&mut app, "ret");
