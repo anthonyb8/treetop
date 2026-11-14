@@ -1351,9 +1351,11 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         full
     };
+    // The mode stays whole however narrow the bar: the summary is cut first.
+    let mode = u16::try_from(Mode::of(app).label().len()).unwrap_or(u16::MAX);
     let right_width = u16::try_from(right.width())
         .unwrap_or(u16::MAX)
-        .min(area.width);
+        .min(area.width.saturating_sub(mode));
     let [left_area, right_area] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(right_width)]).areas(area);
     frame.render_widget(Paragraph::new(footer_left(app)).style(t.bar), left_area);
@@ -7116,6 +7118,18 @@ mod window_tests {
         assert_eq!(corner(&app, "┌ Tree 4 "), normal);
         app.is_inserting = true;
         assert_eq!(corner(&app, "┌ Tree 4 "), insert);
+    }
+
+    #[test]
+    fn on_a_narrow_bar_the_mode_stays_whole_beside_a_long_summary() {
+        let mut app = on("4");
+        app.newer = Some("v0.9.99".into());
+        app.marked.insert("/pool/4/app".into());
+        for width in [40, 60, 70] {
+            let shown = lines(&drawn(&app, width, 30));
+            let bar = shown.last().unwrap();
+            assert!(bar.starts_with(" TABLE "), "{width} columns: {bar}");
+        }
     }
 
     #[test]

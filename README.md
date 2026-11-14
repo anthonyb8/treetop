@@ -122,7 +122,7 @@ Git counts are checked every 4 seconds too, but git runs only for a tree inotify
 Every tree is read in full every 2 minutes as a backstop, and a tree inotify cannot watch is read every time.
 Together that costs under 5% of one core.
 The pool itself comes from `treehouse status`, which takes seconds of CPU, so it is listed only when `git worktree list` changes (a tree leased, returned or destroyed, but not a commit), after every action, and every 2 minutes as a backstop.
-The summary line says how old that listing is.
+How old that listing is shows on the bottom bar with the pool's counts, which are off while `SHOWS_COUNTS` in `src/ui.rs` is false.
 
 On opening, treetop draws the last listing it saved under `$XDG_CACHE_HOME/treetop` (else `~/.cache/treetop`) at once, in italics and marked "cached listing", until a live one lands.
 
