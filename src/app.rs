@@ -210,6 +210,18 @@ const POOL_COMMANDS: [(&str, &str); 12] = [
     ("Quit", "q"),
 ];
 
+/// The way Alt+H, J, K or L moves the keys between the table and the
+/// windows, as vim's Ctrl+W does between its own; plain, Ctrl and Shift
+/// versions keep what they do.
+fn window_move(key: KeyEvent) -> Option<char> {
+    match key.code {
+        KeyCode::Char(to @ ('h' | 'j' | 'k' | 'l')) if key.modifiers == KeyModifiers::ALT => {
+            Some(to)
+        }
+        _ => None,
+    }
+}
+
 /// The key event a command's key stands for.
 fn key_event(key: &str) -> KeyEvent {
     match key {
@@ -1428,7 +1440,7 @@ impl App {
         self.sync_window();
     }
 
-    /// Ctrl+J, K, H and L, as vim's Ctrl+W moves between its windows: down
+    /// Alt+J, K, H and L, as vim's Ctrl+W moves between its windows: down
     /// from the table into the window under it, in Normal, as Ctrl+Q goes;
     /// up from a window to the table; and to the left or right window of
     /// two. Zoomed to the table there is no window to go to.
@@ -2233,11 +2245,14 @@ impl App {
                 KeyCode::Char('c') => return Outcome::Quit,
                 KeyCode::Char('r') => self.read_pr(path),
                 KeyCode::Char('q' | 'Q') => self.cycle_keys(),
-                KeyCode::Char(to @ ('h' | 'j' | 'k' | 'l')) => self.move_keys(to),
                 KeyCode::Char('f' | 'F') => self.toggle_zoom(Zoom::Windows),
                 KeyCode::Char('p' | 'P') => self.open_palette(),
                 _ => {}
             }
+            return Outcome::Continue;
+        }
+        if let Some(to) = window_move(key) {
+            self.move_keys(to);
             return Outcome::Continue;
         }
         // The arrows step the window's tabs, as on every tab in Normal; h
@@ -2384,11 +2399,14 @@ impl App {
                     self.diffs.remove(&path);
                 }
                 KeyCode::Char('q' | 'Q') => self.cycle_keys(),
-                KeyCode::Char(to @ ('h' | 'j' | 'k' | 'l')) => self.move_keys(to),
                 KeyCode::Char('f' | 'F') => self.toggle_zoom(Zoom::Windows),
                 KeyCode::Char('p' | 'P') => self.open_palette(),
                 _ => {}
             }
+            return Outcome::Continue;
+        }
+        if let Some(to) = window_move(key) {
+            self.move_keys(to);
             return Outcome::Continue;
         }
         // The arrows step the window's tabs, as on every tab in Normal; h
@@ -4479,19 +4497,6 @@ impl App {
                     }
                     Outcome::Continue
                 }
-                // Ctrl+H, J, K and L move the keys between the table and
-                // the windows, once nothing else on screen waits on them.
-                KeyCode::Char(to @ ('h' | 'j' | 'k' | 'l')) => {
-                    let is_free = self.reviews.is_empty()
-                        && self.pending.is_none()
-                        && self.shipping.is_none()
-                        && !self.is_help
-                        && !self.is_filtering;
-                    if is_free {
-                        self.move_keys(to);
-                    }
-                    Outcome::Continue
-                }
                 // Ctrl+P: the command palette, once nothing else on screen
                 // waits on the keys, so no command lands in a dialog.
                 KeyCode::Char('p' | 'P') => {
@@ -4523,6 +4528,19 @@ impl App {
                 }
                 _ => Outcome::Continue,
             };
+        }
+        // Alt+H, J, K and L move the keys between the table and the
+        // windows, once nothing else on screen waits on them.
+        if let Some(to) = window_move(key) {
+            let is_free = self.reviews.is_empty()
+                && self.pending.is_none()
+                && self.shipping.is_none()
+                && !self.is_help
+                && !self.is_filtering;
+            if is_free {
+                self.move_keys(to);
+            }
+            return Outcome::Continue;
         }
         if self.is_help {
             self.is_help = false;
@@ -8002,40 +8020,42 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_j_gives_the_window_the_keys_in_normal_and_ctrl_k_gives_them_back() {
+    fn alt_j_gives_the_window_the_keys_in_normal_and_alt_k_gives_them_back() {
         let mut app = with_chat(Status::Idle);
         app.window_rows = 20;
-        ctrl(&mut app, 'j');
+        let tree = cursor_on(&app);
+        alt(&mut app, 'j');
+        assert_eq!(cursor_on(&app), tree, "Alt+J moves no cursor, as j would");
         assert!(
             app.is_window_focused && !app.is_inserting(),
-            "Ctrl+J: Normal"
+            "Alt+J: Normal"
         );
-        ctrl(&mut app, 'j');
-        assert!(app.is_window_focused, "Ctrl+J in the window stays there");
-        ctrl(&mut app, 'k');
-        assert!(!app.is_window_focused, "Ctrl+K: the table");
-        ctrl(&mut app, 'k');
-        assert!(!app.is_window_focused, "Ctrl+K on the table stays there");
-        // With one window, Ctrl+H and L have nowhere to go.
-        ctrl(&mut app, 'l');
+        alt(&mut app, 'j');
+        assert!(app.is_window_focused, "Alt+J in the window stays there");
+        alt(&mut app, 'k');
+        assert!(!app.is_window_focused, "Alt+K: the table");
+        alt(&mut app, 'k');
+        assert!(!app.is_window_focused, "Alt+K on the table stays there");
+        // With one window, Alt+H and L have nowhere to go.
+        alt(&mut app, 'l');
         assert!(!app.is_window_focused);
         // Plain h moves nothing in the window; l on the table opens the
         // tree, as Enter does.
-        ctrl(&mut app, 'j');
+        alt(&mut app, 'j');
         assert_eq!(press(&mut app, KeyCode::Char('h')), Outcome::Continue);
         assert!(app.is_window_focused, "h keeps the keys in the window");
-        // From a diff with the keys, Ctrl+K is the table too.
+        // From a diff with the keys, Alt+K is the table too.
         press(&mut app, KeyCode::Char('d'));
-        ctrl(&mut app, 'k');
+        alt(&mut app, 'k');
         press(&mut app, KeyCode::Char('d'));
         assert!(app.has_keys_on(WindowTab::Diff));
-        ctrl(&mut app, 'k');
-        assert!(!app.is_window_focused, "Ctrl+K from the diff: the table");
-        // Where the tree has no chat, Ctrl+J keeps the keys on the table, as
+        alt(&mut app, 'k');
+        assert!(!app.is_window_focused, "Alt+K from the diff: the table");
+        // Where the tree has no chat, Alt+J keeps the keys on the table, as
         // Ctrl+Q does.
         let mut app = with_chat(Status::Idle);
         select(&mut app, "8");
-        ctrl(&mut app, 'j');
+        alt(&mut app, 'j');
         assert!(
             !app.is_window_focused,
             "tree 8 has no chat to take the keys"
@@ -8043,33 +8063,33 @@ mod tests {
     }
 
     #[test]
-    fn with_two_windows_ctrl_h_and_ctrl_l_go_to_the_left_and_right_one() {
+    fn with_two_windows_alt_h_and_alt_l_go_to_the_left_and_right_one() {
         let mut app = with_chat(Status::Busy);
         app.window_rows = 20;
         ctrl(&mut app, '\\');
-        ctrl(&mut app, 'l');
+        alt(&mut app, 'l');
         assert!(app.is_window_focused);
         assert_eq!((app.side, cursor_on(&app).as_str()), (1, "8"), "the right");
-        ctrl(&mut app, 'h');
+        alt(&mut app, 'h');
         assert_eq!((app.side, cursor_on(&app).as_str()), (0, "4"), "the left");
         assert!(!app.is_inserting());
-        ctrl(&mut app, 'h');
+        alt(&mut app, 'h');
         assert_eq!(app.side, 0, "nothing further left");
-        ctrl(&mut app, 'k');
-        assert!(!app.is_window_focused, "Ctrl+K: the table");
-        ctrl(&mut app, 'j');
+        alt(&mut app, 'k');
+        assert!(!app.is_window_focused, "Alt+K: the table");
+        alt(&mut app, 'j');
         assert!(app.is_window_focused);
-        assert_eq!(app.side, 0, "Ctrl+J: the left window, as Ctrl+Q goes");
+        assert_eq!(app.side, 0, "Alt+J: the left window, as Ctrl+Q goes");
     }
 
     #[test]
-    fn zoomed_to_the_table_ctrl_j_gives_no_hidden_window_the_keys() {
+    fn zoomed_to_the_table_alt_j_gives_no_hidden_window_the_keys() {
         let mut app = with_chat(Status::Busy);
         ctrl(&mut app, '\\');
         ctrl(&mut app, 'f');
         for c in ['j', 'h', 'l'] {
-            ctrl(&mut app, c);
-            assert!(!app.is_window_focused, "Ctrl+{c}");
+            alt(&mut app, c);
+            assert!(!app.is_window_focused, "Alt+{c}");
         }
     }
 
@@ -8238,6 +8258,10 @@ mod tests {
 
     fn ctrl(app: &mut App, c: char) {
         app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+    }
+
+    fn alt(app: &mut App, c: char) {
+        app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT));
     }
 
     fn cursor_on(app: &App) -> String {
