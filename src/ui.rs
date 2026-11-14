@@ -42,7 +42,7 @@ use crate::theme::theme;
 const KEYS: [(&str, &str); 17] = [
     ("Enter", "open"),
     ("i", "type"),
-    ("^J ^Q", "window"),
+    ("M-j ^Q", "window"),
     ("^P", "commands"),
     ("?", "help"),
     ("e", "notifications"),
@@ -70,8 +70,8 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
         &[
             ("Enter l", "open, fold heading"),
             ("^Q", "window, Normal, table"),
-            ("^J ^K", "window, table"),
-            ("^H ^L", "left, right window"),
+            ("M-j M-k", "window, table"),
+            ("M-h M-l", "left, right window"),
             ("i", "type to agent"),
             ("i Enter", "Insert in window"),
             ("^\\", "two windows, one"),
@@ -150,8 +150,8 @@ const NORMAL_KEYS: [(&str, &str); 9] = [
     ("\u{2190}\u{2192}", "tabs"),
     ("j k", "line"),
     ("d u", "half page"),
-    ("^K", "table"),
-    ("^H ^L", "left, right"),
+    ("M-k", "table"),
+    ("M-h M-l", "left, right"),
     ("^Q", "table"),
     ("^F", "zoom"),
     ("^P", "commands"),
@@ -1377,7 +1377,7 @@ fn bar_keys(app: &App) -> Vec<(&'static str, &'static str)> {
                 !matches!(tab, WindowTab::Run | WindowTab::Info) || !matches!(*key, "j k" | "d u")
             })
             // Left and right only with two windows side by side.
-            .filter(|(key, _)| app.other_window().is_some() || *key != "^H ^L")
+            .filter(|(key, _)| app.other_window().is_some() || *key != "M-h M-l")
             .map(|(key, label)| if key == "^Q" { (key, on) } else { (key, label) })
             .collect();
     }
@@ -1385,7 +1385,7 @@ fn bar_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     // to, and the bar is the one treetop had before its windows.
     KEYS.iter()
         .copied()
-        .filter(|(key, _)| !(is_classic(app) && matches!(*key, "^J ^Q" | "^P")))
+        .filter(|(key, _)| !(is_classic(app) && matches!(*key, "M-j ^Q" | "^P")))
         .collect()
 }
 
@@ -7201,14 +7201,17 @@ mod window_tests {
         let (corner, bar) = bottom(&app);
         assert!(corner.starts_with("└ NORMAL  i insert ─"), "{corner}");
         assert!(bar.starts_with(" i  insert  ←→  tabs "), "{bar}");
-        assert!(bar.contains("  ^K  table  "), "{bar}");
-        assert!(!bar.contains("^H ^L"), "one window: {bar}");
+        assert!(bar.contains("  M-k  table  "), "{bar}");
+        assert!(!bar.contains("M-h M-l"), "one window: {bar}");
         app.other = Some(crate::app::OtherWindow {
             path: "/pool/9/app".into(),
             tab: WindowTab::Info,
         });
         let (_, bar) = bottom(&app);
-        assert!(bar.contains("  ^H ^L  left, right  "), "two windows: {bar}");
+        assert!(
+            bar.contains("  M-h M-l  left, right  "),
+            "two windows: {bar}"
+        );
         app.other = None;
         assert!(!bar.contains("top, bottom"), "{bar}");
         app.is_inserting = true;
@@ -7219,7 +7222,7 @@ mod window_tests {
         app.tab = WindowTab::Info;
         let (corner, bar) = bottom(&app);
         assert!(corner.starts_with("└ NORMAL  ─"), "{corner}");
-        assert!(bar.starts_with(" ←→  tabs  ^K  table  ^Q  "), "{bar}");
+        assert!(bar.starts_with(" ←→  tabs  M-k  table  ^Q  "), "{bar}");
         // A shell keeps Ctrl+F and Ctrl+P, so its Insert bar leaves them out.
         app.tab = WindowTab::Shell;
         let (_, bar) = bottom(&app);

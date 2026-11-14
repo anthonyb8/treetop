@@ -44,8 +44,8 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | Enter, `l` | give the keys to the chat of the agent in the tree under the cursor, in the window under the table, in Normal, where Enter again starts Insert, starting a cold one again, else go to the tree itself (see [Agent chats](#agent-chats) and [Entering a tree](#entering-a-tree)); on a group's heading, fold the group or open it again, and on the main checkout's, open the chat of its agent when it has one |
 | `i` | as Enter, but the chat's window gets the keys in Insert, ready to type to the agent at once |
 | Ctrl+Q | (or F13 to F24, such as a Caps Lock remapped to F19) give the keys to the window under the table, in Normal; from Insert, drop to Normal; from Normal, give them back to the table; with two windows, move them round the table, the left window and the right one (see [Normal and Insert](#normal-and-insert)) |
-| Ctrl+J Ctrl+K | as vim's Ctrl+W `j` and `k`: Ctrl+J gives the keys to the window under the table, in Normal, as Ctrl+Q does, and Ctrl+K from a window in Normal gives them back to the table |
-| Ctrl+H Ctrl+L | with two windows, give the keys to the left one or the right one, in Normal, from the table or from a window in Normal |
+| Alt+J Alt+K (`M-j` `M-k`) | as vim's Ctrl+W `j` and `k`: Alt+J gives the keys to the window under the table, in Normal, as Ctrl+Q does, and Alt+K from a window in Normal gives them back to the table |
+| Alt+H Alt+L (`M-h` `M-l`) | with two windows, give the keys to the left one or the right one, in Normal, from the table or from a window in Normal |
 | Ctrl+P | open the command palette: every action, the tree under the cursor's first, found by typing a few of its words, a tree number or a branch, and run with Enter |
 | Ctrl+F | zoom: on the table, the table over the whole screen; in a window, the windows, with the table folded to their trees' rows; again, back |
 | Ctrl+\\ | show two windows under the table, the tree under the cursor on the left and the next tree down on the right, or one again |
@@ -437,7 +437,7 @@ The window under them spans the full width.
 What does not fit in the column scrolls with the mouse wheel over it, and its last line says how many lines are below, such as `↓ 13 more`; another tree under the cursor starts it from the top.
 Once the cursor has rested on a tree for a moment, the chat tab shows its agent's chat, so moving down the list opens no chat on the way; a tree whose agent is not running says Enter starts it again, since opening it would.
 
-Enter gives the chat's window the keys in Normal and Enter again starts Insert, ready to type to, while a click in the chat goes straight to Insert; Ctrl+Q or Ctrl+J gives the window the keys in Normal too (see [Normal and Insert](#normal-and-insert)), and a click outside it gives them back to the table, with the chat still running on screen.
+Enter gives the chat's window the keys in Normal and Enter again starts Insert, ready to type to, while a click in the chat goes straight to Insert; Ctrl+Q or Alt+J gives the window the keys in Normal too (see [Normal and Insert](#normal-and-insert)), and a click outside it gives them back to the table, with the chat still running on screen.
 An agent's question counts as seen once its chat has had the keys, not when it only showed in the window.
 The chat's terminal is the size of the inside of the window, under its tab bar, and follows it when the terminal is resized.
 
@@ -481,14 +481,22 @@ A window with the keys is in one of two modes, as in vim, and says which in the 
 `j` and `k` scroll a line and `d` and `u` half a page, on the chat's history as on the diff and the PR, whose other keys work as ever.
 `i` or Enter on a chat or shell starts Insert.
 `w` opens the workspaces from any tab, giving the keys back to the table.
-Esc, `q`, Ctrl+K or Ctrl+Q gives the keys back to the table; with two windows, Ctrl+Q moves them on to the other one first.
-Ctrl+H, Ctrl+J, Ctrl+K and Ctrl+L move the keys as vim's Ctrl+W does between its windows: Ctrl+K up to the table, Ctrl+J from the table down into the window, and with two windows Ctrl+H and Ctrl+L to the left one and the right one.
+Esc, `q`, Alt+K or Ctrl+Q gives the keys back to the table; with two windows, Ctrl+Q moves them on to the other one first.
+Alt+H, Alt+J, Alt+K and Alt+L move the keys as vim's Ctrl+W does between its windows: Alt+K up to the table, Alt+J from the table down into the window, and with two windows Alt+H and Alt+L to the left one and the right one.
+Inside tmux, a `bind -n M-h` and its like take these keys before treetop sees them, so let treetop's pane have them:
+
+```tmux
+bind -n M-h if -F '#{==:#{pane_current_command},treetop}' 'send-keys M-h' 'select-pane -L'
+bind -n M-j if -F '#{==:#{pane_current_command},treetop}' 'send-keys M-j' 'select-pane -D'
+bind -n M-k if -F '#{==:#{pane_current_command},treetop}' 'send-keys M-k' 'select-pane -U'
+bind -n M-l if -F '#{==:#{pane_current_command},treetop}' 'send-keys M-l' 'select-pane -R'
+```
 
 **Insert** gives every key to the chat or shell, Esc too, which interrupts Claude Code.
 **Ctrl+Q** drops back to Normal.
 F13 to F24 are Ctrl+Q everywhere in treetop, so a Caps Lock remapped to one of them, such as F19 (with keyd on Linux or Karabiner-Elements on a Mac, on the machine whose keyboard you type on, over SSH too), does all Ctrl+Q does in one key, while Esc still interrupts Claude Code.
 Ctrl+\\, Ctrl+F and Ctrl+P keep working as before, and a shell keeps Ctrl+F and Ctrl+P for itself.
-Ctrl+H, Ctrl+J, Ctrl+K and Ctrl+L go to the chat, since Claude Code uses Ctrl+J for a new line and Ctrl+K to cut the rest of it.
+Alt+H, Alt+J, Alt+K and Alt+L go to the chat, so Insert never moves the keys by accident.
 
 `i` on a tree gives its chat's window the keys in Insert at once.
 Ctrl+Q from the table, Enter on a tree and an agent opened with `e` land in Normal, so nothing typed reaches an agent by accident; a second Enter starts Insert, and a click in the chat lands in Insert, ready to type.
@@ -627,7 +635,7 @@ The old conversation is kept: `claude attach <id>`, with the id the info tab's l
 A start that fails leaves the old agent working, as it was.
 Only a tree treetop leased can hand off, since its `treetop.json` is what moves the tree to the new agent, and only a running background agent can be asked; a stopped one is started again with `R` first.
 With `TREETOP_NEW_AGENT` set, a handoff is refused before it starts anything, since treetop cannot name a custom command's agent in the tree.
-In an agent's chat, from 75% of its context the sidebar says so: `H` on the table, which Ctrl+Q drops to Normal for and Ctrl+K reaches from there.
+In an agent's chat, from 75% of its context the sidebar says so: `H` on the table, which Ctrl+Q drops to Normal for and Alt+K reaches from there.
 
 ### What agents say
 
