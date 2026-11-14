@@ -3279,7 +3279,7 @@ impl App {
                         let file = handoff::file(&path, now);
                         let text = handoff::request(&file);
                         self.message = Some(format!(
-                            "asking {} for a handoff; it opens here once written, h again stops waiting",
+                            "asking {} for a handoff; it opens here once written, H again stops waiting",
                             from.agent
                         ));
                         self.handing = Some(Handing {
@@ -3314,7 +3314,7 @@ impl App {
         let handing = self.handing.as_ref()?;
         if handing.since.elapsed() >= handoff::WAIT {
             self.message = Some(format!(
-                "{} wrote no handoff to {}; h asks again",
+                "{} wrote no handoff to {}; H asks again",
                 handing.from.agent,
                 handing.file.display()
             ));
@@ -7270,6 +7270,13 @@ mod tests {
         let Outcome::Send { to, text } = press(&mut app, KeyCode::Char('H')) else {
             panic!("expected the agent to be asked");
         };
+        assert!(
+            app.message
+                .as_deref()
+                .is_some_and(|m| m.ends_with("H again stops waiting")),
+            "{:?}",
+            app.message
+        );
         assert_eq!(to[0].agent, "fix login");
         assert!(text.contains("/p/4/app/.treetop-handoff-"), "{text}");
         assert!(app.is_handing_off(&PathBuf::from("/p/4/app")));
@@ -7344,6 +7351,36 @@ mod tests {
         app.handoff_unsent("fix login", "4");
         assert!(!app.is_handing_off(&PathBuf::from("/p/4/app")));
         assert_eq!(app.wanted_handoff(), None);
+    }
+
+    #[test]
+    fn a_handoff_never_written_says_h_asks_again() {
+        let mut app = app();
+        app.apply_sidecars(HashMap::from([(
+            PathBuf::from("/p/4/app"),
+            Sidecar::leased_now(),
+        )]));
+        let idle = Agent {
+            job: Some("0000aaaa".into()),
+            plugin: Some("claude".into()),
+            status: Some(Status::Idle),
+            ..attachable("fix login")
+        };
+        app.apply_agents(&HashMap::from([(PathBuf::from("/p/4/app"), vec![idle])]));
+        select(&mut app, "4");
+        press(&mut app, KeyCode::Char('H'));
+        let handing = app.handing.as_mut().unwrap();
+        handing.since = Instant::now()
+            .checked_sub(handoff::WAIT)
+            .expect("the clock reaches back a wait");
+        assert_eq!(app.wanted_handoff(), None);
+        assert!(
+            app.message
+                .as_deref()
+                .is_some_and(|m| m.ends_with("; H asks again")),
+            "{:?}",
+            app.message
+        );
     }
 
     #[test]
