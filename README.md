@@ -44,6 +44,8 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | Enter, `l` | give the keys to the chat of the agent in the tree under the cursor, in the window under the table, in Normal, where Enter again starts Insert, starting a cold one again, else go to the tree itself (see [Agent chats](#agent-chats) and [Entering a tree](#entering-a-tree)); on a group's heading, fold the group or open it again, and on the main checkout's, open the chat of its agent when it has one |
 | `i` | as Enter, but the chat's window gets the keys in Insert, ready to type to the agent at once |
 | Ctrl+Q | (or F13 to F24, such as a Caps Lock remapped to F19) give the keys to the window under the table, in Normal; from Insert, drop to Normal; from Normal, give them back to the table; with two windows, move them round the table, the left window and the right one (see [Normal and Insert](#normal-and-insert)) |
+| Ctrl+J Ctrl+K | as vim's Ctrl+W `j` and `k`: Ctrl+J gives the keys to the window under the table, in Normal, as Ctrl+Q does, and Ctrl+K from a window in Normal gives them back to the table |
+| Ctrl+H Ctrl+L | with two windows, give the keys to the left one or the right one, in Normal, from the table or from a window in Normal |
 | Ctrl+P | open the command palette: every action, the tree under the cursor's first, found by typing a few of its words, a tree number or a branch, and run with Enter |
 | Ctrl+F | zoom: on the table, the table over the whole screen; in a window, the windows, with the table folded to their trees' rows; again, back |
 | Ctrl+\\ | show two windows under the table, the tree under the cursor on the left and the next tree down on the right, or one again |
@@ -69,7 +71,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | `O` | open the tree's PR the same way (see [After the agent](#after-the-agent)) |
 | `f` | send what failed on the tree's PR, a check's log or a review's requested changes, to its agent |
 | `R` | resume the tree's stopped or failed agent in the tree, with its conversation and the flags it was started with, rather than a fresh dispatch that loses them |
-| `h` | hand the work of the tree's agent to a new agent in the same tree, on a handoff the old one writes and you read over first (see [Handoffs](#handoffs)) |
+| `H` | hand the work of the tree's agent to a new agent in the same tree, on a handoff the old one writes and you read over first (see [Handoffs](#handoffs)) |
 | `s` | start a ship run of the tree's branch, such as no-mistakes', after a dialog; on a run under way, show it |
 | `b` | rename the branch of the tree under the cursor |
 | `w` | switch to another workspace: the pool of another repository treetop has been opened in, from the table or from a window in Normal |
@@ -89,7 +91,7 @@ GIT says what is not safe yet, in a Powerlevel10k prompt's symbols: `⇡2` commi
 PORTS lists every TCP port the tree's processes listen on, lowest first, so a frontend and a backend both show; the processes themselves are in the info tab and the return dialog.
 A port shared with your phone carries a `p` after it, and one on the internet a `P`: the key that put it there, so what anyone with the link can open is on the row rather than only in the popup that shared it.
 treetop reads which ports are shared back from `tether shares`, or the `shares` the config names, every 10 seconds and at once after `p`, `P` or `x`, so a share made outside treetop, or before it started, is marked too.
-`o` opens the port in the browser on a desktop, and where the tree serves several it opens a menu of them, each with the process listening on it, picked with its number or `j`/`k` and Enter; on a server reached over SSH it copies the URL to the clipboard of the computer you are typing at, through the terminal (OSC 52; inside tmux, `set-clipboard on`).
+`o` opens the port in the browser on a desktop, and where the tree serves several it opens a menu of them, each with the process listening on it, picked with its number or `j`/`k` and Enter or `l`, while Esc or `h` closes it; on a server reached over SSH it copies the URL to the clipboard of the computer you are typing at, through the terminal (OSC 52; inside tmux, `set-clipboard on`).
 AGENT names the coding agent working in the tree, from the sources under [Agents](#agents); `no agent` on a held tree marks one nobody is working in.
 Where a tree has several, it names the most pressing live one, waiting on you, then busy, then idle, the most recently active first, and counts the other live ones as `+N`; a stopped agent shows only where nothing is live, and Enter opens the same agent the row names.
 The assistant is never a tree's agent.
@@ -430,12 +432,12 @@ In an agent's chat treetop takes Ctrl+F for this, as it takes Ctrl+Q; a shell ke
 Moving the cursor keeps the tab, so the diff tab shows each tree's diff in turn and the PR tab each tree's PR, once the cursor rests on it; a PR read before shows as it was last read, and `v` reads it afresh.
 A tab the tree under the cursor has not got shows its info instead.
 At the right of the bar, how full the agent's context is and what its session has spent.
-From 180 columns a Usage column beside the table, as tall as the table's window, has them in full, as the chat popup's sidebar does, for the tree under the cursor: how full its agent's context is and where that comes from, from 75% in a pool tree the hint that `h` hands it off, how much of the plan is used, a bar for each limit with when it resets, which shows even on a tree with no agent, and what the session has spent.
+From 180 columns a Usage column beside the table, as tall as the table's window, has them in full, as the chat popup's sidebar does, for the tree under the cursor: how full its agent's context is and where that comes from, from 75% in a pool tree the hint that `H` hands it off, how much of the plan is used, a bar for each limit with when it resets, which shows even on a tree with no agent, and what the session has spent.
 The window under them spans the full width.
 What does not fit in the column scrolls with the mouse wheel over it, and its last line says how many lines are below, such as `↓ 13 more`; another tree under the cursor starts it from the top.
 Once the cursor has rested on a tree for a moment, the chat tab shows its agent's chat, so moving down the list opens no chat on the way; a tree whose agent is not running says Enter starts it again, since opening it would.
 
-Enter gives the chat's window the keys in Normal and Enter again starts Insert, ready to type to, while a click in the chat goes straight to Insert; Ctrl+Q gives the window the keys in Normal too (see [Normal and Insert](#normal-and-insert)), and a click outside it gives them back to the table, with the chat still running on screen.
+Enter gives the chat's window the keys in Normal and Enter again starts Insert, ready to type to, while a click in the chat goes straight to Insert; Ctrl+Q or Ctrl+J gives the window the keys in Normal too (see [Normal and Insert](#normal-and-insert)), and a click outside it gives them back to the table, with the chat still running on screen.
 An agent's question counts as seen once its chat has had the keys, not when it only showed in the window.
 The chat's terminal is the size of the inside of the window, under its tab bar, and follows it when the terminal is resized.
 
@@ -477,15 +479,16 @@ A window with the keys is in one of two modes, as in vim, and says which in the 
 **Normal** gives the keys to treetop.
 `←` and `→` step through the window's tabs, from a chat as from any other.
 `j` and `k` scroll a line and `d` and `u` half a page, on the chat's history as on the diff and the PR, whose other keys work as ever.
-On a chat, `h` jumps to the top of its history and `l` back to the bottom, by scrolling until the chat stops; a chat that has not asked for the mouse, unlike Claude Code, would get that as arrow keys walking its prompt's history, so there they do nothing.
 `i` or Enter on a chat or shell starts Insert.
 `w` opens the workspaces from any tab, giving the keys back to the table.
-Esc, `q` or Ctrl+Q gives the keys back to the table; with two windows, Ctrl+Q moves them on to the other one first.
+Esc, `q`, Ctrl+K or Ctrl+Q gives the keys back to the table; with two windows, Ctrl+Q moves them on to the other one first.
+Ctrl+H, Ctrl+J, Ctrl+K and Ctrl+L move the keys as vim's Ctrl+W does between its windows: Ctrl+K up to the table, Ctrl+J from the table down into the window, and with two windows Ctrl+H and Ctrl+L to the left one and the right one.
 
 **Insert** gives every key to the chat or shell, Esc too, which interrupts Claude Code.
 **Ctrl+Q** drops back to Normal.
 F13 to F24 are Ctrl+Q everywhere in treetop, so a Caps Lock remapped to one of them, such as F19 (with keyd on Linux or Karabiner-Elements on a Mac, on the machine whose keyboard you type on, over SSH too), does all Ctrl+Q does in one key, while Esc still interrupts Claude Code.
 Ctrl+\\, Ctrl+F and Ctrl+P keep working as before, and a shell keeps Ctrl+F and Ctrl+P for itself.
+Ctrl+H, Ctrl+J, Ctrl+K and Ctrl+L go to the chat, since Claude Code uses Ctrl+J for a new line and Ctrl+K to cut the rest of it.
 
 `i` on a tree gives its chat's window the keys in Insert at once.
 Ctrl+Q from the table, Enter on a tree and an agent opened with `e` land in Normal, so nothing typed reaches an agent by accident; a second Enter starts Insert, and a click in the chat lands in Insert, ready to type.
@@ -568,7 +571,7 @@ Each command prints only what it is asked for, so a question costs the assistant
 ### Scratch chats
 
 `C` lists scratch chats: Claude Code sessions for thinking something through, tied to no tree.
-The first line starts a new one, idle, and opens its chat as soon as it runs; Enter on a chat opens it again, starting it if it stopped, and `x` twice deletes it with `claude rm`.
+The first line starts a new one, idle, and opens its chat as soon as it runs; Enter or `l` on a chat opens it again, starting it if it stopped, and `x` twice deletes it with `claude rm`; Esc or `h` closes the list.
 Each line shows how old the chat is and what it last said.
 They all run in one folder, `$XDG_STATE_HOME/treetop/scratch` (else `~/.local/state/treetop/scratch`), outside every repository, so they never land on a tree, never open as asks, are left out of the summary, and are the same list in every workspace.
 Claude Code runs a background session only in a folder you have trusted, so before the first one, run `claude` in that folder once and accept its trust prompt; until then the list says so.
@@ -615,8 +618,8 @@ Agents with no chat to type into, such as an interactive session or a bare proce
 ### Handoffs
 
 An agent whose context has filled with more than its work needs can hand that work to a fresh one, in the same tree and on the same branch, rather than compacting.
-`h` on its tree types a request into its chat, as `m` would, asking it to write the prompt it would want to be handed to `.treetop-handoff-<time>.md` in the tree, and to stop there.
-The row's STATUS says `handoff...` meanwhile, and `h` again stops waiting.
+`H` on its tree types a request into its chat, as `m` would, asking it to write the prompt it would want to be handed to `.treetop-handoff-<time>.md` in the tree, and to stop there.
+The row's STATUS says `handoff...` meanwhile, and `H` again stops waiting.
 Once the agent has stopped working and you are free on the list, treetop reads the file, takes it out of the tree, and opens it in the compose box, which grows to the screen for it and shows it from the top until you type, which brings its end into view.
 Read it over there, add to it, or press Ctrl+E to edit it in `$VISUAL`, else `$EDITOR`; Enter starts the new agent on it, and Esc drops it.
 The new agent runs under the old one's name, and once it runs, the tree's `treetop.json` names it and the old one is stopped, so `R`, the reports and keeping the tree awake follow the new one.
@@ -624,7 +627,7 @@ The old conversation is kept: `claude attach <id>`, with the id the info tab's l
 A start that fails leaves the old agent working, as it was.
 Only a tree treetop leased can hand off, since its `treetop.json` is what moves the tree to the new agent, and only a running background agent can be asked; a stopped one is started again with `R` first.
 With `TREETOP_NEW_AGENT` set, a handoff is refused before it starts anything, since treetop cannot name a custom command's agent in the tree.
-In an agent's chat, from 75% of its context the sidebar says so: Ctrl+Q until the table has the keys, then `h`.
+In an agent's chat, from 75% of its context the sidebar says so: `H` on the table, which Ctrl+Q drops to Normal for and Ctrl+K reaches from there.
 
 ### What agents say
 
@@ -659,10 +662,10 @@ While anything needs action or is done, a count sits at the right of the Trees w
 It never takes the keys, so what you type keeps going where it was, a chat in Insert included, and it stays bright over a popup.
 `e` from the table, or from a chat or shell in Normal, or a click on the count, opens the notifications under it: Needs action, what is stopped until you act, then Done, what finished or merged and is not working, the newest first.
 Each shows its tree, its ticket and branch, how long ago, and what it is about in full, such as the agent's whole question.
-↑↓ pick one and Enter opens it: an agent's chat, with its question at the bottom; for a PR, the cursor on its tree with its checks in the info tab, where `f` sends a failure to its agent; for a dead agent, the cursor on its tree, where `R` resumes it.
+↑↓ pick one and Enter or `l` opens it: an agent's chat, with its question at the bottom; for a PR, the cursor on its tree with its checks in the info tab, where `f` sends a failure to its agent; for a dead agent, the cursor on its tree, where `R` resumes it.
 Needs action leaves once it is dealt with, and Done once you open it.
 `x` puts one away, out of the list and the count, until it changes, such as its agent asking something new or finishing again; what is put away is kept in treetop's state directory, so it stays away after a restart.
-Esc or `e` closes them, and coming back after time away opens nothing by itself.
+Esc, `h` or `e` closes them, and coming back after time away opens nothing by itself.
 The oldest comes first: each is as old as it has waited, from when it happened, or from when treetop first saw it where that is not known, as for a PR.
 
 Inside tmux, the status line of every window shows the same counts as the count in treetop, such as `● 2 needs action  ✓ 3 done`, at the right before your own `status-right`, what needs action in yellow and what is done plain, and clears once there is nothing to count or treetop quits; what `x` put away leaves it too.
@@ -807,7 +810,7 @@ prompt = "Work on {id}: {title}\n\n{description}\n\n{url}"
 
 A workspace is a repository with a treehouse pool, shown by its main checkout.
 `w` opens a list of every repository treetop has been opened in, most recent first, with how many trees each holds and the one on screen marked; the cursor starts on the last other one, so `w` and Enter go back and forth between two.
-Enter switches the whole screen to that pool, and the badge at the end of the bottom bar names the workspace on screen.
+Enter or `l` switches the whole screen to that pool, Esc or `h` closes the list, and the badge at the end of the bottom bar names the workspace on screen.
 
 treetop adds a repository to the list the first time it is opened there, so run it once in each pooled repository to make it a workspace.
 The list lives in `$XDG_CACHE_HOME/treetop/workspaces.json` (else `~/.cache/treetop`); a repository that has been deleted drops off it.

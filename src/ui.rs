@@ -42,7 +42,7 @@ use crate::theme::theme;
 const KEYS: [(&str, &str); 17] = [
     ("Enter", "open"),
     ("i", "type"),
-    ("^Q", "window"),
+    ("^J ^Q", "window"),
     ("^P", "commands"),
     ("?", "help"),
     ("e", "notifications"),
@@ -70,6 +70,8 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
         &[
             ("Enter l", "open, fold heading"),
             ("^Q", "window, Normal, table"),
+            ("^J ^K", "window, table"),
+            ("^H ^L", "left, right window"),
             ("i", "type to agent"),
             ("i Enter", "Insert in window"),
             ("^\\", "two windows, one"),
@@ -82,7 +84,7 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
             (":", "ask the assistant"),
             ("a", "assistant's chat"),
             ("R", "resume agent"),
-            ("h", "hand off work"),
+            ("H", "hand off work"),
             ("e", "notifications"),
         ],
     ),
@@ -143,12 +145,13 @@ const HELP_COLUMNS: [usize; 4] = [1, 2, 2, 2];
 /// The bar's keys while a window has them in Normal, most useful first.
 /// `i` is left out on a tab with nothing to type into, and Ctrl+Q's label
 /// says where it sends the keys.
-const NORMAL_KEYS: [(&str, &str); 8] = [
+const NORMAL_KEYS: [(&str, &str); 9] = [
     ("i", "insert"),
     ("\u{2190}\u{2192}", "tabs"),
     ("j k", "line"),
     ("d u", "half page"),
-    ("h l", "top, bottom"),
+    ("^K", "table"),
+    ("^H ^L", "left, right"),
     ("^Q", "table"),
     ("^F", "zoom"),
     ("^P", "commands"),
@@ -455,9 +458,9 @@ fn draw_notes(frame: &mut Frame, app: &App) {
     };
     let keys = [
         ("↑↓", "pick"),
-        ("Enter", "open"),
+        ("Enter l", "open"),
         ("x", "not now"),
-        ("Esc", "close"),
+        ("Esc h", "close"),
     ];
     let block = popup_block(Line::styled(
         " Notifications ",
@@ -1369,12 +1372,12 @@ fn bar_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             .iter()
             .copied()
             .filter(|(key, _)| is_terminal || *key != "i")
-            // The run and the info have nothing to scroll, and only a chat
-            // or shell jumps to its top and bottom.
+            // The run and the info have nothing to scroll.
             .filter(|(key, _)| {
                 !matches!(tab, WindowTab::Run | WindowTab::Info) || !matches!(*key, "j k" | "d u")
             })
-            .filter(|(key, _)| is_terminal || *key != "h l")
+            // Left and right only with two windows side by side.
+            .filter(|(key, _)| app.other_window().is_some() || *key != "^H ^L")
             .map(|(key, label)| if key == "^Q" { (key, on) } else { (key, label) })
             .collect();
     }
@@ -1382,7 +1385,7 @@ fn bar_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     // to, and the bar is the one treetop had before its windows.
     KEYS.iter()
         .copied()
-        .filter(|(key, _)| !(is_classic(app) && matches!(*key, "^Q" | "^P")))
+        .filter(|(key, _)| !(is_classic(app) && matches!(*key, "^J ^Q" | "^P")))
         .collect()
 }
 
@@ -2491,7 +2494,7 @@ fn draw_picker(frame: &mut Frame, app: &App, picker: &Picker) {
         .unwrap_or(u16::MAX)
         .saturating_add(2);
     let area = popup::centered(screen, width, height);
-    let keys = [("j/k", "move"), ("Enter", "switch"), ("Esc", "close")];
+    let keys = [("j/k", "move"), ("Enter l", "switch"), ("Esc h", "close")];
     let block = popup_block(Line::styled(
         " Workspaces ",
         fg(t.title).add_modifier(Modifier::BOLD),
@@ -2560,7 +2563,7 @@ fn draw_scratch_menu(frame: &mut Frame, app: &App, menu: &ScratchMenu) {
     let keys: &[(&str, &str)] = if menu.is_deleting {
         &[("x", "again deletes it"), ("any key", "keeps it")]
     } else {
-        &[("Enter", "open"), ("x x", "delete"), ("Esc", "close")]
+        &[("Enter l", "open"), ("x x", "delete"), ("Esc h", "close")]
     };
     let block = popup_block(Line::styled(
         " Scratch chats ",
@@ -2633,7 +2636,7 @@ fn draw_port_menu(frame: &mut Frame, menu: &PortMenu) {
         Reach::Public => "publish",
         Reach::Code => "show",
     };
-    let keys = [("1-9", does), ("Enter", does), ("Esc", "close")];
+    let keys = [("1-9", does), ("Enter l", does), ("Esc h", "close")];
     let block = popup_block(Line::styled(
         format!(" Tree {} serves ", menu.tree),
         fg(t.title).add_modifier(Modifier::BOLD),
@@ -4946,7 +4949,7 @@ fn agent_lines(
     if context.is_some_and(|c| percent(c) >= 75) && tree.is_some_and(|t| t.is_held() && !t.is_main)
     {
         lines.push(Line::styled(
-            "Ctrl+Q, then h hands off",
+            "H on the table hands off",
             fg(theme().warning),
         ));
     }
@@ -5605,7 +5608,7 @@ mod sidebar_tests {
 
     #[test]
     fn from_75_percent_context_the_column_says_how_to_hand_off() {
-        let hint = "Ctrl+Q, then h hands off";
+        let hint = "H on the table hands off";
         let text = scrolled(&mut with_context(pool_on("4"), 750_000), 200, 80);
         assert!(text.contains(hint), "{text}");
         let text = scrolled(&mut with_context(pool_on("4"), 740_000), 200, 80);
@@ -6053,7 +6056,7 @@ mod count_tests {
         assert!(text.contains("Where should the inbox sit"), "{text}");
         assert!(text.contains("the rest of the layout."), "{text}");
         assert!(
-            text.contains("Enter  open  x  not now  Esc  close"),
+            text.contains("Enter l  open  x  not now  Esc h  close"),
             "{text}"
         );
         // The first is under the cursor.
@@ -7198,6 +7201,16 @@ mod window_tests {
         let (corner, bar) = bottom(&app);
         assert!(corner.starts_with("└ NORMAL  i insert ─"), "{corner}");
         assert!(bar.starts_with(" i  insert  ←→  tabs "), "{bar}");
+        assert!(bar.contains("  ^K  table  "), "{bar}");
+        assert!(!bar.contains("^H ^L"), "one window: {bar}");
+        app.other = Some(crate::app::OtherWindow {
+            path: "/pool/9/app".into(),
+            tab: WindowTab::Info,
+        });
+        let (_, bar) = bottom(&app);
+        assert!(bar.contains("  ^H ^L  left, right  "), "two windows: {bar}");
+        app.other = None;
+        assert!(!bar.contains("top, bottom"), "{bar}");
         app.is_inserting = true;
         let (corner, bar) = bottom(&app);
         assert!(corner.starts_with("└ INSERT  ^Q normal ─"), "{corner}");
@@ -7206,7 +7219,7 @@ mod window_tests {
         app.tab = WindowTab::Info;
         let (corner, bar) = bottom(&app);
         assert!(corner.starts_with("└ NORMAL  ─"), "{corner}");
-        assert!(bar.starts_with(" ←→  tabs  ^Q  "), "{bar}");
+        assert!(bar.starts_with(" ←→  tabs  ^K  table  ^Q  "), "{bar}");
         // A shell keeps Ctrl+F and Ctrl+P, so its Insert bar leaves them out.
         app.tab = WindowTab::Shell;
         let (_, bar) = bottom(&app);
