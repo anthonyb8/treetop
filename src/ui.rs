@@ -37,28 +37,6 @@ use crate::ship::{Outcome as CheckOutcome, PrView, Stage};
 use crate::syntax;
 use crate::theme::theme;
 
-/// The bar's keys, most useful first: on a narrow bar the keys at the end
-/// are the ones left out, and `?` lists them all.
-const KEYS: [(&str, &str); 17] = [
-    ("Enter", "open"),
-    ("i", "type"),
-    ("M-j ^Q", "window"),
-    ("^P", "commands"),
-    ("?", "help"),
-    ("e", "notifications"),
-    ("n", "new here"),
-    ("N", "new tree"),
-    ("m", "message"),
-    (":", "ask"),
-    ("a", "assistant"),
-    ("d", "diff"),
-    ("I", "issue"),
-    ("r", "return"),
-    ("Space", "mark"),
-    ("/", "filter"),
-    ("q", "quit"),
-];
-
 /// Every key on the list, for the `?` overlay, in the groups it draws:
 /// the agents first, since that is what the list is for, then the trees
 /// themselves and the ways round them, what they serve and where their work
@@ -72,17 +50,18 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
             ("^Q", "window, Normal, table"),
             ("M-j M-k", "window, table"),
             ("M-h M-l", "left, right window"),
+            ("a s d f", "left, down, up, right"),
             ("i", "type to agent"),
             ("i Enter", "Insert in window"),
-            ("^\\", "two windows, one"),
+            ("^\\", "two windows, next agent"),
             ("^F", "zoom table, windows"),
             ("^P", "command palette"),
-            ("\u{2190} \u{2192}", "window tabs"),
+            ("[ ]", "window tabs"),
             ("n", "new agent here"),
             ("N", "agent in new tree"),
             ("m", "message agents"),
             (":", "ask the assistant"),
-            ("a", "assistant's chat"),
+            ("A", "assistant's chat"),
             ("R", "resume agent"),
             ("H", "hand off work"),
             ("e", "notifications"),
@@ -92,7 +71,7 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
         "Trees",
         &[
             ("t", "go to tree"),
-            ("d", "diff vs base"),
+            ("D", "diff vs base"),
             ("Space", "mark"),
             ("r", "return tree"),
             ("x X", "backburner, fold it"),
@@ -104,7 +83,11 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
     ),
     (
         "Moving",
-        &[("j k \u{2191}\u{2193}", "move"), ("g G", "top, bottom")],
+        &[
+            ("j k", "move"),
+            ("g G", "top, bottom"),
+            ("d u", "half page in a window"),
+        ],
     ),
     (
         "Ports",
@@ -118,10 +101,10 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
     (
         "Ship",
         &[
-            ("s", "ship branch"),
+            ("S", "ship branch"),
             ("v", "view PR"),
             ("O", "open PR"),
-            ("f", "send CI failures"),
+            ("F", "send CI failures"),
         ],
     ),
     ("Issues", &[("Tab", "all issues"), ("I", "tree's issue")]),
@@ -142,33 +125,8 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
 /// four do not fit, neighbours share a column: two, else one.
 const HELP_COLUMNS: [usize; 4] = [1, 2, 2, 2];
 
-/// The bar's keys while a window has them in Normal, most useful first.
-/// `i` is left out on a tab with nothing to type into, and Ctrl+Q's label
-/// says where it sends the keys.
-const NORMAL_KEYS: [(&str, &str); 9] = [
-    ("i", "insert"),
-    ("\u{2190}\u{2192}", "tabs"),
-    ("j k", "line"),
-    ("d u", "half page"),
-    ("M-k", "table"),
-    ("M-h M-l", "left, right"),
-    ("^Q", "table"),
-    ("^F", "zoom"),
-    ("^P", "commands"),
-];
-
-/// The bar's keys while a window's chat or shell has them in Insert: the
-/// Ctrl keys treetop keeps, since every other key goes to the chat.
-/// A shell keeps Ctrl+F and Ctrl+P, so they are left out there.
-const INSERT_KEYS: [(&str, &str); 4] = [
-    ("^Q", "normal"),
-    ("^\\", "next agent"),
-    ("^F", "zoom"),
-    ("^P", "commands"),
-];
-
-/// Most useful first, as with `KEYS`; Esc stays early so the way out is
-/// never the key a narrow bar drops.
+/// Most useful first; Esc stays early so the way out is never the key a
+/// narrow bar drops.
 const DIFF_KEYS: [(&str, &str); 8] = [
     ("j/k", "line"),
     ("Space/b", "page"),
@@ -246,7 +204,7 @@ pub fn draw(
                 // a compose box or the palette.
                 let has_keys =
                     !app.is_window_focused && app.prompt.is_none() && app.palette.is_none();
-                let block = window_block(has_keys).title(title);
+                let block = window_block(has_keys.then_some(Mode::Table)).title(title);
                 let body = block.inner(windows.top);
                 frame.render_widget(block, windows.top);
                 draw_table(frame, app, body, fold);
@@ -555,6 +513,11 @@ fn draw_palette(frame: &mut Frame, app: &App, palette: &crate::app::Palette) {
     frame.render_stateful_widget(table, list, &mut state);
 }
 
+/// The pool's counts, trees, held, running, serving and agents, and how
+/// fresh the listing is, on the bottom bar. Off for now: they are there to
+/// glance at, and what needs you is said beside them whether or not.
+const SHOWS_COUNTS: bool = false;
+
 /// The pool at a glance, for the right end of the bottom bar: counts,
 /// actions and how fresh the listing is, closed by the name as a badge, the
 /// way lualine closes its statusline. Zero marks and actions are left out.
@@ -580,8 +543,10 @@ fn summary(app: &App, is_compact: bool) -> Vec<Span<'static>> {
             .flat_map(App::agents_of)
             .filter(|a| a.status == Some(Status::Waiting))
             .count();
-        spans.push(Span::raw(format!("{trees} trees  {held} held")));
-        if !is_compact {
+        if SHOWS_COUNTS {
+            spans.push(Span::raw(format!("{trees} trees  {held} held")));
+        }
+        if SHOWS_COUNTS && !is_compact {
             spans.push(Span::styled(format!("  {running} running"), fg(t.warning)));
             spans.push(Span::styled(format!("  {serving} serving"), fg(t.info)));
             let noun = if agents == 1 { "agent" } else { "agents" };
@@ -635,7 +600,7 @@ fn summary(app: &App, is_compact: bool) -> Vec<Span<'static>> {
                 fg(t.info).add_modifier(Modifier::BOLD),
             ));
         }
-        if !is_compact {
+        if SHOWS_COUNTS && !is_compact {
             spans.push(freshness(app));
             if app.is_listing {
                 spans.push(Span::styled("  refreshing...", fg(t.info)));
@@ -1308,95 +1273,80 @@ fn fitting_keys(keys: &[(&str, &str)], width: u16) -> Vec<Span<'static>> {
     spans
 }
 
-/// What the left of the bottom bar says: the filter being typed, the error or
-/// message there is, else the keys.
-fn footer_left(app: &App, width: u16) -> Line<'static> {
+/// Which part has the keys, as nvim's status line names its mode: the
+/// table; a window in Normal; or a chat, a shell or the compose box typed
+/// into, in Insert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Table,
+    Normal,
+    Insert,
+}
+
+impl Mode {
+    fn of(app: &App) -> Self {
+        if app.is_inserting() || app.prompt.is_some() {
+            Self::Insert
+        } else if app.is_window_focused {
+            Self::Normal
+        } else {
+            Self::Table
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Table => " TABLE ",
+            Self::Normal => " NORMAL ",
+            Self::Insert => " INSERT ",
+        }
+    }
+
+    /// Its badge's colour, which the border of what has the keys takes too.
+    fn color(self) -> Color {
+        let t = theme();
+        match self {
+            Self::Table => t.badge.bg.unwrap_or(t.muted),
+            Self::Normal => t.success,
+            Self::Insert => t.info,
+        }
+    }
+}
+
+/// What the left of the bottom bar says: the mode, then the filter being
+/// typed, the error or message there is, or the filter narrowing the list.
+/// The keys are on `?`.
+fn footer_left(app: &App) -> Line<'static> {
     let t = theme();
+    let mode = Mode::of(app);
+    let mut spans = vec![Span::styled(mode.label(), t.badge.bg(mode.color()))];
     if app.is_filtering {
-        return Line::raw(format!(
+        spans.push(Span::raw(format!(
             " Filter: {}_   Enter keeps it, Esc clears it",
             app.filter
-        ));
-    }
-    if let Some(err) = &app.error {
-        return Line::styled(format!(" {err}"), fg(t.danger));
-    }
-    if let Some(message) = &app.message {
-        return Line::styled(format!(" {message}"), fg(t.warning));
-    }
-    // What narrows the list is placed first, so the keys give way to it
-    // rather than push it off the bar.
-    let mut narrowing = Vec::new();
-    if !app.filter.is_empty() {
-        narrowing.push(Span::styled(
+        )));
+    } else if let Some(err) = &app.error {
+        spans.push(Span::styled(format!(" {err}"), fg(t.danger)));
+    } else if let Some(message) = &app.message {
+        spans.push(Span::styled(format!(" {message}"), fg(t.warning)));
+    } else if !app.filter.is_empty() {
+        spans.push(Span::styled(
             format!(" filter: {}", app.filter),
             fg(t.accent),
         ));
     }
-    let used = u16::try_from(narrowing.iter().map(Span::width).sum::<usize>()).unwrap_or(width);
-    let keys = bar_keys(app);
-    let mut spans = fitting_keys(&keys, width.saturating_sub(used));
-    spans.extend(narrowing);
     Line::from(spans)
 }
 
-/// The keys the bar lists: the mode's while a window has the keys, else the
-/// table's.
-fn bar_keys(app: &App) -> Vec<(&'static str, &'static str)> {
-    let tab = app.shown_tab();
-    if app.is_inserting() {
-        // Floating, Ctrl+Q leaves the chat for the table, as it always has.
-        let back = if app.chat_floats() { "back" } else { "normal" };
-        return INSERT_KEYS
-            .iter()
-            .copied()
-            .filter(|(key, _)| !(tab == WindowTab::Shell && matches!(*key, "^F" | "^P")))
-            .map(|(key, label)| {
-                if key == "^Q" {
-                    (key, back)
-                } else {
-                    (key, label)
-                }
-            })
-            .collect();
-    }
-    if app.is_window_focused {
-        let is_terminal = matches!(tab, WindowTab::Chat | WindowTab::Shell);
-        // With two windows, Ctrl+Q from the first moves on to the second.
-        let on = if app.other_window().is_some() && app.side == 0 {
-            "other window"
-        } else {
-            "table"
-        };
-        return NORMAL_KEYS
-            .iter()
-            .copied()
-            .filter(|(key, _)| is_terminal || *key != "i")
-            // The run and the info have nothing to scroll.
-            .filter(|(key, _)| {
-                !matches!(tab, WindowTab::Run | WindowTab::Info) || !matches!(*key, "j k" | "d u")
-            })
-            // Left and right only with two windows side by side.
-            .filter(|(key, _)| app.other_window().is_some() || *key != "M-h M-l")
-            .map(|(key, label)| if key == "^Q" { (key, on) } else { (key, label) })
-            .collect();
-    }
-    // Zoomed to the table there is no window for Ctrl+Q to give the keys
-    // to, and the bar is the one treetop had before its windows.
-    KEYS.iter()
-        .copied()
-        .filter(|(key, _)| !(is_classic(app) && matches!(*key, "M-j ^Q" | "^P")))
-        .collect()
-}
-
-/// The bottom bar: keys or a message on the left, the summary on the right.
+/// The bottom bar: the mode and a message on the left, the summary on the
+/// right.
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let t = theme();
-    // The keys keep at least KEY_ROOM columns; a full summary that would
-    // squeeze them gives way to the compact one.
-    const KEY_ROOM: u16 = 40;
+    // The message keeps at least MESSAGE_ROOM columns; a full summary that
+    // would squeeze it gives way to the compact one.
+    const MESSAGE_ROOM: u16 = 40;
     let full = Line::from(summary(app, false));
-    let right = if full.width() > usize::from(area.width.saturating_sub(KEY_ROOM)) {
+    let right = if full.width() > usize::from(area.width.saturating_sub(MESSAGE_ROOM)) {
         Line::from(summary(app, true))
     } else {
         full
@@ -1406,10 +1356,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         .min(area.width);
     let [left_area, right_area] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(right_width)]).areas(area);
-    frame.render_widget(
-        Paragraph::new(footer_left(app, left_area.width)).style(t.bar),
-        left_area,
-    );
+    frame.render_widget(Paragraph::new(footer_left(app)).style(t.bar), left_area);
     frame.render_widget(Paragraph::new(right).style(t.bar), right_area);
 }
 
@@ -1739,11 +1686,10 @@ fn zoomed_rows(app: &App) -> Vec<usize> {
         .collect()
 }
 
-/// A window's border: the title colour on the one that has the keys, as
-/// Neovim marks the window the cursor is in.
-fn window_block(has_keys: bool) -> Block<'static> {
-    let t = theme();
-    let color = if has_keys { t.title } else { t.border };
+/// A window's border: in the mode's colour on the one that has the keys,
+/// as the bar's badge names it, else the plain border.
+fn window_block(keys: Option<Mode>) -> Block<'static> {
+    let color = keys.map_or(theme().border, Mode::color);
     Block::bordered()
         .border_style(fg(color))
         .title_style(Style::new().add_modifier(Modifier::BOLD))
@@ -1960,28 +1906,6 @@ fn other_pane(app: &App) -> Option<Pane<'_>> {
     })
 }
 
-/// The mode in the bottom-left corner of the window with the keys, as
-/// nvim's status line shows it, with the key that leaves it: NORMAL, or
-/// INSERT on a chat or shell typing to it. None on a window without the keys.
-fn mode_line(pane: &Pane) -> Option<Line<'static>> {
-    let t = theme();
-    if !pane.has_keys {
-        return None;
-    }
-    let is_terminal = matches!(pane.tab, WindowTab::Chat | WindowTab::Shell);
-    let (mode, style, hint) = if pane.is_inserting {
-        (" INSERT ", t.badge.bg(t.info), " ^Q normal ")
-    } else if is_terminal {
-        (" NORMAL ", t.badge, " i insert ")
-    } else {
-        (" NORMAL ", t.badge, " ")
-    };
-    Some(Line::from(vec![
-        Span::styled(mode, style),
-        Span::styled(hint, fg(t.muted)),
-    ]))
-}
-
 /// A tab's name in the window's bar, with what the PR column or the run
 /// says of it where there is something.
 fn tab_label(app: &App, tree: Option<&Tree>, tab: WindowTab) -> String {
@@ -2100,7 +2024,7 @@ fn draw_window(frame: &mut Frame, app: &App, area: Rect, pane: &Pane, chat: Opti
             .side
             .map(|side| format!("{} ", SIDES[side]))
             .unwrap_or_default();
-        let block = window_block(true).title(format!(" {mark}New agent "));
+        let block = window_block(Some(Mode::Insert)).title(format!(" {mark}New agent "));
         let body = Block::new()
             .padding(Padding::horizontal(1))
             .inner(block.inner(area));
@@ -2132,10 +2056,12 @@ fn draw_window(frame: &mut Frame, app: &App, area: Rect, pane: &Pane, chat: Opti
             format!(" {mark}{alone}Tree {} · {branch} ", tree.name)
         }
     });
-    let mut block = window_block(pane.has_keys).title(title.unwrap_or_default());
-    if let Some(mode) = mode_line(pane) {
-        block = block.title_bottom(mode);
-    }
+    let mode = if pane.is_inserting {
+        Mode::Insert
+    } else {
+        Mode::Normal
+    };
+    let block = window_block(pane.has_keys.then_some(mode)).title(title.unwrap_or_default());
     frame.render_widget(block, area);
     let [bar, body] = window_areas(area);
     let Some(tree) = tree else {
@@ -6261,7 +6187,7 @@ mod pr_view_tests {
         let mut app = app();
         let path = std::path::PathBuf::from("/pool/4/app");
         while app.current().is_none_or(|t| t.path != path) {
-            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Char('j'));
         }
         press(&mut app, KeyCode::Char('v'));
         let shown = screen(&app, 200, 40);
@@ -6347,7 +6273,7 @@ mod pr_view_tests {
         let mut app = app();
         let path = std::path::PathBuf::from("/pool/4/app");
         while app.current().is_none_or(|t| t.path != path) {
-            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Char('j'));
         }
         press(&mut app, KeyCode::Char('v'));
         let mut pr = pr();
@@ -6447,7 +6373,7 @@ mod pr_view_tests {
         let mut app = app();
         let path = std::path::PathBuf::from("/pool/4/app");
         while app.current().is_none_or(|t| t.path != path) {
-            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Char('j'));
         }
         press(&mut app, KeyCode::Char('v'));
         let mut pr = pr();
@@ -6577,7 +6503,7 @@ mod pr_view_tests {
         let mut app = app();
         let path = std::path::PathBuf::from("/pool/4/app");
         while app.current().is_none_or(|t| t.path != path) {
-            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Char('j'));
         }
         press(&mut app, KeyCode::Char('v'));
         let mut pr = pr();
@@ -6614,7 +6540,7 @@ mod pr_view_tests {
         let mut app = app();
         let path = std::path::PathBuf::from("/pool/4/app");
         while app.current().is_none_or(|t| t.path != path) {
-            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Char('j'));
         }
         press(&mut app, KeyCode::Char('v'));
         let mut pr = pr();
@@ -6684,7 +6610,7 @@ mod pr_view_tests {
         let mut app = app();
         let path = std::path::PathBuf::from("/pool/4/app");
         while app.current().is_none_or(|t| t.path != path) {
-            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Char('j'));
         }
         press(&mut app, KeyCode::Char('v'));
         app.pr_loaded(path.clone(), Ok(None));
@@ -6733,7 +6659,7 @@ mod pr_view_tests {
         let mut app = app();
         let path = std::path::PathBuf::from("/pool/4/app");
         while app.current().is_none_or(|t| t.path != path) {
-            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Char('j'));
         }
         press(&mut app, KeyCode::Char('v'));
         let mut pr = pr();
@@ -6793,7 +6719,7 @@ mod pr_view_tests {
         let mut app = app();
         let path = std::path::PathBuf::from("/pool/4/app");
         while app.current().is_none_or(|t| t.path != path) {
-            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Char('j'));
         }
         press(&mut app, KeyCode::Char('v'));
         let mut pr = pr();
@@ -6841,7 +6767,7 @@ mod pr_view_tests {
         let mut app = app();
         let path = std::path::PathBuf::from("/pool/4/app");
         while app.current().is_none_or(|t| t.path != path) {
-            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Char('j'));
         }
         press(&mut app, KeyCode::Char('v'));
         let mut pr = pr();
@@ -6874,7 +6800,7 @@ mod pr_view_tests {
         let mut app = app();
         let path = std::path::PathBuf::from("/pool/4/app");
         while app.current().is_none_or(|t| t.path != path) {
-            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Char('j'));
         }
         press(&mut app, KeyCode::Char('v'));
         let mut pr = pr();
@@ -6915,7 +6841,7 @@ mod pr_view_tests {
         let mut app = app();
         let path = std::path::PathBuf::from("/pool/4/app");
         while app.current().is_none_or(|t| t.path != path) {
-            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Char('j'));
         }
         press(&mut app, KeyCode::Char('v'));
         let mut pr = pr();
@@ -6945,7 +6871,7 @@ mod pr_view_tests {
         let mut app = app();
         let path = std::path::PathBuf::from("/pool/4/app");
         while app.current().is_none_or(|t| t.path != path) {
-            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Char('j'));
         }
         press(&mut app, KeyCode::Char('v'));
         let mut pr = pr();
@@ -6970,7 +6896,7 @@ mod pr_view_tests {
         let mut app = app();
         let path = std::path::PathBuf::from("/pool/4/app");
         while app.current().is_none_or(|t| t.path != path) {
-            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Char('j'));
         }
         press(&mut app, KeyCode::Char('v'));
         let mut pr = pr();
@@ -7012,7 +6938,7 @@ mod pr_view_tests {
         let mut app = app();
         let path = std::path::PathBuf::from("/pool/4/app");
         while app.current().is_none_or(|t| t.path != path) {
-            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Char('j'));
         }
         press(&mut app, KeyCode::Char('v'));
         let mut pr = pr();
@@ -7030,7 +6956,7 @@ mod pr_view_tests {
         let mut app = app();
         let path = std::path::PathBuf::from("/pool/4/app");
         while app.current().is_none_or(|t| t.path != path) {
-            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Char('j'));
         }
         press(&mut app, KeyCode::Char('v'));
         let mut pr = pr();
@@ -7069,7 +6995,7 @@ mod pr_view_tests {
         let mut app = app();
         let path = std::path::PathBuf::from("/pool/4/app");
         while app.current().is_none_or(|t| t.path != path) {
-            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Char('j'));
         }
         press(&mut app, KeyCode::Char('v'));
         let mut pr = pr();
@@ -7162,8 +7088,12 @@ mod window_tests {
     }
 
     #[test]
-    fn the_window_with_the_keys_has_its_border_in_the_title_colour() {
+    fn what_has_the_keys_has_its_border_in_its_modes_colour() {
         let mut app = on("4");
+        app.tab = WindowTab::Chat;
+        app.window_rows = window_chat_area(&app, Rect::new(0, 0, 200, 50))
+            .unwrap()
+            .height;
         let corner = |app: &App, title: &str| {
             let buffer = drawn(app, 200, 50);
             let row = lines(&buffer)
@@ -7172,15 +7102,24 @@ mod window_tests {
                 .unwrap();
             buffer[(0, u16::try_from(row).unwrap())].fg
         };
-        assert_eq!(corner(&app, "┌ Trees "), theme().title);
+        let (table, normal, insert) = (
+            Mode::Table.color(),
+            Mode::Normal.color(),
+            Mode::Insert.color(),
+        );
+        assert!(table != normal && normal != insert && insert != table);
+        assert_ne!(normal, theme().title, "no orange");
+        assert_eq!(corner(&app, "┌ Trees "), table);
         assert_eq!(corner(&app, "┌ Tree 4 "), theme().border);
         app.is_window_focused = true;
         assert_eq!(corner(&app, "┌ Trees "), theme().border);
-        assert_eq!(corner(&app, "┌ Tree 4 "), theme().title);
+        assert_eq!(corner(&app, "┌ Tree 4 "), normal);
+        app.is_inserting = true;
+        assert_eq!(corner(&app, "┌ Tree 4 "), insert);
     }
 
     #[test]
-    fn the_window_with_the_keys_says_its_mode_in_its_bottom_corner_and_the_bar_its_keys() {
+    fn the_bar_names_the_mode_and_lists_no_keys_and_no_counts() {
         let mut app = on("4");
         app.tab = WindowTab::Chat;
         // The main loop records the window's rows before each draw.
@@ -7191,49 +7130,45 @@ mod window_tests {
             let shown = lines(&drawn(app, 200, 50));
             (shown[48].clone(), shown[49].clone())
         };
+        let keyless = |bar: &str| {
+            for word in [
+                "Enter", "open", "^Q", "M-", "insert", "tabs", "trees", "held", "listed",
+            ] {
+                assert!(!bar.contains(word), "{word}: {bar}");
+            }
+        };
         let (corner, bar) = bottom(&app);
+        assert!(bar.starts_with(" TABLE "), "{bar}");
+        keyless(&bar);
         assert!(
-            !corner.contains("NORMAL") && !corner.contains("INSERT"),
-            "{corner}"
+            bar.trim_end().ends_with("treetop"),
+            "the badge stays: {bar}"
         );
-        assert!(bar.starts_with(" Enter  open "), "{bar}");
+        assert!(!corner.contains("NORMAL"), "{corner}");
         app.is_window_focused = true;
         let (corner, bar) = bottom(&app);
-        assert!(corner.starts_with("└ NORMAL  i insert ─"), "{corner}");
-        assert!(bar.starts_with(" i  insert  ←→  tabs "), "{bar}");
-        assert!(bar.contains("  M-k  table  "), "{bar}");
-        assert!(!bar.contains("M-h M-l"), "one window: {bar}");
-        app.other = Some(crate::app::OtherWindow {
-            path: "/pool/9/app".into(),
-            tab: WindowTab::Info,
-        });
-        let (_, bar) = bottom(&app);
-        assert!(
-            bar.contains("  M-h M-l  left, right  "),
-            "two windows: {bar}"
-        );
-        app.other = None;
-        assert!(!bar.contains("top, bottom"), "{bar}");
+        assert!(bar.starts_with(" NORMAL "), "{bar}");
+        keyless(&bar);
+        assert!(corner.starts_with("└──"), "no mode in the corner: {corner}");
         app.is_inserting = true;
         let (corner, bar) = bottom(&app);
-        assert!(corner.starts_with("└ INSERT  ^Q normal ─"), "{corner}");
-        assert!(bar.starts_with(" ^Q  normal  ^\\  next agent "), "{bar}");
-        // The info has nothing to type into: Normal, without `i`.
-        app.tab = WindowTab::Info;
-        let (corner, bar) = bottom(&app);
-        assert!(corner.starts_with("└ NORMAL  ─"), "{corner}");
-        assert!(bar.starts_with(" ←→  tabs  M-k  table  ^Q  "), "{bar}");
-        // A shell keeps Ctrl+F and Ctrl+P, so its Insert bar leaves them out.
-        app.tab = WindowTab::Shell;
+        assert!(bar.starts_with(" INSERT "), "{bar}");
+        keyless(&bar);
+        assert!(corner.starts_with("└──"), "{corner}");
+        // A message follows the mode.
+        app.message = Some("tree 8 is waiting on you".into());
         let (_, bar) = bottom(&app);
-        assert!(bar.starts_with(" ^Q  normal  ^\\  next agent   "), "{bar}");
+        assert!(
+            bar.starts_with(" INSERT  tree 8 is waiting on you"),
+            "{bar}"
+        );
+        app.message = None;
         // Floating on a terminal too short for the window, a chat is always
-        // in Insert, and Ctrl+Q leaves it for the table.
-        app.tab = WindowTab::Chat;
+        // in Insert.
         app.is_inserting = false;
         app.window_rows = 0;
         let short = lines(&drawn(&app, 200, 12));
-        assert!(short[11].starts_with(" ^Q  back  "), "{}", short[11]);
+        assert!(short[11].starts_with(" INSERT "), "{}", short[11]);
     }
 
     #[test]
@@ -7391,7 +7326,7 @@ mod window_tests {
         );
 
         app.handle_key(ratatui::crossterm::event::KeyEvent::from(
-            ratatui::crossterm::event::KeyCode::Char('d'),
+            ratatui::crossterm::event::KeyCode::Char('D'),
         ));
         let shown = lines(&drawn(&app, 200, 50));
         let title = shown
@@ -7420,7 +7355,7 @@ mod window_tests {
             ));
         };
         let mut app = on("4");
-        press(&mut app, 'd');
+        press(&mut app, 'D');
         let shown = lines(&drawn(&app, 100, 9)).join("\n");
         assert!(
             shown.contains("reading the diff..."),
@@ -7725,13 +7660,9 @@ mod window_tests {
         assert!(shown[37].starts_with('┌'), "{}", shown.join("\n"));
         assert!(shown[38].starts_with("│/pool/4/app"), "{}", shown[38]);
         assert!(shown[48].starts_with('└'));
-        // Its key bar too, with no window for Ctrl+Q to give the keys to.
+        // Its bar names the table's mode, with no keys.
+        assert!(shown[49].starts_with(" TABLE "), "{}", shown[49]);
         assert!(!shown[49].contains("^Q"), "{}", shown[49]);
-        assert!(
-            shown[49].starts_with(" Enter  open  i  type  ?  help "),
-            "{}",
-            shown[49]
-        );
         // Zoomed to the windows on a terminal too short for them, nothing is
         // folded away.
         app.zoom = Some(Zoom::Windows);
@@ -7842,7 +7773,7 @@ mod window_tests {
             let buffer = drawn(app, 200, 50);
             buffer[(0, 1)].fg
         };
-        assert_eq!(table(&app), theme().title, "the table has the keys");
+        assert_eq!(table(&app), Mode::Table.color(), "the table has the keys");
         app.handle_key(ratatui::crossterm::event::KeyEvent::from(
             ratatui::crossterm::event::KeyCode::Char('N'),
         ));
