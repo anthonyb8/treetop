@@ -41,7 +41,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 
 | Key | Does |
 |---|---|
-| Enter | give the keys to the chat of the agent in the tree under the cursor, in the window under the table, in Normal, where Enter again starts Insert, starting a cold one again, else go to the tree itself (see [Agent chats](#agent-chats) and [Entering a tree](#entering-a-tree)); on a group's heading, fold the group or open it again, and on the main checkout's, open the chat of its agent when it has one |
+| Enter, `l` | give the keys to the chat of the agent in the tree under the cursor, in the window under the table, in Normal, where Enter again starts Insert, starting a cold one again, else go to the tree itself (see [Agent chats](#agent-chats) and [Entering a tree](#entering-a-tree)); on a group's heading, fold the group or open it again, and on the main checkout's, open the chat of its agent when it has one |
 | `i` | as Enter, but the chat's window gets the keys in Insert, ready to type to the agent at once |
 | Ctrl+Q | (or F13 to F24, such as a Caps Lock remapped to F19) give the keys to the window under the table, in Normal; from Insert, drop to Normal; from Normal, give them back to the table; with two windows, move them round the table, the left window and the right one (see [Normal and Insert](#normal-and-insert)) |
 | Ctrl+J Ctrl+K | as vim's Ctrl+W `j` and `k`: Ctrl+J gives the keys to the window under the table, in Normal, as Ctrl+Q does, and Ctrl+K from a window in Normal gives them back to the table |
@@ -74,7 +74,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | `H` | hand the work of the tree's agent to a new agent in the same tree, on a handoff the old one writes and you read over first (see [Handoffs](#handoffs)) |
 | `s` | start a ship run of the tree's branch, such as no-mistakes', after a dialog; on a run under way, show it |
 | `b` | rename the branch of the tree under the cursor |
-| `w` | switch to another workspace: the pool of another repository treetop has been opened in |
+| `w` | switch to another workspace: the pool of another repository treetop has been opened in, from the table or from a window in Normal |
 | `C` | scratch chats, tied to no tree: start one, open one, or delete one (see [Scratch chats](#scratch-chats)) |
 | Tab | switch to the Issues screen, and back (see [Issues](#issues)) |
 | `j` `k` / arrows, `g` `G` | move |
@@ -480,6 +480,7 @@ A window with the keys is in one of two modes, as in vim, and says which in the 
 `←` and `→` step through the window's tabs, from a chat as from any other.
 `j` and `k` scroll a line and `d` and `u` half a page, on the chat's history as on the diff and the PR, whose other keys work as ever.
 `i` or Enter on a chat or shell starts Insert.
+`w` opens the workspaces from any tab, giving the keys back to the table.
 Esc, `q`, Ctrl+K or Ctrl+Q gives the keys back to the table; with two windows, Ctrl+Q moves them on to the other one first.
 Ctrl+H, Ctrl+J, Ctrl+K and Ctrl+L move the keys as vim's Ctrl+W does between its windows: Ctrl+K up to the table, Ctrl+J from the table down into the window, and with two windows Ctrl+H and Ctrl+L to the left one and the right one.
 

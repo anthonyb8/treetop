@@ -2037,7 +2037,8 @@ impl App {
     /// The keys a window takes in Normal, on a tab with no keys of its own:
     /// Esc or q gives them back to the table, the arrows step through its
     /// tabs, on a chat or shell i or Enter starts Insert while j, k, d
-    /// and u scroll it, and e goes to what waits on you.
+    /// and u scroll it, e goes to what waits on you, and w to the other
+    /// workspaces.
     fn handle_window_key(&mut self, key: KeyEvent) -> Outcome {
         let is_terminal = matches!(self.shown_tab(), WindowTab::Chat | WindowTab::Shell);
         let half = isize::try_from(self.window_rows / 2).map_or(1, |h| h.max(1));
@@ -2054,6 +2055,10 @@ impl App {
             KeyCode::Char('e') => {
                 self.is_window_focused = false;
                 self.notes = Some(0);
+            }
+            KeyCode::Char('w') => {
+                self.is_window_focused = false;
+                return Outcome::Workspaces;
             }
             _ => {}
         }
@@ -2246,6 +2251,11 @@ impl App {
             self.is_window_focused = false;
             return Outcome::Continue;
         }
+        // w goes to the other workspaces, as on every tab in Normal.
+        if key.code == KeyCode::Char('w') {
+            self.is_window_focused = false;
+            return Outcome::Workspaces;
+        }
         let pr = self.prs.get(&path).and_then(|r| r.pr.clone()?.ok()?);
         let Some(pr) = pr else {
             return Outcome::Continue;
@@ -2391,6 +2401,11 @@ impl App {
         if matches!(key.code, KeyCode::Esc | KeyCode::Tab | KeyCode::Char('q')) {
             self.is_window_focused = false;
             return Outcome::Continue;
+        }
+        // w goes to the other workspaces, as on every tab in Normal.
+        if key.code == KeyCode::Char('w') {
+            self.is_window_focused = false;
+            return Outcome::Workspaces;
         }
         let (len, starts) = match self.diffs.get(&path).map(|d| &d.layout) {
             Some(Ok(layout)) => (layout.rows.len(), layout.file_starts.clone()),
@@ -4607,23 +4622,23 @@ impl App {
         if key.code == KeyCode::Char('C') {
             return Outcome::Scratches;
         }
-        // On a heading, Enter folds its group or opens it again; on the main
-        // checkout's, it opens the chat of an agent working there instead,
-        // and `i` that chat ready to type to.
-        if matches!(key.code, KeyCode::Enter | KeyCode::Char('i'))
+        // On a heading, Enter or `l` folds its group or opens it again; on
+        // the main checkout's, it opens the chat of an agent working there
+        // instead, and `i` that chat ready to type to.
+        if matches!(key.code, KeyCode::Enter | KeyCode::Char('i' | 'l'))
             && let Some(group) = self.current_heading()
         {
             let chat = self.main_under_cursor().and_then(Self::chat_of);
             match (key.code, chat) {
-                (KeyCode::Enter, Some(chat)) => return chat,
+                (KeyCode::Enter | KeyCode::Char('l'), Some(chat)) => return chat,
                 (_, Some(chat)) => return Self::typing_to(chat),
-                (KeyCode::Enter, None) => self.toggle_fold(&group),
+                (KeyCode::Enter | KeyCode::Char('l'), None) => self.toggle_fold(&group),
                 _ => {}
             }
             return Outcome::Continue;
         }
         match key.code {
-            KeyCode::Enter => return self.open_agent(),
+            KeyCode::Enter | KeyCode::Char('l') => return self.open_agent(),
             // The tree itself, even where Enter would open its agent's chat.
             KeyCode::Char('t') => {
                 if let Some(tree) = self.current() {
@@ -6020,6 +6035,28 @@ mod tests {
             matches!(press(&mut app, KeyCode::Char('i')), Outcome::Enter(t) if t.name == "7"),
             "with no chat to type in, i goes to the tree, as Enter does"
         );
+    }
+
+    #[test]
+    fn l_opens_a_tree_and_folds_a_heading_as_enter_does() {
+        let mut app = app();
+        app.base = Some("development".into());
+        app.apply_agents(&HashMap::from([(
+            PathBuf::from("/p/4/app"),
+            vec![attachable("fix-login")],
+        )]));
+        select(&mut app, "4");
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('l')),
+            Outcome::Chat { agent, tree, .. } if agent == "fix-login" && tree == "4"
+        ));
+        select(&mut app, "8");
+        assert!(matches!(press(&mut app, KeyCode::Char('l')), Outcome::Enter(t) if t.name == "8"));
+        app.selected = 0;
+        press(&mut app, KeyCode::Char('l'));
+        assert_eq!(shape(&app)[0], "▸development 2", "l folds the heading");
+        press(&mut app, KeyCode::Char('l'));
+        assert_eq!(shape(&app)[0], "▾development 2", "and opens it again");
     }
 
     #[test]
@@ -7896,6 +7933,29 @@ mod tests {
     }
 
     #[test]
+    fn w_in_a_windows_normal_opens_the_workspaces_and_gives_back_the_keys() {
+        let mut app = with_chat(Status::Idle);
+        app.window_rows = 20;
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        assert!(app.is_window_focused && !app.is_inserting(), "Normal");
+        assert_eq!(press(&mut app, KeyCode::Char('w')), Outcome::Workspaces);
+        assert!(!app.is_window_focused, "the table has the keys again");
+        for (open, tab) in [('d', WindowTab::Diff), ('v', WindowTab::Pr)] {
+            press(&mut app, KeyCode::Char(open));
+            assert!(
+                app.is_window_focused && app.shown_tab() == tab,
+                "{tab:?} in Normal"
+            );
+            assert_eq!(
+                press(&mut app, KeyCode::Char('w')),
+                Outcome::Workspaces,
+                "{tab:?}"
+            );
+            assert!(!app.is_window_focused, "{tab:?} gives the keys back");
+        }
+    }
+
+    #[test]
     fn ctrl_q_lands_in_normal_where_the_keys_scroll_and_step_and_i_or_enter_insert() {
         let ctrl_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
         let mut app = with_chat(Status::Idle);
@@ -7959,9 +8019,8 @@ mod tests {
         // With one window, Ctrl+H and L have nowhere to go.
         ctrl(&mut app, 'l');
         assert!(!app.is_window_focused);
-        // Plain h and l move nothing: l on the table, h in the window.
-        assert_eq!(press(&mut app, KeyCode::Char('l')), Outcome::Continue);
-        assert!(!app.is_window_focused);
+        // Plain h moves nothing in the window; l on the table opens the
+        // tree, as Enter does.
         ctrl(&mut app, 'j');
         assert_eq!(press(&mut app, KeyCode::Char('h')), Outcome::Continue);
         assert!(app.is_window_focused, "h keeps the keys in the window");

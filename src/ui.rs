@@ -68,7 +68,7 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
     (
         "Agents",
         &[
-            ("Enter", "open, fold heading"),
+            ("Enter l", "open, fold heading"),
             ("^Q", "window, Normal, table"),
             ("^J ^K", "window, table"),
             ("^H ^L", "left, right window"),
