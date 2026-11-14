@@ -397,7 +397,7 @@ pub enum WindowTab {
     /// Its agent's chat, live.
     #[default]
     Chat,
-    /// Its diff against its base, as `d` shows it.
+    /// Its diff against its base, as `D` shows it.
     Diff,
     /// Its PR: checks, review threads and CodeRabbit, as `v` shows it.
     Pr,
@@ -1202,7 +1202,7 @@ impl App {
         if Self::chat_agent(tree).is_some() {
             tabs.push(WindowTab::Chat);
         }
-        // The main checkout's heading stands for it, and `d` and `v` work
+        // The main checkout's heading stands for it, and `D` and `v` work
         // only on a tree's own row.
         if tree.is_held() && !tree.is_main {
             tabs.extend([WindowTab::Diff, WindowTab::Pr]);
@@ -1860,7 +1860,7 @@ impl App {
             self.jobs
                 .insert(path.clone(), JobState::Done(job.kind, Instant::now()));
             // Its chat opens only while its popup still stands in for it; Esc
-            // on the popup means it is opened later, with `a`.
+            // on the popup means it is opened later, with `A`.
             let known = self
                 .trees
                 .iter()
@@ -3431,7 +3431,7 @@ impl App {
         !self.ship_plugins.is_empty()
     }
 
-    /// `s`: shows the ship run under way on the tree under the cursor, or
+    /// `S`: shows the ship run under way on the tree under the cursor, or
     /// asks to start one.
     fn ship(&mut self) -> Outcome {
         let Some(tree) = self.current() else {

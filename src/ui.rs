@@ -1,5 +1,5 @@
 //! Drawing, htop style: the pool table, a detail pane for the tree under the
-//! cursor, and a key bar with the summary. A chat, a diff or the compose box
+//! cursor, and a bar naming the mode with the summary. A chat, a diff or the compose box
 //! floats over them in a popup, with the table dimmed round it, so treetop
 //! never leaves the screen. Every colour comes from `theme`.
 
@@ -523,7 +523,7 @@ const SHOWS_COUNTS: bool = false;
 /// way lualine closes its statusline. Zero marks and actions are left out.
 ///
 /// `is_compact` keeps only what needs you, what you marked and what is
-/// running, for a bar too narrow to show the keys beside the full summary.
+/// running, for a bar too narrow to show a message beside the full summary.
 fn summary(app: &App, is_compact: bool) -> Vec<Span<'static>> {
     let t = theme();
     let mut spans = vec![Span::raw("  ")];
