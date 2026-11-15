@@ -397,14 +397,14 @@ pub enum WindowTab {
     /// Its agent's chat, live.
     #[default]
     Chat,
+    /// A shell in it, live.
+    Shell,
     /// Its diff against its base, as `D` shows it.
     Diff,
     /// Its PR: checks, review threads and CodeRabbit, as `v` shows it.
     Pr,
     /// The steps of the keel run that holds it.
     Run,
-    /// A shell in it, live.
-    Shell,
     /// Where it is, its agents, ports and processes, and what its agent
     /// last said: the detail the pane under the list used to hold.
     Info,
@@ -1200,12 +1200,16 @@ impl App {
     }
 
     /// The tabs a window on `tree` has: the chat where an agent offers one,
-    /// the diff and PR of a held tree, the run while keel has one holding
-    /// it, a shell in a held tree, and its info.
+    /// a shell in a held tree, the diff and PR of a held tree, the run while
+    /// keel has one holding it, and its info.
     pub fn tabs_of(&self, tree: &Tree) -> Vec<WindowTab> {
         let mut tabs = Vec::new();
         if Self::chat_agent(tree).is_some() {
             tabs.push(WindowTab::Chat);
+        }
+        // A shell is kept running only while its tree is held.
+        if self.keeps_shell(&tree.name) {
+            tabs.push(WindowTab::Shell);
         }
         // The main checkout's heading stands for it, and `D` and `v` work
         // only on a tree's own row.
@@ -1214,10 +1218,6 @@ impl App {
         }
         if crate::keel::holding(&self.runs, &tree.path).is_some() {
             tabs.push(WindowTab::Run);
-        }
-        // A shell is kept running only while its tree is held.
-        if self.keeps_shell(&tree.name) {
-            tabs.push(WindowTab::Shell);
         }
         tabs.push(WindowTab::Info);
         tabs
@@ -8105,10 +8105,13 @@ mod tests {
             Outcome::ScrollChat(-10)
         );
         press(&mut app, KeyCode::Right);
+        assert_eq!(app.shown_tab(), WindowTab::Shell);
+        press(&mut app, KeyCode::Right);
         assert_eq!(app.shown_tab(), WindowTab::Diff);
         assert!(app.is_window_focused, "the window keeps the keys");
         press(&mut app, KeyCode::Char('i'));
         assert!(!app.is_inserting(), "nothing to type into on the diff");
+        press(&mut app, KeyCode::Left);
         press(&mut app, KeyCode::Left);
         press(&mut app, KeyCode::Left);
         assert_eq!(app.shown_tab(), WindowTab::Info);
@@ -8262,10 +8265,10 @@ mod tests {
     fn each_tree_has_the_tabs_it_can_show_and_the_keys_step_through_them() {
         use WindowTab::*;
         let mut app = with_chat(Status::Busy);
-        assert_eq!(app.window_tabs(), [Chat, Diff, Pr, Shell, Info]);
+        assert_eq!(app.window_tabs(), [Chat, Shell, Diff, Pr, Info]);
         app.runs.insert("/p/4/app".into(), run_in("/p/4/app"));
-        assert_eq!(app.window_tabs(), [Chat, Diff, Pr, Run, Shell, Info]);
-        for wanted in [Diff, Pr, Run, Shell, Info, Chat] {
+        assert_eq!(app.window_tabs(), [Chat, Shell, Diff, Pr, Run, Info]);
+        for wanted in [Shell, Diff, Pr, Run, Info, Chat] {
             press(&mut app, KeyCode::Char(']'));
             assert_eq!(app.shown_tab(), wanted);
         }
@@ -8470,6 +8473,7 @@ mod tests {
         );
         // From the diff with its keys too.
         press(&mut app, KeyCode::Char(']'));
+        press(&mut app, KeyCode::Char(']'));
         assert!(app.has_keys_on(WindowTab::Diff));
         press(&mut app, KeyCode::Char('f'));
         assert_eq!(app.side, 1, "f from the diff: the right");
@@ -8526,7 +8530,7 @@ mod tests {
             assert_eq!((app.selected, app.shown_tab()), (row, tab), "{arrow:?}");
         }
         press(&mut app, KeyCode::Char(']'));
-        assert_eq!(app.shown_tab(), WindowTab::Diff, "] from the chat");
+        assert_eq!(app.shown_tab(), WindowTab::Shell, "] from the chat");
         assert!(!app.is_window_focused, "the table keeps the keys");
         press(&mut app, KeyCode::Char('['));
         assert_eq!(app.shown_tab(), WindowTab::Chat, "[ back");
@@ -8536,6 +8540,8 @@ mod tests {
         press(&mut app, KeyCode::Char('['));
         assert_eq!(app.shown_tab(), WindowTab::Info, "[ from the chat wraps");
         press(&mut app, KeyCode::Char(']'));
+        press(&mut app, KeyCode::Char(']'));
+        assert_eq!(app.shown_tab(), WindowTab::Shell);
         press(&mut app, KeyCode::Char(']'));
         assert_eq!(app.shown_tab(), WindowTab::Diff);
         press(&mut app, KeyCode::Char(']'));

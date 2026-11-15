@@ -50,7 +50,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 | Ctrl+F | zoom: on the table, the table over the whole screen; in a window, the windows, with the table folded to their trees' rows; again, back |
 | Ctrl+\\ | show two windows under the table, the tree under the cursor on the left and the next tree down on the right, or one again |
 | `a` `s` `d` `f` | as Alt+H, J, K and L, unmodified on the left hand, from the table: `a` gives the keys to the left window, `s` to the window under the table, `d` keeps them on the table, `f` gives them to the Usage column where it shows, else to the right window; with two windows, `a` and `f` move between them from a window in Normal too, except `f` on the PR tab, which sends |
-| `[` `]` | step through the window's tabs: chat, diff, PR, run, shell and info, from the table or from the window in Normal, where `←` `→` do too |
+| `[` `]` | step through the window's tabs: chat, shell, diff, PR, run and info, from the table or from the window in Normal, where `←` `→` do too |
 | `t` | go to the tree itself, even when its agent has a chat: its tmux pane or a window in it, else a shell there (see [Entering a tree](#entering-a-tree)) |
 | `n` | start a new agent in the tree under the cursor: a free one is leased for it, on a branch named for the task, and a held one keeps its branch; on the main checkout's heading, start one in the main checkout, for work that needs no tree |
 | `N` | start a new agent in a fresh tree, on a branch named for the task (see [New agents](#new-agents)) |
@@ -401,15 +401,15 @@ The tree treetop was started in is never a target, because returning or destroyi
 The Trees screen is two windows over the bottom bar: the table on top, and under it a window on the tree under the cursor, with the [count](#what-waits-on-you) at the right of the table's top border while anything needs action or is done.
 The table's window is as tall as its rows, up to just under half the screen; the window under it takes the rest.
 While the window under the table has the keys, the table shrinks to a fifth of the screen, scrolling to keep the cursor's row in view, so the window gets the other four fifths; giving the keys back to the table puts both back.
-Whatever has the keys has its border in its mode's colour, as the bottom bar names the mode (see [Normal and Insert](#normal-and-insert)).
+Whatever has the keys has its border in Normal's green, the table and the Usage column too, and a window in Insert has it in Insert's colour; the bottom bar names the mode (see [Normal and Insert](#normal-and-insert)).
 
 The window under the table names the tree and its branch in its border, and has its tabs in a bar on its first row; `[` and `]` step through them from the table or the window, as `←` and `→` do from the window, and a click on one shows it:
 
 - **chat**: the agent's chat, live, where an agent offers one.
+- **shell**: a shell in a held tree, live, in `$SHELL`, run in a terminal of treetop's own as a chat is; Ctrl+Q gives it the keys, and it keeps running behind the screen as a chat does, and while `w` is on another workspace, until treetop quits or the tree is returned.
 - **diff**: the tree's diff, as `D` shows it (see [The diff](#the-diff)), on a held tree; the main checkout's heading has no diff or PR tab, as `D` and `v` do nothing there.
 - **PR**: the tree's PR, as `v` shows it (see [The PR view](#the-pr-view)), on a held tree, named with what the PR column says of it.
 - **run**: the steps of the keel run that holds the tree, the one under way picked out, while an active or paused run holds it (see [keel runs](#keel-runs)).
-- **shell**: a shell in a held tree, live, in `$SHELL`, run in a terminal of treetop's own as a chat is; Ctrl+Q gives it the keys, and it keeps running behind the screen as a chat does.
 - **info**: the tree in full (see [The info tab](#the-info-tab)).
 
 **Ctrl+\\** on the table puts two windows side by side under it: the tree the cursor was on stays in the left one, marked ◧, and the cursor moves to the next tree down, in the right one, marked ◨; each window's tree carries its mark in the table.
