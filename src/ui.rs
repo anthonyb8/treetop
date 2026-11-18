@@ -2871,6 +2871,9 @@ fn draw_prompt(frame: &mut Frame, screen: Rect, prompt: &Prompt) {
         keys.insert(0, ("type", "narrow"));
         keys.insert(0, ("←→", "pick"));
     }
+    if prompt.is_editing_branch_line() {
+        keys.insert(0, ("←→", "move"));
+    }
     if prompt.names_base() {
         keys.insert(0, ("↑↓", "branch, base"));
     } else if prompt.names_branch() {
@@ -2896,7 +2899,8 @@ fn draw_prompt(frame: &mut Frame, screen: Rect, prompt: &Prompt) {
         frame.render_widget(Paragraph::new(branch_line(prompt)), branch_row);
         if prompt.is_editing_branch {
             let typed = prompt.branch.as_deref().map_or(0, |b| b.chars().count());
-            let at = u16::try_from(FIELD_LABEL + typed).unwrap_or(u16::MAX);
+            let at = FIELD_LABEL + typed - prompt.back.min(typed);
+            let at = u16::try_from(at).unwrap_or(u16::MAX);
             frame.set_cursor_position(Position::new(
                 (branch_row.x + at).min(branch_row.right().saturating_sub(1)),
                 branch_row.y,
@@ -2948,6 +2952,15 @@ fn draw_prompt(frame: &mut Frame, screen: Rect, prompt: &Prompt) {
         .map(|r| Line::raw(r.clone()))
         .collect();
     frame.render_widget(Paragraph::new(lines), text_area);
+    // A rename is one line with a cursor that moves along it.
+    if matches!(prompt.purpose, Purpose::Rename { .. }) {
+        let at = prompt.text.chars().count() - prompt.back.min(prompt.text.chars().count());
+        let width = text_width.max(1);
+        let row = u16::try_from((at / width).saturating_sub(first)).unwrap_or(0);
+        let column = u16::try_from(at % width).unwrap_or(0);
+        frame.set_cursor_position(Position::new(text_area.x + column, text_area.y + row));
+        return;
+    }
     // The cursor shows only where the end is in view, since it types there.
     if is_editing_field || first + shown < rows.len() {
         return;
@@ -7816,6 +7829,37 @@ mod window_tests {
             buffer[(x, u16::try_from(first).unwrap())].bg,
             theme().cursor.bg.unwrap_or_default(),
             "the first is picked"
+        );
+    }
+
+    #[test]
+    fn a_renames_cursor_moves_onto_the_branchs_issue_id() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent};
+        let mut app = on("4");
+        app.handle_key(KeyEvent::from(KeyCode::Char('b')));
+        app.handle_key(KeyEvent::from(KeyCode::Home));
+        for _ in 0.."me/".len() {
+            app.handle_key(KeyEvent::from(KeyCode::Right));
+        }
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(200, 50)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &app, None, None, None))
+            .unwrap();
+        let cursor = terminal.get_cursor_position().unwrap();
+        let shown = lines(terminal.backend().buffer());
+        let row: Vec<char> = shown[usize::from(cursor.y)].chars().collect();
+        let at = usize::from(cursor.x);
+        assert_eq!(
+            row[at - 3..at + 3].iter().collect::<String>(),
+            "me/anb",
+            "the cursor is on the issue id: {}",
+            shown[usize::from(cursor.y)]
+        );
+        assert!(
+            shown.iter().any(|l| l.contains("←→") && l.contains("move")),
+            "the keys say the arrows move it:\n{}",
+            shown.join("\n")
         );
     }
 
