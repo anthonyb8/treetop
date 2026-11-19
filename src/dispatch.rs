@@ -90,6 +90,11 @@ pub struct Prompt {
     pub branch: Option<String>,
     /// Keys go to the branch rather than the task.
     pub is_editing_branch: bool,
+    /// How many characters of the branch being edited lie after the
+    /// cursor, so `←` can reach its start, such as the issue id a task
+    /// gave it, without retyping the rest. 0 is the end, where typing
+    /// usually happens.
+    pub back: usize,
     /// Which of the branches matching `base_typed` a fresh tree is cut
     /// from: the first, the pool's base with nothing typed, until `←`/`→`
     /// picks another.
@@ -131,6 +136,7 @@ impl Prompt {
             text: String::new(),
             branch: None,
             is_editing_branch: false,
+            back: 0,
             base_at: 0,
             base_typed: String::new(),
             is_editing_base: false,
@@ -301,6 +307,30 @@ impl Prompt {
         self.is_editing_branch || self.is_editing_base
     }
 
+    /// The keys edit a branch name on one line, with a cursor that moves
+    /// along it: the branch line, or a rename's text.
+    pub fn is_editing_branch_line(&self) -> bool {
+        self.is_editing_branch || matches!(self.purpose, Purpose::Rename { .. })
+    }
+
+    /// Edits the branch line at its cursor: `edit` gets the text before
+    /// the cursor, and the text after it stays as it is.
+    fn edit_before_cursor(&mut self, edit: impl FnOnce(&mut String)) {
+        let back = self.back;
+        let line = self.line();
+        let back = back.min(line.chars().count());
+        let at = line
+            .char_indices()
+            .rev()
+            .take(back)
+            .last()
+            .map_or(line.len(), |(at, _)| at);
+        let after = line.split_off(at);
+        edit(line);
+        line.push_str(&after);
+        self.back = back;
+    }
+
     /// The line keys edit: the branch while it has the focus, else the
     /// text. The base has keys of its own, since what is typed there only
     /// narrows the branches.
@@ -322,8 +352,9 @@ impl Prompt {
             self.retype_base(|typed| typed.push_str(line.trim()));
             return;
         }
-        if self.is_editing_field() {
-            self.line().push_str(&text.replace('\n', ""));
+        if self.is_editing_branch_line() {
+            let line = text.replace('\n', "");
+            self.edit_before_cursor(|before| before.push_str(&line));
         } else {
             self.text.push_str(&text);
         }
@@ -355,6 +386,7 @@ impl Prompt {
         }
         self.is_editing_branch = next == 1;
         self.is_editing_base = next == 2;
+        self.back = 0;
     }
 
     pub fn edit(&mut self, key: KeyEvent) -> Edit {
@@ -400,17 +432,38 @@ impl Prompt {
                     typed.pop();
                 });
             }
-            KeyCode::Char('u') if ctrl => self.line().clear(),
-            KeyCode::Char('w') if ctrl => {
-                // A branch's words are split by / and - rather than spaces.
-                let is_branch = self.is_editing_field();
-                let line = self.line();
-                let kept = line.trim_end().len();
-                let cut = line[..kept]
-                    .rfind(|c: char| c.is_whitespace() || (is_branch && "/-".contains(c)))
-                    .map_or(0, |at| at + 1);
-                line.truncate(cut);
+            // A branch line has a cursor: the arrows move it, and keys
+            // edit at it.
+            KeyCode::Left if self.is_editing_branch_line() => {
+                self.back = (self.back + 1).min(self.line().chars().count());
             }
+            KeyCode::Right if self.is_editing_branch_line() => {
+                self.back = self.back.saturating_sub(1);
+            }
+            KeyCode::Home if self.is_editing_branch_line() => {
+                self.back = self.line().chars().count();
+            }
+            KeyCode::Char('a') if ctrl && self.is_editing_branch_line() => {
+                self.back = self.line().chars().count();
+            }
+            KeyCode::End if self.is_editing_branch_line() => self.back = 0,
+            KeyCode::Char('e') if ctrl && self.is_editing_branch_line() => self.back = 0,
+            KeyCode::Char('u') if ctrl && self.is_editing_branch_line() => {
+                self.edit_before_cursor(|before| before.clear());
+            }
+            KeyCode::Char('w') if ctrl && self.is_editing_branch_line() => {
+                self.edit_before_cursor(|before| cut_word(before, true));
+            }
+            KeyCode::Char(c) if !ctrl && self.is_editing_branch_line() => {
+                self.edit_before_cursor(|before| before.push(c));
+            }
+            KeyCode::Backspace if self.is_editing_branch_line() => {
+                self.edit_before_cursor(|before| {
+                    before.pop();
+                });
+            }
+            KeyCode::Char('u') if ctrl => self.line().clear(),
+            KeyCode::Char('w') if ctrl => cut_word(&mut self.text, false),
             KeyCode::Char(c) if !ctrl => self.line().push(c),
             KeyCode::Backspace => {
                 self.line().pop();
@@ -419,6 +472,16 @@ impl Prompt {
         }
         Edit::Continue
     }
+}
+
+/// Cuts the last word off `line`, as `^W` does in a shell. A branch's
+/// words are split by / and - as well as spaces.
+fn cut_word(line: &mut String, is_branch: bool) {
+    let kept = line.trim_end().len();
+    let cut = line[..kept]
+        .rfind(|c: char| c.is_whitespace() || (is_branch && "/-".contains(c)))
+        .map_or(0, |at| at + 1);
+    line.truncate(cut);
 }
 
 /// The session name for a task: its first few words, so `claude agents` and
@@ -598,6 +661,64 @@ mod tests {
         let mut prompt = Prompt::start(held, "anthony".into());
         type_in(&mut prompt, "Fix login");
         assert_eq!(prompt.branch_name(), None);
+    }
+
+    fn press(prompt: &mut Prompt, code: KeyCode, times: usize) {
+        for _ in 0..times {
+            prompt.edit(KeyEvent::from(code));
+        }
+    }
+
+    #[test]
+    fn a_rename_edits_the_branchs_prefix_without_retyping_the_rest() {
+        let tree = Tree {
+            branch: Some("anthony/end-123-fix-login".into()),
+            ..crate::pool::stand_in(std::path::PathBuf::from("/p/5/app"))
+        };
+        let mut prompt = Prompt::rename(tree);
+        press(&mut prompt, KeyCode::Home, 1);
+        press(&mut prompt, KeyCode::Right, "anthony/end-123".len());
+        press(&mut prompt, KeyCode::Backspace, 3);
+        type_in(&mut prompt, "456");
+        assert_eq!(prompt.text, "anthony/end-456-fix-login");
+        prompt.edit(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(
+            prompt.text, "anthony/end--fix-login",
+            "the word before the cursor"
+        );
+        prompt.edit(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(prompt.text, "-fix-login", "all before the cursor");
+        press(&mut prompt, KeyCode::Left, 99);
+        type_in(&mut prompt, "x");
+        assert_eq!(prompt.text, "x-fix-login", "held to the start");
+        press(&mut prompt, KeyCode::End, 1);
+        type_in(&mut prompt, "!");
+        assert_eq!(prompt.text, "x-fix-login!");
+    }
+
+    #[test]
+    fn a_new_agents_branch_line_edits_at_its_cursor_and_the_task_at_its_end() {
+        let mut prompt = Prompt::dispatch(Target::NewTree, "anthony".into());
+        type_in(&mut prompt, "END-123 Fix login");
+        prompt.edit(KeyEvent::from(KeyCode::Down));
+        press(&mut prompt, KeyCode::Left, "fix-login".len() + 1);
+        press(&mut prompt, KeyCode::Backspace, 3);
+        type_in(&mut prompt, "456");
+        assert_eq!(
+            prompt.branch_name().as_deref(),
+            Some("anthony/end-456-fix-login")
+        );
+        prompt.paste("-b");
+        assert_eq!(
+            prompt.branch_name().as_deref(),
+            Some("anthony/end-456-b-fix-login")
+        );
+        prompt.edit(KeyEvent::from(KeyCode::Up));
+        type_in(&mut prompt, "!");
+        assert_eq!(
+            prompt.text, "END-123 Fix login!",
+            "the task still types at its end"
+        );
     }
 
     #[test]
