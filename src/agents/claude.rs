@@ -202,17 +202,23 @@ fn live_session(home: &Path, session: &Session, start: Option<u64>, dir: PathBuf
     }
     let is_background = session.kind.as_deref() == Some("bg");
     // An interactive session belongs to the terminal it runs in; only a
-    // background one can be attached from another.
+    // background one can be attached from another, by its job's id. That is
+    // its session id's first eight characters until `/clear` gives it a new
+    // session id, when only the job keeps the old one.
     let short = session.session_id.get(..8).filter(|_| is_background);
+    let id = session.job_id.clone().or_else(|| short.map(str::to_string));
     Some(Seen {
-        id: session.job_id.clone().or_else(|| short.map(str::to_string)),
+        attach: id
+            .as_deref()
+            .filter(|_| is_background)
+            .map(|id| attach(home, id)),
+        id,
         name: session.name.clone().unwrap_or_else(|| "claude".into()),
         dir,
         live: true,
         pid: Some(session.pid),
         status: session.status.clone(),
         background: is_background,
-        attach: short.map(|id| attach(home, id)),
         active_at: None,
         answered_at: None,
         context: None,
@@ -1570,6 +1576,28 @@ mod tests {
         assert_eq!(
             seen.attach,
             Some(vec!["claude".into(), "attach".into(), "e6b79280".into()])
+        );
+    }
+
+    #[test]
+    fn a_cleared_session_is_attached_by_its_job_not_its_new_session_id() {
+        // `/clear` gives a background session a new session id, and its
+        // job keeps the old one: `claude attach` knows only the job's.
+        let cleared: Session = serde_json::from_str(
+            &SESSION.replace(r#""kind":"bg""#, r#""kind":"bg","jobId":"3a578b49""#),
+        )
+        .unwrap();
+        let seen = live_session(
+            &config_dir().unwrap_or_default(),
+            &cleared,
+            Some(163482243),
+            here(),
+        )
+        .unwrap();
+        assert_eq!(seen.id.as_deref(), Some("3a578b49"));
+        assert_eq!(
+            seen.attach,
+            Some(vec!["claude".into(), "attach".into(), "3a578b49".into()])
         );
     }
 
