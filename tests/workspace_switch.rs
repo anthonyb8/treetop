@@ -17,9 +17,13 @@ use std::time::{Duration, Instant};
 const ROWS: u16 = 50;
 const COLS: u16 = 200;
 
+/// Writes a stand-in tool, put in place whole: treetop may be running the
+/// one it replaces.
 fn write_script(path: &Path, body: &str) {
-    fs::write(path, format!("#!/bin/sh\n{body}")).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    let new = path.with_extension("new");
+    fs::write(&new, format!("#!/bin/sh\n{body}")).unwrap();
+    fs::set_permissions(&new, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::rename(&new, path).unwrap();
 }
 
 fn git(dir: &Path, args: &[&str]) {
@@ -1095,6 +1099,78 @@ esac
     });
     screen.wait_for("the failure on you again", |text| {
         text.contains("1 needs action") && text.contains("checks failed")
+    });
+    drop(screen);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// ANB-104: a failure still to be typed in when you switch workspace waits on
+/// you again, as it dies with its chat.
+#[test]
+fn a_failure_still_unsent_as_you_switch_workspace_waits_again() {
+    let Workspaces {
+        root, mut screen, ..
+    } = two_workspaces("unsent-switch", "");
+    screen.wait_for("the panels", |text| text.contains("[2] Trees"));
+    let here = root.join("here").canonicalize().unwrap();
+    // A PR that failed its checks on tree 1, and an agent there whose chat
+    // ends as soon as it is opened.
+    let plugins = root.join("config/treetop/plugins");
+    fs::create_dir_all(&plugins).unwrap();
+    write_script(
+        &plugins.join("shp"),
+        r##"read -r request
+case "$request" in
+*'"describe"'*) echo '{"ok":true,"result":{"protocol":1,"name":"shp","kind":"ship","ops":["status","logs"]}}' ;;
+*'"op":"logs"'*) echo '{"ok":true,"result":{"text":"e2e broke"}}' ;;
+*) echo '{"ok":true,"result":{"branches":[{"branch":"here-work","stage":"ci_failed","label":"#65 x e2e"}]}}' ;;
+esac
+"##,
+    );
+    write_script(
+        &plugins.join("ag"),
+        &format!(
+            r#"read -r request
+case "$request" in
+*'"describe"'*) echo '{{"ok":true,"result":{{"protocol":1,"name":"ag","kind":"agent","ops":["find"]}}}}' ;;
+*) echo '{{"ok":true,"result":{{"agents":[{{"id":"a1","name":"fixer","dir":"{}","live":true,"status":"idle","background":true,"attach":["sleep","600"]}}]}}}}' ;;
+esac
+"#,
+            root.join("here-trees/1").display()
+        ),
+    );
+    fs::write(
+        root.join("config/treetop/config.toml"),
+        format!("[repos.\"{}\"]\nship = [\"shp\"]\n", here.display()),
+    )
+    .unwrap();
+    // Away and back reads the plugins.
+    screen.press("]");
+    screen.wait_for("there's trees", |text| text.contains("there-work"));
+    screen.press("\r");
+    screen.wait_on("there");
+    screen.press("]");
+    screen.wait_for("here's trees", |text| text.contains("here-work"));
+    screen.press("\r");
+    screen.wait_on("here");
+    screen.wait_for("the failed PR, on you and in Ship", |text| {
+        text.contains("1 needs action") && text.contains("#65 x e2e") && text.contains("F send it")
+    });
+    screen.press("3");
+    screen.press("F");
+    screen.wait_for("what was sent, in News", |text| {
+        text.contains("you: CI failed on") && text.contains("→ here-work")
+    });
+    screen.press("2");
+    screen.press("]");
+    screen.wait_for("there's trees", |text| text.contains("there-work"));
+    screen.press("\r");
+    screen.wait_on("there");
+    screen.wait_for("the failure on you again, and why, in News", |text| {
+        text.contains("here:1")
+            && text.contains("checks failed")
+            && text.contains("1 needs action")
+            && text.contains("not sent to fixer")
     });
     drop(screen);
     let _ = fs::remove_dir_all(&root);

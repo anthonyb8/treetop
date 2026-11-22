@@ -1140,7 +1140,7 @@ fn state_cell(app: &App, tree: &Tree, why: &HashMap<PathBuf, Kind>) -> Option<Ce
     // Just answered, it is on its way, whatever the last read had.
     let asked = (Kind::NeedsYou, tree.path.clone());
     let status = match agent.status {
-        Some(Status::Waiting) if app.answered.contains_key(&asked) => Some(Status::Busy),
+        Some(Status::Waiting) if app.is_answered(&asked) => Some(Status::Busy),
         status => status,
     };
     let (mark, style) = agent_style(status);

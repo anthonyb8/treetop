@@ -720,6 +720,17 @@ pub struct Chats {
 }
 
 impl Chats {
+    /// The agent and tree of each message still to be typed in, which a
+    /// switch of workspace ends.
+    pub fn unsent(&self) -> Vec<(String, String)> {
+        self.open
+            .iter()
+            .chain(&self.background)
+            .filter(|chat| !chat.outbox.is_empty())
+            .map(|chat| (chat.agent.clone(), chat.tree.clone()))
+            .collect()
+    }
+
     /// Leaves the workspace checked out at `from` for the one at `to`. Its
     /// shells keep running, away, and `to`'s come back behind the screen;
     /// its agents' chat clients end, which leaves the agents running.

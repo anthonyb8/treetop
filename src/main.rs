@@ -1549,6 +1549,16 @@ fn show(
         }
         let exit = run(term, &mut app, &checkout, &mut desktop, &mut chats);
         desktop.switched();
+        if matches!(exit, Ok(Exit::Switch(..))) {
+            for (agent, tree) in chats.unsent() {
+                app.unsent(&tree);
+                app.add_news(
+                    None,
+                    format!("not sent to {agent} in {tree}: you switched workspace first"),
+                    None,
+                );
+            }
+        }
         watch = app.take_watch();
         panel = app.panel;
         // The workspace left is another from the next one, as last read.

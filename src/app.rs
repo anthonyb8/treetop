@@ -612,6 +612,8 @@ pub struct Watch {
     /// read for the first time since, or a switch, is no news either, as
     /// what it holds was already there, as the desktop is not told of it.
     news_read: NewsRead,
+    /// What was answered in the window, and when, until its agent moves on.
+    answered: HashMap<crate::inbox::About, Instant>,
 }
 
 /// A read of what a planning chat made, or why it could not be.
@@ -808,8 +810,6 @@ pub struct App {
     pub is_parked_open: bool,
     /// When an ask's chat last opened by itself.
     pub ask_opened: Option<Instant>,
-    /// What was answered in the window, and when, until its agent moves on.
-    pub answered: HashMap<crate::inbox::About, Instant>,
     /// The same in the panels, where it starts open.
     pub is_parked_shut: bool,
     /// The groups folded to their heading, besides Parked.
@@ -1930,10 +1930,8 @@ impl App {
                             None => Outcome::Switch(checkout),
                         }
                     }
-                    n => {
-                        self.message = Some(format!(
-                            "{n} action(s) still running here; switch once they finish"
-                        ));
+                    _ => {
+                        self.message = Some(self.says_busy());
                         Outcome::Continue
                     }
                 });
@@ -2089,7 +2087,7 @@ impl App {
         if let Some(entry) = found {
             self.put_away(&entry);
             if kind == crate::inbox::Kind::NeedsYou {
-                self.answered.insert(entry.about(), Instant::now());
+                self.watch.answered.insert(entry.about(), Instant::now());
             }
         }
     }
@@ -4428,11 +4426,24 @@ impl App {
         }
     }
 
+    /// Why a switch waits.
+    fn says_busy(&self) -> String {
+        format!(
+            "{} action(s) still running here; switch once they finish",
+            self.active_jobs()
+        )
+    }
+
     /// Opens `entry`, as Enter on its tree's row would.
     fn go_to(&mut self, entry: crate::inbox::Entry) -> Outcome {
         self.viewing = None;
         self.is_window_focused = false;
         self.is_inserting = false;
+        // A switch would lose what an action here came to.
+        if entry.away.is_some() && self.shows_panels() && self.active_jobs() > 0 {
+            self.message = Some(self.says_busy());
+            return Outcome::Continue;
+        }
         if let Some(away) = entry.away {
             return Outcome::SwitchTo {
                 checkout: away.checkout,
@@ -4454,8 +4465,12 @@ impl App {
         let waiting = crate::inbox::needs_action(self);
         // An answer that took shows as its agent moving on; an ask still
         // there after that is the next one, or was not answered.
-        let mut answered = std::mem::take(&mut self.answered);
+        let mut answered = std::mem::take(&mut self.watch.answered);
         answered.retain(|about, at| {
+            // After a switch, its workspace is not read yet.
+            if !self.is_read_of(about) {
+                return true;
+            }
             let is_there = waiting.iter().any(|e| e.about() == *about);
             if is_there && at.elapsed() >= ANSWER_TAKES {
                 self.put_back(&about.1, about.0);
@@ -4463,7 +4478,7 @@ impl App {
             }
             is_there
         });
-        self.answered = answered;
+        self.watch.answered = answered;
         let now = std::time::SystemTime::now();
         let is_new = self.has_looked
             && waiting
@@ -4517,6 +4532,11 @@ impl App {
     /// This workspace's PRs have been read.
     pub fn has_read_ships(&self) -> bool {
         self.is_ships_read
+    }
+
+    /// `about` has been answered, its agent yet to move on.
+    pub fn is_answered(&self, about: &crate::inbox::About) -> bool {
+        self.watch.answered.contains_key(about)
     }
 
     /// Since when `about` has waited, as the last look saw it.
@@ -6144,6 +6164,17 @@ impl App {
         if (self.shows_panels() || self.is_plan) && !self.is_typing() && !self.is_quitting {
             self.message = None;
         }
+        // The top row's screens, from the window as from the panels.
+        if key.code == KeyCode::Tab
+            && is_plain(key)
+            && self.shows_panels()
+            && self.is_window_focused
+            && !self.is_plan
+            && !self.is_typing()
+        {
+            self.is_window_focused = false;
+            return Outcome::Plan;
+        }
         if let Some(outcome) = self.answer_by_number(key) {
             return outcome;
         }
@@ -7559,7 +7590,7 @@ pub(crate) mod tests {
                 .any(|n| n.what.starts_with("you: 1 Left → "))
         );
         let long_ago = Instant::now().checked_sub(ANSWER_TAKES).unwrap();
-        for at in app.answered.values_mut() {
+        for at in app.watch.answered.values_mut() {
             *at = long_ago;
         }
         app.watch_waiting();
@@ -7757,6 +7788,89 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn an_ask_answered_before_a_switch_waits_again_if_it_is_still_there() {
+        let mut app = crate::inbox::tests::with_workspaces();
+        app.reselect(Some(app.trees[0].path.clone()));
+        app.is_window_focused = true;
+        app.dialog = Some(vec!["Left".into(), "Right".into()]);
+        let about = (crate::inbox::Kind::NeedsYou, app.trees[0].path.clone());
+        press(&mut app, KeyCode::Char('1'));
+        app.watch_waiting();
+        // There, the workspace left is another, not read yet.
+        let mut next = crate::inbox::tests::with_workspaces();
+        next.put_away = app.put_away.clone();
+        next.keep_watch(app.take_watch());
+        let left = next.trees.remove(0);
+        next.pools.push(crate::inbox::Pool {
+            away: crate::inbox::Away {
+                name: "left".into(),
+                checkout: "/code/left".into(),
+            },
+            trees: vec![Tree {
+                leased_at: Some("2026-01-01T09:00:00-05:00".into()),
+                ..left.clone()
+            }],
+            sidecars: Default::default(),
+        });
+        let waits = |app: &App| app.notes_list().0.iter().any(|e| e.about() == about);
+        let long_ago = Instant::now().checked_sub(ANSWER_TAKES).unwrap();
+        *next.watch.answered.get_mut(&about).unwrap() = long_ago;
+        next.reports.retain(|r| r.job != "j4");
+        next.watch_waiting();
+        assert!(!waits(&next), "not read there yet");
+        // Read, and asking still.
+        next.reports.push(crate::inbox::tests::report(
+            "j4",
+            "/pool/4/app",
+            State::Blocked,
+            "Where should the inbox sit?",
+            120,
+        ));
+        next.away_live.insert("/code/left".into(), vec![left]);
+        next.watch_waiting();
+        assert!(waits(&next), "{:?}", next.put_away);
+    }
+
+    #[test]
+    fn going_to_another_workspace_from_waiting_waits_for_what_runs_here() {
+        let mut app = crate::inbox::tests::with_workspaces();
+        press(&mut app, KeyCode::Char('1'));
+        let (items, _) = app.notes_list();
+        app.waiting_at = items.iter().position(|e| e.away.is_some()).unwrap();
+        let path = app.trees[0].path.clone();
+        app.jobs.insert(path.clone(), JobState::Queued(Kind::Fix));
+        assert_eq!(press(&mut app, KeyCode::Enter), Outcome::Continue);
+        assert!(
+            app.message
+                .as_deref()
+                .unwrap()
+                .contains("still running here")
+        );
+        app.jobs.remove(&path);
+        assert!(matches!(
+            press(&mut app, KeyCode::Enter),
+            Outcome::SwitchTo { .. }
+        ));
+    }
+
+    #[test]
+    fn tab_switches_screens_from_the_window_in_normal_whatever_it_shows() {
+        for tab in [
+            WindowTab::Chat,
+            WindowTab::Diff,
+            WindowTab::Pr,
+            WindowTab::Info,
+        ] {
+            let mut app = crate::inbox::tests::with_workspaces();
+            app.reselect(Some(app.trees[0].path.clone()));
+            app.tab = tab;
+            app.is_window_focused = true;
+            assert_eq!(press(&mut app, KeyCode::Tab), Outcome::Plan, "{tab:?}");
+            assert!(!app.is_window_focused);
+        }
+    }
+
+    #[test]
     fn a_digit_past_a_questions_choices_stays_with_it() {
         let mut app = crate::inbox::tests::with_workspaces();
         app.reselect(Some(app.trees[0].path.clone()));
@@ -7848,6 +7962,7 @@ pub(crate) mod tests {
         assert_eq!(jobs[0].tree.name, "7");
         assert_eq!(app.panel, Panel::Waiting);
         // Another workspace's is gone to, so nothing here is acted on.
+        app.jobs.clear();
         let (items, _) = app.notes_list();
         app.waiting_at = items.iter().position(|e| e.away.is_some()).unwrap();
         assert!(matches!(
