@@ -193,8 +193,6 @@ fn open_chat(
 ) -> Result<()> {
     let is_popup = ui::is_popup(app, &agent, &tree);
     if !is_popup && !app.is_plan {
-        // Its tree is this workspace's, whatever [2] was looking at.
-        app.viewing = None;
         app.select_tree(&tree);
         app.tab = app::WindowTab::Chat;
         if app.window_tree().map(|t| t.name.as_str()) != Some(tree.as_str()) {
@@ -359,7 +357,7 @@ enum Exit {
     Quit,
     /// Show the pool of the repository checked out here instead, and open
     /// what waits in the tree at the second path, once it is read.
-    Switch(PathBuf, Option<(PathBuf, Option<inbox::Kind>)>),
+    Switch(PathBuf, Option<(PathBuf, inbox::Kind)>),
     /// Start the treetop installed over this one, on this workspace.
     Restart,
 }
@@ -369,8 +367,10 @@ fn choices() -> Vec<Choice> {
     workspaces::list()
         .into_iter()
         .map(|workspace| Choice {
-            held: cache::read(&workspace.checkout)
-                .map(|trees| trees.iter().filter(|t| t.is_held()).count()),
+            trees: cache::read(&workspace.checkout).map(|trees| {
+                let held = trees.iter().filter(|t| t.is_held()).count();
+                (held, trees.len() - held)
+            }),
             name: workspace.name(),
             checkout: workspace.checkout,
         })
@@ -1494,8 +1494,6 @@ fn show(
     let mut watch = app::Watch::default();
     // The other workspaces as last read, kept across a switch.
     let mut away = inbox::AwayRound::default();
-    // The panel with the keys in the panels layout, kept across a switch.
-    let mut panel = app::Panel::default();
     // What the desktop has been told of, kept across a switch too, so a
     // reminder still comes.
     let mut desktop = notify::Desktop::default();
@@ -1511,7 +1509,6 @@ fn show(
         away.ships_read.remove(&checkout);
         app.away_live = std::mem::take(&mut away.trees);
         app.away_ships = std::mem::take(&mut away.ships_read);
-        app.panel = panel;
         app.is_in_tmux = tmux::is_inside();
         app.checkout = checkout.clone();
         app.user = branch::user();
@@ -1560,7 +1557,6 @@ fn show(
             }
         }
         watch = app.take_watch();
-        panel = app.panel;
         // The workspace left is another from the next one, as last read.
         away.trees = std::mem::take(&mut app.away_live);
         away.ships_read = std::mem::take(&mut app.away_ships);

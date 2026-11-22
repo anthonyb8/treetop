@@ -21,7 +21,7 @@ use crate::agents::{Agent, Status};
 use crate::app::{
     App, DiffView, Group, Item, JobState, ListRow, LogEntry, Opening, Outcome, Panel, Pending,
     Phone, Picker, PlanState, PortMenu, Reach, Review, SCRATCH, ScratchMenu, Shipping, WindowTab,
-    WorkspaceTab, Zoom,
+    Zoom,
 };
 use crate::assistant;
 use crate::chat::Chat;
@@ -38,7 +38,6 @@ use crate::popup;
 use crate::pr_view::{self, PrPopup, Tab};
 use crate::reports::{self, State};
 use crate::ship::{Outcome as CheckOutcome, PrView, Stage};
-use crate::sidecar::Shelf;
 use crate::syntax;
 use crate::theme::theme;
 
@@ -127,7 +126,7 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
 ];
 
 /// The same for the panels layout, whose keys differ: its panels, the
-/// workspaces' tabs and Plan in place of the table's windows and zoom.
+/// workspaces and Plan in place of the table's windows and zoom.
 const PANELS_HELP: [(&str, &[(&str, &str)]); 8] = [
     (
         "Agents",
@@ -164,7 +163,7 @@ const PANELS_HELP: [(&str, &[(&str, &str)]); 8] = [
             ("0", "the window"),
             ("1-3", "a panel"),
             ("M-j M-k", "window, panel"),
-            ("[ ]", "workspaces, window tabs"),
+            ("[ ]", "window tabs"),
             ("j k", "move"),
             ("g G", "top, bottom"),
             ("d u", "half page in a window"),
@@ -210,6 +209,7 @@ const PANELS_HELP: [(&str, &[(&str, &str)]); 8] = [
     (
         "treetop",
         &[
+            ("w", "workspaces"),
             ("C", "scratch chats"),
             ("U", "update treetop"),
             ("?", "this help"),
@@ -313,26 +313,20 @@ pub fn draw(
                         panel.number(),
                         panel.title()
                     ))];
-                    if let (Panel::Ship, Some(checkout)) = (panel, &app.viewing) {
-                        title.push(Span::styled(
-                            format!("· {} ", crate::workspaces::name(checkout)),
-                            fg(theme().special),
-                        ));
-                    }
                     if panel == Panel::Trees {
-                        // What the title and the corners leave.
-                        let room = usize::from(area.width).saturating_sub(14);
-                        title.extend(workspace_tab_spans(app, room));
+                        title.push(Span::styled(
+                            project_label(app, area),
+                            fg(theme().special).add_modifier(Modifier::BOLD),
+                        ));
                     }
                     let block =
                         window_block(focused.then_some(Mode::Normal)).title(Line::from(title));
                     let body = block.inner(area);
                     frame.render_widget(block, area);
-                    match (panel, app.viewed_trees()) {
-                        (Panel::Trees, Some(trees)) => draw_viewed(frame, app, body, &trees),
-                        (Panel::Trees, None) => draw_table(frame, app, body, false, true),
-                        (Panel::Ship, _) => draw_ship(frame, app, body, focused),
-                        (Panel::News, _) => draw_news(frame, app, body, focused),
+                    match panel {
+                        Panel::Trees => draw_table(frame, app, body, false, true),
+                        Panel::Ship => draw_ship(frame, app, body, focused),
+                        Panel::News => draw_news(frame, app, body, focused),
                     }
                 }
             } else if is_classic(app) {
@@ -1195,15 +1189,11 @@ fn ship_key(stage: Stage) -> Option<(&'static str, &'static str)> {
     }
 }
 
-/// [1] Ship: the PRs of the workspace [2]'s tab shows, each its tree, branch, the plugin's
-/// label in the stage's colour, and the key that moves it on.
+/// [1] Ship: this workspace's PRs, each its tree, branch, the plugin's label
+/// in the stage's colour, and the key that moves it on.
 fn draw_ship(frame: &mut Frame, app: &App, area: Rect, has_keys: bool) {
     let t = theme();
-    let viewed = app.viewed_trees();
-    let rows = match viewed {
-        Some(trees) => App::with_prs(trees.into_iter()),
-        None => app.ship_rows(),
-    };
+    let rows = app.ship_rows();
     if rows.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::styled(" no PRs here yet", fg(t.muted))),
@@ -1431,140 +1421,27 @@ fn pick_cells(
         .collect()
 }
 
-/// [2] Trees' tabs, after its title, in `room` columns: every workspace by
-/// name, the one shown in the workspace colour, each with how many wait on
-/// you there. Too many for the room, they scroll to keep the one shown in
-/// view, an ellipsis at each end cut.
-fn workspace_tab_spans(app: &App, room: usize) -> Vec<Span<'static>> {
-    let t = theme();
-    let shown = app.viewing.as_ref().unwrap_or(&app.checkout);
-    let tabs = app.workspace_tabs();
-    if tabs.len() < 2 {
-        return Vec::new();
-    }
-    let text = |tab: &WorkspaceTab| match tab.waiting {
-        0 => format!(" {} ", tab.name),
-        n => format!(" {} ▲{n} ", tab.name),
-    };
-    let width = |tab: &WorkspaceTab| text(tab).chars().count() + 1;
-    let at = tabs
-        .iter()
-        .position(|tab| &tab.checkout == shown)
-        .unwrap_or(0);
-    // Out from the one shown, right then left, while they fit with room
-    // for an ellipsis at each end.
-    let (mut first, mut last) = (at, at);
-    let mut used = width(&tabs[at]) + 2;
-    loop {
-        let mut grew = false;
-        if last + 1 < tabs.len() && used + width(&tabs[last + 1]) <= room {
-            last += 1;
-            used += width(&tabs[last]);
-            grew = true;
-        }
-        if first > 0 && used + width(&tabs[first - 1]) <= room {
-            first -= 1;
-            used += width(&tabs[first]);
-            grew = true;
-        }
-        if !grew {
-            break;
-        }
-    }
-    let mut spans = Vec::new();
-    if first > 0 {
-        spans.push(Span::styled("…", fg(t.muted)));
-    }
-    for (n, tab) in tabs[first..=last].iter().enumerate() {
-        if n > 0 {
-            spans.push(Span::styled("│", fg(t.border)));
-        }
-        spans.push(if &tab.checkout == shown {
-            Span::styled(
-                text(tab),
-                Style::new()
-                    .fg(t.badge.fg.unwrap_or(t.text))
-                    .bg(t.special)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else if tab.waiting > 0 {
-            Span::styled(text(tab), fg(t.warning).add_modifier(Modifier::BOLD))
-        } else {
-            Span::styled(text(tab), fg(t.muted))
-        });
-    }
-    if last + 1 < tabs.len() {
-        spans.push(Span::styled("…", fg(t.muted)));
-    }
-    spans.push(Span::raw(" "));
-    spans
+/// [2] Trees' title after its name: the project whose trees it lists, as
+/// much of it as `area`, the panel's, has room for.
+fn project_label(app: &App, area: Rect) -> String {
+    let room = usize::from(area.width.saturating_sub(TREES_TITLE + 4));
+    format!("· {} ", fit(&crate::workspaces::name(&app.checkout), room))
 }
 
-/// Another workspace's trees on its tab, as their last read found them:
-/// those held, worked on then shelved, the cursor among them, then its free
-/// trees on one row. Only looked at: a key that acts switches there.
-fn draw_viewed(frame: &mut Frame, app: &App, area: Rect, trees: &[&Tree]) {
-    let t = theme();
-    let columns = columns(app, true);
-    let why = why_each(app);
-    let room = branch_room(app, area);
-    let header = Row::new(columns.iter().map(|(title, ..)| *title)).style(t.header);
-    let heading = |glyph: &'static str, label: &'static str| {
-        Row::new(pick_cells(
-            &columns,
-            vec![
-                Cell::from(glyph).style(fg(t.accent)),
-                Cell::from(""),
-                Cell::from(label).style(fg(t.muted)),
-            ],
-        ))
-    };
-    let mut rows = Vec::new();
-    let mut selected = None;
-    let mut shown = None;
-    for (at, tree) in trees.iter().enumerate() {
-        let shelf = app.viewed_shelf(tree);
-        if at == 0 || shelf != shown {
-            if at > 0 {
-                rows.push(Row::new(Vec::<Cell>::new()));
-            }
-            rows.push(heading(
-                "▾",
-                match shelf {
-                    Some(Shelf::Parked) => "parked",
-                    Some(Shelf::Backburner) => "backburner",
-                    None => "trees",
-                },
-            ));
-            shown = shelf;
-        }
-        if at == app.viewed {
-            selected = Some(rows.len());
-        }
-        rows.push(Row::new(pick_cells(
-            &columns,
-            panel_row(app, tree, &why, room),
-        )));
-    }
-    let mut free_at = None;
-    let free = app.viewed_free();
-    if !free.is_empty() {
-        rows.push(Row::new(Vec::<Cell>::new()));
-        free_at = Some(rows.len());
-        rows.push(Row::new(pick_cells(&columns, free_row(&free))));
-    }
-    if trees.is_empty() && free.is_empty() {
-        rows.push(heading("", "not read yet"));
-    }
-    let widths: Vec<Constraint> = columns.iter().map(|(_, width, _)| *width).collect();
-    let table = Table::new(rows, widths)
-        .header(header)
-        .row_highlight_style(t.cursor);
-    let mut state = TableState::default().with_selected(selected);
-    frame.render_stateful_widget(table, area, &mut state);
-    if let Some(at) = free_at {
-        draw_free(frame, area, at, &state, &free);
-    }
+/// [2] Trees' title up to the project: ` [2] Trees ` inside the corner.
+const TREES_TITLE: u16 = 1 + 11;
+
+/// Where the project's name is in [2] Trees' title on `screen`, for a click.
+fn project_area(app: &App, screen: Rect) -> Option<Rect> {
+    let windows = windows(app, screen_rows(app, screen).main);
+    windows.panels?;
+    let width = Line::raw(project_label(app, windows.top)).width();
+    Some(Rect {
+        x: windows.top.x + TREES_TITLE,
+        y: windows.top.y,
+        width: u16::try_from(width).unwrap_or(u16::MAX),
+        height: 1,
+    })
 }
 
 fn draw_table(frame: &mut Frame, app: &App, area: Rect, fold: bool, compact: bool) {
@@ -2048,6 +1925,20 @@ fn footer_left(app: &App, is_panels: bool, room: usize) -> Line<'static> {
         if !app.is_inserting() {
             keys.push(("?", "help"));
         }
+        // On the row of free trees, the one a new agent takes.
+        let is_free = app.panel == Panel::Trees
+            && !app.is_window_focused
+            && !app.is_plan
+            && app.current_heading() == Some(Group::Free);
+        let first = app.free_trees().first().map(|tree| tree.name.clone());
+        let starts = first
+            .filter(|_| is_free)
+            .map(|name| format!("new agent in {name}"));
+        for (key, does) in &mut keys {
+            if let ("n", Some(starts)) = (*key, &starts) {
+                *does = starts;
+            }
+        }
         for (at, (key, does)) in keys.iter().enumerate() {
             let width = Line::raw(format!("  {key} {does}")).width();
             let is_last = at + 1 == keys.len();
@@ -2183,12 +2074,6 @@ fn panel_keys(app: &App) -> &'static [(&'static str, &'static str)] {
             ("x", "backburner"),
             ("Esc", "clear marks"),
         ],
-        Panel::Trees if app.viewing.is_some() => &[
-            ("j/k", "move"),
-            ("Enter", "switch there"),
-            ("Esc", "back"),
-            ("[ ]", "workspaces"),
-        ],
         Panel::Ship => &[
             ("j/k", "move"),
             ("F", "send failure"),
@@ -2205,12 +2090,12 @@ fn panel_keys(app: &App) -> &'static [(&'static str, &'static str)] {
             ("1-3", "panels"),
         ],
         Panel::Trees => &[
-            ("[ ]", "workspaces"),
-            ("W", "next needing you"),
             ("j/k", "move"),
             ("Enter", "chat"),
             ("n", "new agent"),
             ("r", "return"),
+            ("w", "workspaces"),
+            ("W", "next needing you"),
             ("Space", "mark"),
             ("/", "filter"),
             ("0", "window"),
@@ -3459,15 +3344,7 @@ fn draw_window(frame: &mut Frame, app: &App, area: Rect, pane: &Pane, chat: Opti
     frame.render_widget(block, area);
     let [bar, body] = window_areas(area);
     let Some(tree) = tree else {
-        // Another workspace's tab is only looked at.
-        let viewing = app.viewing.as_deref().map(|checkout| {
-            format!(
-                "{} is only looked at here: Enter, or a key that acts on a tree, switches there; Esc comes back",
-                crate::workspaces::name(checkout)
-            )
-        });
         let text = match app.current_heading() {
-            _ if viewing.is_some() => viewing.as_deref().unwrap_or_default(),
             Some(_) => "a group's heading: Enter folds it or opens it again",
             None if app.is_loaded => "no trees match",
             None => "",
@@ -3613,7 +3490,9 @@ pub fn is_on_count(app: &App, screen: Rect, mouse: ratatui::crossterm::event::Mo
 }
 
 /// What a click on the list's screen does: on the count, opens or closes
-/// the notifications; on a window's tab, shows it. None for anywhere else.
+/// the notifications; on the project's name, with nothing else taking the
+/// keys, lists the workspaces; on a window's tab, shows it. None for
+/// anywhere else.
 pub fn click(
     app: &mut App,
     screen: Rect,
@@ -3629,6 +3508,13 @@ pub fn click(
         app.is_window_focused = false;
         app.toggle_notes();
         return Some(Outcome::Continue);
+    }
+    if !app.is_plan
+        && !app.is_typing()
+        && app.palette.is_none()
+        && project_area(app, screen).is_some_and(|name| name.contains(at))
+    {
+        return Some(Outcome::Workspaces);
     }
     // The rest of the Plan screen takes the mouse only for its chat.
     if app.is_plan {
@@ -3827,27 +3713,45 @@ fn draw_picker(frame: &mut Frame, app: &App, picker: &Picker) {
     let t = theme();
     let screen = frame.area();
     let width = screen.width.saturating_sub(4).min(96);
+    // As tall as it is whole, so it holds still as it narrows.
     let height = u16::try_from(picker.choices.len())
         .unwrap_or(u16::MAX)
         .saturating_add(2);
     let area = popup::centered(screen, width, height);
-    let keys = [("j/k", "move"), ("Enter l", "switch"), ("Esc h", "close")];
-    let block = popup_block(Line::styled(
+    let keys: &[(&str, &str)] = match picker.query {
+        None => &[
+            ("j/k", "move"),
+            ("Enter l", "switch"),
+            ("/", "narrow"),
+            ("Esc h", "close"),
+        ],
+        Some(_) => &[("↑↓", "move"), ("Enter", "switch"), ("Esc", "all")],
+    };
+    let mut title = vec![Span::styled(
         " Workspaces ",
         fg(t.title).add_modifier(Modifier::BOLD),
-    ))
-    .title_bottom(Line::from(fitting_keys(&keys, width.saturating_sub(2))));
+    )];
+    if let Some(query) = &picker.query {
+        title.push(Span::styled(format!("/{query} "), fg(t.accent)));
+    }
+    let block = popup_block(Line::from(title))
+        .title_bottom(Line::from(fitting_keys(keys, width.saturating_sub(2))));
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
     let waiting = inbox::needs_action(app);
-    let rows: Vec<Row> = picker
-        .choices
+    let shown = picker.shown();
+    if shown.is_empty() {
+        let none = Line::styled(" no workspace matches", fg(t.muted));
+        frame.render_widget(Paragraph::new(none), inner);
+        return;
+    }
+    let rows: Vec<Row> = shown
         .iter()
         .map(|choice| {
             let is_here = choice.checkout == app.checkout;
-            let held = match choice.held {
-                Some(n) => format!("{n} held"),
+            let held = match choice.trees {
+                Some((held, free)) => format!("{held} held · {free} free"),
                 None => "not listed yet".into(),
             };
             let mine: Vec<Kind> = waiting
@@ -3870,7 +3774,7 @@ fn draw_picker(frame: &mut Frame, app: &App, picker: &Picker) {
     let widths = [
         Constraint::Length(1),
         Constraint::Length(20),
-        Constraint::Length(14),
+        Constraint::Length(17),
         Constraint::Length(12),
         Constraint::Fill(1),
     ];
@@ -7489,7 +7393,7 @@ mod count_tests {
         let choice = |name: &str, checkout: &str| crate::app::Choice {
             checkout: checkout.into(),
             name: name.into(),
-            held: Some(2),
+            trees: Some((2, 3)),
         };
         app.picker = Some(Picker {
             choices: vec![
@@ -7498,6 +7402,7 @@ mod count_tests {
                 choice("lander", "/code/lander"),
             ],
             selected: 0,
+            query: None,
         });
         // The picker's rows are the lines that end in their checkout.
         let row = |shown: &[String], name: &str| {
@@ -7510,13 +7415,26 @@ mod count_tests {
         let shown = screen(&app, 200, 30);
         let treetop = row(&shown, "treetop");
         assert!(
-            treetop.contains("●1 ✗2") && !treetop.contains('✓'),
+            treetop.contains("2 held · 3 free   ●1 ✗2") && !treetop.contains('✓'),
             "{treetop}"
         );
         let away = row(&shown, "endodeals-web");
         assert!(away.contains("●1"), "{away}");
         let lander = row(&shown, "lander");
         assert!(!lander.contains('●'), "{lander}");
+        // Narrowed, it says by what, and when that leaves none.
+        app.picker.as_mut().unwrap().query = Some("land".into());
+        let shown = screen(&app, 200, 30);
+        assert!(row(&shown, "lander").contains("lander"));
+        let all = shown.join("\n");
+        assert!(
+            all.contains(" Workspaces /land ") && !all.contains("/code/treetop"),
+            "{all}"
+        );
+        app.picker.as_mut().unwrap().query = Some("nowhere".into());
+        let all = screen(&app, 200, 30).join("\n");
+        assert!(all.contains("no workspace matches"), "{all}");
+        app.picker.as_mut().unwrap().query = None;
         // Tree 4's ask still waits once its chat has opened.
         app.saw_chat(&["claude".into(), "attach".into(), "j4".into()]);
         let treetop = row(&screen(&app, 200, 30), "treetop");
@@ -7529,6 +7447,7 @@ mod count_tests {
         app.picker = Some(Picker {
             choices: Vec::new(),
             selected: 0,
+            query: None,
         });
         let drawn = cells(&app, 200, 30);
         let lines = screen(&app, 200, 30);
@@ -9402,48 +9321,65 @@ mod panels_tests {
 
     use crate::inbox::tests::with_workspaces;
 
-    fn text(spans: &[Span]) -> String {
-        spans.iter().map(|s| s.content.as_ref()).collect()
-    }
-
     #[test]
-    fn the_trees_title_has_every_workspace_as_a_tab_in_name_order() {
-        let app = with_workspaces();
+    fn the_trees_title_names_the_project_and_a_click_on_it_lists_the_workspaces() {
+        let mut app = with_workspaces();
+        app.checkout = "/code/app".into();
         let shown = screen(&app, 160, 46);
         let title = shown.iter().find(|l| l.contains("[2] Trees")).unwrap();
-        // Here tree 4 asks, 7's PR failed and 9 died; in api tree 1 asks.
-        let tabs = " api ▲1 │ main-app ▲3 │ zeta ";
-        assert!(title.contains(tabs), "{title}");
+        assert!(title.contains("┌ [2] Trees · app ─"), "{title}");
+        assert!(!title.contains("zeta"), "{title}");
+        // Also with nothing to count.
+        crate::inbox::tests::nothing_waits(&mut app);
+        assert_eq!(
+            super::count_tests::click_on(&mut app, 160, 46, "· app "),
+            Some(Outcome::Workspaces)
+        );
+        // Not while a filter is typed, or under the palette.
+        app.is_filtering = true;
+        assert_eq!(
+            super::count_tests::click_on(&mut app, 160, 46, "· app "),
+            None
+        );
+        app.is_filtering = false;
+        app.open_palette();
+        assert_eq!(
+            super::count_tests::click_on(&mut app, 160, 46, "· app "),
+            None
+        );
+        app.palette = None;
+        let name = "a-name-too-long-for-the-smallest-of-the-panels-to-show";
+        app.checkout = format!("/code/{name}").into();
+        let shown = screen(&app, 120, 31);
+        let title = shown.iter().find(|l| l.contains("[2] Trees")).unwrap();
+        assert!(
+            title.contains("· a-name-too") && title.contains("… ┐"),
+            "{title}"
+        );
     }
 
     #[test]
-    fn tabs_too_wide_for_the_panel_keep_the_one_shown_in_view() {
-        let mut app = with_workspaces();
-        app.viewing = Some(std::path::PathBuf::from("/code/zeta"));
-        let fitted = text(&workspace_tab_spans(&app, 16));
-        assert!(
-            fitted.starts_with("…") && fitted.contains("zeta"),
-            "{fitted}"
-        );
-        assert!(!fitted.contains("api"), "{fitted}");
-        let all = text(&workspace_tab_spans(&app, 200));
-        assert!(
-            !all.contains('…') && all.contains("api") && all.contains("zeta"),
-            "{all}"
-        );
-    }
-
-    #[test]
-    fn another_workspaces_tab_shows_its_trees_and_free_row_not_this_ones() {
-        let mut app = with_workspaces();
-        app.viewing = Some(std::path::PathBuf::from("/code/zeta"));
-        let all = screen(&app, 160, 46).join("\n");
-        assert!(all.contains("zeta-work") && all.contains("○ 2"), "{all}");
-        assert!(
-            !all.contains("me/help-columns"),
-            "this workspace's trees are not shown:\n{all}"
-        );
-        assert!(all.contains("zeta is only looked at here"), "{all}");
+    fn the_bar_names_the_free_tree_a_new_agent_takes_on_their_row() {
+        let mut app = panels();
+        for name in ["12", "9"] {
+            let path = format!("/pool/f{name}");
+            let mut tree = crate::inbox::tests::tree(&path, name, "", Vec::new());
+            tree.status = "available".into();
+            app.trees.push(tree);
+        }
+        let bar = |app: &App| screen(app, 200, 46).pop().unwrap();
+        assert!(bar(&app).contains("n new agent  "), "{}", bar(&app));
+        let is_free = |row: &ListRow| {
+            matches!(
+                row,
+                ListRow::Heading {
+                    group: Group::Free,
+                    ..
+                }
+            )
+        };
+        app.selected = app.rows().iter().position(is_free).unwrap();
+        assert!(bar(&app).contains("n new agent in 9  "), "{}", bar(&app));
     }
 
     #[test]
@@ -9712,7 +9648,7 @@ mod panels_tests {
     }
 
     #[test]
-    fn ship_shows_a_label_whole_and_the_prs_of_the_workspace_looked_at() {
+    fn ship_shows_a_label_whole_where_there_is_room() {
         let mut app = with_workspaces();
         let mut ship = app.trees[2].ship.clone().unwrap();
         ship.label = "#66 checks 19/24".into();
@@ -9724,27 +9660,6 @@ mod panels_tests {
         app.trees[2].ship = Some(ship.clone());
         let rows = panel_rows(&screen(&app, 160, 46), "[1] Ship").join("\n");
         assert!(rows.contains("#66 a label") && rows.contains('…'), "{rows}");
-        // Looking at another workspace, its PRs, named in the title.
-        let api = PathBuf::from("/code/api");
-        let mut tree = app
-            .pools
-            .iter()
-            .find(|p| p.away.checkout == api)
-            .unwrap()
-            .trees[0]
-            .clone();
-        ship.label = "#7 api's".into();
-        tree.ship = Some(ship);
-        app.away_live.insert(api.clone(), vec![tree]);
-        app.viewing = Some(api);
-        let shown = screen(&app, 160, 46);
-        let rows = panel_rows(&shown, "[1] Ship").join("\n");
-        assert!(rows.contains("#7 api's") && !rows.contains("#66"), "{rows}");
-        assert!(
-            shown.join("\n").contains("[1] Ship · api"),
-            "{}",
-            shown.join("\n")
-        );
     }
 
     #[test]
@@ -9783,10 +9698,6 @@ mod panels_tests {
                 "{width}: {cut}"
             );
         }
-        // The same on another workspace's tab.
-        let mut app = with_workspaces();
-        app.viewing = Some("/code/zeta".into());
-        assert!(row(&app, 160).contains("free · 1"), "{}", row(&app, 160));
     }
 
     #[test]
@@ -9811,10 +9722,6 @@ mod panels_tests {
                 "{width}: {bar}"
             );
         }
-        app.viewing = Some("/code/api".into());
-        let shown = screen(&app, 120, 31).join("\n");
-        assert!(shown.contains("Esc comes back"), "{shown}");
-        app.viewing = None;
         app.add_news(
             None,
             "you: If you have shown me a draft, yes: create those issues → me/fix-login".into(),
@@ -10049,7 +9956,8 @@ mod panels_tests {
         for (key, does) in [
             ("0", "the window"),
             ("1-3", "a panel"),
-            ("[ ]", "workspaces"),
+            ("[ ]", "window tabs"),
+            ("w", "workspaces"),
             ("W", "next needing you"),
             ("Tab", "Plan, Issues"),
             ("M", "merge"),

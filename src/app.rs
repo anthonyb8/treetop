@@ -133,14 +133,36 @@ impl<'a> Item<'a> {
 pub struct Choice {
     pub checkout: PathBuf,
     pub name: String,
-    pub held: Option<usize>,
+    /// Its trees held and free, as last listed.
+    pub trees: Option<(usize, usize)>,
 }
 
 /// The workspace picker `w` opens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Picker {
     pub choices: Vec<Choice>,
+    /// The one under the cursor, among those shown.
     pub selected: usize,
+    /// What narrows it, by name, while `/` has the keys.
+    pub query: Option<String>,
+}
+
+impl Picker {
+    /// Its workspaces, those `query` leaves.
+    pub fn shown(&self) -> Vec<&Choice> {
+        let query = self.query.as_deref().unwrap_or_default().to_lowercase();
+        self.choices
+            .iter()
+            .filter(|c| c.name.to_lowercase().contains(&query))
+            .collect()
+    }
+
+    /// Puts the cursor on the first shown that is not `here`, since going
+    /// there is all Enter does.
+    fn select_other(&mut self, here: &std::path::Path) {
+        let shown = self.shown();
+        self.selected = shown.iter().position(|c| c.checkout != here).unwrap_or(0);
+    }
 }
 
 /// The command palette Ctrl+P opens: what has been typed to narrow it,
@@ -166,7 +188,6 @@ pub struct Command {
 enum Run {
     Key(KeyEvent),
     Open(String),
-    Workspaces,
     Issues,
     Plan,
 }
@@ -222,7 +243,7 @@ const PANELS_COMMANDS: [(&str, &str); 12] = [
     ("Next thing that needs you", "W"),
     ("Planning chats", "Tab"),
     ("Issues", ""),
-    ("Switch workspace", ""),
+    ("Switch workspace", "w"),
     ("Scratch chats", "C"),
     ("Filter the trees", "/"),
     ("Notifications", "e"),
@@ -438,15 +459,6 @@ pub enum Zoom {
     Windows,
 }
 
-/// A workspace as a tab of [2] Trees in the panels layout: its name, its
-/// checkout, and how many of its trees wait on you.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkspaceTab {
-    pub name: String,
-    pub checkout: PathBuf,
-    pub waiting: usize,
-}
-
 /// A numbered panel on the left of the panels layout, on its number key;
 /// the window on the right is 0.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -520,11 +532,11 @@ pub enum Outcome {
     Switch(PathBuf),
     /// Show the pool of the repository checked out at `checkout`, and open
     /// what waits, of `kind`, in the tree at `tree` once it is read: what
-    /// waits in another workspace; with no kind, only put the cursor on it.
+    /// waits in another workspace.
     SwitchTo {
         checkout: PathBuf,
         tree: PathBuf,
-        kind: Option<crate::inbox::Kind>,
+        kind: crate::inbox::Kind,
     },
     /// Start the newer treetop installed over this one, on this workspace.
     Restart,
@@ -876,12 +888,6 @@ pub struct App {
     /// it and the screen has room. Its keys and rows follow this, so a
     /// screen too small for it keeps the table layout's.
     pub is_panels_shown: bool,
-    /// In the panels layout, another workspace whose tab [2] Trees shows,
-    /// from its last read, until a key that acts switches there; None for
-    /// this one's.
-    pub viewing: Option<PathBuf>,
-    /// The tree under the cursor on that tab, among `viewed_trees`.
-    pub viewed: usize,
     /// The question dialog the window's chat shows, as its choices, while
     /// one has its keys and treetop can read it: one question, one choice.
     /// main reads it off the chat's screen each pass.
@@ -934,7 +940,7 @@ pub struct App {
     returning: Option<OtherWindow>,
     /// The tree whose agent opens once this workspace's agents are read:
     /// what waits there, gone to from another workspace.
-    pub arriving: Option<(PathBuf, Option<crate::inbox::Kind>)>,
+    pub arriving: Option<(PathBuf, crate::inbox::Kind)>,
     /// The cursor was put on its tree, so it stays on it as the list is
     /// first sorted by what its reads find.
     pub is_cursor_held: bool,
@@ -1058,7 +1064,6 @@ struct HeldCursors {
     notes: Held,
     ship: Held,
     news: Held,
-    viewed: Held,
     made: Held,
     ready: Held,
 }
@@ -1531,9 +1536,8 @@ impl App {
     /// The tree the window under the table shows: the one under the
     /// cursor, or the main checkout on its heading.
     pub fn window_tree(&self) -> Option<&Tree> {
-        // Another workspace's tab is only looked at: its trees open nothing.
-        // Nor does the Plan screen, whose window is its planning chat's.
-        if self.viewing.is_some() || self.is_plan {
+        // The Plan screen's window is its planning chat's.
+        if self.is_plan {
             return None;
         }
         self.current().or(self.main_under_cursor())
@@ -1658,7 +1662,6 @@ impl App {
                 key: key.to_string(),
                 run: match (*label, *key) {
                     ("Issues", "") => Run::Issues,
-                    ("Switch workspace", "") => Run::Workspaces,
                     ("Planning chats", _) => Run::Plan,
                     _ => Run::Key(key_event(key)),
                 },
@@ -1717,7 +1720,6 @@ impl App {
                         // On the tree it names, from whichever panel.
                         Run::Key(key) if self.shows_panels() => self.run_on_trees(key),
                         Run::Key(key) => self.handle_key(key),
-                        Run::Workspaces => Outcome::Workspaces,
                         Run::Plan => Outcome::Plan,
                         Run::Issues => {
                             self.is_issues = true;
@@ -1741,87 +1743,6 @@ impl App {
             _ => {}
         }
         Outcome::Continue
-    }
-
-    /// Every workspace as a tab, this one among them, in name order so
-    /// stepping through them keeps its place; each with what waits there.
-    pub fn workspace_tabs(&self) -> Vec<WorkspaceTab> {
-        let (waiting, _) = self.notes_list();
-        let count = |checkout: &std::path::Path| {
-            waiting
-                .iter()
-                .filter(|e| match &e.away {
-                    Some(away) => away.checkout == checkout,
-                    None => checkout == self.checkout,
-                })
-                .count()
-        };
-        let mut tabs: Vec<WorkspaceTab> = std::iter::once((
-            crate::workspaces::name(&self.checkout),
-            self.checkout.clone(),
-        ))
-        .chain(
-            self.pools
-                .iter()
-                .map(|p| (p.away.name.clone(), p.away.checkout.clone())),
-        )
-        .map(|(name, checkout)| WorkspaceTab {
-            waiting: count(&checkout),
-            name,
-            checkout,
-        })
-        .collect();
-        tabs.sort_by(|a, b| a.name.cmp(&b.name).then(a.checkout.cmp(&b.checkout)));
-        tabs
-    }
-
-    /// The held trees of the workspace whose tab is shown, while it is
-    /// another's, as its last read found them, else as its cache lists
-    /// them: those worked on first, then those shelved.
-    pub fn viewed_trees(&self) -> Option<Vec<&Tree>> {
-        let mut trees = self.viewed_pool()?;
-        trees.retain(|t| t.is_held());
-        // Worked on, then the Backburner, then Parked, as the table has them.
-        trees.sort_by_key(|t| match self.viewed_shelf(t) {
-            None => 0,
-            Some(Shelf::Backburner) => 1,
-            Some(Shelf::Parked) => 2,
-        });
-        Some(trees)
-    }
-
-    /// The free trees of the workspace whose tab is shown, lowest first.
-    pub fn viewed_free(&self) -> Vec<&Tree> {
-        let mut free = self.viewed_pool().unwrap_or_default();
-        free.retain(|t| !t.is_held());
-        free.sort_by_key(|t| (t.name.parse::<u32>().ok(), t.name.clone()));
-        free
-    }
-
-    /// Every tree of the workspace whose tab is shown but its main
-    /// checkout, in pool order.
-    fn viewed_pool(&self) -> Option<Vec<&Tree>> {
-        let checkout = self.viewing.as_ref()?;
-        let pool = self.pools.iter().find(|p| &p.away.checkout == checkout);
-        let trees: Vec<&Tree> = match self.away_live.get(checkout) {
-            Some(live) => live.iter().collect(),
-            None => pool.map(|p| p.trees.iter().collect()).unwrap_or_default(),
-        };
-        Some(trees.into_iter().filter(|t| !t.is_main).collect())
-    }
-
-    /// The shelf of a tree on another workspace's tab, for its heading.
-    pub fn viewed_shelf(&self, tree: &Tree) -> Option<Shelf> {
-        let checkout = self.viewing.as_ref()?;
-        tree.sidecar
-            .as_deref()
-            .or_else(|| {
-                self.pools
-                    .iter()
-                    .find(|p| &p.away.checkout == checkout)
-                    .and_then(|p| p.sidecars.get(&tree.path))
-            })
-            .and_then(Sidecar::shelf)
     }
 
     /// The window follows the PR under [1] Ship's cursor, where its tree is
@@ -1863,83 +1784,6 @@ impl App {
             code if acts_on_tree(code) => return Some(Outcome::Continue),
             _ => return None,
         };
-        Some(Outcome::Continue)
-    }
-
-    /// [2] Trees' keys for its tabs in the panels layout: `[` and `]` step
-    /// through the workspaces, and on another's tab the cursor moves among
-    /// its trees, Esc comes back, a key that acts switches there for real,
-    /// refused while an action runs, and the rest do nothing, so none acts
-    /// on a tree of this workspace's that is not on screen. None for a key
-    /// it leaves to the table.
-    fn handle_tab_key(&mut self, key: KeyEvent) -> Option<Outcome> {
-        let is_trees = self.shows_panels()
-            && self.panel == Panel::Trees
-            && !self.is_window_focused
-            && !self.is_typing();
-        // The palette lists this workspace's trees, which are not shown.
-        if is_trees && self.viewing.is_some() && crate::chat::is_palette(key) {
-            self.message = Some("Esc comes back to this workspace's trees first".into());
-            return Some(Outcome::Continue);
-        }
-        if !is_trees || !is_plain(key) {
-            return None;
-        }
-        if let KeyCode::Char(step @ ('[' | ']')) = key.code {
-            let tabs = self.workspace_tabs();
-            let here = self.viewing.as_ref().unwrap_or(&self.checkout);
-            let at = tabs.iter().position(|t| &t.checkout == here).unwrap_or(0);
-            // The open workspace is always among them, so there is one.
-            let n = tabs.len();
-            let next = if step == ']' {
-                (at + 1) % n
-            } else {
-                (at + n - 1) % n
-            };
-            if let Some(tab) = tabs.get(next) {
-                self.viewing = (tab.checkout != self.checkout).then(|| tab.checkout.clone());
-                self.viewed = 0;
-                self.marked.clear();
-            }
-            return Some(Outcome::Continue);
-        }
-        let checkout = self.viewing.clone()?;
-        let last = self.viewed_trees().map_or(0, |t| t.len().saturating_sub(1));
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => self.viewed = (self.viewed + 1).min(last),
-            KeyCode::Char('k') | KeyCode::Up => self.viewed = self.viewed.saturating_sub(1),
-            KeyCode::Char('g') | KeyCode::Home => self.viewed = 0,
-            KeyCode::Char('G') | KeyCode::End => self.viewed = last,
-            KeyCode::Esc => self.viewing = None,
-            KeyCode::Enter | KeyCode::Char('l' | 'i' | 'n' | 'r' | 'm' | 'z' | 'x' | 't') => {
-                return Some(match self.active_jobs() {
-                    0 => {
-                        let tree = self
-                            .viewed_trees()
-                            .and_then(|trees| trees.get(self.viewed).map(|t| t.path.clone()));
-                        self.viewing = None;
-                        match tree {
-                            Some(tree) => Outcome::SwitchTo {
-                                checkout,
-                                tree,
-                                kind: None,
-                            },
-                            None => Outcome::Switch(checkout),
-                        }
-                    }
-                    _ => {
-                        self.message = Some(self.says_busy());
-                        Outcome::Continue
-                    }
-                });
-            }
-            // What works anywhere still does: help, quit, the notifications,
-            // the assistant and the other screens.
-            // `:` is left out: it asks about the tree under this workspace's
-            // cursor, which is not the one shown.
-            KeyCode::Char('?' | 'q' | 'e' | 'w' | 'A' | 'C') | KeyCode::Tab => return None,
-            _ => {}
-        }
         Some(Outcome::Continue)
     }
 
@@ -2109,7 +1953,6 @@ impl App {
     /// cursor alone, whatever is marked, then back to the panel it was run
     /// from, unless it went somewhere.
     fn run_on_trees(&mut self, key: KeyEvent) -> Outcome {
-        self.viewing = None;
         // It goes somewhere, whichever panel has the keys.
         if key.code == KeyCode::Char('W') {
             return self.handle_key(key);
@@ -2344,8 +2187,8 @@ impl App {
     /// The Plan screen's window in Normal, on its planning chat, as a
     /// tree's chat tab has it: `i` or Enter types to it, j, k, d and u
     /// scroll it, and Esc, `q` or Ctrl+Q gives the keys back to the panels.
-    /// None for what the screen's own keys take: the panels' numbers, `e`
-    /// and Tab.
+    /// None for what the screen's own keys take: the panels' numbers, `e`,
+    /// `w` and Tab.
     fn handle_plan_window_key(&mut self, key: KeyEvent) -> Option<Outcome> {
         let half = isize::try_from(self.window_rows / 2).map_or(1, |h| h.max(1));
         match key.code {
@@ -2356,7 +2199,7 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => return Some(Outcome::ScrollChat(-1)),
             KeyCode::Char('d') => return Some(Outcome::ScrollChat(half)),
             KeyCode::Char('u') => return Some(Outcome::ScrollChat(-half)),
-            KeyCode::Char('1'..='3' | 'e') | KeyCode::Tab => return None,
+            KeyCode::Char('1'..='3' | 'e' | 'w') | KeyCode::Tab => return None,
             _ => {}
         }
         Some(Outcome::Continue)
@@ -2437,9 +2280,10 @@ impl App {
     /// The Plan screen's keys: j and k move among its planning chats, `n`
     /// starts one for this workspace, Enter or `i` opens the one under the
     /// cursor in the window, `D` asks it to draft its plan as issues and
-    /// `S` to create them in Linear, as `/spec` does, and Tab goes on to
-    /// Issues. Every other key, the Trees screen's and Ctrl's among them,
-    /// does nothing here, so none acts on a tree.
+    /// `S` to create them in Linear, as `/spec` does, `e` lists what needs
+    /// you, `w` the workspaces, and Tab goes on to Issues. Every other key,
+    /// the Trees screen's and Ctrl's among them, does nothing here, so none
+    /// acts on a tree.
     fn handle_plan_key(&mut self, key: KeyEvent) -> Outcome {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return self.quit();
@@ -2503,6 +2347,10 @@ impl App {
             KeyCode::Char('e') => {
                 self.leave_plan_window();
                 self.notes = Some(0);
+            }
+            KeyCode::Char('w') => {
+                self.leave_plan_window();
+                return Outcome::Workspaces;
             }
             KeyCode::Enter | KeyCode::Char('i' | 'l' | '0') => {
                 if let Some(chat) = chat {
@@ -2602,12 +2450,8 @@ impl App {
     /// The PRs [1] Ship lists: this workspace's trees whose ship plugin
     /// has something to say.
     pub fn ship_rows(&self) -> Vec<&Tree> {
-        Self::with_prs(self.trees.iter())
-    }
-
-    /// The trees of `trees` with a PR under way.
-    pub fn with_prs<'a>(trees: impl Iterator<Item = &'a Tree>) -> Vec<&'a Tree> {
-        trees
+        self.trees
+            .iter()
             .filter(|t| {
                 t.ship
                     .as_ref()
@@ -2738,17 +2582,11 @@ impl App {
                 self.is_inserting = false;
                 self.is_usage_focused = false;
                 self.panel = panel;
-                // Another workspace's tab is [2]'s alone: leaving it comes
-                // back, so no key acts on a tree here that is not shown.
-                if panel != Panel::Trees {
-                    self.viewing = None;
-                }
                 if panel == Panel::Ship {
                     self.follow_ship();
                 }
             }
             None if c == '0' && !self.is_window_focused => {
-                self.viewing = None;
                 self.focus_window();
             }
             None => {}
@@ -2894,7 +2732,7 @@ impl App {
     /// Takes whether the Usage column is on screen as just drawn; gone, it
     /// gives up the keys to the table.
     /// The panels layout is drawn, rather than the table layout it falls
-    /// back to on a small screen; another workspace's tab ends without it.
+    /// back to on a small screen.
     pub fn show_panels(&mut self, is_shown: bool) {
         // The list's groups stand in another order there, the cursor on the
         // same tree.
@@ -2913,8 +2751,6 @@ impl App {
             self.zoom = None;
             self.other = None;
             self.side = 0;
-        } else {
-            self.viewing = None;
         }
     }
 
@@ -4214,7 +4050,6 @@ impl App {
             && !self.is_filtering
             && !self.is_issues
             && !self.is_plan
-            && self.viewing.is_none()
             && !self.is_quitting
     }
 
@@ -4291,7 +4126,8 @@ impl App {
 
     /// The list is on screen with nothing over it but a dialog, and the
     /// count over it, so a click can open what it counts, or the Usage
-    /// column runs past its foot, for the wheel. Elsewhere the
+    /// column runs past its foot, for the wheel, or the panels are shown,
+    /// where a click on the project's name lists the workspaces. Elsewhere the
     /// mouse is left to the terminal, so text selects as it always has.
     pub fn wants_mouse(&self) -> bool {
         // A chat or shell read in Normal takes the wheel, to scroll it, and
@@ -4299,7 +4135,11 @@ impl App {
         let is_reading = self.is_window_focused
             && (self.is_plan || matches!(self.shown_tab(), WindowTab::Chat | WindowTab::Shell));
         let (needs, done) = self.notes_list();
-        (is_reading || !needs.is_empty() || !done.is_empty() || self.usage_overflow > 0)
+        (is_reading
+            || !needs.is_empty()
+            || !done.is_empty()
+            || self.usage_overflow > 0
+            || self.shows_panels())
             && !self.is_issues
             && (!self.is_plan || is_reading || !needs.is_empty())
             && !self.has_keys_on(WindowTab::Diff)
@@ -4405,7 +4245,6 @@ impl App {
 
     /// Opens `entry`, as Enter on its tree's row would.
     fn go_to(&mut self, entry: crate::inbox::Entry) -> Outcome {
-        self.viewing = None;
         self.notes = None;
         self.is_window_focused = false;
         self.is_inserting = false;
@@ -4426,7 +4265,7 @@ impl App {
             return Outcome::SwitchTo {
                 checkout: away.checkout,
                 tree: entry.path,
-                kind: Some(entry.kind),
+                kind: entry.kind,
             };
         }
         self.open_tree(entry.path, entry.kind)
@@ -4568,28 +4407,16 @@ impl App {
     pub fn arrival(&mut self) -> Option<Outcome> {
         // The cursor goes there as soon as it is listed, so no key lands on
         // another tree while the agents are read.
-        if let Some((path, Some(_))) = &self.arriving
+        if let Some((path, _)) = &self.arriving
             && !self.is_cursor_held
             && self.trees.iter().any(|t| &t.path == path)
         {
             self.reveal(path.clone());
         }
-        // Only looked at.
-        if let Some((path, None)) = &self.arriving {
-            if !self.is_loaded && self.trees.is_empty() {
-                return None;
-            }
-            let path = path.clone();
-            self.arriving = None;
-            self.has_landed = true;
-            self.reveal(path);
-            return None;
-        }
         if !self.is_agents_read || !self.is_free() {
             return None;
         }
         let (path, kind) = self.arriving.take()?;
-        let kind = kind?;
         self.has_landed = true;
         if !self.trees.iter().any(|t| t.path == path) {
             self.message = Some(format!("{} is no longer in this pool", path.display()));
@@ -5760,38 +5587,68 @@ impl App {
             );
             return;
         }
-        let selected = choices
-            .iter()
-            .position(|c| c.checkout != self.checkout)
-            .unwrap_or(0);
-        self.picker = Some(Picker { choices, selected });
+        let mut picker = Picker {
+            choices,
+            selected: 0,
+            query: None,
+        };
+        picker.select_other(&self.checkout);
+        self.picker = Some(picker);
     }
 
     fn handle_picker_key(&mut self, key: KeyEvent) -> Outcome {
         let Some(picker) = self.picker.as_mut() else {
             return Outcome::Continue;
         };
-        let last = picker.choices.len().saturating_sub(1);
+        let last = picker.shown().len().saturating_sub(1);
+        if let Some(query) = picker.query.as_mut() {
+            let is_narrowed = match key.code {
+                KeyCode::Esc => {
+                    picker.query = None;
+                    true
+                }
+                KeyCode::Backspace => {
+                    query.pop();
+                    true
+                }
+                KeyCode::Char(c) if is_plain(key) => {
+                    query.push(c);
+                    true
+                }
+                // The list's letters are typed here, so with Ctrl or Alt
+                // they do nothing.
+                KeyCode::Char(_) => return Outcome::Continue,
+                _ => false,
+            };
+            if is_narrowed {
+                picker.select_other(&self.checkout);
+                return Outcome::Continue;
+            }
+        }
         match key.code {
+            KeyCode::Char('/') => {
+                picker.query = Some(String::new());
+                picker.select_other(&self.checkout);
+            }
             KeyCode::Down | KeyCode::Char('j') => picker.selected = (picker.selected + 1).min(last),
             KeyCode::Up | KeyCode::Char('k') => picker.selected = picker.selected.saturating_sub(1),
             KeyCode::Enter | KeyCode::Char('l') => {
-                let chosen = picker
-                    .choices
+                let Some(chosen) = picker
+                    .shown()
                     .get(picker.selected)
-                    .map(|c| c.checkout.clone());
+                    .map(|c| c.checkout.clone())
+                else {
+                    return Outcome::Continue;
+                };
                 self.picker = None;
-                match chosen {
-                    Some(path) if path == self.checkout => {}
-                    Some(_) if self.active_jobs() > 0 => {
-                        self.message = Some(format!(
-                            "{} action(s) still running here; switch once they finish",
-                            self.active_jobs()
-                        ));
-                    }
-                    Some(path) => return Outcome::Switch(path),
-                    None => {}
+                if chosen == self.checkout {
+                    return Outcome::Continue;
                 }
+                if self.active_jobs() > 0 {
+                    self.message = Some(self.says_busy());
+                    return Outcome::Continue;
+                }
+                return Outcome::Switch(chosen);
             }
             KeyCode::Esc | KeyCode::Char('q' | 'h' | 'w') => self.picker = None,
             _ => {}
@@ -6119,15 +5976,6 @@ impl App {
                 .collect();
             hold(&mut self.news_at, &mut self.held.news, news);
         }
-        // Another workspace's tab, whose paths are its own, so one tab's
-        // cursor is never put by another's.
-        let viewed: Vec<String> = self
-            .viewed_trees()
-            .unwrap_or_default()
-            .iter()
-            .map(|t| t.path.display().to_string())
-            .collect();
-        hold(&mut self.viewed, &mut self.held.viewed, viewed);
         let made: Vec<String> = self.made().iter().map(|i| i.id.clone()).collect();
         hold(&mut self.made_at, &mut self.held.made, made);
         let ready: Vec<String> = self.ready_issues().iter().map(|i| i.id.clone()).collect();
@@ -6169,6 +6017,9 @@ impl App {
         if let Some(outcome) = self.handle_next_key(key) {
             return outcome;
         }
+        if self.is_plan && self.picker.is_some() {
+            return self.handle_picker_key(key);
+        }
         if self.is_plan && self.is_notes_shown() {
             return self.handle_notes_key(key);
         }
@@ -6182,9 +6033,6 @@ impl App {
             return outcome;
         }
         if let Some(outcome) = self.handle_news_key(key) {
-            return outcome;
-        }
-        if let Some(outcome) = self.handle_tab_key(key) {
             return outcome;
         }
         if self.view.is_some() && self.has_keys_on(WindowTab::Diff) {
@@ -6621,87 +6469,6 @@ pub(crate) mod tests {
     use crate::inbox::tests::with_workspaces;
 
     #[test]
-    fn brackets_step_the_workspaces_in_name_order_and_show_another_only_to_look_at() {
-        let mut app = with_workspaces();
-        // This workspace's cursor on a tree, which the window would open.
-        app.reselect(Some(app.trees[0].path.clone()));
-        assert!(app.window_tree().is_some());
-        let names = |app: &App| -> Vec<String> {
-            app.workspace_tabs().into_iter().map(|t| t.name).collect()
-        };
-        assert_eq!(names(&app), ["api", "main-app", "zeta"]);
-        press(&mut app, KeyCode::Char(']'));
-        assert_eq!(app.viewing, Some(PathBuf::from("/code/zeta")));
-        assert_eq!(app.window_tree(), None, "nothing of this workspace opens");
-        let shown: Vec<_> = app
-            .viewed_trees()
-            .unwrap()
-            .iter()
-            .map(|t| t.name.clone())
-            .collect();
-        assert_eq!(shown, ["1"]);
-        assert_eq!(app.viewed_free().len(), 1);
-        // Past the last it wraps to the first, and back home.
-        press(&mut app, KeyCode::Char(']'));
-        assert_eq!(app.viewing, Some(PathBuf::from("/code/api")));
-        press(&mut app, KeyCode::Char(']'));
-        assert_eq!(app.viewing, None);
-        press(&mut app, KeyCode::Char('['));
-        assert_eq!(app.viewing, Some(PathBuf::from("/code/api")));
-    }
-
-    #[test]
-    fn on_another_workspaces_tab_only_a_key_that_acts_does_anything_and_it_switches() {
-        let mut app = with_workspaces();
-        // This workspace's cursor on a tree, hidden while another is shown.
-        app.reselect(Some(app.trees[0].path.clone()));
-        press(&mut app, KeyCode::Char(']'));
-        // A key that acts on this workspace's trees does nothing here: not
-        // its diff, nor renaming its branch.
-        for key in ['D', 'b'] {
-            assert_eq!(press(&mut app, KeyCode::Char(key)), Outcome::Continue);
-        }
-        assert!(app.view.is_none() && app.prompt.is_none() && app.pending.is_none());
-        assert!(matches!(
-            press(&mut app, KeyCode::Char('n')),
-            Outcome::SwitchTo { checkout, kind: None, .. } if checkout == std::path::Path::new("/code/zeta")
-        ));
-        assert_eq!(app.viewing, None);
-        // Esc comes back; so does leaving [2] for another panel.
-        press(&mut app, KeyCode::Char(']'));
-        press(&mut app, KeyCode::Esc);
-        assert_eq!(app.viewing, None);
-        press(&mut app, KeyCode::Char(']'));
-        press(&mut app, KeyCode::Char('3'));
-        assert_eq!(app.viewing, None, "no other panel shows another workspace");
-        // A screen too small for the panels keeps the table's keys.
-        app.panel = Panel::Trees;
-        app.show_panels(false);
-        press(&mut app, KeyCode::Char(']'));
-        assert_eq!(app.viewing, None);
-    }
-
-    #[test]
-    fn another_workspaces_tab_will_not_switch_while_an_action_runs_here() {
-        let mut app = with_workspaces();
-        app.reselect(Some(app.trees[0].path.clone()));
-        press(&mut app, KeyCode::Char('r'));
-        press(&mut app, KeyCode::Char('y'));
-        assert!(app.active_jobs() > 0, "a return runs");
-        press(&mut app, KeyCode::Char(']'));
-        assert_eq!(press(&mut app, KeyCode::Enter), Outcome::Continue);
-        assert!(
-            app.message
-                .as_deref()
-                .unwrap_or_default()
-                .contains("still running here"),
-            "{:?}",
-            app.message
-        );
-        assert!(app.viewing.is_some(), "the tab stays shown");
-    }
-
-    #[test]
     fn a_digit_typed_into_a_prompt_never_answers_the_windows_dialog() {
         let mut app = with_workspaces();
         app.reselect(Some(app.trees[0].path.clone()));
@@ -7133,19 +6900,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_palette_stays_shut_on_another_workspaces_tab_whose_trees_it_does_not_list() {
-        let mut app = crate::inbox::tests::with_workspaces();
-        let palette = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
-        press(&mut app, KeyCode::Char(']'));
-        assert!(app.viewing.is_some());
-        app.handle_key(palette);
-        assert!(app.palette.is_none());
-        press(&mut app, KeyCode::Esc);
-        app.handle_key(palette);
-        assert!(app.palette.is_some(), "back here it opens");
-    }
-
-    #[test]
     fn the_next_key_clears_a_message_in_every_panel_the_window_and_on_plan() {
         for key in ['1', '2', '3', '4', '0', 'j', 'k', ']'] {
             for panel in Panel::ALL {
@@ -7219,16 +6973,6 @@ pub(crate) mod tests {
         app.is_draft_shown = true;
         app.typed_in_window(key(KeyCode::Enter));
         assert!(!asks(&app));
-    }
-
-    #[test]
-    fn an_ask_waits_to_open_until_another_workspaces_tab_is_left() {
-        let mut app = crate::inbox::tests::with_workspaces();
-        app.is_agents_read = true;
-        app.viewing = Some("/code/api".into());
-        assert_eq!(app.next_ask(), None, "only looking at api");
-        app.viewing = None;
-        assert!(app.next_ask().is_some(), "back here, it opens");
     }
 
     #[test]
@@ -7385,8 +7129,7 @@ pub(crate) mod tests {
     fn the_cursor_put_on_a_tree_follows_it_into_parked_as_records_are_read() {
         let mut app = crate::inbox::tests::with_workspaces();
         let path = app.trees[0].path.clone();
-        app.arriving = Some((path.clone(), None));
-        app.arrival();
+        app.reveal(path.clone());
         let parked = Sidecar {
             parked: true,
             ..Sidecar::leased_now()
@@ -7740,53 +7483,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_cursor_on_another_workspaces_tab_stays_on_its_tree_as_the_pool_changes() {
-        use crate::inbox::tests::tree;
-        let mut app = crate::inbox::tests::with_workspaces();
-        let held = |n: &str| Tree {
-            leased_at: Some("2026-01-01T09:00:00-05:00".into()),
-            ..tree(
-                &format!("/code/zeta-trees/{n}"),
-                n,
-                &format!("work-{n}"),
-                Vec::new(),
-            )
-        };
-        let zeta = PathBuf::from("/code/zeta");
-        app.away_live
-            .insert(zeta.clone(), vec![held("1"), held("2"), held("3")]);
-        app.viewing = Some(zeta.clone());
-        let at = |app: &App| {
-            app.viewed_trees()
-                .and_then(|t| t.get(app.viewed).map(|t| t.name.clone()))
-        };
-        press(&mut app, KeyCode::Char('j'));
-        let on = at(&app);
-        assert!(on.is_some());
-        // The one above it is returned.
-        let first = app.viewed_trees().unwrap()[0].name.clone();
-        let rest = ["1", "2", "3"]
-            .iter()
-            .filter(|n| **n != first)
-            .map(|n| held(n));
-        app.away_live.insert(zeta, rest.collect());
-        app.hold_cursors();
-        assert_eq!(at(&app), on);
-    }
-
-    #[test]
     fn an_ask_waits_until_a_key_once_you_have_been_taken_to_another_tree() {
-        for kind in [None, Some(crate::inbox::Kind::Failed)] {
-            let mut app = crate::inbox::tests::with_workspaces();
-            app.is_agents_read = true;
-            app.arriving = Some((app.trees[1].path.clone(), kind));
-            assert_eq!(app.next_ask(), None, "still on the way");
-            app.arrival();
-            assert_eq!(app.next_ask(), None, "landed on what was picked");
-            assert_eq!(app.current().map(|t| t.name.as_str()), Some("2"));
-            press(&mut app, KeyCode::Char('j'));
-            assert!(app.next_ask().is_some(), "moved on, it opens");
-        }
+        let mut app = crate::inbox::tests::with_workspaces();
+        app.is_agents_read = true;
+        app.arriving = Some((app.trees[1].path.clone(), crate::inbox::Kind::Failed));
+        assert_eq!(app.next_ask(), None, "still on the way");
+        app.arrival();
+        assert_eq!(app.next_ask(), None, "landed on what was picked");
+        assert_eq!(app.current().map(|t| t.name.as_str()), Some("2"));
+        press(&mut app, KeyCode::Char('j'));
+        assert!(app.next_ask().is_some(), "moved on, it opens");
     }
 
     #[test]
@@ -8044,15 +7750,16 @@ pub(crate) mod tests {
         app.trees = trees;
         app.is_loaded = true;
         let unread = order(&app);
-        let waits = Some(crate::inbox::Kind::NeedsYou);
+        let waits = crate::inbox::Kind::NeedsYou;
         app.arriving = Some((format!("/pool/{}/app", unread[1]).into(), waits));
         assert_eq!(app.arrival(), None, "no agent is read, so nothing opens");
         assert_eq!(on(&app), Some(unread[1].clone()), "before any read");
         app.reselect(Some(format!("/pool/{}/app", unread[2]).into()));
         app.arrival();
         assert_eq!(on(&app), Some(unread[2].clone()), "moved since, left there");
-        app.arriving = Some((format!("/pool/{}/app", unread[0]).into(), None));
-        assert_eq!(app.arrival(), None, "only looked at, so nothing opens");
+        app.is_cursor_held = false;
+        app.arriving = Some((format!("/pool/{}/app", unread[0]).into(), waits));
+        assert_eq!(app.arrival(), None);
         assert_eq!(on(&app), Some(unread[0].clone()));
         // The last one's agent waits on you, so it sorts first.
         let last = PathBuf::from(format!("/pool/{}/app", unread[2]));
@@ -8077,7 +7784,8 @@ pub(crate) mod tests {
             .collect();
         app.is_loaded = true;
         app.is_agents_read = true;
-        app.arriving = Some((format!("/pool/{}/app", unread[0]).into(), None));
+        let merged = crate::inbox::Kind::Merged;
+        app.arriving = Some((format!("/pool/{}/app", unread[0]).into(), merged));
         app.arrival();
         let mut ship = crate::inbox::tests::app().trees[2].ship.clone().unwrap();
         ship.branch = format!("work-{}", unread[2]);
@@ -8139,23 +7847,6 @@ pub(crate) mod tests {
         app.reselect(Some(app.trees[0].path.clone()));
         app.is_window_focused = true;
         assert_eq!(press(&mut app, KeyCode::Char('I')), Outcome::Plan);
-    }
-
-    #[test]
-    fn an_answered_ask_leaves_its_workspaces_tab_count_with_its_row() {
-        let mut app = crate::inbox::tests::with_workspaces();
-        let count = |app: &App| {
-            app.workspace_tabs()
-                .iter()
-                .find(|t| t.checkout == app.checkout)
-                .map(|t| t.waiting)
-        };
-        let before = count(&app).unwrap();
-        app.reselect(Some(app.trees[0].path.clone()));
-        app.is_window_focused = true;
-        app.dialog = Some(vec!["Left".into(), "Right".into()]);
-        assert_eq!(press(&mut app, KeyCode::Char('1')), Outcome::Answer('1'));
-        assert_eq!(count(&app), Some(before - 1));
     }
 
     #[test]
@@ -10369,7 +10060,7 @@ pub(crate) mod tests {
         Choice {
             checkout: PathBuf::from(path),
             name: crate::workspaces::name(std::path::Path::new(path)),
-            held,
+            trees: held.map(|held| (held, 1)),
         }
     }
 
@@ -10420,6 +10111,90 @@ pub(crate) mod tests {
             Outcome::Switch(PathBuf::from("/home/me/lander"))
         );
         assert!(app.picker.is_none());
+    }
+
+    #[test]
+    fn slash_narrows_the_picker_by_name_and_enter_switches_to_the_one_left() {
+        let mut app = app_with_main();
+        app.checkout = PathBuf::from("/repo");
+        let names = |app: &App| -> Vec<String> {
+            let picker = app.picker.as_ref().unwrap();
+            picker.shown().iter().map(|c| c.name.clone()).collect()
+        };
+        app.open_picker(vec![
+            choice("/repo", None),
+            choice("/home/me/harness", None),
+            choice("/home/me/Lander", None),
+        ]);
+        press(&mut app, KeyCode::Char('/'));
+        // Its keys are typed now, `j`, `q` and `w` among them.
+        for c in "jqw".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(names(&app), [""; 0]);
+        // Nor with Ctrl, which a terminal may send for Backspace or Enter.
+        for c in "whlj".chars() {
+            let ctrl = KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+            assert_eq!(app.handle_key(ctrl), Outcome::Continue);
+            assert_eq!(app.picker.as_ref().unwrap().query.as_deref(), Some("jqw"));
+        }
+        assert_eq!(press(&mut app, KeyCode::Enter), Outcome::Continue);
+        assert!(app.picker.is_some(), "nothing to switch to");
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        press(&mut app, KeyCode::Char('l'));
+        assert_eq!(names(&app), ["Lander"], "whatever its case");
+        // Esc widens it, the cursor never on the one you are in.
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(names(&app).len(), 3);
+        let at = |app: &App| app.picker.as_ref().unwrap().selected;
+        assert_eq!(at(&app), 1);
+        press(&mut app, KeyCode::Char('/'));
+        assert_eq!(at(&app), 1);
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(names(&app), ["harness", "Lander"]);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Outcome::Switch(PathBuf::from("/home/me/Lander"))
+        );
+    }
+
+    #[test]
+    fn w_lists_the_workspaces_from_every_panel_and_from_plan_which_takes_the_keys() {
+        let mut app = crate::inbox::tests::with_workspaces();
+        app.checkout = PathBuf::from("/repo");
+        for panel in Panel::ALL {
+            app.panel = panel;
+            assert_eq!(press(&mut app, KeyCode::Char('w')), Outcome::Workspaces);
+        }
+        app.is_plan = true;
+        for is_window_focused in [false, true] {
+            app.is_window_focused = is_window_focused;
+            assert_eq!(press(&mut app, KeyCode::Char('w')), Outcome::Workspaces);
+        }
+        app.open_picker(vec![choice("/repo", None), choice("/home/me/lander", None)]);
+        press(&mut app, KeyCode::Char('k'));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Outcome::Switch(PathBuf::from("/home/me/lander"))
+        );
+    }
+
+    #[test]
+    fn brackets_step_the_windows_tabs_from_every_panel() {
+        for panel in Panel::ALL {
+            let mut app = crate::inbox::tests::with_workspaces();
+            app.reselect(Some(app.trees[0].path.clone()));
+            app.panel = panel;
+            let before = app.shown_tab();
+            press(&mut app, KeyCode::Char(']'));
+            assert_ne!(app.shown_tab(), before, "{panel:?}");
+            press(&mut app, KeyCode::Char('['));
+            assert_eq!(app.shown_tab(), before, "{panel:?}");
+        }
     }
 
     #[test]

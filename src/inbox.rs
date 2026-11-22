@@ -979,13 +979,13 @@ pub mod tests {
             Outcome::SwitchTo {
                 checkout: "/code/endodeals-web".into(),
                 tree: "/other/12/web".into(),
-                kind: Some(Kind::NeedsYou),
+                kind: Kind::NeedsYou,
             }
         );
 
         // The pool of endodeals-web, as the switch opens it.
         let mut there = App::new(None);
-        there.arriving = Some(("/other/12/web".into(), Some(Kind::NeedsYou)));
+        there.arriving = Some(("/other/12/web".into(), Kind::NeedsYou));
         there.trees = vec![tree(
             "/other/12/web",
             "12",
@@ -1101,7 +1101,7 @@ pub mod tests {
                 matches!(
                     o,
                     Outcome::SwitchTo {
-                        kind: Some(Kind::Failed),
+                        kind: Kind::Failed,
                         ..
                     }
                 )
@@ -1109,7 +1109,7 @@ pub mod tests {
             Outcome::SwitchTo {
                 checkout: "/code/endodeals-web".into(),
                 tree: "/other/7/web".into(),
-                kind: Some(Kind::Failed),
+                kind: Kind::Failed,
             }
         );
 
@@ -1117,7 +1117,7 @@ pub mod tests {
         let mut there = App::new(None);
         there.trees = vec![tree("/other/7/web", "7", "me/END-91-fix-login", Vec::new())];
         there.is_agents_read = true;
-        there.arriving = Some(("/other/7/web".into(), Some(Kind::Failed)));
+        there.arriving = Some(("/other/7/web".into(), Kind::Failed));
         assert_eq!(there.arrival(), None, "no chat opens for a PR");
         assert_eq!(there.current().map(|t| t.name.as_str()), Some("7"));
         assert!(
@@ -1159,7 +1159,7 @@ pub mod tests {
             there.is_in_tmux = is_in_tmux;
             there.trees = vec![tree("/other/5/web", "5", "me/seo-meta", vec![pane.clone()])];
             there.is_agents_read = true;
-            there.arriving = Some(("/other/5/web".into(), Some(Kind::NeedsYou)));
+            there.arriving = Some(("/other/5/web".into(), Kind::NeedsYou));
             (there.arrival(), there.message)
         };
         assert!(matches!(arrive(true).0, Some(Outcome::Enter(t)) if t.name == "5"));
