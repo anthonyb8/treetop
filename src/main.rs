@@ -51,6 +51,7 @@ mod syntax;
 mod theme;
 mod tickets;
 mod tmux;
+mod tree_issues;
 mod ui;
 mod update;
 mod watch;
@@ -377,12 +378,22 @@ fn choices() -> Vec<Choice> {
         .collect()
 }
 
+/// A read of the trees' issues: all of them, or one's text and comments.
+enum IssueRead {
+    All(tree_issues::Read),
+    One(
+        tree_issues::Key,
+        std::result::Result<Box<linear::Detail>, String>,
+    ),
+}
+
 fn run(
     term: &mut Term,
     app: &mut App,
     checkout: &Path,
     desktop: &mut notify::Desktop,
     chats: &mut Chats,
+    editor: &mut tree_issues::Editor,
 ) -> Result<Exit> {
     let refresher = Refresher::spawn(checkout.to_path_buf(), app.trees.clone());
     let worker = Worker::spawn();
@@ -397,6 +408,8 @@ fn run(
     // read is a few `gh` calls and the popup stays live meanwhile.
     let (prs_done, prs) = std::sync::mpsc::channel();
     // The Issues screen, made the first time it is shown.
+    app.tree_issues.own = tickets::own_team(checkout);
+    let (issue_reads_done, issue_reads) = std::sync::mpsc::channel();
     let mut issues: Option<issues::Screen> = None;
     let mut was_issues = false;
     // Drawn only when something changed, or every REDRAW: drawing the whole
@@ -564,6 +577,51 @@ fn run(
                 let _ = done.send((path, pr));
             });
             is_stale = true;
+        }
+        // The issues the trees work on, and the edits made to them here.
+        if was_issues && !app.is_issues {
+            app.tree_issues.read_again();
+        }
+        while let Ok(read) = issue_reads.try_recv() {
+            is_stale = true;
+            match read {
+                IssueRead::All(read) => app.tree_issues.apply(read),
+                IssueRead::One(key, read) => app.tree_issues.apply_detail(key, read),
+            }
+        }
+        while let Some(answered) = editor.answered() {
+            is_stale = true;
+            if answered.checkout == checkout {
+                app.edit_answered(answered.asked, answered.said);
+            } else if let Some(why) = answered.failed() {
+                app.message = Some(why);
+            }
+        }
+        if !chat_has_keys(chats, app)
+            && app.can_reopen_comment()
+            && let Some(refused) = editor.take_unposted(checkout)
+        {
+            app.reopen_comment(refused);
+            is_stale = true;
+        }
+        if let Some(wanted) = app.wanted_issues() {
+            let done = issue_reads_done.clone();
+            let here = checkout.to_path_buf();
+            std::thread::spawn(move || {
+                let at = Instant::now();
+                let read = tree_issues::read(wanted, at, |name| tickets::named(name, &here));
+                let _ = done.send(IssueRead::All(read));
+            });
+        }
+        if let Some(key) = app.wanted_detail() {
+            let done = issue_reads_done.clone();
+            let here = checkout.to_path_buf();
+            std::thread::spawn(move || {
+                let read = tickets::named(key.source.as_deref(), &here)
+                    .and_then(|backend| backend.detail(&key.id))
+                    .map(Box::new);
+                let _ = done.send(IssueRead::One(key, read));
+            });
         }
         if app.is_issues {
             match issues.as_mut() {
@@ -1326,6 +1384,7 @@ fn run(
                 tree,
                 kind,
             } => return Ok(Exit::Switch(checkout, Some((tree, kind)))),
+            Outcome::Edit(asked) => editor.send(checkout, asked),
             Outcome::Restart => return Ok(Exit::Restart),
             Outcome::Update => {
                 app.is_updating = true;
@@ -1478,6 +1537,7 @@ fn show(
     start: PathBuf,
     mut checkout: PathBuf,
     is_issues: bool,
+    editor: &mut tree_issues::Editor,
 ) -> Result<Option<PathBuf>> {
     let mut here = Some(start);
     // What waits, as the last workspace looked, so `e` keeps its place.
@@ -1537,7 +1597,7 @@ fn show(
             cached.insert(0, pool::main_tree(&checkout));
             app.set_cached(cached);
         }
-        let exit = run(term, &mut app, &checkout, &mut desktop, &mut chats);
+        let exit = run(term, &mut app, &checkout, &mut desktop, &mut chats, editor);
         desktop.switched();
         if matches!(exit, Ok(Exit::Switch(..))) {
             let left = workspaces::name(&checkout);
@@ -1632,8 +1692,19 @@ fn main() -> Result<()> {
     }));
 
     let mut term = enter_screen()?;
-    let result = show(&mut term, start, checkout, is_issues);
+    // Kept across a switch, so a change made just before one still goes, and
+    // waited for before quitting.
+    let mut editor = tree_issues::Editor::spawn(tickets::named);
+    let result = show(&mut term, start, checkout, is_issues, &mut editor);
     leave_screen()?;
+    for answered in editor.finish() {
+        if let Some(why) = answered.failed() {
+            eprintln!("treetop: {why}");
+        }
+        if let Some(text) = answered.unposted() {
+            eprintln!("{text}");
+        }
+    }
     match result? {
         Some(workspace) => restart(&workspace),
         None => Ok(()),

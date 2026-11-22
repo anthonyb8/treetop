@@ -1305,7 +1305,7 @@ fn fields(issue: &Issue, p: &Palette) -> Line<'static> {
 
 /// The picker in the middle of the screen: what is picked for which issue,
 /// the query, and the choices it keeps, the issue's own marked.
-fn draw_picker(frame: &mut Frame, area: Rect, picker: &Picker, p: &Palette) {
+pub fn draw_picker(frame: &mut Frame, area: Rect, picker: &Picker, p: &Palette) {
     let shown = picker.shown();
     let width = picker
         .choices

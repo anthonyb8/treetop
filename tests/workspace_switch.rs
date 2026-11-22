@@ -450,7 +450,8 @@ fn with_no_layout_set_treetop_opens_on_numbered_panels_and_number_keys_move_the_
         [
             "[1] Ship",
             "[2] Trees",
-            "[3] Keel",
+            "[3] Linear",
+            "[4] Keel",
             "[0] Tree 1 · here-work",
         ]
         .iter()
@@ -468,6 +469,99 @@ fn with_no_layout_set_treetop_opens_on_numbered_panels_and_number_keys_move_the_
     screen.press("2");
     screen.wait_for("panel 2 with the keys", |text| {
         bar(text).starts_with(" PANEL 2 ") && bar(text).contains("j/k move")
+    });
+    drop(screen);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// ANB-112: the Linear panel shows the issue of the tree under the cursor, and
+/// the next tree's as the cursor moves, with no Enter; Enter reads it in the
+/// window and Esc gives the keys back.
+#[test]
+fn the_linear_panel_follows_the_cursor_and_its_issue_is_read_in_the_window() {
+    let Workspaces {
+        root, mut screen, ..
+    } = two_workspaces_with("linear", "", |root| {
+        add_tree(root, "here", "2", Some("me/anb-91-second"));
+        add_tree(root, "here", "3", Some("here-third"));
+        // Linear as a ticket plugin, which can be read and not changed.
+        let plugins = root.join("config/treetop/plugins");
+        fs::create_dir_all(&plugins).unwrap();
+        write_script(
+            &plugins.join("tix"),
+            r#"read -r request
+case "$request" in
+*'"describe"'*) echo '{"ok":true,"result":{"protocol":1,"name":"tix","kind":"tickets","ops":["list","get"]}}' ;;
+*'"ANB-90"'*) echo '{"ok":true,"result":{"id":"ANB-90","title":"Show the rail","state":"In Progress","project":"Inbox","labels":["Bug"],"description":"Draw it as a rail."}}' ;;
+*'"ANB-91"'*) echo '{"ok":true,"result":{"id":"ANB-91","title":"Keep the rail","state":"Todo"}}' ;;
+*) echo '{"ok":true,"result":{"tickets":[]}}' ;;
+esac
+"#,
+        );
+        let here = root.join("here").canonicalize().unwrap();
+        fs::write(
+            root.join("config/treetop/config.toml"),
+            format!(
+                "[issues.tix]\nplugin = \"tix\"\nteam = \"ANB\"\n[repos.\"{}\"]\nissues = \"tix\"\n",
+                here.display()
+            ),
+        )
+        .unwrap();
+        // Tree 1 was picked up from an issue; tree 2's branch names one.
+        let git_dir = Command::new("git")
+            .args(["rev-parse", "--path-format=absolute", "--git-dir"])
+            .current_dir(root.join("here-trees/1"))
+            .output()
+            .unwrap();
+        let git_dir = PathBuf::from(String::from_utf8(git_dir.stdout).unwrap().trim());
+        fs::write(
+            git_dir.join("treetop.json"),
+            serde_json::json!({ "version": 1, "ticket": "ANB-90", "source": "tix", "leased_at": 1 })
+                .to_string(),
+        )
+        .unwrap();
+    });
+    let linear = |text: &str| -> String {
+        let rows = text.lines().skip_while(|l| !l.contains("[3] Linear"));
+        rows.take(7)
+            .map(|l| l.chars().take(72).collect::<String>() + "\n")
+            .collect()
+    };
+    let bar_is =
+        |mode: &'static str| move |text: &str| text.lines().last().unwrap_or("").starts_with(mode);
+    screen.wait_for("tree 1's issue", |text| {
+        let rows = linear(text);
+        rows.contains("[3] Linear · ANB-90 ")
+            && rows.contains("bug  Show the rail")
+            && rows.contains("In Progress")
+            && rows.contains("Inbox")
+    });
+    // Back and forth, each at once: no key but the cursor's.
+    for (tree, has) in [("2", "Keep the rail"), ("3", "no issue on this tree")] {
+        screen.press("j");
+        screen.wait_for(tree, |text| {
+            text.contains(&format!("[0] Tree {tree} ·")) && linear(text).contains(has)
+        });
+    }
+    screen.press("kk");
+    screen.press("3");
+    screen.press("\r");
+    screen.wait_for("it in the window, with the keys", |text| {
+        text.contains("ANB-90  Show the rail")
+            && text.contains("Draw it as a rail.")
+            && bar_is(" NORMAL ")(text)
+    });
+    screen.press("l");
+    screen.wait_for("its project", |text| {
+        text.contains("this source's plugin cannot read projects")
+    });
+    screen.press("\x1b");
+    screen.wait_for("the keys back on [3]", bar_is(" PANEL 3 "));
+    screen.press("s");
+    screen.wait_for("why not", |text| {
+        text.lines()
+            .last()
+            .is_some_and(|bar| bar.contains("can list and read issues, not change them"))
     });
     drop(screen);
     let _ = fs::remove_dir_all(&root);
@@ -498,14 +592,14 @@ fn the_keel_panel_follows_the_cursor_from_tree_to_tree() {
         write_script(&root.join("bin/keel"), &format!("echo '{runs}'\n"));
     });
     let keel = |text: &str| -> String {
-        let rows = text.lines().skip_while(|l| !l.contains("[3] Keel"));
+        let rows = text.lines().skip_while(|l| !l.contains("[4] Keel"));
         rows.map(|l| l.chars().take(72).collect::<String>() + "\n")
             .collect()
     };
     screen.wait_for("tree 1's run", |text| {
         let rows = keel(text);
         text.contains("[0] Tree 1 · here-work")
-            && rows.contains("[3] Keel · tree 1 ")
+            && rows.contains("[4] Keel · tree 1 ")
             && rows.contains("issue █████▓░░░░░░░░ 5 of 11 !1 flagged")
             && rows.contains("✓ 4  Step number 4")
             && rows.contains("▸ 5  Step number 5")
@@ -513,10 +607,10 @@ fn the_keel_panel_follows_the_cursor_from_tree_to_tree() {
     screen.press("j");
     screen.wait_for("tree 2, with none", |text| {
         let rows = keel(text);
-        rows.contains("[3] Keel · tree 2 ") && rows.contains("no keel run in this tree")
+        rows.contains("[4] Keel · tree 2 ") && rows.contains("no keel run in this tree")
     });
     screen.press("k");
-    screen.press("3");
+    screen.press("4");
     // Enter is taken after the rest, so what they did shows by then.
     for key in ["r", "F", "x", "\r"] {
         screen.press(key);
@@ -1212,7 +1306,7 @@ fn the_palettes_rename_is_of_the_tree_it_names_from_any_panel() {
     });
     let bar_is =
         |mode: String| move |text: &str| text.lines().last().unwrap_or("").starts_with(&mode);
-    for panel in ["3", "1", "2"] {
+    for panel in ["4", "3", "1", "2"] {
         screen.press(panel);
         screen.press("\x10");
         screen.wait_for("the palette", |text| {
