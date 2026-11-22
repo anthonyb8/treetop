@@ -1098,3 +1098,28 @@ esac
     drop(screen);
     let _ = fs::remove_dir_all(&root);
 }
+
+/// ANB-102: the next key clears what the bar says, so it shows the keys of
+/// what has them again, on Trees and on Plan.
+#[test]
+fn a_message_on_the_bar_gives_way_to_the_keys_at_the_next_one() {
+    let Workspaces {
+        root, mut screen, ..
+    } = two_workspaces("message", "");
+    let bar_has =
+        |what: &'static str| move |text: &str| text.lines().last().unwrap_or("").contains(what);
+    screen.wait_for("the panels", |text| text.contains("[2] Trees"));
+    // Tree 1 has no PR whose failure F could send.
+    screen.press("F");
+    screen.wait_for("why not", bar_has("nothing has failed on tree 1's PR"));
+    screen.press("1");
+    screen.wait_for("[1]'s keys", bar_has("Enter open it"));
+    screen.press("\t");
+    screen.wait_for("Plan", bar_has("new chat"));
+    screen.press("D");
+    screen.wait_for("why not", bar_has("no planning chat yet"));
+    screen.press("j");
+    screen.wait_for("Plan's keys", bar_has("draft issues"));
+    drop(screen);
+    let _ = fs::remove_dir_all(&root);
+}

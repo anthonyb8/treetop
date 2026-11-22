@@ -47,6 +47,26 @@ fn id_before(text: &str) -> Option<String> {
     (is_team && is_number).then(|| id.to_string())
 }
 
+/// `command` runs `keel linear create`, rather than naming it in what it
+/// searches for or prints.
+fn runs_create(command: &str) -> bool {
+    const NAMES_IT: [&str; 9] = [
+        "grep", "rg", "ag", "echo", "printf", "cat", "sed", "awk", "which",
+    ];
+    command.split(['\n', ';', '&', '|', '(', '`']).any(|part| {
+        let Some(at) = part.find("keel linear create") else {
+            return false;
+        };
+        let before = &part[..at];
+        let is_word = before
+            .chars()
+            .next_back()
+            .is_none_or(|c| c.is_whitespace() || c == '/');
+        let first = before.split_whitespace().next().unwrap_or_default();
+        is_word && !before.contains(['\'', '"']) && !NAMES_IT.contains(&first)
+    })
+}
+
 /// Reads each transcript on from where it last stopped, so a long chat is
 /// read once, not again every look.
 #[derive(Default)]
@@ -100,9 +120,7 @@ impl Reader {
                 .and_then(Value::as_array)
                 .map_or(&[][..], Vec::as_slice);
             for item in items {
-                let is_create = item["input"]["command"]
-                    .as_str()
-                    .is_some_and(|c| c.contains("keel linear create"));
+                let is_create = item["input"]["command"].as_str().is_some_and(runs_create);
                 let answers_create = item["tool_use_id"]
                     .as_str()
                     .is_some_and(|id| read.creates.contains(id));
@@ -360,13 +378,37 @@ mod tests {
         let path = scratch("quoted");
         let mut text = call("t1", "cat src/planned.rs", MADE);
         text += &call("t2", "keel linear get ANB-9", MADE);
+        for (n, command) in [
+            "grep 'keel linear create' notes",
+            "rg -n keel linear create notes",
+            "echo keel linear create; cat notes",
+        ]
+        .iter()
+        .enumerate()
+        {
+            text += &call(&format!("q{n}"), command, MADE);
+        }
         text += &call(
             "t3",
             "cd /code/here && keel linear create --title x --body f",
             &MADE.replace("101", "205"),
         );
+        for (n, command) in [
+            "for f in a b; do keel linear create --body $f; done",
+            "id=$(keel linear create --title x)",
+            "KEEL=1 ~/bin/keel linear create --title x | tee log",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let made = MADE.replace("101", &format!("30{n}"));
+            text += &call(&format!("m{n}"), command, &made);
+        }
         std::fs::write(&path, text).unwrap();
-        assert_eq!(Reader::default().new_ids(&path), ["ANB-205"]);
+        assert_eq!(
+            Reader::default().new_ids(&path),
+            ["ANB-205", "ANB-300", "ANB-301", "ANB-302"]
+        );
         let _ = std::fs::remove_file(&path);
     }
 

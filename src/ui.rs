@@ -310,6 +310,12 @@ pub fn draw(
                         panel.number(),
                         panel.title()
                     ))];
+                    if let (Panel::Ship, Some(checkout)) = (panel, &app.viewing) {
+                        title.push(Span::styled(
+                            format!("· {} ", crate::workspaces::name(checkout)),
+                            fg(theme().special),
+                        ));
+                    }
                     if panel == Panel::Trees {
                         // What the title and the corners leave.
                         let room = usize::from(area.width).saturating_sub(14);
@@ -708,13 +714,17 @@ fn summary(app: &App, is_compact: bool) -> Vec<Span<'static>> {
             let noun = if agents == 1 { "agent" } else { "agents" };
             spans.push(Span::raw(format!("  {agents} {noun}")));
         }
-        if waiting > 0 {
+        // The panels' [1] Waiting and top row say who waits.
+        let is_said = app.shows_panels();
+        if waiting > 0 && !is_said {
             spans.push(Span::styled(
                 format!("  {waiting} waiting"),
                 fg(t.warning).add_modifier(Modifier::BOLD),
             ));
         }
-        if let n @ 1.. = app.needing_you() {
+        if let n @ 1.. = app.needing_you()
+            && !is_said
+        {
             spans.push(Span::styled(
                 format!("  {n} need you"),
                 fg(t.danger).add_modifier(Modifier::BOLD),
@@ -1220,11 +1230,15 @@ fn ship_key(stage: Stage) -> Option<(&'static str, &'static str)> {
     }
 }
 
-/// [3] Ship: this workspace's PRs, each its tree, branch, the plugin's
+/// [3] Ship: the PRs of the workspace [2]'s tab shows, each its tree, branch, the plugin's
 /// label in the stage's colour, and the key that moves it on.
 fn draw_ship(frame: &mut Frame, app: &App, area: Rect, has_keys: bool) {
     let t = theme();
-    let rows = app.ship_rows();
+    let viewed = app.viewed_trees();
+    let rows = match viewed {
+        Some(trees) => App::with_prs(trees.into_iter()),
+        None => app.ship_rows(),
+    };
     if rows.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::styled(" no PRs here yet", fg(t.muted))),
@@ -1232,6 +1246,12 @@ fn draw_ship(frame: &mut Frame, app: &App, area: Rect, has_keys: bool) {
         );
         return;
     }
+    // Each label whole where the branch still has half the row.
+    let label = widest(
+        rows.iter()
+            .filter_map(|t| Some(t.ship.as_ref()?.label.as_str())),
+    )
+    .clamp(8, usize::from(area.width / 2).saturating_sub(9).max(8));
     let lines: Vec<Row> = rows
         .iter()
         .filter_map(|tree| {
@@ -1246,7 +1266,7 @@ fn draw_ship(frame: &mut Frame, app: &App, area: Rect, has_keys: bool) {
             Some(Row::new(vec![
                 Cell::from(tree.name.clone()).style(fg(t.muted)),
                 Cell::from(tree.branch.clone().unwrap_or_default()),
-                pr_cell(tree),
+                Cell::from(fit(&ship.label, label)).style(stage_style(ship.stage)),
                 Cell::from(key),
             ]))
         })
@@ -1254,7 +1274,7 @@ fn draw_ship(frame: &mut Frame, app: &App, area: Rect, has_keys: bool) {
     let widths = [
         Constraint::Length(3),
         Constraint::Fill(1),
-        Constraint::Length(14),
+        Constraint::Length(u16::try_from(label).unwrap_or(u16::MAX)),
         Constraint::Length(9),
     ];
     let table = Table::new(lines, widths).row_highlight_style(t.cursor);
@@ -1924,6 +1944,25 @@ fn badge(app: &App, is_panels: bool) -> String {
     }
 }
 
+/// The keys of a window asking a question, for the bar: the numbers of its
+/// choices.
+fn answer_keys(app: &App) -> &'static [(&'static str, &'static str)] {
+    const REST: [(&str, &str); 2] = [("i", "type"), ("Esc", "back")];
+    const KEYS: [[(&str, &str); 3]; 9] = {
+        let numbers = ["1", "1-2", "1-3", "1-4", "1-5", "1-6", "1-7", "1-8", "1-9"];
+        let mut keys = [[("", "answer"), REST[0], REST[1]]; 9];
+        let mut at = 0;
+        while at < 9 {
+            keys[at][0].0 = numbers[at];
+            at += 1;
+        }
+        keys
+    };
+    static ANSWERS: [[(&str, &str); 3]; 9] = KEYS;
+    let choices = app.dialog.as_ref().map_or(1, Vec::len);
+    &ANSWERS[choices.clamp(1, 9) - 1]
+}
+
 /// The keys of what has them in the panels layout, for the bar: the
 /// window's, [2] Trees', and only the panel keys for the panels still
 /// empty.
@@ -1933,7 +1972,7 @@ fn panel_keys(app: &App) -> &'static [(&'static str, &'static str)] {
         return &[("Ctrl+Q", "normal")];
     }
     if app.is_window_focused && app.dialog.is_some() {
-        return &[("1-9", "answer"), ("i", "type"), ("Esc", "back")];
+        return answer_keys(app);
     }
     if app.is_plan && app.is_window_focused {
         return &[
@@ -2469,12 +2508,25 @@ fn draw_ready(frame: &mut Frame, app: &App, area: Rect, keys: Option<Mode>) {
         return;
     }
     let id_width = widest(ready.iter().map(|i| i.id.as_str()));
+    let from = |id: &str| {
+        app.planned_in(id)
+            .map(|chat| format!("from {}", chat.name))
+            .unwrap_or_default()
+    };
+    let froms: Vec<String> = ready.iter().map(|i| from(&i.id)).collect();
+    let room = usize::from(body.width)
+        .saturating_sub(1 + id_width + 2 + 2 + widest(froms.iter().map(String::as_str)));
+    let title_width = widest(ready.iter().map(|i| i.title.as_str())).min(room);
     let rows = ready
         .iter()
-        .map(|issue| {
+        .zip(&froms)
+        .map(|(issue, from)| {
+            let title = fit(&issue.title, title_width);
+            let pad = " ".repeat(title_width.saturating_sub(Span::raw(title.as_str()).width()));
             ListItem::new(Line::from(vec![
                 Span::styled(format!(" {:<id_width$}  ", issue.id), fg(t.muted)),
-                Span::raw(issue.title.clone()),
+                Span::raw(format!("{title}{pad}  ")),
+                Span::styled(from.clone(), fg(t.muted)),
             ]))
         })
         .collect();
@@ -9522,6 +9574,67 @@ mod panels_tests {
         assert!(
             top.contains("api ▲1") && top.trim_end().ends_with('…'),
             "{top}"
+        );
+    }
+
+    #[test]
+    fn ship_shows_a_label_whole_and_the_prs_of_the_workspace_looked_at() {
+        let mut app = with_workspaces();
+        let mut ship = app.trees[2].ship.clone().unwrap();
+        ship.label = "#66 checks 19/24".into();
+        app.trees[2].ship = Some(ship.clone());
+        let rows = panel_rows(&screen(&app, 160, 46), "[3] Ship").join("\n");
+        assert!(rows.contains("#66 checks 19/24"), "{rows}");
+        // A long one is cut where it says so.
+        ship.label = "#66 a label too long for any panel's row".into();
+        app.trees[2].ship = Some(ship.clone());
+        let rows = panel_rows(&screen(&app, 160, 46), "[3] Ship").join("\n");
+        assert!(rows.contains("#66 a label") && rows.contains('…'), "{rows}");
+        // Looking at another workspace, its PRs, named in the title.
+        let api = PathBuf::from("/code/api");
+        let mut tree = app
+            .pools
+            .iter()
+            .find(|p| p.away.checkout == api)
+            .unwrap()
+            .trees[0]
+            .clone();
+        ship.label = "#7 api's".into();
+        tree.ship = Some(ship);
+        app.away_live.insert(api.clone(), vec![tree]);
+        app.viewing = Some(api);
+        let shown = screen(&app, 160, 46);
+        let rows = panel_rows(&shown, "[3] Ship").join("\n");
+        assert!(rows.contains("#7 api's") && !rows.contains("#66"), "{rows}");
+        assert!(
+            shown.join("\n").contains("[3] Ship · api"),
+            "{}",
+            shown.join("\n")
+        );
+    }
+
+    #[test]
+    fn the_bar_counts_nobody_the_waiting_panel_does_not() {
+        let mut app = panels();
+        app.trees[0].agents[0].status = Some(Status::Waiting);
+        let bar = screen(&app, 220, 46).pop().unwrap();
+        assert!(
+            !bar.contains("1 waiting") && !bar.contains("  2 need you"),
+            "{bar}"
+        );
+        app.look = Look::Table;
+        app.show_panels(false);
+        let bar = screen(&app, 220, 46).pop().unwrap();
+        assert!(bar.contains("1 waiting  2 need you"), "{bar}");
+    }
+
+    #[test]
+    fn a_ready_issue_names_the_chat_it_came_from() {
+        let app = with_issues(1, Some(Ok(vec![to_do(100)])));
+        let rows = panel_rows(&screen(&app, 160, 46), "[3] Ready");
+        assert!(
+            rows[0].contains("title 100") && rows[0].contains("from plan 1"),
+            "{rows:?}"
         );
     }
 

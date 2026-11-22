@@ -1261,7 +1261,7 @@ impl App {
     /// opens for it if folded, since its trees are worked on; Parked alone
     /// stays folded, its trees out of sight.
     fn toggle_shelf(&mut self, shelf: Shelf) -> Outcome {
-        if !self.marked.is_empty() {
+        if self.shows_panels() && !self.marked.is_empty() {
             return self.shelve_marked(shelf);
         }
         let Some(tree) = self.current() else {
@@ -1784,7 +1784,7 @@ impl App {
     }
 
     /// The window in Normal with a question dialog on screen in its chat:
-    /// a number among its choices answers it, pressed in the chat, and what
+    /// a number past its choices does nothing, and one among them answers it, pressed in the chat, and what
     /// waited on you there is put away at once rather than at the next
     /// read. None for any other key, or with no dialog; the number keys
     /// then give the panels the keys.
@@ -1794,13 +1794,12 @@ impl App {
         };
         let choices = self.dialog.as_ref()?;
         let n = usize::from(c as u8 - b'0');
-        if !self.shows_panels()
-            || !self.is_window_focused
-            || !is_plain(key)
-            || n > choices.len()
-            || self.is_typing()
-        {
+        if !self.shows_panels() || !self.is_window_focused || !is_plain(key) || self.is_typing() {
             return None;
+        }
+        // No such choice: the keys stay on the question.
+        if n > choices.len() {
+            return Some(Outcome::Continue);
         }
         if let Some(path) = self
             .window_tree()
@@ -1816,6 +1815,9 @@ impl App {
     /// on something said, or an answer to its dialog, takes the agent's ask
     /// off what waits at once, as a number key's answer does.
     pub fn typed_in_window(&mut self, key: KeyEvent) {
+        if self.shows_panels() {
+            self.message = None;
+        }
         let answers = match key.code {
             KeyCode::Enter if key.modifiers.is_empty() => {
                 std::mem::take(&mut self.has_typed) || self.dialog.is_some()
@@ -2338,8 +2340,12 @@ impl App {
     /// The PRs [3] Ship lists: this workspace's trees whose ship plugin
     /// has something to say.
     pub fn ship_rows(&self) -> Vec<&Tree> {
-        self.trees
-            .iter()
+        Self::with_prs(self.trees.iter())
+    }
+
+    /// The trees of `trees` with a PR under way.
+    pub fn with_prs<'a>(trees: impl Iterator<Item = &'a Tree>) -> Vec<&'a Tree> {
+        trees
             .filter(|t| {
                 t.ship
                     .as_ref()
@@ -5687,6 +5693,11 @@ impl App {
         if self.palette.is_some() {
             return self.handle_palette_key(key);
         }
+        // In the panels layout any key moves on from what the bar says, so
+        // it shows the keys of what has them again.
+        if (self.shows_panels() || self.is_plan) && !self.is_typing() && !self.is_quitting {
+            self.message = None;
+        }
         if let Some(outcome) = self.answer_by_number(key) {
             return outcome;
         }
@@ -6252,7 +6263,8 @@ pub(crate) mod tests {
         assert!(asks(&app));
         assert_eq!(press(&mut app, KeyCode::Char('2')), Outcome::Answer('2'));
         assert!(!asks(&app), "answered, it waits on you no more");
-        // Past its choices the number keys give the panels the keys again.
+        // Its question gone, the number keys give the panels the keys again.
+        app.dialog = None;
         assert_eq!(press(&mut app, KeyCode::Char('3')), Outcome::Continue);
         assert_eq!((app.panel, app.is_window_focused), (Panel::Ship, false));
         // The table layout has no number keys for it.
@@ -6319,6 +6331,8 @@ pub(crate) mod tests {
     #[test]
     fn marked_trees_are_shelved_together_and_come_back_together() {
         let mut app = crate::inbox::tests::app();
+        app.look = crate::config::Look::Panels;
+        app.show_panels(true);
         let two: Vec<PathBuf> = app.trees[..2].iter().map(|t| t.path.clone()).collect();
         let shelve = |app: &mut App| {
             app.marked.extend(two.iter().cloned());
@@ -6659,6 +6673,61 @@ pub(crate) mod tests {
         press(&mut app, KeyCode::Esc);
         app.handle_key(palette);
         assert!(app.palette.is_some(), "back here it opens");
+    }
+
+    #[test]
+    fn the_next_key_clears_a_message_in_every_panel_the_window_and_on_plan() {
+        for key in ['1', '2', '3', '4', '0', 'j', 'k', ']'] {
+            for panel in Panel::ALL {
+                let mut app = crate::inbox::tests::with_workspaces();
+                app.reselect(Some(app.trees[0].path.clone()));
+                app.panel = panel;
+                app.message = Some("stale".into());
+                press(&mut app, KeyCode::Char(key));
+                assert_ne!(app.message.as_deref(), Some("stale"), "{panel:?} {key}");
+            }
+        }
+        for key in ['1', '3', 'j', 'x'] {
+            for is_window_focused in [false, true] {
+                let mut app = with_made();
+                app.is_window_focused = is_window_focused;
+                app.message = Some("stale".into());
+                press(&mut app, KeyCode::Char(key));
+                assert_eq!(app.message, None, "on Plan {key}");
+            }
+        }
+        // Typing to a chat moves on from it too.
+        let mut app = crate::inbox::tests::with_workspaces();
+        app.reselect(Some(app.trees[0].path.clone()));
+        app.insert_in_window();
+        app.message = Some("stale".into());
+        app.typed_in_window(KeyEvent::from(KeyCode::Char('a')));
+        assert_eq!(app.message, None);
+    }
+
+    #[test]
+    fn a_digit_past_a_questions_choices_stays_with_it() {
+        let mut app = crate::inbox::tests::with_workspaces();
+        app.reselect(Some(app.trees[0].path.clone()));
+        app.is_window_focused = true;
+        app.dialog = Some(vec!["Left".into(), "Right".into()]);
+        assert_eq!(press(&mut app, KeyCode::Char('3')), Outcome::Continue);
+        assert!(app.is_window_focused, "the keys stay on the question");
+        assert_eq!(press(&mut app, KeyCode::Char('2')), Outcome::Answer('2'));
+    }
+
+    #[test]
+    fn in_the_table_layout_z_shelves_the_tree_under_the_cursor_whatever_is_marked() {
+        let mut app = crate::inbox::tests::app();
+        app.marked.insert(app.trees[1].path.clone());
+        app.reselect(Some(app.trees[0].path.clone()));
+        let Outcome::Record { path, .. } = press(&mut app, KeyCode::Char('z')) else {
+            panic!("z shelves one");
+        };
+        assert_eq!(path, app.trees[0].path);
+        // On a heading, with no tree under it, nothing.
+        app.selected = 0;
+        assert_eq!(press(&mut app, KeyCode::Char('z')), Outcome::Continue);
     }
 
     /// The PR answer for tree 7 of the inbox fixture, at `stage`.
