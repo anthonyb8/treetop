@@ -1208,3 +1208,31 @@ fn enter_on_another_workspaces_parked_tree_lands_on_it() {
     drop(screen);
     let _ = fs::remove_dir_all(&root);
 }
+
+/// ANB-108: a palette command is on the tree it names, whichever panel has
+/// the keys. A rename, since treetop returns no tree it was started in.
+#[test]
+fn the_palettes_rename_is_of_the_tree_it_names_from_any_panel() {
+    let Workspaces {
+        root, mut screen, ..
+    } = two_workspaces("palette", "");
+    screen.wait_for("tree 1 in the window", |text| {
+        text.contains("[0] Tree 1 · here-work")
+    });
+    let bar_is =
+        |mode: String| move |text: &str| text.lines().last().unwrap_or("").starts_with(&mode);
+    for panel in ["4", "3", "1"] {
+        screen.press(panel);
+        screen.press("\x10");
+        screen.wait_for("the palette", |text| {
+            text.contains("Rename the branch of tree 1")
+        });
+        screen.press("rename");
+        screen.press("\r");
+        screen.wait_for("the box to rename it", bar_is(" INSERT ".into()));
+        screen.press("\x1b");
+        screen.wait_for("the panel's keys again", bar_is(format!(" PANEL {panel} ")));
+    }
+    drop(screen);
+    let _ = fs::remove_dir_all(&root);
+}
