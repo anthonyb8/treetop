@@ -215,6 +215,12 @@ struct Workspaces {
 }
 
 fn two_workspaces(name: &str, config: &str) -> Workspaces {
+    two_workspaces_with(name, config, |_| {})
+}
+
+/// `two_workspaces`, once `prepare` has had its root, before treetop starts:
+/// a pool changed after that races treetop's own first listing of it.
+fn two_workspaces_with(name: &str, config: &str, prepare: impl FnOnce(&Path)) -> Workspaces {
     let root = std::env::temp_dir().join(format!("treetop-{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     let bin = root.join("bin");
@@ -271,6 +277,7 @@ fn two_workspaces(name: &str, config: &str) -> Workspaces {
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
     fs::create_dir_all(root.join("config/treetop")).unwrap();
     fs::write(root.join("config/treetop/config.toml"), config).unwrap();
+    prepare(&root);
     let screen = Screen::start(
         Command::new(env!("CARGO_BIN_EXE_treetop"))
             .current_dir(root.join("here-trees/1"))
@@ -1005,8 +1012,9 @@ fn add_tree(root: &Path, name: &str, number: &str, branch: Option<&str>) {
 fn enter_on_another_workspaces_tree_lands_on_it() {
     let Workspaces {
         root, mut screen, ..
-    } = two_workspaces("land", "");
-    add_tree(&root, "there", "2", Some("there-second"));
+    } = two_workspaces_with("land", "", |root| {
+        add_tree(root, "there", "2", Some("there-second"));
+    });
     screen.wait_for("the panels", |text| text.contains("[2] Trees"));
     // Away and back, so there's listing is read with its second tree.
     screen.press("]");
@@ -1240,8 +1248,9 @@ fn a_planning_chat_left_starting_joins_the_list_on_plan() {
 fn enter_on_another_workspaces_tree_lands_on_it_while_another_there_asks() {
     let Workspaces {
         root, mut screen, ..
-    } = two_workspaces("land-ask", "");
-    add_tree(&root, "there", "2", Some("there-second"));
+    } = two_workspaces_with("land-ask", "", |root| {
+        add_tree(root, "there", "2", Some("there-second"));
+    });
     // Tree 1's agent asks, with a chat that would open.
     let plugins = root.join("config/treetop/plugins");
     fs::create_dir_all(&plugins).unwrap();
@@ -1283,9 +1292,10 @@ esac
 fn enter_on_another_workspaces_parked_tree_lands_on_it() {
     let Workspaces {
         root, mut screen, ..
-    } = two_workspaces("land-shelf", "");
-    add_tree(&root, "there", "2", Some("there-second"));
-    add_tree(&root, "there", "3", None);
+    } = two_workspaces_with("land-shelf", "", |root| {
+        add_tree(root, "there", "2", Some("there-second"));
+        add_tree(root, "there", "3", None);
+    });
     let git_dir = Command::new("git")
         .args(["rev-parse", "--path-format=absolute", "--git-dir"])
         .current_dir(root.join("there-trees/2"))
@@ -1380,9 +1390,10 @@ fn asking_in(tree: &Path, asker: &Asker) -> PathBuf {
 fn waitings_cursor_stays_on_what_it_was_on_as_another_resolves() {
     let Workspaces {
         root, mut screen, ..
-    } = two_workspaces("hold", "");
-    add_tree(&root, "there", "2", Some("there-second"));
-    add_tree(&root, "there", "3", Some("there-third"));
+    } = two_workspaces_with("hold", "", |root| {
+        add_tree(root, "there", "2", Some("there-second"));
+        add_tree(root, "there", "3", Some("there-third"));
+    });
     screen.wait_for("the panels", |text| text.contains("[2] Trees"));
     // Away and back, so there's trees are known.
     screen.press("]");
@@ -1441,8 +1452,9 @@ fn waitings_cursor_stays_on_what_it_was_on_as_another_resolves() {
 fn waitings_cursor_is_on_the_item_it_took_you_to_in_another_workspace() {
     let Workspaces {
         root, mut screen, ..
-    } = two_workspaces("jump", "");
-    add_tree(&root, "there", "2", Some("there-second"));
+    } = two_workspaces_with("jump", "", |root| {
+        add_tree(root, "there", "2", Some("there-second"));
+    });
     screen.wait_for("the panels", |text| text.contains("[2] Trees"));
     screen.press("]");
     screen.wait_for("there's trees", |text| text.contains("there-work"));
@@ -1490,9 +1502,10 @@ fn waitings_cursor_is_on_the_item_it_took_you_to_in_another_workspace() {
 fn w_reaches_everything_waiting_across_workspaces() {
     let Workspaces {
         root, mut screen, ..
-    } = two_workspaces("round", "");
-    add_tree(&root, "there", "2", Some("there-second"));
-    add_tree(&root, "here", "2", Some("here-second"));
+    } = two_workspaces_with("round", "", |root| {
+        add_tree(root, "there", "2", Some("there-second"));
+        add_tree(root, "here", "2", Some("here-second"));
+    });
     let askers = [(); 4].map(|()| Asker(Command::new("sleep").arg("600").spawn().unwrap()));
     let trees = [
         "here-trees/1",
