@@ -468,9 +468,6 @@ fn run(
                     if !news.is_empty() {
                         announce(&news)?;
                     }
-                    for line in news {
-                        app.add_news(None, line, None);
-                    }
                 }
                 Update::Sidecars(sidecars) => app.apply_sidecars(sidecars),
                 Update::Ship(answer) => {
@@ -511,12 +508,7 @@ fn run(
                     if job.kind == Kind::Ship {
                         refresher.refresh_ship();
                     }
-                    let before = app.message.clone();
                     app.job_finished(job, is_ok, output);
-                    // What it came to, kept in [4] News past the next key.
-                    if let Some(said) = app.message.clone().filter(|m| Some(m) != before.as_ref()) {
-                        app.add_news(None, said, None);
-                    }
                     if !is_preview {
                         refresher.refresh();
                     }
@@ -541,7 +533,6 @@ fn run(
             snapshot::write(checkout, &status);
         }
         if let Some(Outcome::Send { to, text }) = app.ready_failure() {
-            app.note_sent(&to, &text);
             send(term, app, chats, &worker, to, &text)?;
             refresher.refresh_ship();
         }
@@ -1433,7 +1424,6 @@ fn run(
                 refresher.refresh();
             }
             Outcome::Send { to, text } => {
-                app.note_sent(&to, &text);
                 // Plan's `S` makes issues: read for them at the next look.
                 if app.is_plan {
                     plan_read_at = None;
@@ -1499,6 +1489,8 @@ fn show(
     let mut desktop = notify::Desktop::default();
     let mut is_issues = is_issues;
     let mut arriving = None;
+    // What was still to be sent in the workspace left, for the bar of the next.
+    let mut unsent = None;
     let mut chats = Chats::default();
     loop {
         std::env::set_current_dir(&checkout)?;
@@ -1537,6 +1529,7 @@ fn show(
             app.put_away_file = Some(file);
         }
         app.arriving = arriving.take();
+        app.message = unsent.take();
         app.pools = inbox::other_pools(&checkout);
         app.ship_plugins = ship::plugins(&checkout).0;
         app.is_issues = std::mem::take(&mut is_issues);
@@ -1547,14 +1540,18 @@ fn show(
         let exit = run(term, &mut app, &checkout, &mut desktop, &mut chats);
         desktop.switched();
         if matches!(exit, Ok(Exit::Switch(..))) {
+            let left = workspaces::name(&checkout);
+            let mut to = Vec::new();
             for (agent, tree) in chats.unsent() {
                 app.unsent(&tree);
-                app.add_news(
-                    None,
-                    format!("not sent to {agent} in {tree}: you switched workspace first"),
-                    None,
-                );
+                to.push(format!("{agent} in {left}:{tree}"));
             }
+            unsent = (!to.is_empty()).then(|| {
+                format!(
+                    "not sent to {}, you switched workspace first",
+                    to.join(" or ")
+                )
+            });
         }
         watch = app.take_watch();
         // The workspace left is another from the next one, as last read.

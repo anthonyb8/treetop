@@ -466,18 +466,18 @@ pub enum Panel {
     Ship,
     #[default]
     Trees,
-    News,
+    Keel,
 }
 
 impl Panel {
-    pub const ALL: [Panel; 3] = [Panel::Ship, Panel::Trees, Panel::News];
+    pub const ALL: [Panel; 3] = [Panel::Ship, Panel::Trees, Panel::Keel];
 
     /// Its number key and title.
     pub fn number(self) -> u8 {
         match self {
             Panel::Ship => 1,
             Panel::Trees => 2,
-            Panel::News => 3,
+            Panel::Keel => 3,
         }
     }
 
@@ -485,7 +485,7 @@ impl Panel {
         match self {
             Panel::Ship => "Ship",
             Panel::Trees => "Trees",
-            Panel::News => "News",
+            Panel::Keel => "Keel",
         }
     }
 }
@@ -597,30 +597,11 @@ pub enum Outcome {
     Editor,
 }
 
-/// What had been read at a look for news: the workspace on screen, whether
-/// its PRs had been, and the other workspaces.
-#[derive(Debug, Clone, Default)]
-struct NewsRead {
-    here: PathBuf,
-    is_ships_read: bool,
-    away: HashSet<PathBuf>,
-    away_ships: HashSet<PathBuf>,
-}
-
 /// What waits on you as treetop last looked, kept across a switch of
 /// workspace: since when each has waited, so each keeps its age.
 #[derive(Debug, Clone, Default)]
 pub struct Watch {
     since: HashMap<crate::inbox::About, std::time::SystemTime>,
-    /// [3] News, newest first, kept across a switch as what waits is.
-    news: VecDeque<News>,
-    /// What waited or was done at the last look, for what is new since;
-    /// None before the first, which is no news.
-    news_seen: Option<HashSet<crate::inbox::About>>,
-    /// The workspace on screen and the others read, at the last look: one
-    /// read for the first time since, or a switch, is no news either, as
-    /// what it holds was already there, as the desktop is not told of it.
-    news_read: NewsRead,
     /// What was last gone to of what waits, which `W` goes on from.
     gone_to: Option<crate::inbox::About>,
     /// What was answered in the window, and when, until its agent moves on.
@@ -640,18 +621,6 @@ pub enum PlanState {
     Idle,
 }
 
-/// A line of [3] News: when, where, and what happened; `kind` for the
-/// inbox's, None for treetop's own and what you sent.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct News {
-    pub at: std::time::SystemTime,
-    pub place: String,
-    pub what: String,
-    pub kind: Option<crate::inbox::Kind>,
-    /// What it is about, for Enter to go to.
-    pub entry: Option<crate::inbox::Entry>,
-}
-
 /// How long an answer has to show in what its agent does: past it, an ask
 /// still there was not answered, or is the next one.
 const ANSWER_TAKES: Duration = Duration::from_secs(10);
@@ -659,9 +628,6 @@ const ANSWER_TAKES: Duration = Duration::from_secs(10);
 /// How long a question that opened by itself takes no number: one pressed as
 /// it opened was for something else.
 const ASK_SETTLES: Duration = Duration::from_millis(1500);
-
-/// The most lines [3] News keeps, the oldest going first.
-const NEWS_KEPT: usize = 300;
 
 #[derive(Default)]
 pub struct App {
@@ -901,8 +867,10 @@ pub struct App {
     pub typed: (PathBuf, usize),
     /// The window's chat shows a draft in its input box, as last drawn.
     pub is_draft_shown: bool,
-    /// In [3] News, the line under its cursor.
-    pub news_at: usize,
+    /// In [3] Keel, the step under its cursor, and the tree whose run it is
+    /// of: another tree's starts on its current step, as does the same one's
+    /// once another panel has had the keys.
+    keel_at: Option<(PathBuf, usize)>,
     /// The Plan screen is shown, in the panels layout: Tab goes Trees,
     /// Plan, Issues. Never with `is_issues`.
     pub is_plan: bool,
@@ -1063,7 +1031,6 @@ struct Held {
 struct HeldCursors {
     notes: Held,
     ship: Held,
-    news: Held,
     made: Held,
     ready: Held,
 }
@@ -1754,36 +1721,60 @@ impl App {
         self.reselect(path);
     }
 
-    /// [3] News' keys in the panels layout: j, k, g and G move its cursor,
-    /// which scrolls it, and Enter goes to what its line is about. None for a key it leaves to the rest.
-    fn handle_news_key(&mut self, key: KeyEvent) -> Option<Outcome> {
+    /// The step under [3] Keel's cursor, counted from none: the run's current
+    /// one until it is moved, or its last where none is.
+    pub fn keel_step(&self, run: &crate::keel::Run) -> usize {
+        let last = run.steps.len().saturating_sub(1);
+        self.keel_at
+            .as_ref()
+            .filter(|(tree, _)| *tree == run.tree)
+            .map(|(_, at)| *at)
+            .or(run.current.and_then(|at| at.checked_sub(1)))
+            .unwrap_or(last)
+            .min(last)
+    }
+
+    /// [3] Keel's keys in the panels layout: j, k, g and G move among the
+    /// steps of the run it shows, and Enter shows that run in the window; a
+    /// key that acts on a tree does nothing. None for a key it leaves to the
+    /// rest.
+    fn handle_keel_key(&mut self, key: KeyEvent) -> Option<Outcome> {
         if !self.shows_panels()
-            || self.panel != Panel::News
+            || self.panel != Panel::Keel
             || self.is_window_focused
             || !is_plain(key)
             || self.is_typing()
         {
             return None;
         }
-        let last = self.news().len().saturating_sub(1);
-        let at = self.news_at.min(last);
-        self.news_at = match key.code {
+        let run = self.window_tree().and_then(|tree| self.run_of(tree));
+        let (tree, at, last) = match run {
+            Some(run) => (
+                run.tree.clone(),
+                self.keel_step(run),
+                run.steps.len().saturating_sub(1),
+            ),
+            None => (PathBuf::new(), 0, 0),
+        };
+        let to = match key.code {
             KeyCode::Char('j') | KeyCode::Down => (at + 1).min(last),
             KeyCode::Char('k') | KeyCode::Up => at.saturating_sub(1),
             KeyCode::Char('g') | KeyCode::Home => 0,
             KeyCode::Char('G') | KeyCode::End => last,
             KeyCode::Enter | KeyCode::Char('l') => {
-                let entry = self.news().get(at).and_then(|n| n.entry.clone());
-                return Some(match entry {
-                    Some(entry) => self.go_to(entry),
-                    None => Outcome::Continue,
-                });
+                if self.window_tabs().contains(&WindowTab::Run) {
+                    self.tab = WindowTab::Run;
+                    self.focus_window();
+                } else {
+                    self.message = Some("no keel run holds this tree".into());
+                }
+                return Some(Outcome::Continue);
             }
-            // It lists no trees for them.
             KeyCode::Char(' ') => return Some(Outcome::Continue),
             code if acts_on_tree(code) => return Some(Outcome::Continue),
             _ => return None,
         };
+        self.keel_at = Some((tree, to));
         Some(Outcome::Continue)
     }
 
@@ -1815,20 +1806,6 @@ impl App {
             .filter(|_| !self.is_plan)
             .map(|t| t.path.clone())
         {
-            let picked = self
-                .dialog
-                .as_ref()
-                .and_then(|choices| choices.get(n - 1).cloned())
-                .unwrap_or_default();
-            let to = self
-                .window_tree()
-                .map(|t| {
-                    t.branch
-                        .clone()
-                        .unwrap_or_else(|| format!("tree {}", t.name))
-                })
-                .unwrap_or_default();
-            self.add_news(None, format!("you: {c} {picked} → {to}"), None);
             self.put_away_kind(&path, crate::inbox::Kind::NeedsYou);
         }
         Some(Outcome::Answer(c))
@@ -2022,30 +1999,6 @@ impl App {
             .or_else(|| items.iter().position(is_here))
             .map_or(0, |at| (at + 1) % items.len());
         Some(self.go_to(items[next].clone()))
-    }
-
-    /// [3] News, newest first.
-    pub fn news(&self) -> &VecDeque<News> {
-        &self.watch.news
-    }
-
-    /// Adds a line to [3] News, in this workspace unless `place` says
-    /// where.
-    pub fn add_news(
-        &mut self,
-        place: Option<String>,
-        what: String,
-        kind: Option<crate::inbox::Kind>,
-    ) {
-        let place = place.unwrap_or_else(|| crate::workspaces::name(&self.checkout));
-        self.watch.news.push_front(News {
-            at: std::time::SystemTime::now(),
-            place,
-            what,
-            kind,
-            entry: None,
-        });
-        self.watch.news.truncate(NEWS_KEPT);
     }
 
     /// Shows the Plan screen with `chats`, the open workspace's planning
@@ -2389,62 +2342,6 @@ impl App {
             _ => {}
         }
         Outcome::Continue
-    }
-
-    /// What you sent each of `to`, into [3] News: its first line, and the
-    /// branch it went to, else its tree's number.
-    pub fn note_sent(&mut self, to: &[Recipient], text: &str) {
-        let said = text.lines().next().unwrap_or_default();
-        for recipient in to {
-            let to = self
-                .trees
-                .iter()
-                .find(|t| t.name == recipient.tree)
-                .and_then(|t| t.branch.clone())
-                .unwrap_or_else(|| match recipient.tree.as_str() {
-                    SCRATCH => recipient.agent.clone(),
-                    tree => format!("tree {tree}"),
-                });
-            self.add_news(None, format!("you: {said} → {to}"), None);
-        }
-    }
-
-    /// What started waiting, or was done or merged, in any workspace since
-    /// the last look goes into [3] News; what already was at the first look
-    /// is not news, as the bell does not ring for it.
-    fn look_for_news(&mut self) {
-        let entries = crate::inbox::entries(self);
-        let now: HashSet<crate::inbox::About> = entries.iter().map(|e| e.about()).collect();
-        let read = NewsRead {
-            here: self.checkout.clone(),
-            is_ships_read: self.is_ships_read,
-            away: self.away_live.keys().cloned().collect(),
-            away_ships: self.away_ships.clone(),
-        };
-        let was = std::mem::replace(&mut self.watch.news_read, read);
-        let Some(seen) = self.watch.news_seen.replace(now) else {
-            return;
-        };
-        let new: Vec<crate::inbox::Entry> = entries
-            .into_iter()
-            .filter(|e| !seen.contains(&e.about()))
-            .filter(|e| match &e.away {
-                None => was.here == self.checkout && (was.is_ships_read || !e.kind.is_pr()),
-                Some(away) if e.kind.is_pr() => was.away_ships.contains(&away.checkout),
-                Some(away) => was.away.contains(&away.checkout),
-            })
-            .collect();
-        for entry in new {
-            let place = match &entry.away {
-                Some(away) => format!("{}:{}", away.name, entry.tree),
-                None => format!("{}:{}", crate::workspaces::name(&self.checkout), entry.tree),
-            };
-            let what = entry.title.clone().unwrap_or_else(|| entry.what.clone());
-            self.add_news(Some(place), what, Some(entry.kind));
-            if let Some(line) = self.watch.news.front_mut() {
-                line.entry = Some(entry);
-            }
-        }
     }
 
     /// The PRs [1] Ship lists: this workspace's trees whose ship plugin
@@ -4278,7 +4175,6 @@ impl App {
         if !self.is_read() {
             return None;
         }
-        self.look_for_news();
         let waiting = crate::inbox::needs_action(self);
         // An answer that took shows as its agent moving on; an ask still
         // there after that is the next one, or was not answered.
@@ -5967,14 +5863,8 @@ impl App {
         if is_gone && self.panel == Panel::Ship && self.shows_panels() && !self.is_window_focused {
             self.follow_ship();
         }
-        // Not looked at, News stays at its newest.
-        if self.panel == Panel::News || self.news_at > 0 {
-            let news: Vec<String> = self
-                .news()
-                .iter()
-                .map(|n| format!("{:?} {} {}", n.at, n.place, n.what))
-                .collect();
-            hold(&mut self.news_at, &mut self.held.news, news);
+        if self.panel != Panel::Keel {
+            self.keel_at = None;
         }
         let made: Vec<String> = self.made().iter().map(|i| i.id.clone()).collect();
         hold(&mut self.made_at, &mut self.held.made, made);
@@ -6032,7 +5922,7 @@ impl App {
         if let Some(outcome) = self.handle_ship_key(key) {
             return outcome;
         }
-        if let Some(outcome) = self.handle_news_key(key) {
+        if let Some(outcome) = self.handle_keel_key(key) {
             return outcome;
         }
         if self.view.is_some() && self.has_keys_on(WindowTab::Diff) {
@@ -6458,7 +6348,7 @@ pub(crate) mod tests {
         assert!(app.is_window_focused, "0 gives the window the keys");
         // From the window in Normal a panel number takes them back.
         press(&mut app, KeyCode::Char('3'));
-        assert_eq!((app.panel, app.is_window_focused), (Panel::News, false));
+        assert_eq!((app.panel, app.is_window_focused), (Panel::Keel, false));
         // Typing a filter keeps its digits.
         press(&mut app, KeyCode::Char('2'));
         press(&mut app, KeyCode::Char('/'));
@@ -6589,94 +6479,6 @@ pub(crate) mod tests {
         };
         assert_eq!(shelve(&mut app), [Some(Shelf::Parked); 2]);
         assert_eq!(shelve(&mut app), [None; 2], "all parked, so all come back");
-    }
-
-    #[test]
-    fn what_already_waits_in_a_workspace_read_for_the_first_time_is_not_news() {
-        use crate::inbox::tests::{agent, tree};
-        let mut app = crate::inbox::tests::with_workspaces();
-        app.is_loaded = true;
-        app.is_agents_read = true;
-        let asking = |path: &str, name: &str| {
-            tree(
-                path,
-                name,
-                "zeta-work",
-                vec![agent("asker", name, crate::agents::Status::Waiting)],
-            )
-        };
-        app.watch_waiting();
-        let at_first = app.news().len();
-        // Zeta's first read lands, an agent there already asking.
-        app.away_live.insert(
-            PathBuf::from("/code/zeta"),
-            vec![asking("/code/zeta-trees/1", "1")],
-        );
-        app.watch_waiting();
-        assert_eq!(app.news().len(), at_first, "{:?}", app.news());
-        // Another there starts asking, a tree its pool lists: that is news.
-        let zeta = app
-            .pools
-            .iter_mut()
-            .find(|p| p.away.name == "zeta")
-            .unwrap();
-        zeta.trees
-            .push(tree("/code/zeta-trees/3", "3", "zeta-work", Vec::new()));
-        app.away_live.insert(
-            PathBuf::from("/code/zeta"),
-            vec![
-                asking("/code/zeta-trees/1", "1"),
-                asking("/code/zeta-trees/3", "3"),
-            ],
-        );
-        app.watch_waiting();
-        assert_eq!(app.news().len(), at_first + 1, "{:?}", app.news());
-        assert_eq!(app.news()[0].place, "zeta:3");
-    }
-
-    #[test]
-    fn what_already_waits_in_the_workspace_switched_to_is_not_news() {
-        let mut app = crate::inbox::tests::app();
-        app.is_loaded = true;
-        app.is_agents_read = true;
-        app.checkout = PathBuf::from("/code/main-app");
-        app.watch_waiting();
-        let at_first = app.news().len();
-        // A switch: a new App, the watch kept, its own trees already asking.
-        let mut there = crate::inbox::tests::app();
-        there.is_loaded = true;
-        there.is_agents_read = true;
-        there.checkout = PathBuf::from("/code/api");
-        for tree in &mut there.trees {
-            tree.path = PathBuf::from("/code/api-trees").join(&tree.name);
-        }
-        there.keep_watch(app.take_watch());
-        there.watch_waiting();
-        assert_eq!(there.news().len(), at_first, "{:?}", there.news());
-    }
-
-    #[test]
-    fn what_you_send_is_news_by_the_branch_it_went_to() {
-        let mut app = crate::inbox::tests::app();
-        let seven = app.trees.iter().find(|t| t.name == "7").unwrap();
-        let to = seven
-            .agents
-            .iter()
-            .find_map(|a| Recipient::of(a, &seven.name))
-            .unwrap();
-        let unknown = Recipient {
-            tree: "99".into(),
-            ..to.clone()
-        };
-        app.note_sent(&[to, unknown], "retry the e2e\nwith the log below");
-        let lines: Vec<&str> = app.news().iter().map(|n| n.what.as_str()).collect();
-        assert_eq!(
-            lines,
-            [
-                "you: retry the e2e → tree 99",
-                "you: retry the e2e → me/fix-login"
-            ]
-        );
     }
 
     fn on_plan() -> App {
@@ -7023,9 +6825,9 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_tree_key_on_an_empty_ship_or_on_news_acts_on_no_tree() {
-        for panel in [Panel::Ship, Panel::News] {
-            for key in ['r', 'x', 'z', 'n', 'm', 't', 'F', 'M', 'S', ' '] {
+    fn a_tree_key_on_an_empty_ship_or_on_keel_acts_on_no_tree() {
+        for panel in [Panel::Ship, Panel::Keel] {
+            for key in ['r', 'x', 'z', 'n', 'm', 't', 'D', 'I', 'F', 'M', 'S', ' '] {
                 let mut app = crate::inbox::tests::with_workspaces();
                 app.trees[2].ship = None;
                 app.reselect(Some(app.trees[0].path.clone()));
@@ -7040,6 +6842,9 @@ pub(crate) mod tests {
                     app.pending.is_none() && app.prompt.is_none(),
                     "{panel:?} {key}"
                 );
+                assert!(!app.is_window_focused && !app.is_issues, "{panel:?} {key}");
+                // What a key on a tree could not do there is said.
+                assert_eq!(app.message, None, "{panel:?} {key}");
                 assert_eq!(app.marked.len(), 1, "{panel:?} {key}");
             }
         }
@@ -7051,41 +6856,6 @@ pub(crate) mod tests {
             panic!("x shelves the row's tree");
         };
         assert_eq!(path, app.trees[2].path);
-    }
-
-    #[test]
-    fn enter_on_news_goes_to_what_it_is_about() {
-        let mut app = crate::inbox::tests::with_workspaces();
-        app.reports.clear();
-        app.watch_waiting();
-        app.apply_reports(vec![crate::inbox::tests::report(
-            "j4",
-            "/pool/4/app",
-            State::Blocked,
-            "Which?",
-            1,
-        )]);
-        app.watch_waiting();
-        app.reselect(Some(app.trees[1].path.clone()));
-        app.panel = Panel::News;
-        assert!(matches!(
-            press(&mut app, KeyCode::Enter),
-            Outcome::Chat { ref tree, .. } if tree == "4"
-        ));
-        // What you sent is about nothing to go to.
-        app.add_news(None, "you: hi → x".into(), None);
-        app.panel = Panel::News;
-        app.is_window_focused = false;
-        press(&mut app, KeyCode::Char('g'));
-        assert_eq!(press(&mut app, KeyCode::Enter), Outcome::Continue);
-    }
-
-    #[test]
-    fn what_you_send_a_planning_chat_is_news_by_its_name() {
-        let mut app = on_plan();
-        let to = Recipient::of_job("plan 1", SCRATCH.into(), "j1", true);
-        app.note_sent(&[to], "Draft it");
-        assert_eq!(app.news()[0].what, "you: Draft it → plan 1");
     }
 
     #[test]
@@ -7318,12 +7088,6 @@ pub(crate) mod tests {
         press(&mut app, KeyCode::Char('1'));
         app.watch_waiting();
         assert!(!asks(&app), "answered");
-        // As news too, by what was picked.
-        assert!(
-            app.news()
-                .iter()
-                .any(|n| n.what.starts_with("you: 1 Left → "))
-        );
         let long_ago = Instant::now().checked_sub(ANSWER_TAKES).unwrap();
         for at in app.watch.answered.values_mut() {
             *at = long_ago;
@@ -7427,7 +7191,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn plans_and_newss_cursors_stay_on_theirs_as_others_join_above() {
+    fn plans_cursors_stay_on_theirs_as_others_join_above() {
         let mut app = with_made();
         press(&mut app, KeyCode::Char('3'));
         let mut newer = app.plan_chats[0].clone();
@@ -7462,24 +7226,6 @@ pub(crate) mod tests {
         app.plan_made.get_mut("j1").unwrap().reverse();
         app.hold_cursors();
         assert_eq!(app.made()[app.made_at].id, "ANB-90");
-        // [3] News.
-        let mut app = crate::inbox::tests::with_workspaces();
-        app.add_news(None, "first".into(), None);
-        app.add_news(None, "second".into(), None);
-        press(&mut app, KeyCode::Char('3'));
-        press(&mut app, KeyCode::Char('G'));
-        app.add_news(None, "third".into(), None);
-        app.hold_cursors();
-        assert_eq!(app.news()[app.news_at].what, "first");
-        // The same twice over, the cursor still goes down past it.
-        for _ in 0..3 {
-            app.add_news(None, "same".into(), None);
-        }
-        app.news_at = 0;
-        for at in 1..4 {
-            press(&mut app, KeyCode::Char('j'));
-            assert_eq!(app.news_at, at);
-        }
     }
 
     #[test]
@@ -7632,8 +7378,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn shift_w_from_ship_or_news_leaves_the_keys_on_the_tree_it_shows() {
-        for panel in [Panel::Ship, Panel::News] {
+    fn shift_w_from_ship_or_keel_leaves_the_keys_on_the_tree_it_shows() {
+        for panel in [Panel::Ship, Panel::Keel] {
             let mut app = crate::inbox::tests::with_workspaces();
             app.pools.clear();
             app.reports.clear();
@@ -7884,72 +7630,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn another_workspaces_pr_failed_before_its_prs_were_first_read_is_not_news() {
-        let mut app = crate::inbox::tests::with_workspaces();
-        let mut ship = app.trees[2].ship.clone().unwrap();
-        ship.branch = "zeta-work".into();
-        let zeta = PathBuf::from("/code/zeta");
-        let mut tree = app
-            .pools
-            .iter()
-            .find(|p| p.away.checkout == zeta)
-            .unwrap()
-            .trees[0]
-            .clone();
-        // Its agents are read first, and its PRs a while later.
-        app.away_live.insert(zeta.clone(), vec![tree.clone()]);
-        app.watch_waiting();
-        app.watch_waiting();
-        let before = app.news().len();
-        tree.ship = Some(ship.clone());
-        app.away_live.insert(zeta.clone(), vec![tree.clone()]);
-        app.away_ships.insert(zeta.clone());
-        app.watch_waiting();
-        assert_eq!(app.news().len(), before, "{:?}", app.news());
-        // It passes, then fails again: that is news.
-        tree.ship = None;
-        app.away_live.insert(zeta.clone(), vec![tree.clone()]);
-        app.watch_waiting();
-        tree.ship = Some(ship);
-        app.away_live.insert(zeta, vec![tree]);
-        app.watch_waiting();
-        assert_eq!(app.news().len(), before + 1, "{:?}", app.news());
-    }
-
-    #[test]
-    fn a_pr_failed_before_treetop_opened_is_not_news_and_one_failing_after_is() {
-        // The first look comes before the PRs are read.
-        let mut app = crate::inbox::tests::with_workspaces();
-        let ship = app.trees[2].ship.take().unwrap();
-        app.watch_waiting();
-        let answer = |ship: &crate::ship::Ship| {
-            Ok(Answer {
-                ships: [("/pool/7/app".into(), ship.clone())].into(),
-                ..Answer::default()
-            })
-        };
-        let failed = |app: &App| {
-            app.news()
-                .iter()
-                .filter(|n| n.kind == Some(crate::inbox::Kind::Failed))
-                .count()
-        };
-        app.apply_ship(answer(&ship));
-        app.watch_waiting();
-        assert_eq!(failed(&app), 0, "{:?}", app.news());
-        // It passes, then fails again: that is news.
-        let passing = crate::ship::Ship {
-            stage: Stage::Checks,
-            ..(*ship).clone()
-        };
-        app.apply_ship(answer(&passing));
-        app.watch_waiting();
-        app.apply_ship(answer(&ship));
-        app.watch_waiting();
-        assert_eq!(failed(&app), 1, "{:?}", app.news());
-    }
-
-    #[test]
     fn the_window_follows_the_pr_under_ships_cursor() {
         let mut app = crate::inbox::tests::with_workspaces();
         let mut ship = app.trees[2].ship.clone().unwrap();
@@ -7961,18 +7641,6 @@ pub(crate) mod tests {
         assert_eq!(app.window_tree().map(|t| &t.path), Some(&rows[0]));
         press(&mut app, KeyCode::Char('j'));
         assert_eq!(app.window_tree().map(|t| &t.path), Some(&rows[1]));
-    }
-
-    #[test]
-    fn j_on_news_scrolls_it_and_leaves_the_trees_cursor() {
-        let mut app = crate::inbox::tests::with_workspaces();
-        app.reselect(Some(app.trees[0].path.clone()));
-        let at = app.selected;
-        press(&mut app, KeyCode::Char('3'));
-        for key in ['j', 'j', 'G', 'k', 'g'] {
-            press(&mut app, KeyCode::Char(key));
-            assert_eq!(app.selected, at, "{key}");
-        }
     }
 
     #[test]
@@ -8083,27 +7751,6 @@ pub(crate) mod tests {
             to.iter().map(|r| r.tree.as_str()).collect::<Vec<_>>(),
             ["7"]
         );
-    }
-
-    #[test]
-    fn news_keeps_what_happened_newest_first_capped_and_across_a_switch() {
-        let mut app = crate::inbox::tests::app();
-        app.add_news(None, "first".into(), None);
-        app.add_news(Some("api:2".into()), "second".into(), None);
-        assert_eq!(app.news()[0].what, "second");
-        assert_eq!(app.news()[0].place, "api:2");
-        for n in 0..NEWS_KEPT {
-            app.add_news(None, format!("{n}"), None);
-        }
-        assert_eq!(app.news().len(), NEWS_KEPT);
-        assert!(
-            app.news().iter().all(|n| n.what != "first"),
-            "the oldest go"
-        );
-        // A switch builds a new App; the log rides along with what waits.
-        let mut next = App::new(None);
-        next.keep_watch(app.take_watch());
-        assert_eq!(next.news().len(), NEWS_KEPT);
     }
 
     #[test]
@@ -10181,6 +9828,81 @@ pub(crate) mod tests {
             press(&mut app, KeyCode::Enter),
             Outcome::Switch(PathBuf::from("/home/me/lander"))
         );
+    }
+
+    /// A run of eleven steps in the tree at `path`, on its `current`.
+    fn run_at(path: &std::path::Path, current: Option<usize>) -> crate::keel::Run {
+        let step = |n: usize| crate::keel::Step {
+            title: format!("Step {n}"),
+            state: "pending".into(),
+        };
+        crate::keel::Run {
+            tree: path.into(),
+            playbook: "issue".into(),
+            goal: String::new(),
+            state: "active".into(),
+            steps: (1..12).map(step).collect(),
+            current,
+            attention: 0,
+            stale: false,
+        }
+    }
+
+    #[test]
+    fn keels_cursor_moves_among_the_steps_and_starts_again_on_another_trees_run() {
+        let mut app = crate::inbox::tests::with_workspaces();
+        let (four, two) = (app.trees[0].path.clone(), app.trees[1].path.clone());
+        for (path, at) in [(&four, Some(5)), (&two, Some(2))] {
+            app.runs.insert(path.clone(), run_at(path, at));
+        }
+        app.reselect(Some(four.clone()));
+        let at = |app: &App| app.keel_step(&app.runs[&app.window_tree().unwrap().path]);
+        assert_eq!(at(&app), 4, "the current one");
+        press(&mut app, KeyCode::Char('3'));
+        let cursor = app.selected;
+        for (key, want) in [
+            ('j', 5),
+            ('k', 4),
+            ('k', 3),
+            ('G', 10),
+            ('j', 10),
+            ('g', 0),
+            ('k', 0),
+        ] {
+            press(&mut app, KeyCode::Char(key));
+            assert_eq!((at(&app), app.selected), (want, cursor), "{key}");
+        }
+        // Once another panel has had the keys, it is on the current one again.
+        for key in ['2', '3'] {
+            press(&mut app, KeyCode::Char(key));
+            assert_eq!(at(&app), 4, "{key}");
+        }
+        press(&mut app, KeyCode::Char('G'));
+        app.reselect(Some(two.clone()));
+        assert_eq!(at(&app), 1);
+        // All done, it is on the last.
+        app.runs.insert(two.clone(), run_at(&two, None));
+        assert_eq!(at(&app), 10);
+        // A run of no steps, and none at all.
+        app.runs.get_mut(&two).unwrap().steps.clear();
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(at(&app), 0);
+        app.runs.clear();
+        press(&mut app, KeyCode::Char('j'));
+    }
+
+    #[test]
+    fn enter_on_keel_shows_the_run_in_the_window_and_says_so_where_none_holds_it() {
+        let mut app = crate::inbox::tests::with_workspaces();
+        let path = app.trees[0].path.clone();
+        app.reselect(Some(path.clone()));
+        app.panel = Panel::Keel;
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.is_window_focused);
+        assert!(app.message.as_deref().unwrap().contains("no keel run"));
+        app.runs.insert(path.clone(), run_at(&path, Some(5)));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.is_window_focused && app.shown_tab() == WindowTab::Run);
     }
 
     #[test]

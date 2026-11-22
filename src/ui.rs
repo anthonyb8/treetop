@@ -304,7 +304,7 @@ pub fn draw(
                 let boxes = [
                     (Panel::Ship, panels.ship),
                     (Panel::Trees, windows.top),
-                    (Panel::News, panels.news),
+                    (Panel::Keel, panels.keel),
                 ];
                 for (panel, area) in boxes {
                     let focused = has_keys && app.panel == panel;
@@ -319,6 +319,12 @@ pub fn draw(
                             fg(theme().special).add_modifier(Modifier::BOLD),
                         ));
                     }
+                    if let (Panel::Keel, Some(tree)) = (panel, app.window_tree()) {
+                        title.push(Span::styled(
+                            format!("· tree {} ", tree.name),
+                            fg(theme().muted),
+                        ));
+                    }
                     let block =
                         window_block(focused.then_some(Mode::Normal)).title(Line::from(title));
                     let body = block.inner(area);
@@ -326,7 +332,7 @@ pub fn draw(
                     match panel {
                         Panel::Trees => draw_table(frame, app, body, false, true),
                         Panel::Ship => draw_ship(frame, app, body, focused),
-                        Panel::News => draw_news(frame, app, body, focused),
+                        Panel::Keel => draw_keel(frame, app, body, focused),
                     }
                 }
             } else if is_classic(app) {
@@ -1086,7 +1092,9 @@ fn panel_row(
     if let Some(branch) = &tree.branch {
         cells[BRANCH] = Cell::from(fit(short_branch(app, branch), room));
     }
-    if let Some(state) = state_cell(app, tree, why) {
+    if let Some(state) =
+        state_said(app, tree, why).map(|(said, style)| Cell::from(said).style(style))
+    {
         cells[STATUS] = state;
     }
     cells
@@ -1094,8 +1102,7 @@ fn panel_row(
 
 /// Why a held tree waits, else what its agent is doing; None where the
 /// pool's status says more: an action on it, or a tree nobody holds.
-fn state_cell(app: &App, tree: &Tree, why: &HashMap<PathBuf, Kind>) -> Option<Cell<'static>> {
-    let t = theme();
+fn state_said(app: &App, tree: &Tree, why: &HashMap<PathBuf, Kind>) -> Option<(String, Style)> {
     if app.jobs.contains_key(&tree.path)
         || app.is_handing_off(&tree.path)
         || !tree.is_held()
@@ -1111,14 +1118,18 @@ fn state_cell(app: &App, tree: &Tree, why: &HashMap<PathBuf, Kind>) -> Option<Ce
             Kind::Merged => "merged",
             kind => asks_for(*kind),
         };
-        return Some(
-            Cell::from(format!("{mark} {said}")).style(fg(color).add_modifier(Modifier::BOLD)),
-        );
+        let style = fg(color).add_modifier(Modifier::BOLD);
+        return Some((format!("{mark} {said}"), style));
     }
+    agent_said(app, tree)
+}
+
+/// What the tree's agent is doing; None while the agents are yet to be read.
+fn agent_said(app: &App, tree: &Tree) -> Option<(String, Style)> {
     let Some(agent) = App::agents_of(tree).into_iter().next() else {
         return app
             .is_agents_read
-            .then(|| Cell::from("no agent").style(fg(t.muted)));
+            .then(|| ("no agent".into(), fg(theme().muted)));
     };
     // Just answered, it is on its way, whatever the last read had.
     let asked = (Kind::NeedsYou, tree.path.clone());
@@ -1134,7 +1145,7 @@ fn state_cell(app: &App, tree: &Tree, why: &HashMap<PathBuf, Kind>) -> Option<Ce
         Some(Status::Cold) => "stopped",
         None => "agent",
     };
-    Some(Cell::from(format!("{mark} {said}")).style(style))
+    Some((format!("{mark} {said}"), style))
 }
 
 /// The columns the table draws, each its title, width and place in a
@@ -1242,45 +1253,155 @@ fn draw_ship(frame: &mut Frame, app: &App, area: Rect, has_keys: bool) {
     frame.render_stateful_widget(table, area, &mut state);
 }
 
-/// [3] News: what happened in every workspace, newest first, when by the
-/// clock, where, and what; it stays however many keys go by, and scrolls
-/// with its cursor while it has the keys.
-fn draw_news(frame: &mut Frame, app: &App, area: Rect, has_keys: bool) {
+/// [3] Keel: the keel run in the tree under the cursor, its playbook and how
+/// far along over its steps, the one under way in view, which the panel's
+/// cursor scrolls while it has the keys; with no run, what its agent is doing
+/// and last said.
+fn draw_keel(frame: &mut Frame, app: &App, area: Rect, has_keys: bool) {
     let t = theme();
-    let news = app.news();
-    if news.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Line::styled(
-                " nothing new since treetop opened",
-                fg(t.muted),
-            )),
-            area,
-        );
+    let width = usize::from(area.width);
+    let Some(tree) = app.window_tree() else {
+        let text = Line::styled(" pick a tree to see its run", fg(t.muted));
+        frame.render_widget(Paragraph::new(text), area);
         return;
-    }
-    let lines: Vec<ListItem> = news
+    };
+    let Some(run) = app.run_of(tree) else {
+        draw_no_run(frame, app, tree, area);
+        return;
+    };
+    let [head, _, steps] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(u16::from(area.height > 6)),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+    frame.render_widget(Paragraph::new(run_head(run, width)), head);
+    let rows = usize::from(steps.height);
+    let at = app.keel_step(run);
+    // Three behind the step, where there are, and what is next after it.
+    let first = at
+        .saturating_sub(3)
+        .min(run.steps.len().saturating_sub(rows));
+    let lines: Vec<Line> = run
+        .steps
         .iter()
-        .map(|line| {
-            let (said, color) = match line.kind {
-                Some(Kind::Done) => ("done", t.success),
-                Some(Kind::Merged) => ("merged", t.special),
-                Some(kind) => (asks_for(kind), mark_of(kind).1),
-                None => ("", t.text),
+        .enumerate()
+        .skip(first)
+        .take(rows)
+        .map(|(index, step)| {
+            let (glyph, style, title) = match step.state.as_str() {
+                "done" => ("✓", fg(t.success), fg(t.muted)),
+                "skipped" => ("-", fg(t.muted), fg(t.muted)),
+                _ if run.current == Some(index + 1) && run.holds_tree() => (
+                    "▸",
+                    fg(t.warning).add_modifier(Modifier::BOLD),
+                    Style::new().add_modifier(Modifier::BOLD),
+                ),
+                _ if run.holds_tree() => ("○", fg(t.muted), Style::new()),
+                _ => ("○", fg(t.muted), fg(t.muted)),
             };
-            let mut spans = vec![
-                Span::styled(format!(" {} ", clock_of(line.at)), fg(t.muted)),
-                Span::styled(format!("{} ", line.place), fg(t.muted)),
-            ];
-            if !said.is_empty() {
-                spans.push(Span::styled(format!("{said} "), fg(color)));
-            }
-            let room = usize::from(area.width).saturating_sub(Line::from(spans.clone()).width());
-            spans.push(Span::raw(fit_news(&line.what, room)));
-            ListItem::new(Line::from(spans))
+            let number = format!("{:<3}", index + 1);
+            let row = if has_keys && index == at {
+                t.cursor
+            } else {
+                Style::new()
+            };
+            let text = fit(&step.title, width.saturating_sub(6));
+            let pad = width.saturating_sub(6 + Line::raw(text.as_str()).width());
+            Line::from(vec![
+                Span::styled(format!(" {glyph} "), style),
+                Span::styled(number, fg(t.muted)),
+                Span::styled(text, title),
+                Span::raw(" ".repeat(pad)),
+            ])
+            .style(row)
         })
         .collect();
-    let selected = has_keys.then_some(app.news_at.min(news.len() - 1));
-    draw_list(frame, area, lines, selected);
+    frame.render_widget(Paragraph::new(lines), steps);
+}
+
+/// A run in one line of `width`: its playbook, a bar of its steps and how
+/// many, then what needs looking at, which the bar and then the playbook give
+/// way to; how it ended, in grey, once it has.
+fn run_head(run: &crate::keel::Run, width: usize) -> Line<'static> {
+    const BAR: usize = 14;
+    const BAR_MIN: usize = 4;
+    let t = theme();
+    let total = run.steps.len();
+    let at = run.current.map_or(total, |at| at.min(total));
+    if !run.holds_tree() {
+        let words = format!(" {} {} · {at} of {total}", run.playbook, run.state);
+        return Line::styled(fit(&words, width), fg(t.muted));
+    }
+    let mut tail = vec![Span::raw(format!(" {at} of {total}"))];
+    let warn = fg(t.warning).add_modifier(Modifier::BOLD);
+    if run.attention > 0 {
+        tail.push(Span::styled(format!(" !{} flagged", run.attention), warn));
+    }
+    if run.state == "paused" {
+        tail.push(Span::styled(" paused", warn));
+    }
+    if run.stale {
+        tail.push(Span::styled(" stale", warn));
+    }
+    // A space either side of the playbook.
+    let room = width.saturating_sub(tail.iter().map(Span::width).sum::<usize>() + 2);
+    let bar = room
+        .saturating_sub(Line::raw(run.playbook.as_str()).width())
+        .clamp(BAR_MIN, BAR);
+    let playbook = fit(&run.playbook, room.saturating_sub(bar));
+    let done = run.current.map_or(total, |_| at.saturating_sub(1));
+    let full = (bar * done).checked_div(total).unwrap_or(0);
+    let half = usize::from(run.current.is_some() && full < bar);
+    let mut spans = vec![
+        Span::styled(
+            format!(" {playbook} "),
+            fg(t.special).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("█".repeat(full), fg(t.success)),
+        Span::styled("▓".repeat(half), fg(t.warning)),
+        Span::styled("░".repeat(bar - full - half), fg(t.border)),
+    ];
+    spans.extend(tail);
+    Line::from(spans)
+}
+
+/// A tree no keel run is in: what its agent is doing, and what it last said
+/// as far as `area` has room.
+fn draw_no_run(frame: &mut Frame, app: &App, tree: &Tree, area: Rect) {
+    const LABEL: u16 = 8;
+    let t = theme();
+    let label = |text: &str| Span::styled(format!(" {text:<7}"), fg(t.muted));
+    let mut lines = vec![
+        Line::styled(" no keel run in this tree", fg(t.muted)),
+        Line::raw(""),
+    ];
+    // The main checkout, or a tree with an action under way, has its agent
+    // still.
+    let state = state_said(app, tree, &why_each(app)).or_else(|| agent_said(app, tree));
+    if let Some((said, style)) = state {
+        lines.push(Line::from(vec![label("agent"), Span::styled(said, style)]));
+    }
+    let Some(item) = app.says(tree) else {
+        frame.render_widget(Paragraph::new(lines), area);
+        return;
+    };
+    let above = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    lines.push(Line::from(label("last")));
+    frame.render_widget(Paragraph::new(lines), area);
+    let at = Rect {
+        x: area.x + LABEL,
+        y: area.y + above,
+        width: area.width.saturating_sub(LABEL + 1),
+        height: area.height.saturating_sub(above),
+    };
+    let said: Vec<&str> = item
+        .text()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    let said = Paragraph::new(said.join("\n")).wrap(Wrap { trim: true });
+    frame.render_widget(said, at);
 }
 
 /// A question's choices on their number keys, for the bottom border of a
@@ -1327,19 +1448,6 @@ fn fit_each(texts: &[String], room: usize) -> Vec<String> {
         widest -= 1;
     }
     texts.iter().map(|text| fit(text, widest)).collect()
-}
-
-/// What a News line says cut to `room` columns, keeping whom it went to, the
-/// end of what you sent: `you: ship it… → fix-login`.
-fn fit_news(what: &str, room: usize) -> String {
-    match what.rsplit_once(" → ") {
-        Some((said, to)) if what.starts_with("you: ") => {
-            let to = fit(&format!(" → {to}"), room / 2);
-            let said = fit(said, room.saturating_sub(Line::raw(to.as_str()).width()));
-            format!("{said}{to}")
-        }
-        _ => fit(what, room),
-    }
 }
 
 /// The branch column's width in [2] Trees on `area`: what its fixed columns
@@ -1400,14 +1508,6 @@ fn draw_free(frame: &mut Frame, area: Rect, at: usize, state: &TableState, free:
         numbers.push_str(&next);
     }
     frame.render_widget(Paragraph::new(numbers).style(fg(theme().muted)), at);
-}
-
-/// When `at` was, as `HH:MM` in local time.
-fn clock_of(at: std::time::SystemTime) -> String {
-    let secs = at
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs().cast_signed());
-    reports::clock(secs)
 }
 
 /// Only the cells of the columns drawn, a heading's missing ones blank.
@@ -2083,9 +2183,9 @@ fn panel_keys(app: &App) -> &'static [(&'static str, &'static str)] {
             ("0", "window"),
             ("1-3", "panels"),
         ],
-        Panel::News => &[
-            ("j/k", "move"),
-            ("Enter", "go to it"),
+        Panel::Keel => &[
+            ("j/k", "steps"),
+            ("Enter", "run"),
             ("0", "window"),
             ("1-3", "panels"),
         ],
@@ -2196,7 +2296,7 @@ struct Windows {
 #[derive(Debug, Clone, Copy)]
 struct PanelAreas {
     ship: Rect,
-    news: Rect,
+    keel: Rect,
 }
 
 /// The smallest screen above the bar the panels layout is drawn on; below
@@ -2221,17 +2321,17 @@ fn panels(app: &App, main: Rect) -> Option<Windows> {
     let columns = (main.width * PANELS_SHARE / 100).clamp(PANELS_MIN_COLUMNS, PANELS_MAX_COLUMNS);
     let [left, window] =
         Layout::horizontal([Constraint::Length(columns), Constraint::Fill(1)]).areas(main);
-    let [ship, trees, news] = Layout::vertical([
+    let [ship, trees, keel] = Layout::vertical([
         Constraint::Fill(2),
         Constraint::Fill(5),
-        Constraint::Fill(3),
+        Constraint::Fill(4),
     ])
     .areas(left);
     Some(Windows {
         top: trees,
         usage: None,
         window: Some(window),
-        panels: Some(PanelAreas { ship, news }),
+        panels: Some(PanelAreas { ship, keel }),
     })
 }
 
@@ -9252,14 +9352,14 @@ mod panels_tests {
                 .unwrap_or_else(|| panic!("{text} is not on screen:\n{}", shown.join("\n")))
         };
         // Down the left in order, the window on the right.
-        let (ship, trees, news) = (row("[1] Ship"), row("[2] Trees"), row("[3] News"));
-        assert!(ship < trees && trees < news);
+        let (ship, trees, keel) = (row("[1] Ship"), row("[2] Trees"), row("[3] Keel"));
+        assert!(ship < trees && trees < keel);
         // On a heading the window has no tree, and is still [0].
         assert!(shown[ship].contains("┌ [0] ─"), "{}", shown[ship]);
         assert!(shown[ship].find("[0]").unwrap() > shown[trees].find("[2]").unwrap());
         // [2] holds the table, its trees between it and [3].
         let branch = row("me/help-columns");
-        assert!(trees < branch && branch < news, "{}", shown.join("\n"));
+        assert!(trees < branch && branch < keel, "{}", shown.join("\n"));
         assert!(shown[trees + 1].contains("BRANCH"));
         assert!(shown.last().unwrap().starts_with(" PANEL 2 "));
     }
@@ -9305,7 +9405,7 @@ mod panels_tests {
         let mut app = panels();
         app.selected = 1;
         assert_eq!(green(&app), ["[2]"]);
-        app.panel = Panel::News;
+        app.panel = Panel::Keel;
         assert_eq!(green(&app), ["[3]"]);
         // The window with the keys is green instead, and the bar shows its
         // keys; its height is what the main loop gives it each frame.
@@ -9475,30 +9575,6 @@ mod panels_tests {
         assert!(rows[0].contains("no PRs here yet"), "{rows:?}");
     }
 
-    #[test]
-    fn news_shows_where_and_what_newest_first() {
-        let mut app = panels();
-        let rows = panel_rows(&screen(&app, 160, 46), "[3] News");
-        assert!(
-            rows[0].contains("nothing new since treetop opened"),
-            "{rows:?}"
-        );
-        app.add_news(
-            Some("api:2".into()),
-            "END-212 fix-login".into(),
-            Some(Kind::Failed),
-        );
-        app.add_news(None, "you: retry → me/fix-login".into(), None);
-        let rows = panel_rows(&screen(&app, 160, 46), "[3] News");
-        assert!(rows[0].contains("you: retry → me/fix-login"), "{rows:?}");
-        assert!(
-            rows[1].contains("api:2")
-                && rows[1].contains("checks failed")
-                && rows[1].contains("END-212"),
-            "{rows:?}"
-        );
-    }
-
     fn plan_chat(job: &str, name: &str) -> crate::scratch::Scratch {
         crate::scratch::Scratch {
             job: job.into(),
@@ -9662,6 +9738,156 @@ mod panels_tests {
         assert!(rows.contains("#66 a label") && rows.contains('…'), "{rows}");
     }
 
+    /// A run at step 5 of 11 in the tree under the cursor, tree 4.
+    fn with_run() -> App {
+        let mut app = panels();
+        let path = app.trees[0].path.clone();
+        let step = |n: usize| crate::keel::Step {
+            title: format!("Step number {n}"),
+            state: match n {
+                1..3 => "done",
+                3 => "skipped",
+                4 => "done",
+                5 => "doing",
+                _ => "pending",
+            }
+            .into(),
+        };
+        app.runs.insert(
+            path.clone(),
+            crate::keel::Run {
+                tree: path.clone(),
+                playbook: "issue".into(),
+                goal: "ANB-41 Show the inbox as a rail".into(),
+                state: "active".into(),
+                steps: (1..12).map(step).collect(),
+                current: Some(5),
+                attention: 0,
+                stale: false,
+            },
+        );
+        app.select_tree("4");
+        app
+    }
+
+    #[test]
+    fn keel_shows_the_run_of_the_tree_under_the_cursor_round_its_current_step() {
+        let mut app = with_run();
+        let shown = screen(&app, 160, 40);
+        assert!(
+            shown.iter().any(|l| l.contains("[3] Keel · tree 4 ")),
+            "{}",
+            shown.join("\n")
+        );
+        let rows = |app: &App, height: u16| panel_rows(&screen(app, 160, height), "[3] Keel");
+        let all = rows(&app, 40);
+        assert!(all[0].contains("issue █████▓░░░░░░░░ 5 of 11  "), "{all:?}");
+        let at = all
+            .iter()
+            .position(|l| l.contains("▸ 5  Step number 5"))
+            .unwrap();
+        assert!(all[at - 1].contains("✓ 4  Step number 4"), "{all:?}");
+        assert!(all[at - 2].contains("- 3  Step number 3"), "{all:?}");
+        assert!(all[at + 1].contains("○ 6  Step number 6"), "{all:?}");
+        // On the smallest screen the current step is still there.
+        let few = rows(&app, 31).join("\n");
+        assert!(
+            few.contains("5 of 11") && few.contains("▸ 5  Step number 5"),
+            "{few}"
+        );
+        // Its cursor scrolls it.
+        app.panel = Panel::Keel;
+        app.handle_key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Char('G'),
+        ));
+        assert!(rows(&app, 31).join("\n").contains("○ 11 Step number 11"));
+        // What needs looking at.
+        let run = app.runs.values_mut().next().unwrap();
+        run.attention = 2;
+        run.state = "paused".into();
+        run.stale = true;
+        let head = rows(&app, 40)[0].clone();
+        assert!(head.contains("5 of 11 !2 flagged paused stale"), "{head}");
+        // Ended, how.
+        let run = app.runs.values_mut().next().unwrap();
+        run.state = "stopped".into();
+        let ended = rows(&app, 40);
+        assert!(ended[0].contains("issue stopped · 5 of 11"), "{ended:?}");
+        assert!(!ended.join("").contains('▸'), "{ended:?}");
+    }
+
+    #[test]
+    fn keel_shows_what_the_agent_does_and_said_where_there_is_no_run() {
+        let mut app = with_run();
+        app.select_tree("2");
+        let rows = panel_rows(&screen(&app, 160, 46), "[3] Keel").join("\n");
+        assert!(rows.contains("no keel run in this tree"), "{rows}");
+        assert!(rows.contains("agent  ✓ done"), "{rows}");
+        assert!(rows.contains("last   Done: opened PR #31"), "{rows}");
+        // What it said in wide characters is wrapped, not cut.
+        let report = app.reports.iter_mut().find(|r| r.job == "j2").unwrap();
+        report.text = format!("{}終", "長い".repeat(20));
+        let rows = panel_rows(&screen(&app, 120, 46), "[3] Keel").join("\n");
+        assert!(rows.contains('終'), "{rows}");
+        // An action under way on the tree leaves its agent what it is.
+        let path = app.trees[1].path.clone();
+        app.jobs
+            .insert(path, crate::app::JobState::Queued(crate::jobs::Kind::Fix));
+        let rows = panel_rows(&screen(&app, 160, 46), "[3] Keel").join("\n");
+        assert!(rows.contains("agent  ○ idle"), "{rows}");
+        // On a heading there is no tree, but on the main checkout's there is.
+        app.selected = 0;
+        let rows = panel_rows(&screen(&app, 160, 46), "[3] Keel").join("\n");
+        assert!(rows.contains("pick a tree to see its run"), "{rows}");
+        let mut main = crate::inbox::tests::tree("/code/main", "main", "main", Vec::new());
+        main.is_main = true;
+        main.agents = vec![app.trees[2].agents[0].clone()];
+        app.trees.push(main);
+        app.selected = app
+            .rows()
+            .iter()
+            .position(
+                |r| matches!(r, ListRow::Heading { group: Group::Base(b), .. } if b == "main"),
+            )
+            .unwrap();
+        let rows = panel_rows(&screen(&app, 160, 46), "[3] Keel").join("\n");
+        assert!(rows.contains("working"), "{rows}");
+    }
+
+    #[test]
+    fn a_runs_flags_show_whole_on_the_narrowest_panel_whatever_its_playbook() {
+        let mut app = with_run();
+        let run = app.runs.values_mut().next().unwrap();
+        run.current = Some(10);
+        run.attention = 2;
+        run.stale = true;
+        for (playbook, shown) in [
+            ("autonomous-run", "autonomous-run ███▓ 10 of 11"),
+            ("a-playbook-named-at-length", "a-playbook-na… ███▓ 10 of 11"),
+        ] {
+            app.runs.values_mut().next().unwrap().playbook = playbook.into();
+            let head = panel_rows(&screen(&app, 120, 40), "[3] Keel")[0].clone();
+            assert!(head.contains(shown), "{head}");
+            assert!(head.contains("!2 flagged stale"), "{head}");
+        }
+    }
+
+    #[test]
+    fn a_run_with_no_steps_or_past_its_steps_draws() {
+        let mut app = with_run();
+        let run = app.runs.values_mut().next().unwrap();
+        run.steps.clear();
+        run.current = None;
+        let rows = panel_rows(&screen(&app, 120, 31), "[3] Keel").join("\n");
+        assert!(rows.contains("issue") && rows.contains("0 of 0"), "{rows}");
+        // Nor does one past its steps, as keel does not say, go past them.
+        let mut app = with_run();
+        app.runs.values_mut().next().unwrap().current = Some(15);
+        let rows = panel_rows(&screen(&app, 120, 31), "[3] Keel").join("\n");
+        assert!(rows.contains("11 of 11"), "{rows}");
+        assert!(rows.contains("Step number 11"), "{rows}");
+    }
+
     #[test]
     fn the_free_row_says_how_many_and_that_it_leaves_some_out() {
         let free = |app: &mut App, n: usize| {
@@ -9722,19 +9948,6 @@ mod panels_tests {
                 "{width}: {bar}"
             );
         }
-        app.add_news(
-            None,
-            "you: If you have shown me a draft, yes: create those issues → me/fix-login".into(),
-            None,
-        );
-        app.add_news(
-            None,
-            "a line far too long for any of the panels to show whole".into(),
-            None,
-        );
-        let news = panel_rows(&screen(&app, 150, 45), "[3] News");
-        assert!(news[0].contains('…'), "{news:?}");
-        assert!(news[1].contains("… → me/fix-login"), "{news:?}");
         // The main checkout's heading says so whole.
         let mut main = crate::inbox::tests::tree("/code/main", "main", "main", Vec::new());
         main.is_main = true;
@@ -9914,14 +10127,6 @@ mod panels_tests {
     }
 
     #[test]
-    fn the_bar_lists_newss_own_keys() {
-        let mut app = panels();
-        app.panel = Panel::News;
-        let bar = screen(&app, 160, 46).pop().unwrap();
-        assert!(bar.contains("j/k move  Enter go to it  0 window"), "{bar}");
-    }
-
-    #[test]
     fn the_bar_counts_nobody_the_top_row_does_not() {
         let mut app = panels();
         app.trees[0].agents[0].status = Some(Status::Waiting);
@@ -10030,30 +10235,6 @@ mod panels_tests {
         app.selected = 1;
         let shown = screen(&app, 160, 46).join("\n");
         assert!(shown.contains("· ANB-41 from plan 1 (I)"), "{shown}");
-    }
-
-    #[test]
-    fn news_says_when_by_the_clock_and_scrolls() {
-        let mut app = panels();
-        for n in 0..30 {
-            app.add_news(None, format!("line {n}."), None);
-        }
-        let clock = reports::clock(
-            std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-                .cast_signed(),
-        );
-        let rows = panel_rows(&screen(&app, 160, 46), "[3] News");
-        assert!(
-            rows[0].contains(&clock[..3]) && rows[0].contains("line 29."),
-            "{rows:?}"
-        );
-        app.panel = Panel::News;
-        crate::app::tests::press(&mut app, ratatui::crossterm::event::KeyCode::Char('G'));
-        let rows = panel_rows(&screen(&app, 160, 46), "[3] News").join("\n");
-        assert!(rows.contains("line 0."), "{rows}");
     }
 
     /// The Plan screen on a chat with `n` issues made, read as `read` says.

@@ -450,7 +450,7 @@ fn with_no_layout_set_treetop_opens_on_numbered_panels_and_number_keys_move_the_
         [
             "[1] Ship",
             "[2] Trees",
-            "[3] News",
+            "[3] Keel",
             "[0] Tree 1 · here-work",
         ]
         .iter()
@@ -469,6 +469,64 @@ fn with_no_layout_set_treetop_opens_on_numbered_panels_and_number_keys_move_the_
     screen.wait_for("panel 2 with the keys", |text| {
         bar(text).starts_with(" PANEL 2 ") && bar(text).contains("j/k move")
     });
+    drop(screen);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// ANB-111: the Keel panel shows the run of the tree under the cursor, and the
+/// next tree's as the cursor moves, with no Enter; a tree's keys there act on
+/// none, and Enter shows the run in the window.
+#[test]
+fn the_keel_panel_follows_the_cursor_from_tree_to_tree() {
+    let Workspaces {
+        root, mut screen, ..
+    } = two_workspaces_with("keel", "", |root| {
+        add_tree(root, "here", "2", Some("here-second"));
+        let steps: Vec<_> = (1..12)
+            .map(|n| {
+                let state = match n {
+                    1..5 => "done",
+                    5 => "doing",
+                    _ => "pending",
+                };
+                serde_json::json!({ "title": format!("Step number {n}"), "state": state })
+            })
+            .collect();
+        let runs = serde_json::json!([{ "version": 1, "tree": root.join("here-trees/1"),
+            "playbook": "issue", "goal": "ANB-41", "state": "active", "steps": steps,
+            "current": 5, "attention": 1, "stale": false }]);
+        write_script(&root.join("bin/keel"), &format!("echo '{runs}'\n"));
+    });
+    let keel = |text: &str| -> String {
+        let rows = text.lines().skip_while(|l| !l.contains("[3] Keel"));
+        rows.map(|l| l.chars().take(72).collect::<String>() + "\n")
+            .collect()
+    };
+    screen.wait_for("tree 1's run", |text| {
+        let rows = keel(text);
+        text.contains("[0] Tree 1 · here-work")
+            && rows.contains("[3] Keel · tree 1 ")
+            && rows.contains("issue █████▓░░░░░░░░ 5 of 11 !1 flagged")
+            && rows.contains("✓ 4  Step number 4")
+            && rows.contains("▸ 5  Step number 5")
+    });
+    screen.press("j");
+    screen.wait_for("tree 2, with none", |text| {
+        let rows = keel(text);
+        rows.contains("[3] Keel · tree 2 ") && rows.contains("no keel run in this tree")
+    });
+    screen.press("k");
+    screen.press("3");
+    // Enter is taken after the rest, so what they did shows by then.
+    for key in ["r", "F", "x", "\r"] {
+        screen.press(key);
+    }
+    screen.wait_for("the run in the window", |text| {
+        text.contains("keel run · issue · ANB-41")
+            && text.lines().last().unwrap_or("").starts_with(" NORMAL ")
+    });
+    let shown = screen.text();
+    assert!(!shown.contains("backburner"), "x put it there:\n{shown}");
     drop(screen);
     let _ = fs::remove_dir_all(&root);
 }
@@ -556,47 +614,6 @@ fn an_ask_in_another_workspace_is_listed_by_e_and_enter_goes_there() {
     screen.wait_for("there's tree in the window", |text| {
         text.contains("[0] Tree 1 · there-work")
     });
-    drop(asker);
-    drop(screen);
-    let _ = fs::remove_dir_all(&root);
-}
-
-/// ANB-105: in the panels layout an agent starting to ask in another
-/// workspace is a line in [3] News, which stays however many keys go by.
-#[test]
-fn an_ask_in_another_workspace_is_news_that_stays() {
-    let Workspaces {
-        root, mut screen, ..
-    } = two_workspaces("news", "layout = \"panels\"\n");
-    screen.wait_on("here");
-    screen.wait_for("nothing new yet", |text| {
-        text.contains("nothing new since treetop opened")
-    });
-    // Its first read is done before the agent asks, so the ask is new.
-    std::thread::sleep(std::time::Duration::from_secs(5));
-    let asker = Asker(Command::new("sleep").arg("600").spawn().unwrap());
-    let git_dir = Command::new("git")
-        .args(["rev-parse", "--path-format=absolute", "--git-dir"])
-        .current_dir(root.join("there-trees/1"))
-        .output()
-        .unwrap();
-    let git_dir = PathBuf::from(String::from_utf8(git_dir.stdout).unwrap().trim());
-    fs::write(
-        git_dir.join("agent.json"),
-        serde_json::json!({ "name": "asker", "pid": asker.0.id(), "status": "waiting" })
-            .to_string(),
-    )
-    .unwrap();
-    let is_news = |text: &str| {
-        text.lines()
-            .skip_while(|l| !l.contains("[3] News"))
-            .any(|l| l.contains("there:1") && l.contains("asks you"))
-    };
-    screen.wait_for("there's ask in [3] News", is_news);
-    for key in ["j", "k", "3", "2"] {
-        screen.press(key);
-    }
-    assert!(is_news(&screen.text()), "{}", screen.text());
     drop(asker);
     drop(screen);
     let _ = fs::remove_dir_all(&root);
@@ -1045,9 +1062,6 @@ esac
     });
     screen.press("1");
     screen.press("F");
-    screen.wait_for("what was sent, in News", |text| {
-        text.contains("you: CI failed on") && text.contains("→ here-work")
-    });
     screen.wait_for("the send failing", |text| {
         text.contains("not sent to fixer in 1")
     });
@@ -1106,13 +1120,20 @@ esac
     });
     screen.press("1");
     screen.press("F");
-    screen.wait_for("what was sent, in News", |text| {
-        text.contains("you: CI failed on") && text.contains("→ here-work")
+    // A switch waits for the failure to be read; then it is being typed in.
+    screen.wait_for("the failure read, and sent", |text| {
+        text.lines()
+            .map(|l| l.chars().take(50).collect::<String>())
+            .any(|l| l.contains("idle") && l.contains("here-work"))
     });
     screen.press("2");
     screen.switch_to("there");
-    screen.wait_for("the failure on you again, and why, in News", |text| {
-        text.contains("1 needs you") && text.contains("not sent to fixer")
+    screen.wait_for("the failure on you again, and why, on the bar", |text| {
+        text.contains("1 needs you")
+            && text
+                .lines()
+                .last()
+                .is_some_and(|bar| bar.contains("not sent to fixer in here:1, you switched"))
     });
     screen.press("e");
     screen.wait_for("which it is", |text| text.contains("✗ here 1"));
