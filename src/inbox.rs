@@ -10,9 +10,10 @@
 //! and the tmux status line show until it stops being true. What counts is decided here for the
 //! phone's pushes too, so the desktop and the phone never disagree.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::agents::Status;
@@ -160,6 +161,13 @@ pub enum Kind {
     Merged,
 }
 
+impl Kind {
+    /// It comes from a read of PRs, not of agents.
+    pub fn is_pr(self) -> bool {
+        matches!(self, Self::Failed | Self::Merged)
+    }
+}
+
 /// Another workspace's entry: where it lives, so opening it switches there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Away {
@@ -251,82 +259,104 @@ fn due(
         .collect()
 }
 
+/// The other workspaces as last read, by checkout.
+#[derive(Debug, Clone, Default)]
+pub struct AwayRound {
+    pub trees: HashMap<PathBuf, Vec<Tree>>,
+    /// Those whose PRs have been read at least once.
+    pub ships_read: HashSet<PathBuf>,
+}
+
 /// Reads each other workspace opened within STALE: its trees with their
-/// agents as often as the open workspace's own, and their PRs every
-/// SHIP_EVERY, by checkout. With no other workspace due it reads nothing.
-/// A switch drops it, which stops it.
-pub fn spawn_reader(here: PathBuf) -> Reader<HashMap<PathBuf, Vec<Tree>>> {
-    let mut away = AwayRead::default();
-    spawn_every(crate::refresh::AGENTS_EVERY, move || {
-        let pools = due(crate::workspaces::list(), &here, secs(SystemTime::now()))
+/// agents as often as the open workspace's own, and, on a thread of its
+/// own so a slow one holds up no agents' read, their PRs every SHIP_EVERY.
+/// With no other workspace due it reads nothing. A switch drops it, which
+/// stops it.
+pub fn spawn_reader(here: PathBuf) -> Reader<AwayRound> {
+    let ships = Arc::new(Mutex::new(AwayShips::default()));
+    let pools = move || -> Vec<(PathBuf, Vec<Tree>)> {
+        due(crate::workspaces::list(), &here, secs(SystemTime::now()))
             .into_iter()
             .filter_map(|w| {
                 let trees = with_main(&w.checkout, crate::cache::read(&w.checkout)?);
                 Some((w.checkout, trees))
             })
-            .collect();
-        away.read(pools, crate::cli::read_agents, crate::cli::read_ship)
+            .collect()
+    };
+    let for_ships = (pools.clone(), Arc::clone(&ships));
+    let ship_reader = spawn_every(SHIP_EVERY, move || {
+        let (pools, ships) = &for_ships;
+        for (checkout, mut trees) in pools() {
+            crate::cli::read_ship(&checkout, &mut trees);
+            ships
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .apply(checkout, &trees);
+        }
+    });
+    spawn_every(crate::refresh::AGENTS_EVERY, move || {
+        // Kept as long as this reader, and dropped with it.
+        let _ = &ship_reader;
+        let ships = ships.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        ships.read(pools(), crate::cli::read_agents)
     })
 }
 
-/// Rounds of the other workspaces' agents between reads of their PRs.
-const SHIP_ROUNDS: u32 = (SHIP_EVERY.as_secs() / crate::refresh::AGENTS_EVERY.as_secs()) as u32;
-
-/// The other workspaces' reads across rounds: agents every round, PRs every
-/// SHIP_ROUNDS, each tree keeping the PR stage last read in between, since
-/// each round's trees come fresh from the caches.
-#[derive(Default)]
-struct AwayRead {
-    round: u32,
-    ships: HashMap<PathBuf, Box<crate::ship::Ship>>,
+/// The other workspaces' PRs as last read, and whose have been.
+#[derive(Debug, Clone, Default)]
+struct AwayShips {
+    by_tree: HashMap<PathBuf, Box<crate::ship::Ship>>,
+    read: HashSet<PathBuf>,
 }
 
-impl AwayRead {
+impl AwayShips {
+    /// Takes up what a read of the PRs of `checkout`'s `trees` found, in
+    /// place of what its last did, so a PR gone since is not kept.
+    fn apply(&mut self, checkout: PathBuf, trees: &[Tree]) {
+        for tree in trees {
+            match &tree.ship {
+                Some(ship) => {
+                    self.by_tree.insert(tree.path.clone(), ship.clone());
+                }
+                None => {
+                    self.by_tree.remove(&tree.path);
+                }
+            }
+        }
+        self.read.insert(checkout);
+    }
+
     /// Fills in `pools`, each workspace's trees by checkout: every
     /// workspace's agents with one call to `agents`, so the running
-    /// processes are walked once a round however many are due, and their
-    /// PRs with `ship` on the first round and every SHIP_ROUNDS after.
+    /// processes are walked once a round however many are due, and the PR
+    /// stage each tree was last read at.
     fn read(
-        &mut self,
+        &self,
         pools: Vec<(PathBuf, Vec<Tree>)>,
         agents: impl FnOnce(&mut [Tree]),
-        mut ship: impl FnMut(&Path, &mut [Tree]),
-    ) -> HashMap<PathBuf, Vec<Tree>> {
+    ) -> AwayRound {
         let sizes: Vec<(PathBuf, usize)> =
             pools.iter().map(|(c, t)| (c.clone(), t.len())).collect();
         let mut all: Vec<Tree> = pools.into_iter().flat_map(|(_, trees)| trees).collect();
         agents(&mut all);
-        let is_ship_round = self.round.is_multiple_of(SHIP_ROUNDS);
-        self.round = self.round.wrapping_add(1);
-        if is_ship_round {
-            self.ships.clear();
+        // Only while the tree is still on that PR's branch: one returned
+        // and leased again since has another's stage.
+        for tree in &mut all {
+            tree.ship = self
+                .by_tree
+                .get(&tree.path)
+                .filter(|ship| tree.branch.as_deref() == Some(ship.branch.as_str()))
+                .cloned();
         }
         let mut rest = all.into_iter();
-        sizes
+        let trees = sizes
             .into_iter()
-            .map(|(checkout, size)| {
-                let mut trees: Vec<Tree> = rest.by_ref().take(size).collect();
-                if is_ship_round {
-                    ship(&checkout, &mut trees);
-                    for tree in &trees {
-                        if let Some(read) = &tree.ship {
-                            self.ships.insert(tree.path.clone(), read.clone());
-                        }
-                    }
-                } else {
-                    // Only while the tree is still on that PR's branch: one
-                    // returned and leased again since has another's stage.
-                    for tree in &mut trees {
-                        tree.ship = self
-                            .ships
-                            .get(&tree.path)
-                            .filter(|ship| tree.branch.as_deref() == Some(ship.branch.as_str()))
-                            .cloned();
-                    }
-                }
-                (checkout, trees)
-            })
-            .collect()
+            .map(|(checkout, size)| (checkout, rest.by_ref().take(size).collect()))
+            .collect();
+        AwayRound {
+            trees,
+            ships_read: self.read.clone(),
+        }
     }
 }
 
@@ -612,7 +642,7 @@ pub mod tests {
     use crate::app::Outcome;
     use crate::ship::Ship;
     use crate::sidecar::Sidecar;
-    use ratatui::crossterm::event::{KeyCode, KeyEvent};
+    use ratatui::crossterm::event::KeyCode;
     use std::time::Duration;
 
     pub fn agent(name: &str, job: &str, status: Status) -> Agent {
@@ -807,9 +837,7 @@ pub mod tests {
             .collect()
     }
 
-    fn press(app: &mut App, code: KeyCode) -> Outcome {
-        app.handle_key(KeyEvent::from(code))
-    }
+    use crate::app::tests::press;
 
     #[test]
     fn what_waits_is_oldest_first_and_what_is_done_never_waits() {
@@ -1113,64 +1141,38 @@ pub mod tests {
 
     #[test]
     fn another_workspace_keeps_its_pr_stage_between_its_slower_pr_reads() {
-        let mut away = AwayRead::default();
-        let mut ship_reads = 0;
-        let round = |away: &mut AwayRead, ship_reads: &mut u32| {
-            away.read(
-                vec![away_pool("/code/api", &["me/fix-login"])],
-                |_| {},
-                |_, trees: &mut [Tree]| {
-                    *ship_reads += 1;
-                    // The PR is gone by the second read.
-                    if *ship_reads == 1 {
-                        trees[0].ship = Some(failing_pr("me/fix-login"));
-                    }
-                },
-            )
+        let mut ships = AwayShips::default();
+        let api = || away_pool("/code/api", &["me/fix-login"]);
+        let stage = |ships: &AwayShips| {
+            let read = ships.read(vec![api()], |_| {});
+            let ship = read.trees[Path::new("/code/api")][0].ship.clone();
+            (ship.map(|s| s.stage), read.ships_read.len())
         };
-        let stage = |read: &HashMap<PathBuf, Vec<Tree>>| {
-            read[Path::new("/code/api")][0]
-                .ship
-                .as_ref()
-                .map(|s| s.stage)
-        };
-        let first = round(&mut away, &mut ship_reads);
-        assert_eq!(stage(&first), Some(Stage::CiFailed));
-        // Every round until the next PR read keeps what the last one said,
-        // without running the ship plugins again.
-        for _ in 1..SHIP_ROUNDS {
-            let between = round(&mut away, &mut ship_reads);
-            assert_eq!(stage(&between), Some(Stage::CiFailed));
-        }
-        assert_eq!(ship_reads, 1, "the ship plugins ran between PR reads");
-        let second = round(&mut away, &mut ship_reads);
-        assert_eq!(ship_reads, 2, "the PRs were not read again on time");
-        // A PR the next read no longer finds is not brought back after it.
-        assert_eq!(stage(&second), None);
-        let after = round(&mut away, &mut ship_reads);
-        assert_eq!(stage(&after), None, "a gone PR's stage came back");
+        assert_eq!(stage(&ships), (None, 0), "its PRs are not read yet");
+        let (checkout, mut trees) = api();
+        trees[0].ship = Some(failing_pr("me/fix-login"));
+        ships.apply(checkout.clone(), &trees);
+        assert_eq!(stage(&ships), (Some(Stage::CiFailed), 1));
+        assert_eq!(stage(&ships), (Some(Stage::CiFailed), 1), "a round later");
+        // A PR the next read no longer finds is not kept.
+        ships.apply(checkout, &api().1);
+        assert_eq!(stage(&ships), (None, 1));
     }
 
     #[test]
     fn a_tree_leased_again_between_pr_reads_drops_the_old_branchs_pr() {
-        let mut away = AwayRead::default();
-        away.read(
-            vec![away_pool("/code/api", &["me/fix-login"])],
-            |_| {},
-            |_, trees: &mut [Tree]| trees[0].ship = Some(failing_pr("me/fix-login")),
-        );
+        let mut ships = AwayShips::default();
+        let (checkout, mut trees) = away_pool("/code/api", &["me/fix-login"]);
+        trees[0].ship = Some(failing_pr("me/fix-login"));
+        ships.apply(checkout, &trees);
         // Returned and leased again on another branch before the next PR read.
-        let read = away.read(
-            vec![away_pool("/code/api", &["me/new-work"])],
-            |_| {},
-            |_, _: &mut [Tree]| {},
-        );
-        assert_eq!(read[Path::new("/code/api")][0].ship, None);
+        let read = ships.read(vec![away_pool("/code/api", &["me/new-work"])], |_| {});
+        assert_eq!(read.trees[Path::new("/code/api")][0].ship, None);
     }
 
     #[test]
     fn one_agents_read_covers_every_workspace_and_each_gets_its_own_trees_back() {
-        let mut away = AwayRead::default();
+        let away = AwayShips::default();
         let mut agent_reads = 0;
         let read = away.read(
             vec![
@@ -1183,14 +1185,13 @@ pub mod tests {
                     tree.agents = vec![agent("x", "j", Status::Waiting)];
                 }
             },
-            |_, _: &mut [Tree]| {},
         );
         assert_eq!(
             agent_reads, 1,
             "the processes were walked once per workspace"
         );
         let branches = |checkout: &str| -> Vec<Option<String>> {
-            read[Path::new(checkout)]
+            read.trees[Path::new(checkout)]
                 .iter()
                 .map(|t| t.branch.clone())
                 .collect()
@@ -1200,7 +1201,7 @@ pub mod tests {
             [Some("me/a".into()), Some("me/b".into())]
         );
         assert_eq!(branches("/code/web"), [Some("me/c".into())]);
-        assert!(read.values().flatten().all(|t| t.agents.len() == 1));
+        assert!(read.trees.values().flatten().all(|t| t.agents.len() == 1));
     }
 
     #[test]

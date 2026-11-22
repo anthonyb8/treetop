@@ -439,11 +439,10 @@ fn with_no_layout_set_treetop_opens_on_numbered_panels_and_number_keys_move_the_
         .all(|title| text.contains(title))
     });
     let bar = |text: &str| text.lines().last().unwrap_or_default().to_string();
-    assert!(
-        bar(&screen.text()).starts_with(" PANEL 2 "),
-        "{}",
-        screen.text()
-    );
+    // Waited for too: the bar is the last row drawn.
+    screen.wait_for("panel 2 with the keys", |text| {
+        bar(text).starts_with(" PANEL 2 ")
+    });
     screen.press("3");
     screen.wait_for("panel 3 with the keys", |text| {
         bar(text).starts_with(" PANEL 3 ")
@@ -522,7 +521,7 @@ fn an_ask_in_another_workspace_is_listed_in_waiting_and_enter_goes_there() {
     .unwrap();
     screen.wait_for("there's ask in [1] Waiting", |text| {
         text.lines()
-            .any(|l| l.contains("there:1") && l.contains("needs you"))
+            .any(|l| l.contains("there:1") && l.contains("asks you"))
     });
     screen.press("1");
     screen.press("\r");
@@ -564,7 +563,7 @@ fn an_ask_in_another_workspace_is_news_that_stays() {
     let is_news = |text: &str| {
         text.lines()
             .skip_while(|l| !l.contains("[4] News"))
-            .any(|l| l.contains("there:1") && l.contains("needs you"))
+            .any(|l| l.contains("there:1") && l.contains("asks you"))
     };
     screen.wait_for("there's ask in [4] News", is_news);
     for key in ["j", "k", "3", "2"] {
@@ -741,6 +740,148 @@ fn a_dialog_open_over_the_panels_has_a_bar_of_its_mode_alone() {
         !bar.contains("j/k move") && !bar.contains("1-4 panels"),
         "{bar}"
     );
+    drop(screen);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// ANB-101: a slow read of another workspace's PRs holds up none of its
+/// agents' reads.
+#[test]
+fn an_agents_ask_shows_within_seconds_while_its_workspaces_prs_are_slow_to_read() {
+    let Workspaces {
+        root, mut screen, ..
+    } = two_workspaces("slow-prs", "");
+    // Asked before the first read starts, GitHub takes its time to say no.
+    write_script(&root.join("bin/gh"), "sleep 9\nexit 1\n");
+    screen.wait_for("the panels", |text| text.contains("[2] Trees"));
+    // Off to there and back starts the reader again, with the slow PRs.
+    screen.press("]");
+    screen.press("\r");
+    screen.wait_on("there");
+    screen.press("]");
+    screen.press("\r");
+    screen.wait_on("here");
+    std::thread::sleep(Duration::from_millis(1500));
+    let asker = Asker(Command::new("sleep").arg("600").spawn().unwrap());
+    let git_dir = Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--git-dir"])
+        .current_dir(root.join("there-trees/1"))
+        .output()
+        .unwrap();
+    let git_dir = PathBuf::from(String::from_utf8(git_dir.stdout).unwrap().trim());
+    fs::write(
+        git_dir.join("agent.json"),
+        serde_json::json!({ "name": "asker", "pid": asker.0.id(), "status": "waiting" })
+            .to_string(),
+    )
+    .unwrap();
+    let asked = Instant::now();
+    while !screen.text().contains("1 needs action") {
+        assert!(
+            asked.elapsed() < Duration::from_secs(5),
+            "there's ask did not show within 5 s:\n{}",
+            screen.text()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    drop(asker);
+    drop(screen);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// ANB-106: a planning chat opens in [0] as a tree's chat tab does, with
+/// Normal and Insert, and leaving Plan leaves nothing of it on Trees.
+#[test]
+fn a_planning_chat_opens_in_the_window_with_normal_and_insert() {
+    let Workspaces {
+        root, mut screen, ..
+    } = two_workspaces("plan-chat", "");
+    let here = root.join("here").canonicalize().unwrap();
+    let records = root.join("state/treetop/scratch");
+    fs::create_dir_all(&records).unwrap();
+    for n in [1, 2] {
+        fs::write(
+            records.join(format!("{n}.json")),
+            serde_json::json!({"job": format!("j{n}"), "name": format!("plan {n}"),
+                "created": 10 - n, "checkout": here})
+            .to_string(),
+        )
+        .unwrap();
+    }
+    write_script(
+        &root.join("bin/claude"),
+        "[ \"$1\" = attach ] || exit 1\necho \"chat $2 is open\"\n\
+         while read -r line; do echo \"$2 heard $line\"; done\n",
+    );
+    let bar_is =
+        |mode: &'static str| move |text: &str| text.lines().last().unwrap_or("").starts_with(mode);
+    screen.wait_for("the panels", |text| text.contains("[2] Trees"));
+    screen.press("\t");
+    screen.wait_for("the planning chats", |text| text.contains("plan 1"));
+    // Enter opens it in [0], in Normal: the panels stay, nothing floats.
+    screen.press("\r");
+    screen.wait_for("the chat in [0]", |text| {
+        text.contains("chat j1 is open")
+            && text.contains("┐┌ [0] plan 1 ─")
+            && text.contains("[2] Made from it")
+            && !text.contains("back to treetop")
+    });
+    screen.wait_for("Normal", bar_is(" NORMAL "));
+    screen.press("i");
+    screen.wait_for("Insert", bar_is(" INSERT   Ctrl+Q normal"));
+    // Capitals, digits and Tab are the chat's, not Plan's keys.
+    screen.press("Split 2 S\r");
+    screen.wait_for("what was typed, heard", |text| {
+        text.contains("j1 heard Split 2 S")
+    });
+    screen.press("\x11");
+    screen.wait_for("Normal again", bar_is(" NORMAL "));
+    screen.press("\x1b");
+    screen.wait_for("Plan's own keys", bar_is(" PLAN "));
+    // Another chat under the cursor is another chat in [0].
+    screen.press("j");
+    screen.wait_for("[0] on the other chat", |text| {
+        text.contains("┐┌ [0] plan 2 ─") && !text.contains("chat j1 is open")
+    });
+    screen.press("i");
+    screen.wait_for("its chat, in Insert", |text| {
+        text.contains("chat j2 is open") && bar_is(" INSERT ")(text)
+    });
+    screen.press("\x11");
+    screen.wait_for("Normal in it", bar_is(" NORMAL "));
+    // On to Issues, under the same top row, and back on Trees.
+    screen.press("\t");
+    screen.wait_for("Issues", |text| {
+        text.contains("no issue source for this repository")
+            && text.starts_with(" treetop    Trees   Plan   Issues ")
+            && !text.contains("chat j2 is open")
+    });
+    screen.press("\t");
+    screen.wait_for("Trees, the planning chat gone", |text| {
+        text.contains("[2] Trees") && !text.contains("chat j2 is open") && bar_is(" PANEL 2 ")(text)
+    });
+    drop(screen);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// ANB-103: on another workspace's tab a capital, which a terminal sends
+/// with Shift, acts on no tree of this one's.
+#[test]
+fn a_capital_on_another_workspaces_tab_acts_on_nothing_here() {
+    let Workspaces {
+        root, mut screen, ..
+    } = two_workspaces("capital", "");
+    screen.wait_for("the panels", |text| text.contains("[2] Trees"));
+    screen.press("]");
+    screen.wait_for("there's trees", |text| text.contains("there-work"));
+    // N would open a new agent's form for this workspace, which takes the
+    // keys; `?` after it opens the help only if nothing did.
+    screen.press("N");
+    screen.press("?");
+    screen.wait_for("the help, so no form had opened", |text| {
+        text.contains("show every key") || text.contains("Keys")
+    });
+    assert!(!screen.text().contains("New agent"), "{}", screen.text());
     drop(screen);
     let _ = fs::remove_dir_all(&root);
 }

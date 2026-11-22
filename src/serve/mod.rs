@@ -80,9 +80,10 @@ pub struct Pool {
     pub app: Mutex<App>,
 }
 
-/// The other workspaces' reading, and whether a round of it has come in.
+/// The other workspaces' reading, and whether a round of it has come in
+/// with their PRs as well as their agents.
 struct Away {
-    reader: crate::inbox::Reader<HashMap<PathBuf, Vec<treehouse::Tree>>>,
+    reader: crate::inbox::Reader<crate::inbox::AwayRound>,
     is_read: bool,
 }
 
@@ -187,8 +188,9 @@ impl Pool {
             is_read: false,
         });
         while let Ok(live) = away.reader.rounds.try_recv() {
-            app.away_live = live;
-            away.is_read = true;
+            away.is_read |= live.trees.keys().all(|c| live.ships_read.contains(c));
+            app.away_live = live.trees;
+            app.away_ships = live.ships_read;
         }
         away.is_read
     }

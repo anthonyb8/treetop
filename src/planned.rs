@@ -159,38 +159,48 @@ pub struct Planned {
     pub blocked_by: Vec<String>,
 }
 
-/// Each of `ids` as `backend` has it, with its stage by its team's states;
-/// an issue it cannot read is left out.
-pub fn read(backend: &dyn Backend, ids: &[String]) -> Vec<Planned> {
-    let team = backend.team().ok().flatten();
-    let kind_of = |state_id: Option<&str>| {
-        let kind = team
-            .as_ref()
-            .and_then(|t| t.states.iter().find(|s| Some(s.id.as_str()) == state_id))
-            .map(|s| s.kind.as_str());
-        match kind {
-            Some("started") => Stage::Going,
-            Some("completed") => Stage::Done,
-            Some("canceled") => Stage::Canceled,
-            _ => Stage::NotStarted,
-        }
-    };
-    ids.iter()
-        .filter_map(|id| backend.detail(id).ok())
-        .map(|detail| Planned {
-            stage: kind_of(detail.issue.state_id.as_deref()),
-            blocked_by: detail
-                .links
-                .iter()
-                .filter(|l| l.kind == "blocked by" && !l.is_done)
-                .map(|l| l.id.clone())
+/// Each of `ids` as `backend` has it, in that order; one it does not have is
+/// left out. Why not, where it could read none.
+pub fn read(backend: &dyn Backend, ids: &[String]) -> Result<Vec<Planned>, String> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut found = backend.standings(ids)?;
+    found.sort_by_key(|s| ids.iter().position(|id| *id == s.id));
+    Ok(found
+        .into_iter()
+        .map(|s| Planned {
+            stage: stage(s.kind.as_deref(), &s.state),
+            blocked_by: s
+                .blocked_by
+                .into_iter()
+                .filter(|l| !l.is_done)
+                .map(|l| l.id)
                 .collect(),
-            id: detail.issue.id,
-            title: detail.issue.title,
-            project: detail.issue.project,
-            state: detail.issue.state,
+            id: s.id,
+            title: s.title,
+            project: s.project,
+            state: s.state,
         })
-        .collect()
+        .collect())
+}
+
+/// The stage of a status: by its type, or, from a source that gives none,
+/// a ticket plugin's, by its name, so one done or under way there is not
+/// offered to pick up.
+fn stage(kind: Option<&str>, name: &str) -> Stage {
+    match kind {
+        Some("started") => Stage::Going,
+        Some("completed") => Stage::Done,
+        Some("canceled" | "duplicate") => Stage::Canceled,
+        Some(_) => Stage::NotStarted,
+        None => match name.to_lowercase().as_str() {
+            "done" | "closed" | "completed" | "merged" | "resolved" => Stage::Done,
+            "canceled" | "cancelled" | "duplicate" | "won't do" => Stage::Canceled,
+            "in progress" | "in review" | "started" | "doing" => Stage::Going,
+            _ => Stage::NotStarted,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -215,10 +225,13 @@ mod tests {
         path
     }
 
-    /// A Linear with ANB-1 started, ANB-2 done, ANB-3 canceled and ANB-4 in
-    /// Backlog, blocked by ANB-2 (done) and ANB-1 (not), and ANB-5 it cannot
-    /// read.
-    struct Fake;
+    /// A source with ANB-1 done, ANB-2 under way, ANB-3 canceled and ANB-4
+    /// to do, waiting on ANB-1 and ANB-2; it names each one's status and,
+    /// `has_kinds`, gives its type, as Linear does.
+    struct Fake {
+        has_kinds: bool,
+        is_down: bool,
+    }
 
     impl Backend for Fake {
         fn name(&self) -> &str {
@@ -230,13 +243,9 @@ mod tests {
         }
 
         fn detail(&self, id: &str) -> Result<linear::Detail, String> {
-            let state = match id {
-                "ANB-1" => "Doing",
-                "ANB-2" => "Done",
-                "ANB-3" => "Dropped",
-                "ANB-4" => "Backlog",
-                _ => return Err(format!("no {id}")),
-            };
+            if self.is_down {
+                return Err("work: unavailable".into());
+            }
             let link = |id: &str, is_done| linear::Link {
                 kind: "blocked by".into(),
                 id: id.into(),
@@ -244,67 +253,104 @@ mod tests {
                 state: String::new(),
                 is_done,
             };
+            let state = match id {
+                "ANB-1" => "Done",
+                "ANB-2" => "In Progress",
+                "ANB-3" => "Cancelled",
+                "ANB-4" => "Todo",
+                _ => return Err(format!("no {id}")),
+            };
             Ok(linear::Detail {
                 issue: linear::Issue {
                     id: id.into(),
                     title: format!("{id} title"),
                     state: state.into(),
-                    state_id: Some(state.into()),
                     project: Some("treetop panels".into()),
                     ..linear::Issue::default()
                 },
                 comments: Vec::new(),
                 links: if id == "ANB-4" {
-                    vec![link("ANB-2", true), link("ANB-1", false)]
+                    vec![link("ANB-1", true), link("ANB-2", false)]
                 } else {
                     Vec::new()
                 },
             })
         }
 
-        fn team(&self) -> Result<Option<std::sync::Arc<linear::Team>>, String> {
-            let state = |name: &str, kind: &str| linear::State {
-                id: name.into(),
-                name: name.into(),
-                kind: kind.into(),
-                position: 0.0,
-            };
-            Ok(Some(std::sync::Arc::new(linear::Team {
-                id: "t".into(),
-                key: "ANB".into(),
-                name: "ANB".into(),
-                states: vec![
-                    state("Backlog", "backlog"),
-                    state("Doing", "started"),
-                    state("Done", "completed"),
-                    state("Dropped", "canceled"),
-                ],
-                labels: Vec::new(),
-                members: Vec::new(),
-                projects: Vec::new(),
-                cycles: Vec::new(),
-                me: None,
-            })))
+        fn standings(&self, ids: &[String]) -> Result<Vec<linear::Standing>, String> {
+            // Out of order, as Linear answers.
+            let mut found = Vec::new();
+            for id in ids.iter().rev() {
+                let Ok(detail) = self.detail(id) else {
+                    continue;
+                };
+                let kind = match id.as_str() {
+                    "ANB-1" => "completed",
+                    "ANB-2" => "started",
+                    "ANB-3" => "canceled",
+                    _ => "backlog",
+                };
+                found.push(linear::Standing {
+                    id: detail.issue.id,
+                    title: detail.issue.title,
+                    project: detail.issue.project,
+                    state: if self.has_kinds {
+                        "Custom".into()
+                    } else {
+                        detail.issue.state
+                    },
+                    kind: self.has_kinds.then(|| kind.into()),
+                    blocked_by: detail.links,
+                });
+            }
+            if found.is_empty() {
+                return Err("work: unavailable".into());
+            }
+            Ok(found)
         }
     }
 
     #[test]
-    fn each_issue_stands_where_its_status_kind_says_and_waits_only_on_blockers_not_done() {
+    fn each_issue_stands_where_its_status_type_says_else_its_name() {
         let ids: Vec<String> = (1..=5).map(|n| format!("ANB-{n}")).collect();
-        let read = read(&Fake, &ids);
-        let stages: Vec<(&str, Stage)> = read.iter().map(|p| (p.id.as_str(), p.stage)).collect();
+        for has_kinds in [true, false] {
+            let fake = Fake {
+                has_kinds,
+                is_down: false,
+            };
+            let read = read(&fake, &ids).unwrap();
+            let stages: Vec<(&str, Stage)> =
+                read.iter().map(|p| (p.id.as_str(), p.stage)).collect();
+            assert_eq!(
+                stages,
+                [
+                    ("ANB-1", Stage::Done),
+                    ("ANB-2", Stage::Going),
+                    ("ANB-3", Stage::Canceled),
+                    ("ANB-4", Stage::NotStarted),
+                ],
+                "types: {has_kinds}; ANB-5 it does not have"
+            );
+            assert_eq!(read[3].blocked_by, ["ANB-2"]);
+            assert_eq!(read[3].project.as_deref(), Some("treetop panels"));
+        }
+    }
+
+    #[test]
+    fn a_source_that_cannot_be_read_says_why_rather_than_that_nothing_was_made() {
+        let fake = Fake {
+            has_kinds: true,
+            is_down: true,
+        };
         assert_eq!(
-            stages,
-            [
-                ("ANB-1", Stage::Going),
-                ("ANB-2", Stage::Done),
-                ("ANB-3", Stage::Canceled),
-                ("ANB-4", Stage::NotStarted),
-            ],
-            "ANB-5, unreadable, is left out"
+            read(&fake, &["ANB-1".to_string()]),
+            Err("work: unavailable".into())
         );
-        assert_eq!(read[3].blocked_by, ["ANB-1"]);
-        assert_eq!(read[3].project.as_deref(), Some("treetop panels"));
+        assert_eq!(
+            read(&fake, &[]),
+            Ok(Vec::new()),
+            "nothing made, nothing read"
+        );
     }
 
     const MADE: &str = "ANB-101 https://linear.app/a/issue/ANB-101/r (team ANB, workspace anb)";

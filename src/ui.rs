@@ -3,7 +3,8 @@
 //! floats over them in a popup, with the table dimmed round it, so treetop
 //! never leaves the screen. Every colour comes from `theme`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::time::{Duration, UNIX_EPOCH};
 
 use ratatui::Frame;
@@ -12,7 +13,8 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Cell, Clear, Padding, Paragraph, Row, Table, TableState, Wrap,
+    Block, Borders, Cell, Clear, List, ListItem, ListState, Padding, Paragraph, Row, Table,
+    TableState, Wrap,
 };
 
 use crate::agents::{Agent, Status};
@@ -180,14 +182,18 @@ pub fn draw(
     // add accents, so nothing falls back to a theme's dim default.
     frame.render_widget(Block::new().style(fg(theme().text)), frame.area());
     match issues.filter(|_| app.is_issues) {
-        Some(screen) => screen.draw(frame, frame.area(), &palette(), app),
+        Some(screen) => {
+            let rows = screen_rows(app, frame.area());
+            let area = rows.main.union(rows.footer);
+            screen.draw(frame, area, &palette(), app);
+        }
         None if app.is_plan => {
-            let rows = screen_rows(frame.area());
+            let rows = screen_rows(app, frame.area());
             draw_plan(frame, app, rows.main, chat);
             draw_footer(frame, app, rows.footer, true);
         }
         None => {
-            let rows = screen_rows(frame.area());
+            let rows = screen_rows(app, frame.area());
             let windows = windows(app, rows.main);
             // Marked only while nothing else takes the keys: a window,
             // a compose box or the palette. In Normal's green, as a
@@ -226,7 +232,7 @@ pub fn draw(
                         (Panel::Trees, None) => draw_table(frame, app, body, false, true),
                         (Panel::Waiting, _) => draw_waiting(frame, app, body, focused),
                         (Panel::Ship, _) => draw_ship(frame, app, body, focused),
-                        (Panel::News, _) => draw_news(frame, app, body),
+                        (Panel::News, _) => draw_news(frame, app, body, focused),
                     }
                 }
             } else if is_classic(app) {
@@ -257,7 +263,7 @@ pub fn draw(
             if let Some(area) = windows.window {
                 let screen = frame.area();
                 let (cursor_area, other_area) = pane_areas(app, area);
-                let shown = chat.filter(|c| !floats(app, is_popup_chat(c), screen));
+                let shown = chat.filter(|c| !floats(app, is_popup_chat(app, c), screen));
                 let pane = Pane {
                     is_alone: other_area.is_none() && app.other_window().is_some(),
                     ..cursor_pane(app)
@@ -273,7 +279,10 @@ pub fn draw(
             draw_footer(frame, app, rows.footer, windows.panels.is_some());
         }
     }
-    let popup_chat = chat.filter(|c| floats(app, is_popup_chat(c), frame.area()));
+    if let Some(top) = screen_rows(app, frame.area()).top {
+        draw_top(frame, app, top);
+    }
+    let popup_chat = chat.filter(|c| floats(app, is_popup_chat(app, c), frame.area()));
     let floating_tab = !app.is_issues
         && floats(app, false, frame.area())
         && (app.has_keys_on(WindowTab::Diff) || app.has_keys_on(WindowTab::Pr));
@@ -284,7 +293,7 @@ pub fn draw(
         form.is_none()
             && (o.key.is_none() || app.prompt.is_none() && !has_window(app, frame.area()))
     });
-    if popup_chat.is_some() && !app.is_plan
+    if popup_chat.is_some()
         || floating_tab
         || app.prompt.is_some() && form.is_none()
         || popup_opening.is_some()
@@ -304,7 +313,7 @@ pub fn draw(
             .set_style(area, Style::new().add_modifier(Modifier::DIM));
     }
     // Drawn over the dimming, so it stays bright under a popup.
-    draw_count(frame, app, screen_rows(frame.area()).main);
+    draw_count(frame, app, screen_rows(app, frame.area()).main);
     if let Some(chat) = popup_chat {
         draw_chat(frame, app, chat);
     } else if floating_tab {
@@ -436,7 +445,7 @@ fn draw_notes(frame: &mut Frame, app: &App) {
     // Under the count, above the bar, its right edge as far in from the
     // screen's as the count's is from the table's, so the Usage column
     // beside the table never moves it.
-    let main = screen_rows(frame.area()).main;
+    let main = screen_rows(app, frame.area()).main;
     // With nothing counted, where the count would end: inside the table
     // window's corner.
     let table = windows(app, main).top;
@@ -613,15 +622,6 @@ fn summary(app: &App, is_compact: bool) -> Vec<Span<'static>> {
             spans.push(Span::styled(
                 format!("  {n} need you"),
                 fg(t.danger).add_modifier(Modifier::BOLD),
-            ));
-        }
-        // Planning chats asking you, from any screen of the panels layout.
-        if let n @ 1.. = app.plan_asking()
-            && app.look == Look::Panels
-        {
-            spans.push(Span::styled(
-                format!("  ▲{n} planning"),
-                fg(t.warning).add_modifier(Modifier::BOLD),
             ));
         }
         if let n @ 1.. = app.merged() {
@@ -961,6 +961,69 @@ fn row(app: &App, tree: &Tree) -> Vec<Cell<'static>> {
     cells
 }
 
+/// Why each tree waits, or that it is done, in every workspace, by path:
+/// the panels' rows say it, without what is put away once acted on.
+fn why_each(app: &App) -> HashMap<PathBuf, Kind> {
+    let (needs, _) = app.notes_list();
+    // The last to land on a path is the one kept: what needs you over what
+    // is done, and an ask over a failed PR.
+    let mut entries: Vec<inbox::Entry> = inbox::done(app);
+    entries.extend(needs);
+    entries.sort_by_key(|e| std::cmp::Reverse(e.kind));
+    entries.into_iter().map(|e| (e.path, e.kind)).collect()
+}
+
+/// A tree's cells in [2] Trees of the panels layout: the full table's, with
+/// why it waits, or what its agent is doing, where that has the pool's
+/// status.
+fn panel_row(app: &App, tree: &Tree, why: &HashMap<PathBuf, Kind>) -> Vec<Cell<'static>> {
+    const STATUS: usize = 2;
+    let mut cells = row(app, tree);
+    if let Some(state) = state_cell(app, tree, why) {
+        cells[STATUS] = state;
+    }
+    cells
+}
+
+/// Why a held tree waits, else what its agent is doing; None where the
+/// pool's status says more: an action on it, or a tree nobody holds.
+fn state_cell(app: &App, tree: &Tree, why: &HashMap<PathBuf, Kind>) -> Option<Cell<'static>> {
+    let t = theme();
+    if app.jobs.contains_key(&tree.path)
+        || app.is_handing_off(&tree.path)
+        || !tree.is_held()
+        || tree.is_main
+    {
+        return None;
+    }
+    if let Some(kind) = why.get(&tree.path) {
+        let (mark, color) = mark_of(*kind);
+        let said = match kind {
+            Kind::Failed => "ci failed",
+            Kind::Done => "done",
+            Kind::Merged => "merged",
+            kind => asks_for(*kind),
+        };
+        return Some(
+            Cell::from(format!("{mark} {said}")).style(fg(color).add_modifier(Modifier::BOLD)),
+        );
+    }
+    let Some(agent) = App::agents_of(tree).into_iter().next() else {
+        return app
+            .is_agents_read
+            .then(|| Cell::from("no agent").style(fg(t.muted)));
+    };
+    let (mark, style) = agent_style(agent.status);
+    let said = match agent.status {
+        Some(Status::Waiting) => "asks you",
+        Some(Status::Busy) => "working",
+        Some(Status::Idle) => "idle",
+        Some(Status::Cold) => "stopped",
+        None => "agent",
+    };
+    Some(Cell::from(format!("{mark} {said}")).style(style))
+}
+
 /// The columns the table draws, each its title, width and place in a
 /// row's cells: all of them, or in [2] Trees of the panels layout the few
 /// that fit beside the window, which shows the rest.
@@ -993,7 +1056,7 @@ fn columns(app: &App, compact: bool) -> Vec<(&'static str, Constraint, usize)> {
     numbered
         .filter_map(|(title, width, at)| match title {
             "" | "#" | "BRANCH" => Some((title, width, at)),
-            "STATUS" => Some((title, Constraint::Length(10), at)),
+            "STATUS" => Some((title, Constraint::Length(12), at)),
             "PORTS" => Some((title, Constraint::Length(8), at)),
             "GIT" => Some((title, Constraint::Length(6), at)),
             _ => None,
@@ -1024,7 +1087,7 @@ fn draw_waiting(frame: &mut Frame, app: &App, area: Rect, has_keys: bool) {
                 Cell::from(mark).style(fg(color).add_modifier(Modifier::BOLD)),
                 Cell::from(place).style(fg(t.muted)),
                 Cell::from(what),
-                Cell::from(waits_for(entry.kind)).style(fg(color)),
+                Cell::from(asks_for(entry.kind)).style(fg(color)),
                 Cell::from(entry.at.map(reports::age).unwrap_or_default()).style(fg(t.muted)),
             ])
         })
@@ -1104,9 +1167,10 @@ fn draw_ship(frame: &mut Frame, app: &App, area: Rect, has_keys: bool) {
     frame.render_stateful_widget(table, area, &mut state);
 }
 
-/// [4] News: what happened in every workspace, newest first, as long ago
-/// as it was, where, and what; it stays however many keys go by.
-fn draw_news(frame: &mut Frame, app: &App, area: Rect) {
+/// [4] News: what happened in every workspace, newest first, when by the
+/// clock, where, and what; it stays however many keys go by, and scrolls
+/// with its cursor while it has the keys.
+fn draw_news(frame: &mut Frame, app: &App, area: Rect, has_keys: bool) {
     let t = theme();
     let news = app.news();
     if news.is_empty() {
@@ -1119,28 +1183,36 @@ fn draw_news(frame: &mut Frame, app: &App, area: Rect) {
         );
         return;
     }
-    let lines: Vec<Line> = news
+    let lines: Vec<ListItem> = news
         .iter()
-        .take(usize::from(area.height))
         .map(|line| {
             let (said, color) = match line.kind {
                 Some(Kind::Done) => ("done", t.success),
                 Some(Kind::Merged) => ("merged", t.special),
-                Some(kind) => (waits_for(kind), mark_of(kind).1),
+                Some(kind) => (asks_for(kind), mark_of(kind).1),
                 None => ("", t.text),
             };
             let mut spans = vec![
-                Span::styled(format!("{:>4} ", reports::age(line.at)), fg(t.muted)),
+                Span::styled(format!(" {} ", clock_of(line.at)), fg(t.muted)),
                 Span::styled(format!("{} ", line.place), fg(t.muted)),
             ];
             if !said.is_empty() {
                 spans.push(Span::styled(format!("{said} "), fg(color)));
             }
             spans.push(Span::raw(line.what.clone()));
-            Line::from(spans)
+            ListItem::new(Line::from(spans))
         })
         .collect();
-    frame.render_widget(Paragraph::new(lines), area);
+    let selected = has_keys.then_some(app.news_at.min(news.len() - 1));
+    draw_list(frame, area, lines, selected);
+}
+
+/// When `at` was, as `HH:MM` in local time.
+fn clock_of(at: std::time::SystemTime) -> String {
+    let secs = at
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs().cast_signed());
+    reports::clock(secs)
 }
 
 /// Only the cells of the columns drawn, a heading's missing ones blank.
@@ -1229,6 +1301,7 @@ fn workspace_tab_spans(app: &App, room: usize) -> Vec<Span<'static>> {
 fn draw_viewed(frame: &mut Frame, app: &App, area: Rect, trees: &[&Tree]) {
     let t = theme();
     let columns = columns(app, true);
+    let why = why_each(app);
     let header = Row::new(columns.iter().map(|(title, ..)| *title)).style(t.header);
     let heading = |glyph: &'static str, label: &'static str| {
         Row::new(pick_cells(
@@ -1262,7 +1335,7 @@ fn draw_viewed(frame: &mut Frame, app: &App, area: Rect, trees: &[&Tree]) {
         if at == app.viewed {
             selected = Some(rows.len());
         }
-        rows.push(Row::new(pick_cells(&columns, row(app, tree))));
+        rows.push(Row::new(pick_cells(&columns, panel_row(app, tree, &why))));
     }
     let free = app.viewed_free();
     if !free.is_empty() {
@@ -1296,6 +1369,11 @@ fn draw_viewed(frame: &mut Frame, app: &App, area: Rect, trees: &[&Tree]) {
 fn draw_table(frame: &mut Frame, app: &App, area: Rect, fold: bool, compact: bool) {
     let t = theme();
     let columns = columns(app, compact);
+    let why = if compact {
+        why_each(app)
+    } else {
+        HashMap::new()
+    };
     let header = Row::new(columns.iter().map(|(title, ..)| *title)).style(t.header);
     let pick = |cells| pick_cells(&columns, cells);
     // A blank line sets each heading apart from the trees above it. The
@@ -1315,7 +1393,12 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect, fold: bool, compact: boo
             selected = rows.len();
         }
         rows.push(match list_row {
-            ListRow::Tree(tree) => Row::new(pick(row(app, tree))).style(if app.is_cached {
+            ListRow::Tree(tree) => Row::new(pick(if compact {
+                panel_row(app, tree, &why)
+            } else {
+                row(app, tree)
+            }))
+            .style(if app.is_cached {
                 Style::new().add_modifier(Modifier::ITALIC)
             } else {
                 Style::new()
@@ -1736,7 +1819,7 @@ fn footer_left(app: &App, is_panels: bool) -> Line<'static> {
 /// the keys where the table's would say TABLE.
 fn badge(app: &App, is_panels: bool) -> String {
     match Mode::of(app) {
-        _ if app.is_plan && !app.is_inserting() => " PLAN ".to_string(),
+        Mode::Table if app.is_plan => " PLAN ".to_string(),
         Mode::Table if is_panels && !app.marked.is_empty() => {
             format!(" {} MARKED ", app.marked.len())
         }
@@ -1749,6 +1832,22 @@ fn badge(app: &App, is_panels: bool) -> String {
 /// window's, [2] Trees', and only the panel keys for the panels still
 /// empty.
 fn panel_keys(app: &App) -> &'static [(&'static str, &'static str)] {
+    // Every other key goes to what is typed into.
+    if app.is_inserting() {
+        return &[("Ctrl+Q", "normal")];
+    }
+    if app.is_window_focused && app.dialog.is_some() {
+        return &[("1-9", "answer"), ("i", "type"), ("Esc", "back")];
+    }
+    if app.is_plan && app.is_window_focused {
+        return &[
+            ("i", "insert"),
+            ("j/k", "scroll"),
+            ("Esc", "back"),
+            ("1-3", "panels"),
+            ("Tab", "Issues"),
+        ];
+    }
     if app.is_plan && app.plan_focus >= 2 {
         return &[
             ("j/k", "move"),
@@ -1767,9 +1866,6 @@ fn panel_keys(app: &App) -> &'static [(&'static str, &'static str)] {
             ("1-3", "panels"),
             ("Tab", "Issues"),
         ];
-    }
-    if app.is_window_focused && app.dialog.is_some() {
-        return &[("1-9", "answer"), ("i", "type"), ("Esc", "back")];
     }
     if app.is_window_focused {
         return &[
@@ -1924,7 +2020,7 @@ struct PanelAreas {
 /// The smallest screen above the bar the panels layout is drawn on; below
 /// it the table layout is, until the panels have a small-terminal form.
 const PANELS_MIN_WIDTH: u16 = 120;
-const PANELS_MIN_HEIGHT: u16 = 30;
+const PANELS_MIN_HEIGHT: u16 = 31;
 
 /// The share of the width the panels down the left take, between their
 /// fewest and most columns, the window on the right taking the rest.
@@ -1936,8 +2032,8 @@ const PANELS_MAX_COLUMNS: u16 = 72;
 /// has room: [1] to [4] down the left, [2] Trees the tallest, and the
 /// window on the right.
 fn panels(app: &App, main: Rect) -> Option<Windows> {
-    if app.look != Look::Panels || main.width < PANELS_MIN_WIDTH || main.height < PANELS_MIN_HEIGHT
-    {
+    // They fit where the top row is, above `main`.
+    if app.look != Look::Panels || main.y == 0 {
         return None;
     }
     let columns = (main.width * PANELS_SHARE / 100).clamp(PANELS_MIN_COLUMNS, PANELS_MAX_COLUMNS);
@@ -2103,7 +2199,7 @@ pub fn usage_overflow(app: &App, screen: Rect) -> u16 {
     if app.is_issues {
         return 0;
     }
-    let Some(area) = windows(app, screen_rows(screen).main).usage else {
+    let Some(area) = windows(app, screen_rows(app, screen).main).usage else {
         return 0;
     };
     let inner = usage_block(false).inner(area);
@@ -2111,15 +2207,6 @@ pub fn usage_overflow(app: &App, screen: Rect) -> u16 {
     u16::try_from(lines.len())
         .unwrap_or(u16::MAX)
         .saturating_sub(inner.height)
-}
-
-/// Where a popup chat lays itself out on `screen`: the whole of it, or on
-/// the Plan screen its window, [0], where its planning chat shows.
-pub fn popup_screen(app: &App, screen: Rect) -> Rect {
-    if !app.is_plan {
-        return screen;
-    }
-    plan_areas(screen_rows(screen).main).1
 }
 
 /// The Plan screen on `main`: its panels down the left, as the Trees
@@ -2146,7 +2233,8 @@ fn planned_mark(app: &App, issue: &crate::planned::Planned) -> (&'static str, Co
 
 /// [2] Made from it: the project the chat under [1]'s cursor made, under a
 /// bar of its issues done, going and not started, then each with where it
-/// stands: in which tree, ready, waiting on another, or its status.
+/// stands: in which tree, ready, waiting on another, or its status, its
+/// cursor kept on screen. Issues made that are not read say so, and why.
 fn draw_made(frame: &mut Frame, app: &App, area: Rect, keys: Option<Mode>) {
     use crate::planned::Stage;
     let t = theme();
@@ -2154,18 +2242,30 @@ fn draw_made(frame: &mut Frame, app: &App, area: Rect, keys: Option<Mode>) {
     let body = block.inner(area);
     frame.render_widget(block, area);
     let made = app.made();
+    let chat = app.plan_chats.get(app.plan_at);
+    let recorded = chat.map_or(0, |c| c.issues.len());
+    let unread = chat
+        .and_then(|c| app.plan_unread.get(&c.job))
+        .or(app.plan_error.as_ref());
     if made.is_empty() {
-        let said = app
-            .plan_error
-            .clone()
-            .unwrap_or_else(|| " nothing yet: D drafts issues, S creates them".into());
+        let (said, color) = match (recorded, unread) {
+            (0, _) => (
+                " nothing yet: D drafts issues, S creates them".to_string(),
+                t.muted,
+            ),
+            (n, Some(why)) => (
+                format!(" {}, not read: {why}", plural(n, "issue")),
+                t.danger,
+            ),
+            (n, None) => (format!(" {}, reading them...", plural(n, "issue")), t.muted),
+        };
         frame.render_widget(
-            Paragraph::new(Line::styled(said, fg(t.muted))).wrap(Wrap { trim: false }),
+            Paragraph::new(Line::styled(said, fg(color))).wrap(Wrap { trim: false }),
             body,
         );
         return;
     }
-    let is_going = |i: &&crate::planned::Planned| {
+    let is_going = |i: &crate::planned::Planned| {
         i.stage == Stage::Going
             || (i.stage == Stage::NotStarted && app.tree_of_ticket(&i.id).is_some())
     };
@@ -2179,7 +2279,7 @@ fn draw_made(frame: &mut Frame, app: &App, area: Rect, keys: Option<Mode>) {
         .iter()
         .find_map(|i| i.project.clone())
         .unwrap_or_else(|| "its issues".into());
-    let mut lines = vec![
+    let mut head = vec![
         Line::from(vec![
             Span::styled(" project ", fg(t.muted)),
             Span::styled(project, fg(t.special).add_modifier(Modifier::BOLD)),
@@ -2195,39 +2295,66 @@ fn draw_made(frame: &mut Frame, app: &App, area: Rect, keys: Option<Mode>) {
             ),
         ]),
     ];
-    // Each title padded to the longest that fits, so where each stands
-    // reads down one column.
-    let widest_said = 12;
-    let room = usize::from(body.width).saturating_sub(3 + 8 + 2 + widest_said);
-    let title_width = made
-        .iter()
-        .map(|i| i.title.chars().count())
-        .max()
-        .unwrap_or(0)
-        .min(room);
-    for (at, issue) in made.iter().enumerate() {
-        let (mark, color) = planned_mark(app, issue);
-        let title: String = issue.title.chars().take(title_width).collect();
-        let (said, said_color) = match app.tree_of_ticket(&issue.id) {
-            Some(tree) => (format!("tree {}", tree.name), t.info),
-            None if app.is_ready(issue) => ("ready".into(), t.success),
-            None => match issue.blocked_by.first() {
-                Some(by) => (format!("⊘ {by}"), t.danger),
-                None => (issue.state.clone(), t.muted),
-            },
-        };
-        let mut line = Line::from(vec![
-            Span::styled(format!(" {mark} "), fg(color).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("{:<8}", issue.id), fg(t.muted)),
-            Span::raw(format!("{title:<title_width$}  ")),
-            Span::styled(said, fg(said_color).add_modifier(Modifier::BOLD)),
-        ]);
-        if keys.is_some() && at == app.made_at {
-            line = line.style(t.cursor);
-        }
-        lines.push(line);
+    // What is missing or old, above the rows so it is never scrolled off.
+    if let Some(why) = unread {
+        head.push(Line::styled(format!(" as last read: {why}"), fg(t.danger)));
+    } else if recorded > made.len() {
+        head.push(Line::styled(
+            format!(" {} not found", recorded - made.len()),
+            fg(t.warning),
+        ));
     }
-    frame.render_widget(Paragraph::new(lines), body);
+    let rows_at = u16::try_from(head.len()).unwrap_or(u16::MAX);
+    let [head_area, rows_area] =
+        Layout::vertical([Constraint::Length(rows_at), Constraint::Fill(1)]).areas(body);
+    frame.render_widget(Paragraph::new(head), head_area);
+    // Ids and titles padded to the longest that fit, so where each stands
+    // reads down one column.
+    let id_width = widest(made.iter().map(|i| i.id.as_str()));
+    const WIDEST_SAID: usize = 12;
+    let room = usize::from(body.width).saturating_sub(3 + id_width + 2 + 2 + WIDEST_SAID);
+    let title_width = widest(made.iter().map(|i| i.title.as_str())).min(room);
+    let rows: Vec<ListItem> = made
+        .iter()
+        .map(|issue| {
+            let (mark, color) = planned_mark(app, issue);
+            let title = fit(&issue.title, title_width);
+            let pad = " ".repeat(title_width.saturating_sub(Span::raw(title.as_str()).width()));
+            let (said, said_color) = match app.tree_of_ticket(&issue.id) {
+                Some(tree) => (format!("tree {}", tree.name), t.info),
+                None if app.is_ready(issue) => ("ready".into(), t.success),
+                None => match issue.blocked_by.first() {
+                    Some(by) if issue.stage == Stage::NotStarted => (format!("⊘ {by}"), t.danger),
+                    _ => (issue.state.clone(), t.muted),
+                },
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!(" {mark} "), fg(color).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{:<id_width$}  ", issue.id), fg(t.muted)),
+                Span::raw(format!("{title}{pad}  ")),
+                Span::styled(said, fg(said_color).add_modifier(Modifier::BOLD)),
+            ]))
+        })
+        .collect();
+    draw_list(
+        frame,
+        rows_area,
+        rows,
+        keys.is_some().then_some(app.made_at),
+    );
+}
+
+/// The widest of `texts`, in columns.
+fn widest<'a>(texts: impl Iterator<Item = &'a str>) -> usize {
+    texts.map(|s| Span::raw(s).width()).max().unwrap_or(0)
+}
+
+/// A panel's rows, scrolled to keep the one at `cursor` on screen.
+fn draw_list(frame: &mut Frame, area: Rect, rows: Vec<ListItem>, cursor: Option<usize>) {
+    let mut state =
+        ListState::default().with_selected(cursor.map(|at| at.min(rows.len().saturating_sub(1))));
+    let list = List::new(rows).highlight_style(theme().cursor);
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 /// [3] Ready to pick up: every planning chat's issues nothing holds up,
@@ -2245,22 +2372,17 @@ fn draw_ready(frame: &mut Frame, app: &App, area: Rect, keys: Option<Mode>) {
         );
         return;
     }
-    let lines: Vec<Line> = ready
+    let id_width = widest(ready.iter().map(|i| i.id.as_str()));
+    let rows = ready
         .iter()
-        .enumerate()
-        .map(|(at, issue)| {
-            let line = Line::from(vec![
-                Span::styled(format!(" {:<8}", issue.id), fg(t.muted)),
+        .map(|issue| {
+            ListItem::new(Line::from(vec![
+                Span::styled(format!(" {:<id_width$}  ", issue.id), fg(t.muted)),
                 Span::raw(issue.title.clone()),
-            ]);
-            if keys.is_some() && at == app.ready_at {
-                line.style(t.cursor)
-            } else {
-                line
-            }
+            ]))
         })
         .collect();
-    frame.render_widget(Paragraph::new(lines), body);
+    draw_list(frame, body, rows, keys.is_some().then_some(app.ready_at));
 }
 
 /// The Plan screen: [1] Planning chats, [2] what the chat under the
@@ -2275,7 +2397,8 @@ fn draw_plan(frame: &mut Frame, app: &App, main: Rect, chat: Option<&Chat>) {
         Constraint::Fill(2),
     ])
     .areas(left);
-    let is_open = chat.is_some_and(|c| c.tree == SCRATCH);
+    let shown = app.plan_chat();
+    let open = chat.filter(|c| shown.is_some_and(|s| s.attach() == c.command()));
     let asking = app.plan_asking();
     let mut title = vec![Span::raw(" [1] Planning chats ")];
     if asking > 0 {
@@ -2284,7 +2407,8 @@ fn draw_plan(frame: &mut Frame, app: &App, main: Rect, chat: Option<&Chat>) {
             fg(t.warning).add_modifier(Modifier::BOLD),
         ));
     }
-    let focused = |n: u8| (!is_open && app.plan_focus.max(1) == n).then_some(Mode::Normal);
+    let focused =
+        |n: u8| (!app.is_window_focused && app.plan_focus.max(1) == n).then_some(Mode::Normal);
     let block = window_block(focused(1)).title(Line::from(title));
     let body = block.inner(chats);
     frame.render_widget(block, chats);
@@ -2301,6 +2425,7 @@ fn draw_plan(frame: &mut Frame, app: &App, main: Rect, chat: Option<&Chat>) {
                 let (mark, said, color) = match app.plan_state(chat) {
                     PlanState::Asks => ("▲", "asks you", t.warning),
                     PlanState::Talking => ("◆", "talking", t.info),
+                    PlanState::Made => ("●", "made", t.success),
                     PlanState::Idle => ("○", "idle", t.muted),
                 };
                 let age = reports::age(UNIX_EPOCH + std::time::Duration::from_secs(chat.created));
@@ -2325,15 +2450,23 @@ fn draw_plan(frame: &mut Frame, app: &App, main: Rect, chat: Option<&Chat>) {
     }
     draw_made(frame, app, made, focused(2));
     draw_ready(frame, app, ready, focused(3));
-    // The chat draws itself here once open; until then what it last said.
-    if is_open {
+    let name = shown.map_or(String::new(), |c| format!("{} ", c.name));
+    let block =
+        window_block(app.is_window_focused.then(|| Mode::of(app))).title(format!(" [0] {name}"));
+    // The chat itself once open; until then what it last said.
+    if let Some(chat) = open {
+        let body = block.inner(window);
+        frame.render_widget(block, window);
+        if !chat.is_ready() {
+            draw_note(frame, body, &opening_note(&chat.agent));
+            return;
+        }
+        let cursor = draw_screen(chat.screen(), frame.buffer_mut(), body);
+        if let Some(cursor) = cursor.filter(|_| app.is_inserting()) {
+            frame.set_cursor_position(cursor);
+        }
         return;
     }
-    let shown = app
-        .plan_chats
-        .get(app.plan_at.min(app.plan_chats.len().saturating_sub(1)));
-    let name = shown.map_or(String::new(), |c| format!("{} ", c.name));
-    let block = window_block(None).title(format!(" [0] {name}"));
     let body = Block::new()
         .padding(Padding::horizontal(1))
         .inner(block.inner(window));
@@ -2367,12 +2500,12 @@ fn draw_plan(frame: &mut Frame, app: &App, main: Rect, chat: Option<&Chat>) {
 /// The panels layout is on `screen`: the config asks for it and it fits,
 /// for its keys and rows.
 pub fn has_panels(app: &App, screen: Rect) -> bool {
-    !app.is_issues && windows(app, screen_rows(screen).main).panels.is_some()
+    !app.is_issues && windows(app, screen_rows(app, screen).main).panels.is_some()
 }
 
 /// The Usage column is on `screen` beside the table, for its keys.
 pub fn has_usage_column(app: &App, screen: Rect) -> bool {
-    !app.is_issues && windows(app, screen_rows(screen).main).usage.is_some()
+    !app.is_issues && windows(app, screen_rows(app, screen).main).usage.is_some()
 }
 
 /// Something floats over the Trees screen and takes a click: a dialog,
@@ -2391,7 +2524,7 @@ pub fn is_floating(app: &App) -> bool {
 /// The column is under `mouse`, for its wheel and a click.
 pub fn is_on_usage(app: &App, screen: Rect, mouse: ratatui::crossterm::event::MouseEvent) -> bool {
     !app.is_issues
-        && windows(app, screen_rows(screen).main)
+        && windows(app, screen_rows(app, screen).main)
             .usage
             .is_some_and(|u| u.contains(Position::new(mouse.column, mouse.row)))
 }
@@ -2399,14 +2532,110 @@ pub fn is_on_usage(app: &App, screen: Rect, mouse: ratatui::crossterm::event::Mo
 /// The Trees screen's rows on `screen`: the screen above the bar, then the
 /// bar.
 struct ScreenRows {
+    /// The screens' tabs and the workspaces, in the panels layout.
+    top: Option<Rect>,
     main: Rect,
     footer: Rect,
 }
 
-fn screen_rows(screen: Rect) -> ScreenRows {
-    let [main, footer] =
-        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(screen);
-    ScreenRows { main, footer }
+fn screen_rows(app: &App, screen: Rect) -> ScreenRows {
+    let has_top = app.look == Look::Panels
+        && screen.width >= PANELS_MIN_WIDTH
+        && screen.height >= PANELS_MIN_HEIGHT;
+    let [top, main, footer] = Layout::vertical([
+        Constraint::Length(u16::from(has_top)),
+        Constraint::Fill(1),
+        Constraint::Length(1),
+    ])
+    .areas(screen);
+    ScreenRows {
+        top: has_top.then_some(top),
+        main,
+        footer,
+    }
+}
+
+/// The top row of the panels layout: the screens, the one shown marked and
+/// Plan with how many of its chats ask you, and at its right every
+/// workspace with how many wait on you there.
+fn draw_top(frame: &mut Frame, app: &App, area: Rect) {
+    let t = theme();
+    let shown = if app.is_issues {
+        "Issues"
+    } else if app.is_plan {
+        "Plan"
+    } else {
+        "Trees"
+    };
+    let badge = |color: Color| {
+        Style::new()
+            .fg(t.badge.fg.unwrap_or(t.text))
+            .bg(color)
+            .add_modifier(Modifier::BOLD)
+    };
+    let mut left = vec![Span::styled(" treetop ", badge(t.accent)), Span::raw("  ")];
+    for name in ["Trees", "Plan", "Issues"] {
+        let asking = if name == "Plan" { app.plan_asking() } else { 0 };
+        let count = if asking > 0 {
+            format!("▲{asking} ")
+        } else {
+            String::new()
+        };
+        if name == shown {
+            left.push(Span::styled(format!(" {name} {count}"), badge(t.special)));
+        } else {
+            left.push(Span::styled(format!(" {name} "), fg(t.muted)));
+            left.push(Span::styled(
+                count,
+                fg(t.warning).add_modifier(Modifier::BOLD),
+            ));
+        }
+        left.push(Span::raw(" "));
+    }
+    left.push(Span::styled("  Tab switches screens", fg(t.muted)));
+    // As many workspaces as fit, those with something waiting first.
+    let mut tabs = app.workspace_tabs();
+    let order: Vec<PathBuf> = tabs.iter().map(|w| w.checkout.clone()).collect();
+    tabs.sort_by_key(|w| w.waiting == 0);
+    let text = |w: &WorkspaceTab| match w.waiting {
+        0 => format!("{} ✓  ", w.name),
+        n => format!("{} ▲{n}  ", w.name),
+    };
+    let mut room = usize::from(area.width).saturating_sub(Line::from(left.clone()).width() + 4);
+    let all = tabs.len();
+    tabs.retain(|w| {
+        let width = Span::raw(text(w)).width();
+        let is_fit = width <= room;
+        room = if is_fit { room - width } else { 0 };
+        is_fit
+    });
+    let is_cut = tabs.len() < all;
+    tabs.sort_by_key(|w| order.iter().position(|c| *c == w.checkout));
+    let mut right: Vec<Span> = Vec::new();
+    for tab in &tabs {
+        right.push(Span::styled(format!("{} ", tab.name), fg(t.muted)));
+        right.push(match tab.waiting {
+            0 => Span::styled("✓  ", fg(t.success)),
+            n => Span::styled(
+                format!("▲{n}  "),
+                fg(t.warning).add_modifier(Modifier::BOLD),
+            ),
+        });
+    }
+    if is_cut {
+        right.push(Span::styled("… ", fg(t.muted)));
+    }
+    frame.render_widget(Paragraph::new(Line::from(left)).style(t.bar), area);
+    let right = Line::from(right);
+    let width = u16::try_from(right.width())
+        .unwrap_or(area.width)
+        .min(area.width);
+    let at = Rect {
+        x: area.right() - width,
+        width,
+        ..area
+    };
+    frame.render_widget(Paragraph::new(right).style(t.bar), at);
 }
 
 /// The count's words: what needs action and what is done, and the key
@@ -2457,6 +2686,14 @@ fn draw_count(frame: &mut Frame, app: &App, main: Rect) {
     };
     frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// What a waiting entry is, in the panels' words.
+fn asks_for(kind: Kind) -> &'static str {
+    match kind {
+        Kind::NeedsYou => "asks you",
+        _ => waits_for(kind),
+    }
 }
 
 /// What a waiting entry is, in a notification's words.
@@ -2523,14 +2760,15 @@ fn window_block(keys: Option<Mode>) -> Block<'static> {
         .title_style(Style::new().add_modifier(Modifier::BOLD))
 }
 
-/// A chat that floats in a popup rather than the window under the table:
-/// the assistant's and the scratch chats, which belong to no tree.
-pub fn is_popup(agent: &str, tree: &str) -> bool {
-    assistant::is_assistant(agent) || tree == SCRATCH
+/// A chat that floats in a popup rather than the window: the assistant's
+/// and the scratch chats, which belong to no tree; on the Plan screen its
+/// planning chats are the window's, as a tree's is on Trees.
+pub fn is_popup(app: &App, agent: &str, tree: &str) -> bool {
+    assistant::is_assistant(agent) || tree == SCRATCH && !app.is_plan
 }
 
-pub fn is_popup_chat(chat: &Chat) -> bool {
-    is_popup(&chat.agent, &chat.tree)
+pub fn is_popup_chat(app: &App, chat: &Chat) -> bool {
+    is_popup(app, &chat.agent, &chat.tree)
 }
 
 /// A chat drawn in a popup: the assistant's and the scratch ones always,
@@ -2552,7 +2790,10 @@ fn window_areas(area: Rect) -> [Rect; 2] {
 /// Where the chat in the window under the table goes on `screen`, for
 /// sizing its terminal and placing its mouse events.
 pub fn window_chat_area(app: &App, screen: Rect) -> Option<Rect> {
-    let main = screen_rows(screen).main;
+    let main = screen_rows(app, screen).main;
+    if app.is_plan {
+        return Some(Block::bordered().inner(plan_areas(main).1));
+    }
     let window = windows(app, main).window?;
     Some(window_areas(pane_areas(app, window).0)[1])
 }
@@ -2596,7 +2837,7 @@ fn window_form(app: &App, screen: Rect) -> Option<Rect> {
     if app.is_issues {
         return None;
     }
-    let main = screen_rows(screen).main;
+    let main = screen_rows(app, screen).main;
     let (cursor, other) = pane_areas(app, windows(app, main).window?);
     if app.prompt.as_ref().is_some_and(Prompt::starts_agent) {
         return Some(cursor);
@@ -2877,7 +3118,7 @@ fn draw_window(frame: &mut Frame, app: &App, area: Rect, pane: &Pane, chat: Opti
         String::new()
     };
     // In the panels layout the window is [0], as its number key is.
-    let number = if windows(app, screen_rows(frame.area()).main)
+    let number = if windows(app, screen_rows(app, frame.area()).main)
         .panels
         .is_some()
     {
@@ -2895,9 +3136,9 @@ fn draw_window(frame: &mut Frame, app: &App, area: Rect, pane: &Pane, chat: Opti
                 .sidecar
                 .as_ref()
                 .and_then(|s| s.ticket.as_deref())
-                .and_then(|ticket| app.planned_in(ticket))
+                .and_then(|ticket| Some((ticket, app.planned_in(ticket)?)))
                 .filter(|_| !number.is_empty())
-                .map(|chat| format!("· from {} (I) ", chat.name))
+                .map(|(ticket, chat)| format!("· {ticket} from {} (I) ", chat.name))
                 .unwrap_or_default();
             format!(
                 " {number}{mark}{alone}Tree {} · {branch} {planned}",
@@ -3089,7 +3330,7 @@ fn draw_floating_tab(frame: &mut Frame, app: &App) {
 
 /// The count is under `mouse`.
 pub fn is_on_count(app: &App, screen: Rect, mouse: ratatui::crossterm::event::MouseEvent) -> bool {
-    count_area(app, screen_rows(screen).main)
+    count_area(app, screen_rows(app, screen).main)
         .is_some_and(|count| count.contains(Position::new(mouse.column, mouse.row)))
 }
 
@@ -3101,10 +3342,11 @@ pub fn click(
     mouse: ratatui::crossterm::event::MouseEvent,
 ) -> Option<Outcome> {
     use ratatui::crossterm::event::{MouseButton, MouseEventKind};
-    if mouse.kind != MouseEventKind::Down(MouseButton::Left) || !app.wants_mouse() {
+    // The Plan screen's window takes the mouse only for its chat.
+    if mouse.kind != MouseEventKind::Down(MouseButton::Left) || !app.wants_mouse() || app.is_plan {
         return None;
     }
-    let rows = screen_rows(screen);
+    let rows = screen_rows(app, screen);
     let at = Position::new(mouse.column, mouse.row);
     if count_area(app, rows.main).is_some_and(|count| count.contains(at)) {
         app.is_window_focused = false;
@@ -5658,7 +5900,7 @@ fn chat_frame(frame: &mut Frame, app: &App, agent: &str, tree: &str, seen: Optio
         ]
     };
     let keys = key_bar(&[("^Q", "back to treetop"), ("^\\", "next chat")]);
-    let screen = popup_screen(app, frame.area());
+    let screen = frame.area();
     bar_popup(frame, screen, title, keys);
     if let Some(side) = popup::sidebar(screen) {
         let block = Block::new()
@@ -7044,7 +7286,6 @@ mod count_tests {
 #[cfg(test)]
 mod pr_view_tests {
     use super::*;
-    use crate::app::Outcome;
     use crate::coderabbit::{Finding, Kind as Found};
     use crate::inbox::tests::app;
     use crate::plugin;
@@ -7068,9 +7309,7 @@ mod pr_view_tests {
             .join("\n")
     }
 
-    fn press(app: &mut App, code: KeyCode) -> Outcome {
-        app.handle_key(KeyEvent::from(code))
-    }
+    use crate::app::tests::press;
 
     fn pr() -> PrView {
         PrView {
@@ -8835,7 +9074,7 @@ mod panels_tests {
 
     #[test]
     fn a_screen_too_small_for_the_panels_shows_the_table_layout() {
-        for (width, height) in [(119, 46), (160, 29)] {
+        for (width, height) in [(119, 46), (160, 30)] {
             let shown = screen(&panels(), width, height);
             let all = shown.join("\n");
             assert!(!all.contains("[2] Trees"), "{width}x{height}:\n{all}");
@@ -8956,7 +9195,8 @@ mod panels_tests {
         app.trees[1].status = "available".into();
         app.trees[1].name = "5".into();
         let all = screen(&app, 160, 46).join("\n");
-        assert!(all.contains("free       ○ 5"), "{all}");
+        let row = all.lines().find(|l| l.contains("free ")).unwrap();
+        assert!(row.contains("○ 5") && !row.contains("○ 2"), "{all}");
         assert!(!all.contains("not leased"), "{all}");
     }
 
@@ -8980,8 +9220,8 @@ mod panels_tests {
         // failure carries no time until treetop has watched it.
         for (place, what, why, age) in [
             (" 9 ", "port-menu", "agent died", " 31m"),
-            ("endodeals-web:12", "END-88", "needs you", " 6m"),
-            (" 4 ", "ANB-41", "needs you", " 2m"),
+            ("endodeals-web:12", "END-88", "asks you", " 6m"),
+            (" 4 ", "ANB-41", "asks you", " 2m"),
             (" 7 ", "fix-login", "checks failed", ""),
         ] {
             assert!(
@@ -9071,7 +9311,7 @@ mod panels_tests {
     }
 
     #[test]
-    fn news_shows_how_long_ago_where_and_what_newest_first() {
+    fn news_shows_where_and_what_newest_first() {
         let mut app = panels();
         let rows = panel_rows(&screen(&app, 160, 46), "[4] News");
         assert!(
@@ -9090,13 +9330,6 @@ mod panels_tests {
             rows[1].contains("api:2")
                 && rows[1].contains("checks failed")
                 && rows[1].contains("END-212"),
-            "{rows:?}"
-        );
-        assert!(
-            rows[1]
-                .trim_start_matches('│')
-                .trim_start()
-                .starts_with("now"),
             "{rows:?}"
         );
     }
@@ -9158,10 +9391,15 @@ mod panels_tests {
     }
 
     #[test]
-    fn planning_chats_asking_are_counted_on_the_bar_from_the_trees_screen() {
-        let mut app = panels();
+    fn the_top_row_has_the_screens_with_plans_asks_and_every_workspaces_count() {
+        let mut app = with_workspaces();
         app.plan_chats = vec![plan_chat("j1", "plan 1")];
-        assert!(!screen(&app, 160, 46).pop().unwrap().contains("planning"));
+        let top = screen(&app, 160, 46)[0].clone();
+        assert!(
+            top.starts_with(" treetop    Trees   Plan   Issues "),
+            "{top}"
+        );
+        assert!(top.contains("api ▲1") && top.contains("zeta ✓"), "{top}");
         app.reports.push(crate::inbox::tests::report(
             "j1",
             "/state/scratch",
@@ -9169,8 +9407,185 @@ mod panels_tests {
             "Split it in two?",
             1,
         ));
+        for is_plan in [false, true] {
+            app.is_plan = is_plan;
+            let top = screen(&app, 160, 46)[0].clone();
+            assert!(top.contains(" Plan ▲1 "), "{top}");
+        }
+        // Too many to fit: those with something waiting are kept.
+        app.is_plan = false;
+        let top = screen(&app, 120, 31)[0].clone();
+        assert!(top.contains("api ▲1"), "{top}");
+        for n in 0..20 {
+            let mut more = app.pools[0].clone();
+            more.away.name = format!("quiet-{n:02}");
+            more.away.checkout = format!("/code/quiet-{n}").into();
+            app.pools.push(more);
+        }
+        let top = screen(&app, 120, 31)[0].clone();
+        assert!(
+            top.contains("api ▲1") && top.trim_end().ends_with('…'),
+            "{top}"
+        );
+    }
+
+    #[test]
+    fn each_tree_says_why_it_waits_or_what_its_agent_is_doing() {
+        let mut app = panels();
+        app.trees.push(Tree {
+            leased_at: Some("2026-01-01T09:00:00-05:00".into()),
+            ..crate::inbox::tests::tree("/pool/10/app", "10", "me/quiet", Vec::new())
+        });
+        let rows = panel_rows(&screen(&app, 160, 46), "[2] Trees");
+        let row = |branch: &str| {
+            rows.iter()
+                .find(|l| l.contains(branch))
+                .unwrap_or_else(|| panic!("{branch}: {}", rows.join("\n")))
+                .clone()
+        };
+        assert!(row("me/anb-41").contains("● asks you"), "{rows:?}");
+        assert!(row("me/help-columns").contains("✓ done"), "{rows:?}");
+        assert!(row("me/fix-login").contains("ci failed"), "{rows:?}");
+        assert!(row("me/port-menu").contains("agent died"), "{rows:?}");
+        assert!(row("me/quiet").contains("no agent"), "{rows:?}");
+        // Once nothing waits, what its agent is doing.
+        app.trees[2].ship = None;
+        app.reports.clear();
+        let rows = panel_rows(&screen(&app, 160, 46), "[2] Trees");
+        assert!(
+            rows.iter()
+                .any(|l| l.contains("me/fix-login") && l.contains("● working")),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn in_insert_the_bar_says_how_to_leave_it_and_offers_no_key_that_would_be_typed() {
+        let mut app = panels();
+        app.selected = 1;
+        app.tab = WindowTab::Chat;
+        app.insert_in_window();
         let bar = screen(&app, 160, 46).pop().unwrap();
-        assert!(bar.contains("▲1 planning"), "{bar}");
+        assert!(bar.starts_with(" INSERT   Ctrl+Q normal"), "{bar}");
+        assert!(!bar.contains("1-4") && !bar.contains("Esc"), "{bar}");
+    }
+
+    #[test]
+    fn a_planned_trees_window_names_its_issue_and_chat() {
+        let mut app = panels();
+        let mut chat = plan_chat("j1", "plan 1");
+        chat.issues = vec!["ANB-41".into()];
+        app.plan_chats = vec![chat];
+        app.selected = 1;
+        let shown = screen(&app, 160, 46).join("\n");
+        assert!(shown.contains("· ANB-41 from plan 1 (I)"), "{shown}");
+    }
+
+    #[test]
+    fn news_says_when_by_the_clock_and_scrolls() {
+        let mut app = panels();
+        for n in 0..30 {
+            app.add_news(None, format!("line {n}."), None);
+        }
+        let clock = reports::clock(
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .cast_signed(),
+        );
+        let rows = panel_rows(&screen(&app, 160, 46), "[4] News");
+        assert!(
+            rows[0].contains(&clock[..3]) && rows[0].contains("line 29."),
+            "{rows:?}"
+        );
+        app.panel = Panel::News;
+        crate::app::tests::press(&mut app, ratatui::crossterm::event::KeyCode::Char('G'));
+        let rows = panel_rows(&screen(&app, 160, 46), "[4] News").join("\n");
+        assert!(rows.contains("line 0."), "{rows}");
+    }
+
+    /// The Plan screen on a chat with `n` issues made, read as `read` says.
+    fn with_issues(n: usize, read: Option<crate::app::MadeRead>) -> App {
+        let mut app = panels();
+        let mut chat = plan_chat("j1", "plan 1");
+        chat.issues = (100..100 + n).map(|i| format!("ANB-{i}")).collect();
+        app.open_plan(vec![chat.clone()]);
+        if let Some(read) = read {
+            let made = [("j1".to_string(), read)].into();
+            app.apply_plan_read(vec![chat], Ok(("work".into(), made)));
+        }
+        app
+    }
+
+    fn to_do(id: usize) -> crate::planned::Planned {
+        crate::planned::Planned {
+            id: format!("ANB-{id}"),
+            title: format!("title {id}"),
+            project: None,
+            state: "Todo".into(),
+            stage: crate::planned::Stage::NotStarted,
+            blocked_by: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn issues_that_cannot_be_read_are_said_not_called_nothing() {
+        let said = |app: &App| panel_rows(&screen(app, 160, 46), "[2] Made from it").join("\n");
+        let unread = said(&with_issues(3, Some(Err("work: unavailable".into()))));
+        assert!(
+            unread.contains("3 issues") && unread.contains("work: unavailable"),
+            "{unread}"
+        );
+        let reading = said(&with_issues(3, None));
+        assert!(
+            reading.contains("3 issues") && reading.contains("reading"),
+            "{reading}"
+        );
+        let mut app = with_issues(3, None);
+        app.apply_plan_read(Vec::new(), Err("no issue source".into()));
+        assert!(said(&app).contains("no issue source"), "{}", said(&app));
+        let partly = said(&with_issues(3, Some(Ok(vec![to_do(100)]))));
+        assert!(
+            partly.contains("ANB-100") && partly.contains("2 not found"),
+            "{partly}"
+        );
+        for said in [unread, reading, partly] {
+            assert!(!said.contains("nothing yet"), "{said}");
+        }
+        assert!(said(&with_issues(0, None)).contains("nothing yet"));
+        // A failed read after one that worked keeps what it had, marked old.
+        let mut app = with_issues(1, Some(Ok(vec![to_do(100)])));
+        let failed = [("j1".to_string(), Err("work: unavailable".to_string()))].into();
+        app.apply_plan_read(Vec::new(), Ok(("work".into(), failed)));
+        let old = said(&app);
+        assert!(
+            old.contains("title 100") && old.contains("work: unavailable"),
+            "{old}"
+        );
+    }
+
+    #[test]
+    fn made_and_ready_scroll_to_keep_their_cursor_on_screen() {
+        let mut app = with_issues(30, Some(Ok((100..130).map(to_do).collect())));
+        for (panel, title) in [(2, "[2] Made from it"), (3, "[3] Ready")] {
+            app.plan_focus = panel;
+            app.made_at = 25;
+            app.ready_at = 25;
+            let rows = panel_rows(&screen(&app, 160, 46), title).join("\n");
+            assert!(rows.contains("ANB-125"), "{rows}");
+        }
+    }
+
+    #[test]
+    fn a_chat_with_issues_made_and_nothing_to_say_reads_made() {
+        let rows = panel_rows(&screen(&with_issues(2, None), 160, 46), "[1] Planning");
+        assert!(
+            rows[0].contains("● ") && rows[0].contains("made"),
+            "{rows:?}"
+        );
+        let rows = panel_rows(&screen(&with_issues(0, None), 160, 46), "[1] Planning");
+        assert!(rows[0].contains("idle"), "{rows:?}");
     }
 
     #[test]
@@ -9200,13 +9615,13 @@ mod panels_tests {
                 "work".into(),
                 [(
                     "j1".to_string(),
-                    vec![
+                    Ok(vec![
                         issue("ANB-41", Stage::NotStarted, &[]),
                         issue("ANB-90", Stage::NotStarted, &[]),
                         issue("ANB-91", Stage::NotStarted, &["ANB-90"]),
                         issue("ANB-92", Stage::Done, &[]),
                         issue("ANB-93", Stage::Canceled, &[]),
-                    ],
+                    ]),
                 )]
                 .into(),
             )),
@@ -9234,22 +9649,6 @@ mod panels_tests {
             ready[0].contains("ANB-90") && !ready.join("").contains("ANB-91"),
             "{ready:?}"
         );
-        // On Trees, tree 4's window names the chat its issue came from.
-        app.is_plan = false;
-        app.selected = 1;
-        let shown = screen(&app, 160, 46).join("\n");
-        assert!(shown.contains("· from plan 1 (I)"), "{shown}");
-    }
-
-    #[test]
-    fn a_planning_chat_lays_out_in_the_windows_place_and_others_over_the_screen() {
-        let mut app = panels();
-        let screen = Rect::new(0, 0, 160, 46);
-        assert_eq!(popup_screen(&app, screen), screen);
-        app.open_plan(Vec::new());
-        let window = popup_screen(&app, screen);
-        assert!(window.x > 0 && window.right() == 160, "{window:?}");
-        assert_eq!(window.height, 45, "above the bar");
     }
 
     #[test]

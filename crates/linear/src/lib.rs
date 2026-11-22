@@ -21,9 +21,9 @@ use serde_json::{Value, json};
 
 pub use edit::{Change, NewIssue};
 pub use filter::{ANY_STATE, Filter, ME, UNASSIGNED, priority};
-pub use model::{Comment, Cycle, Detail, Issue, Link, Named, State, Team};
+pub use model::{Comment, Cycle, Detail, Issue, Link, Named, Standing, State, Team};
 
-use model::{ISSUE_FIELDS, RawIssue, RawTeam};
+use model::{ISSUE_FIELDS, RawIssue, RawStanding, RawTeam, STANDING_FIELDS};
 
 const API: &str = "https://api.linear.app/graphql";
 
@@ -32,6 +32,9 @@ const LIMIT: Duration = Duration::from_secs(10);
 
 /// Issues one list returns, the most recently updated first.
 const PAGE: usize = 100;
+
+/// The most issues whose standing one request reads.
+const STANDINGS: usize = 50;
 
 /// The most issues Linear changes in one batch.
 const BATCH: usize = 50;
@@ -153,6 +156,24 @@ impl Client {
         );
         let data = self.query(&query, json!({ "id": id }))?;
         raw_issue(data.get("issue"), id).map(RawIssue::into_detail)
+    }
+
+    /// Where each of the issues `ids` stands, in one request for every
+    /// STANDINGS of them; one Linear does not have is left out.
+    pub fn standings(&self, ids: &[String]) -> Result<Vec<Standing>, Error> {
+        let query = format!(
+            "query($filter: IssueFilter, $first: Int) {{ issues(filter: $filter, first: $first, \
+             includeArchived: true) {{ nodes {{ {STANDING_FIELDS} }} }} }}"
+        );
+        let mut found = Vec::new();
+        for ids in ids.chunks(STANDINGS) {
+            let data = self.query(
+                &query,
+                json!({ "filter": by_identifier(ids), "first": STANDINGS }),
+            )?;
+            found.extend(standings(&data)?);
+        }
+        Ok(found)
     }
 
     /// The file at `url`, such as an image in a description. Linear's own
@@ -445,6 +466,42 @@ fn reply(body: &[u8]) -> Result<Value, Error> {
         .unwrap_or(Value::Null))
 }
 
+/// The filter for exactly the issues `ids`, such as `END-123`, which Linear
+/// keeps as a team's key and a number.
+fn by_identifier(ids: &[String]) -> Value {
+    let mut teams: Vec<(&str, Vec<u64>)> = Vec::new();
+    for id in ids {
+        let Some((team, number)) = id.split_once('-') else {
+            continue;
+        };
+        let Ok(number) = number.parse() else {
+            continue;
+        };
+        match teams.iter_mut().find(|(key, _)| *key == team) {
+            Some((_, numbers)) => numbers.push(number),
+            None => teams.push((team, vec![number])),
+        }
+    }
+    let any: Vec<Value> = teams
+        .into_iter()
+        .map(|(key, numbers)| {
+            json!({ "team": { "key": { "eq": key } }, "number": { "in": numbers } })
+        })
+        .collect();
+    json!({ "or": any })
+}
+
+/// The standings a reply to `standings` holds.
+fn standings(data: &Value) -> Result<Vec<Standing>, Error> {
+    let nodes = data
+        .pointer("/issues/nodes")
+        .cloned()
+        .unwrap_or(Value::Array(Vec::new()));
+    let raw: Vec<RawStanding> = serde_json::from_value(nodes)
+        .map_err(|err| Error::failed(format!("unreadable issues: {err}")))?;
+    Ok(raw.into_iter().map(Standing::from).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,6 +530,43 @@ mod tests {
         assert_eq!(issue.cycle.as_deref(), Some("cycle 12"));
         assert_eq!(issue.priority, 2);
         assert_eq!(issue.team_id.as_deref(), Some("t1"));
+    }
+
+    #[test]
+    fn issues_of_several_teams_are_asked_for_by_key_and_number_at_once() {
+        let ids = ["ANB-1", "END-9", "ANB-2", "odd"].map(String::from);
+        assert_eq!(
+            by_identifier(&ids),
+            json!({ "or": [
+                { "team": { "key": { "eq": "ANB" } }, "number": { "in": [1, 2] } },
+                { "team": { "key": { "eq": "END" } }, "number": { "in": [9] } },
+            ] })
+        );
+    }
+
+    #[test]
+    fn a_standing_has_its_status_type_and_only_what_blocks_it() {
+        let data = json!({ "issues": { "nodes": [
+            { "identifier": "ANB-2", "title": "Tabs", "state": { "name": "Todo", "type": "unstarted" },
+              "project": { "name": "Panels" }, "inverseRelations": { "nodes": [
+                { "type": "blocks", "issue": { "identifier": "ANB-1", "title": "Read",
+                  "state": { "name": "Done", "type": "completed" } } },
+                { "type": "related", "issue": { "identifier": "ANB-7", "title": "Other",
+                  "state": { "name": "Todo", "type": "unstarted" } } } ] } },
+            { "identifier": "ANB-3", "title": "Bare", "state": null, "project": null } ] } });
+        let read = standings(&data).unwrap();
+        assert_eq!(read[0].kind.as_deref(), Some("unstarted"));
+        assert_eq!(read[0].project.as_deref(), Some("Panels"));
+        let blockers: Vec<(&str, bool)> = read[0]
+            .blocked_by
+            .iter()
+            .map(|l| (l.id.as_str(), l.is_done))
+            .collect();
+        assert_eq!(blockers, [("ANB-1", true)]);
+        assert_eq!(
+            (read[1].kind.as_deref(), read[1].blocked_by.len()),
+            (None, 0)
+        );
     }
 
     #[test]
