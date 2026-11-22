@@ -51,6 +51,9 @@ use crate::watch::Watcher;
 const FAST: Duration = Duration::from_secs(2);
 const SLOW: Duration = Duration::from_secs(120);
 const GIT_EVERY: u32 = 2;
+/// How often the open workspace's agents are read, which the other
+/// workspaces' agents match so what waits there is not news late.
+pub const AGENTS_EVERY: Duration = Duration::from_secs(FAST.as_secs() * GIT_EVERY as u64);
 const SHIP: Duration = Duration::from_secs(60);
 const SHIP_GAP: Duration = Duration::from_secs(15);
 const SHIP_BACKOFF: Duration = Duration::from_secs(300);

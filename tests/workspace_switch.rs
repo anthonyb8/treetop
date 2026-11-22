@@ -187,9 +187,18 @@ fn shells(file: &Path) -> Vec<i32> {
         .collect()
 }
 
-#[test]
-fn a_shell_left_for_another_workspace_is_the_same_shell_on_coming_back() {
-    let root = std::env::temp_dir().join(format!("treetop-switch-{}", std::process::id()));
+/// Two pooled repositories, `here` and `there`, each with tree 1 leased,
+/// both workspaces with `here` opened last, and treetop started on `here`
+/// in a terminal of its own, against stand-ins for everything it reads.
+struct Workspaces {
+    root: PathBuf,
+    /// Where the stand-in shell writes down each one it starts.
+    started: PathBuf,
+    screen: Screen,
+}
+
+fn two_workspaces(name: &str) -> Workspaces {
+    let root = std::env::temp_dir().join(format!("treetop-{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     let bin = root.join("bin");
     let cache = root.join("cache/treetop");
@@ -233,7 +242,7 @@ fn a_shell_left_for_another_workspace_is_the_same_shell_on_coming_back() {
     .unwrap();
 
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
-    let mut screen = Screen::start(
+    let screen = Screen::start(
         Command::new(env!("CARGO_BIN_EXE_treetop"))
             .current_dir(root.join("here-trees/1"))
             .env_clear()
@@ -245,6 +254,21 @@ fn a_shell_left_for_another_workspace_is_the_same_shell_on_coming_back() {
             .env("TERM", "xterm-256color")
             .env("SHELL", &shell),
     );
+    Workspaces {
+        root,
+        started,
+        screen,
+    }
+}
+
+#[test]
+fn a_shell_left_for_another_workspace_is_the_same_shell_on_coming_back() {
+    let Workspaces {
+        root,
+        started,
+        mut screen,
+        ..
+    } = two_workspaces("switch");
     screen.wait_on("here");
     screen.wait_for("tree 1's window", |text| {
         text.contains("Tree 1 · here-work")
@@ -299,6 +323,73 @@ fn a_shell_left_for_another_workspace_is_the_same_shell_on_coming_back() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+    drop(screen);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The process ids the stand-in agent runs as; killed when the test ends.
+struct Asker(Child);
+
+impl Drop for Asker {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// ANB-101: an agent that starts asking in another workspace shows in
+/// treetop as quickly as one in the open workspace, rather than at that
+/// workspace's next read of its PRs, minutes later.
+#[test]
+fn an_agent_asking_in_another_workspace_shows_within_seconds() {
+    let Workspaces {
+        root, mut screen, ..
+    } = two_workspaces("asking");
+    screen.wait_on("here");
+    screen.wait_for("tree 1's window", |text| {
+        text.contains("Tree 1 · here-work")
+    });
+    // There is read once it has been opened, which lists its pool: over
+    // with `w`, and back.
+    screen.press("w");
+    screen.press("j\r");
+    screen.wait_on("there");
+    screen.press("w");
+    screen.press("j\r");
+    screen.wait_on("here");
+    screen.wait_for("tree 1's window", |text| {
+        text.contains("Tree 1 · here-work")
+    });
+    // Its first read is done, its agent not yet asking.
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(!screen.text().contains("needs action"), "{}", screen.text());
+
+    // An agent in there's tree 1 starts asking, by the open `agent.json`
+    // convention any agent can follow.
+    let asker = Asker(Command::new("sleep").arg("600").spawn().unwrap());
+    let git_dir = Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--git-dir"])
+        .current_dir(root.join("there-trees/1"))
+        .output()
+        .unwrap();
+    let git_dir = PathBuf::from(String::from_utf8(git_dir.stdout).unwrap().trim());
+    fs::write(
+        git_dir.join("agent.json"),
+        serde_json::json!({ "name": "asker", "pid": asker.0.id(), "status": "waiting" })
+            .to_string(),
+    )
+    .unwrap();
+
+    let asked = Instant::now();
+    while !screen.text().contains("1 needs action") {
+        assert!(
+            asked.elapsed() < Duration::from_secs(5),
+            "there's ask did not show within 5 s:\n{}",
+            screen.text()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    drop(asker);
     drop(screen);
     let _ = fs::remove_dir_all(&root);
 }

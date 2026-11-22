@@ -705,7 +705,7 @@ fn run(
                 _ => {}
             }
         }
-        // The other workspaces' agents and PRs, as their slower read last
+        // The other workspaces' agents and PRs, as their own reader last
         // found them.
         while let Ok(live) = away.rounds.try_recv() {
             app.away_live = live;

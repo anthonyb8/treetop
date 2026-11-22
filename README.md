@@ -691,7 +691,7 @@ It goes as the terminal's own notification escape, OSC 777, which foot, WezTerm,
 Inside tmux it needs `allow-passthrough` set to `all` (`tmux set -g allow-passthrough all`), since `on` passes it only from the window on screen, and until it is, treetop says so once on its status line.
 
 Another workspace's entries carry its name, such as `keel:3`, and opening one switches there first; an agent with no chat, such as `claude` in a tmux pane, is gone to inside tmux, as `t` does.
-Its background agents are placed in their trees by the workspace's last listing; its PRs that failed, and its agents waiting at a prompt in a tmux pane, come from a read of its pool every three minutes, for the workspaces opened in the last week, so they can show a few minutes late.
+Its background agents are placed in their trees by the workspace's last listing; its agents waiting at a prompt in a tmux pane, and those that died, come from a read of its pool as often as the open workspace's agents are read, every few seconds, and its PRs that failed from a read every three minutes, since that runs its ship plugins, for the workspaces opened in the last week.
 With only one workspace nothing extra is read.
 The `w` picker counts what waits in each workspace after its held trees, `●` for what needs you and `✗` for what failed.
 
