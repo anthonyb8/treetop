@@ -536,6 +536,8 @@ pub enum Outcome {
     },
     /// Write each tree's record, as `Record` does for one.
     Records(Vec<(PathBuf, Sidecar)>),
+    /// Press this key in the window's chat, its dialog's choice.
+    Answer(char),
     /// Open `command`, agent `agent`'s chat in tree `tree`, in a popup over
     /// treetop until Ctrl+Q or until it exits.
     Chat {
@@ -794,6 +796,12 @@ pub struct App {
     pub viewing: Option<PathBuf>,
     /// The tree under the cursor on that tab, among `viewed_trees`.
     pub viewed: usize,
+    /// The question dialog the window's chat shows, as its choices, while
+    /// one has its keys and treetop can read it: one question, one choice.
+    /// main reads it off the chat's screen each pass.
+    pub dialog: Option<Vec<String>>,
+    /// In [1] Waiting, the item under its cursor.
+    pub waiting_at: usize,
     /// The command palette, while Ctrl+P has it open.
     pub palette: Option<Palette>,
     /// In a double, the side of the window the cursor drives, the one that
@@ -1583,17 +1591,7 @@ impl App {
         let is_trees = self.shows_panels()
             && self.panel == Panel::Trees
             && !self.is_window_focused
-            && self.prompt.is_none()
-            && self.picker.is_none()
-            && self.port_menu.is_none()
-            && self.phone.is_none()
-            && self.scratch_menu.is_none()
-            && !self.is_notes_shown()
-            && !self.is_filtering
-            && !self.is_help
-            && self.reviews.is_empty()
-            && self.pending.is_none()
-            && self.shipping.is_none();
+            && !self.is_typing();
         if !is_trees || !key.modifiers.is_empty() {
             return None;
         }
@@ -1647,16 +1645,87 @@ impl App {
         Some(Outcome::Continue)
     }
 
-    /// In the panels layout, a number key from the table or a window in
-    /// Normal: 1 to 4 give the keys to that panel, 0 to the window, as
-    /// lazygit numbers its panels, so they win over the PR tab's own 1 to 4,
-    /// which h and l still step. False for any other key, for the table
-    /// layout, and while something takes typed text or a key of its own.
-    fn focus_by_number(&mut self, key: KeyEvent) -> bool {
-        let KeyCode::Char(c @ '0'..='4') = key.code else {
-            return false;
+    /// The window in Normal with a question dialog on screen in its chat:
+    /// a number among its choices answers it, pressed in the chat, and what
+    /// waited on you there is put away at once rather than at the next
+    /// read. None for any other key, or with no dialog; the number keys
+    /// then give the panels the keys.
+    fn answer_by_number(&mut self, key: KeyEvent) -> Option<Outcome> {
+        let KeyCode::Char(c @ '1'..='9') = key.code else {
+            return None;
         };
-        let is_taken = self.prompt.is_some()
+        let choices = self.dialog.as_ref()?;
+        let n = usize::from(c as u8 - b'0');
+        if !self.shows_panels()
+            || !self.is_window_focused
+            || !key.modifiers.is_empty()
+            || n > choices.len()
+            || self.is_typing()
+        {
+            return None;
+        }
+        if let Some(path) = self.window_tree().map(|t| t.path.clone()) {
+            self.put_away_kind(&path, crate::inbox::Kind::NeedsYou);
+        }
+        Some(Outcome::Answer(c))
+    }
+
+    /// Puts away what waits of `kind` in the tree at `path` here, acted on.
+    fn put_away_kind(&mut self, path: &std::path::Path, kind: crate::inbox::Kind) {
+        let found = crate::inbox::needs_action(self)
+            .into_iter()
+            .find(|e| e.away.is_none() && e.path == path && e.kind == kind);
+        if let Some(entry) = found {
+            self.put_away(&entry);
+        }
+    }
+
+    /// [1] Waiting's keys in the panels layout: j and k move among what
+    /// waits, and Enter or l opens it as the notifications do, its tree in
+    /// the window, another workspace's switched to first. `w` from anywhere
+    /// in the panels layout opens the next one after the tree under the
+    /// cursor. None for a key it leaves to the rest.
+    fn handle_waiting_key(&mut self, key: KeyEvent) -> Option<Outcome> {
+        if !self.shows_panels() || !key.modifiers.is_empty() || self.is_typing() {
+            return None;
+        }
+        // What needs you in every workspace, the oldest first.
+        let (items, _) = self.notes_list();
+        if key.code == KeyCode::Char('w') && !self.is_window_focused {
+            if items.is_empty() {
+                self.message = Some("nothing waits on you".into());
+                return Some(Outcome::Continue);
+            }
+            let here = self.window_tree().map(|t| t.path.clone());
+            let next = items
+                .iter()
+                .position(|e| Some(&e.path) == here.as_ref())
+                .map_or(0, |at| (at + 1) % items.len());
+            self.waiting_at = next;
+            return Some(self.go_to(items[next].clone()));
+        }
+        if self.panel != Panel::Waiting || self.is_window_focused {
+            return None;
+        }
+        let last = items.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => self.waiting_at = (self.waiting_at + 1).min(last),
+            KeyCode::Char('k') | KeyCode::Up => self.waiting_at = self.waiting_at.saturating_sub(1),
+            KeyCode::Enter | KeyCode::Char('l') => {
+                return Some(match items.into_iter().nth(self.waiting_at.min(last)) {
+                    Some(entry) => self.go_to(entry),
+                    None => Outcome::Continue,
+                });
+            }
+            _ => return None,
+        }
+        Some(Outcome::Continue)
+    }
+
+    /// Something takes typed text or keys of its own, so the panels' keys
+    /// leave them alone.
+    fn is_typing(&self) -> bool {
+        self.prompt.is_some()
             || self.picker.is_some()
             || self.port_menu.is_some()
             || self.phone.is_some()
@@ -1666,8 +1735,19 @@ impl App {
             || self.is_help
             || !self.reviews.is_empty()
             || self.pending.is_some()
-            || self.shipping.is_some();
-        if !self.shows_panels() || !key.modifiers.is_empty() || is_taken {
+            || self.shipping.is_some()
+    }
+
+    /// In the panels layout, a number key from the table or a window in
+    /// Normal: 1 to 4 give the keys to that panel, 0 to the window, as
+    /// lazygit numbers its panels, so they win over the PR tab's own 1 to 4,
+    /// which h and l still step. False for any other key, for the table
+    /// layout, and while something takes typed text or a key of its own.
+    fn focus_by_number(&mut self, key: KeyEvent) -> bool {
+        let KeyCode::Char(c @ '0'..='4') = key.code else {
+            return false;
+        };
+        if !self.shows_panels() || !key.modifiers.is_empty() || self.is_typing() {
             return false;
         }
         match Panel::ALL
@@ -3333,18 +3413,10 @@ impl App {
             .chain(&crate::inbox::done(self))
             .map(|e| (e.about(), e.at.unwrap_or(now)))
             .collect();
-        // The counts alone, as the count in the table's corner has them.
-        let (needs, done) = self.notes_list();
-        let counts = [
-            (needs.len(), "●", "needs action"),
-            (done.len(), "✓", "done"),
-        ];
-        let parts: Vec<String> = counts
-            .iter()
-            .filter(|(n, ..)| *n > 0)
-            .map(|(n, mark, what)| format!("{mark} {n} {what}"))
-            .collect();
-        let line = (!parts.is_empty()).then(|| parts.join("  "));
+        // What waits on you alone, as the count has it: what is done needs
+        // nothing, so it is the tree's status, not news to act on.
+        let (needs, _) = self.notes_list();
+        let line = (!needs.is_empty()).then(|| format!("● {} needs action", needs.len()));
         Some((is_new, line))
     }
 
@@ -3692,7 +3764,9 @@ impl App {
             Some(format!("tree {name} already has an action queued"))
         } else {
             let job = Job::new(Kind::Fix, tree.clone());
-            self.jobs.insert(path, JobState::Queued(Kind::Fix));
+            self.jobs.insert(path.clone(), JobState::Queued(Kind::Fix));
+            // Sent, so its failed checks wait on you no more.
+            self.put_away_kind(&path, crate::inbox::Kind::Failed);
             return Outcome::Queue(vec![job]);
         };
         Outcome::Continue
@@ -3715,7 +3789,10 @@ impl App {
             Some(format!("tree {name} already has an action queued"))
         } else {
             let job = Job::new(Kind::Resume, tree.clone());
-            self.jobs.insert(path, JobState::Queued(Kind::Resume));
+            self.jobs
+                .insert(path.clone(), JobState::Queued(Kind::Resume));
+            // Resumed, so its dead agent waits on you no more.
+            self.put_away_kind(&path, crate::inbox::Kind::Died);
             return Outcome::Queue(vec![job]);
         };
         Outcome::Continue
@@ -4886,8 +4963,14 @@ impl App {
         if self.palette.is_some() {
             return self.handle_palette_key(key);
         }
+        if let Some(outcome) = self.answer_by_number(key) {
+            return outcome;
+        }
         if self.focus_by_number(key) {
             return Outcome::Continue;
+        }
+        if let Some(outcome) = self.handle_waiting_key(key) {
+            return outcome;
         }
         if let Some(outcome) = self.handle_tab_key(key) {
             return outcome;
@@ -5395,6 +5478,102 @@ mod tests {
             app.message
         );
         assert!(app.viewing.is_some(), "the tab stays shown");
+    }
+
+    #[test]
+    fn a_digit_typed_into_a_prompt_never_answers_the_windows_dialog() {
+        let mut app = with_workspaces();
+        app.reselect(Some(app.trees[0].path.clone()));
+        app.is_window_focused = true;
+        app.dialog = Some(vec!["Yes".into(), "No".into()]);
+        assert_eq!(press(&mut app, KeyCode::Char('1')), Outcome::Answer('1'));
+        // A prompt opened over the window, as a written handoff opens one.
+        app.dialog = Some(vec!["Yes".into(), "No".into()]);
+        app.open_message();
+        assert!(app.prompt.is_some());
+        assert_ne!(press(&mut app, KeyCode::Char('1')), Outcome::Answer('1'));
+    }
+
+    #[test]
+    fn a_number_answers_the_windows_question_and_takes_it_off_what_waits() {
+        let mut app = crate::inbox::tests::app();
+        app.look = crate::config::Look::Panels;
+        app.show_panels(true);
+        // Tree 4's agent asks; the window on it has the keys.
+        app.reselect(Some(app.trees[0].path.clone()));
+        app.is_window_focused = true;
+        app.dialog = Some(vec!["Clerk".into(), "Supabase".into()]);
+        let asks = |app: &App| {
+            app.notes_list()
+                .0
+                .iter()
+                .any(|e| e.tree == "4" && e.kind == crate::inbox::Kind::NeedsYou)
+        };
+        assert!(asks(&app));
+        assert_eq!(press(&mut app, KeyCode::Char('2')), Outcome::Answer('2'));
+        assert!(!asks(&app), "answered, it waits on you no more");
+        // Past its choices the number keys give the panels the keys again.
+        assert_eq!(press(&mut app, KeyCode::Char('3')), Outcome::Continue);
+        assert_eq!((app.panel, app.is_window_focused), (Panel::Ship, false));
+        // The table layout has no number keys for it.
+        app.look = crate::config::Look::Table;
+        app.is_window_focused = true;
+        assert_ne!(press(&mut app, KeyCode::Char('1')), Outcome::Answer('1'));
+    }
+
+    #[test]
+    fn waiting_opens_what_waits_and_w_goes_to_the_next() {
+        let mut app = crate::inbox::tests::app();
+        app.look = crate::config::Look::Panels;
+        app.show_panels(true);
+        // The oldest first: 9 here, 12 in another workspace, then 4 and 7.
+        let items: Vec<(String, bool)> = app
+            .notes_list()
+            .0
+            .iter()
+            .map(|e| (e.tree.clone(), e.away.is_some()))
+            .collect();
+        assert_eq!(items[..2], [("9".into(), false), ("12".into(), true)]);
+        let at = |app: &App| app.current().map(|t| t.name.clone());
+        press(&mut app, KeyCode::Char('1'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(at(&app).as_deref(), Some("9"), "Enter opens it here");
+        press(&mut app, KeyCode::Char('1'));
+        press(&mut app, KeyCode::Char('j'));
+        assert!(
+            matches!(press(&mut app, KeyCode::Enter), Outcome::SwitchTo { .. }),
+            "another workspace's is switched to first"
+        );
+        // `w` from the panels opens the one after the tree under the cursor.
+        app.panel = Panel::Trees;
+        app.is_window_focused = false;
+        app.reselect(Some(app.trees[0].path.clone()));
+        assert_eq!(at(&app).as_deref(), Some("4"));
+        press(&mut app, KeyCode::Char('w'));
+        assert_eq!(at(&app).as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn sending_a_failure_or_resuming_takes_it_off_what_waits() {
+        let mut app = crate::inbox::tests::app();
+        let has = |app: &App, kind| app.notes_list().0.iter().any(|e| e.kind == kind);
+        // Tree 7's PR failed and its agent can take the failure.
+        assert!(has(&app, crate::inbox::Kind::Failed));
+        app.reselect(Some(app.trees[2].path.clone()));
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('F')),
+            Outcome::Queue(_)
+        ));
+        assert!(!has(&app, crate::inbox::Kind::Failed));
+        // Tree 9's agent died and is gone, so `R` resumes it.
+        app.trees[3].agents[0].pid = None;
+        assert!(has(&app, crate::inbox::Kind::Died));
+        app.reselect(Some(app.trees[3].path.clone()));
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('R')),
+            Outcome::Queue(_)
+        ));
+        assert!(!has(&app, crate::inbox::Kind::Died));
     }
 
     #[test]

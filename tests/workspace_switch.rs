@@ -67,6 +67,18 @@ fn repository(root: &Path, name: &str) -> (PathBuf, String) {
     (checkout, status.to_string())
 }
 
+/// The name treetop's cache gives a checkout's listing: its path's FNV-1a.
+fn cache_key(checkout: &Path) -> String {
+    let hash = checkout
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+        });
+    format!("{hash:016x}")
+}
+
 /// treetop in a pseudo-terminal, its screen parsed as it draws.
 struct Screen {
     child: Child,
@@ -208,6 +220,11 @@ fn two_workspaces(name: &str, config: &str) -> Workspaces {
     fs::create_dir_all(root.join("home")).unwrap();
     let (here, here_status) = repository(&root, "here");
     let (there, there_status) = repository(&root, "there");
+    // Each pool as an earlier run's listing left it, so the other
+    // workspace is known before it is opened.
+    for (checkout, status) in [(&here, &here_status), (&there, &there_status)] {
+        fs::write(cache.join(format!("{}.json", cache_key(checkout))), status).unwrap();
+    }
 
     write_script(
         &bin.join("treehouse"),
@@ -232,11 +249,16 @@ fn two_workspaces(name: &str, config: &str) -> Workspaces {
         &format!("echo $$ >> {}\nexec sleep 600\n", started.display()),
     );
     // Both are workspaces, here opened last.
+    // Opened this past minute, so each is recent enough to be read.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     fs::write(
         cache.join("workspaces.json"),
         serde_json::json!([
-            { "checkout": here, "opened": 2 },
-            { "checkout": there, "opened": 1 },
+            { "checkout": here, "opened": now },
+            { "checkout": there, "opened": now - 1 },
         ])
         .to_string(),
     )
@@ -442,13 +464,6 @@ fn a_bracket_shows_another_workspace_on_the_trees_panel_and_enter_switches_there
         root, mut screen, ..
     } = two_workspaces("tabs", "layout = \"panels\"\n");
     screen.wait_on("here");
-    // There is listed once it has been opened: over with `w`, and back.
-    screen.press("w");
-    screen.press("j\r");
-    screen.wait_on("there");
-    screen.press("w");
-    screen.press("j\r");
-    screen.wait_on("here");
     screen.wait_for("here's tree in the window", |text| {
         text.contains("[0] Tree 1 · here-work")
     });
@@ -476,6 +491,46 @@ fn a_bracket_shows_another_workspace_on_the_trees_panel_and_enter_switches_there
     screen.wait_for("there's tree in the window", |text| {
         text.contains("[0] Tree 1 · there-work")
     });
+    drop(screen);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// ANB-104: in the panels layout an agent asking in another workspace is
+/// listed in [1] Waiting with where it is, and Enter on it switches there
+/// with its tree in the window.
+#[test]
+fn an_ask_in_another_workspace_is_listed_in_waiting_and_enter_goes_there() {
+    let Workspaces {
+        root, mut screen, ..
+    } = two_workspaces("waiting", "layout = \"panels\"\n");
+    screen.wait_on("here");
+    screen.wait_for("here's tree in the window", |text| {
+        text.contains("[0] Tree 1 · here-work")
+    });
+    let asker = Asker(Command::new("sleep").arg("600").spawn().unwrap());
+    let git_dir = Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--git-dir"])
+        .current_dir(root.join("there-trees/1"))
+        .output()
+        .unwrap();
+    let git_dir = PathBuf::from(String::from_utf8(git_dir.stdout).unwrap().trim());
+    fs::write(
+        git_dir.join("agent.json"),
+        serde_json::json!({ "name": "asker", "pid": asker.0.id(), "status": "waiting" })
+            .to_string(),
+    )
+    .unwrap();
+    screen.wait_for("there's ask in [1] Waiting", |text| {
+        text.lines()
+            .any(|l| l.contains("there:1") && l.contains("needs you"))
+    });
+    screen.press("1");
+    screen.press("\r");
+    screen.wait_on("there");
+    screen.wait_for("there's tree in the window", |text| {
+        text.contains("[0] Tree 1 · there-work")
+    });
+    drop(asker);
     drop(screen);
     let _ = fs::remove_dir_all(&root);
 }

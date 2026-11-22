@@ -869,6 +869,16 @@ fn run(
                 app,
                 Rect::new(0, 0, size.width, size.height),
             ));
+            // The window's chat asking a question, for number keys to answer.
+            app.dialog = chats
+                .open()
+                .filter(|c| app.is_window_focused && is_window_chat(c, app))
+                .and_then(|c| {
+                    let text = c.screen().contents();
+                    (chat::input(&text, c.hints()?) == chat::Input::Dialog)
+                        .then(|| serve::answer::choices(&text))
+                        .flatten()
+                });
             let other = app
                 .other_chat()
                 .and_then(|(command, ..)| chats.running(&command));
@@ -1164,6 +1174,17 @@ fn run(
             Outcome::Record { path, record } => {
                 if let Err(err) = sidecar::write(&path, &record) {
                     app.message = Some(format!("could not record it: {err}"));
+                }
+            }
+            // Only while the dialog is still there: one gone since the
+            // screen was drawn would take the number as typing.
+            Outcome::Answer(key) => {
+                if let Some(open) = chats.open_mut().filter(|c| {
+                    c.hints().is_some_and(|hints| {
+                        chat::input(&c.screen().contents(), hints) == chat::Input::Dialog
+                    })
+                }) {
+                    open.send_key(event::KeyEvent::from(event::KeyCode::Char(key)));
                 }
             }
             Outcome::Records(records) => {

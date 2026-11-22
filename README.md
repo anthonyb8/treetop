@@ -200,6 +200,7 @@ A hook is a command and its arguments, run in the tree with `TREETOP_TREE`, `TRE
 
 `layout = "panels"` lays the Trees screen out in numbered panels down the left, with the tree under the cursor in a window on the right, [0]: [1] Waiting, [2] Trees, which holds the table, [3] Ship and [4] News, the last three still being built.
 The number keys give a panel the keys, from the table or the window in Normal, and 0 gives them to the window; the bar names the panel with the keys and shows its keys.
+[1] Waiting lists what needs you in every workspace, the oldest first: an agent asking, wanting permission or dead, or a PR whose checks failed, each with where it is and how long it has waited; Enter opens it, another workspace's switched to first, and `w` from the panels opens the next one. When the window's agent shows a question with choices, its bottom border offers them on the number keys, and pressing one answers it; sending a failure with `F` or resuming with `R` takes what waited off the list at once too.
 [2] Trees shows one workspace at a time, every workspace a tab in its title in name order, with `▲` and how many wait on you there; `[` and `]` step through them, showing another workspace at once from its last read, only to look at: Esc comes back, and Enter, or any key that acts on a tree, such as `n`, `r` or `z`, switches there.
 Its trees come first, then those parked or on the Backburner, then the free ones as one row of numbers, where `n` starts an agent in the lowest.
 With trees marked, `z` and `x` park them or put them on the Backburner together, or bring them all back when all are there already, and the bar shows what the marked trees can be given.
@@ -406,7 +407,7 @@ The tree treetop was started in is never a target, because returning or destroyi
 
 ## Agent chats
 
-The Trees screen is two windows over the bottom bar: the table on top, and under it a window on the tree under the cursor, with the [count](#what-waits-on-you) at the right of the table's top border while anything needs action or is done.
+The Trees screen is two windows over the bottom bar: the table on top, and under it a window on the tree under the cursor, with the [count](#what-waits-on-you) at the right of the table's top border while anything needs action.
 The table's window is as tall as its rows, up to just under half the screen; the window under it takes the rest.
 While the window under the table has the keys, the table shrinks to a fifth of the screen, scrolling to keep the cursor's row in view, so the window gets the other four fifths; giving the keys back to the table puts both back.
 Whatever has the keys has its border in Normal's green, the table and the Usage column too, and a window in Insert has it in Insert's colour; the bottom bar names the mode (see [Normal and Insert](#normal-and-insert)).
@@ -680,7 +681,7 @@ An agent still asking is the one ask however often it writes, so it rings once.
 So there is nothing to dismiss, and an agent that finished or a PR that merged never waits: it is done instead.
 An agent whose turn has ended, its session idle, has finished, though it never wrote a report saying so; and a report that it was waiting on you stops counting once its session has run a turn past it, answered since, so a question answered days ago no longer waits, while one nobody answered still does, however long ago.
 
-While anything needs action or is done, a count sits at the right of the Trees window's top border, such as `● 2 needs action  ✓ 3 done  e`.
+While anything needs action, a count sits at the right of the Trees window's top border, such as `● 2 needs action  e`, or in the panels layout on [1] Waiting's; what is done shows on its tree's row and in the notifications `e` opens, not in the count.
 It never takes the keys, so what you type keeps going where it was, a chat in Insert included, and it stays bright over a popup.
 `e` from the table, or from a chat or shell in Normal, or a click on the count, opens the notifications under it: Needs action, what is stopped until you act, then Done, what finished or merged and is not working, the newest first.
 They keep to the right of the screen, over the Usage column where it shows, so a wider terminal never moves them.
@@ -691,7 +692,7 @@ Needs action leaves once it is dealt with, and Done once you open it.
 Esc, `h` or `e` closes them, and coming back after time away opens nothing by itself.
 The oldest comes first: each is as old as it has waited, from when it happened, or from when treetop first saw it where that is not known, as for a PR.
 
-Inside tmux, the status line of every window shows the same counts as the count in treetop, such as `● 2 needs action  ✓ 3 done`, at the right before your own `status-right`, what needs action in yellow and what is done plain, and clears once there is nothing to count or treetop quits; what `x` put away leaves it too.
+Inside tmux, the status line of every window shows the same count as treetop, such as `● 2 needs action`, at the right before your own `status-right`, in yellow, and clears once nothing needs action or treetop quits; what `x` put away leaves it too.
 treetop sets it on its session over the global `status-right`, and unsets it again, so your own `status-right` is left as it was.
 When something starts waiting, treetop rings the terminal bell, once, so it is heard from any window; the assistant finishing an answer rings it too, and shows it in the status line for five seconds.
 It shows a desktop notification too, on the machine whose terminal treetop is in, a laptop reaching the server over SSH included: the tree, its ticket and branch, what it waits for and, for an ask, the question.

@@ -1263,8 +1263,8 @@ pub mod tests {
         assert!(!is_new);
         assert_eq!(
             line.as_deref(),
-            Some("● 4 needs action  ✓ 1 done"),
-            "the counts alone, as the count in the table's corner has them"
+            Some("● 4 needs action"),
+            "what waits alone, as the count has it: what is done is no news to act on"
         );
         assert_eq!(app.watch_waiting(), Some((false, line)), "nor again");
         // Tree 4's agent, still asking, writes its report again: the same

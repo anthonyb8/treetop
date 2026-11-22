@@ -12,7 +12,7 @@
 //! port and claim any login: those run as the owner already.
 
 mod actions;
-mod answer;
+pub mod answer;
 mod chat;
 mod install;
 mod issues;

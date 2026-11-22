@@ -470,6 +470,11 @@ impl Chat {
         self.is_ended
     }
 
+    /// How its screen shows that it takes a message, where known.
+    pub fn hints(&self) -> Option<&Screen> {
+        self.hints.as_ref()
+    }
+
     pub fn screen(&self) -> &vt100::Screen {
         self.parser.screen()
     }

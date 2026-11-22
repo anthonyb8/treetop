@@ -120,6 +120,23 @@ pub fn read(command: &[String], hints: &Screen) -> Result<Value, String> {
     }
 }
 
+/// The choices of the one question a dialog on `text` asks, for number
+/// keys to pick: None for a layout `asked` does not read, for several
+/// questions, and for one that takes several choices, which are typed
+/// instead.
+pub fn choices(text: &str) -> Option<Vec<String>> {
+    let asked = asked(text)?;
+    let question = asked.as_array()?.first()?;
+    if question["multi"].as_bool() == Some(true) {
+        return None;
+    }
+    question["options"]
+        .as_array()?
+        .iter()
+        .map(|o| o["label"].as_str().map(str::to_string))
+        .collect()
+}
+
 /// Claude Code's own last entries in a question's list: one to type an
 /// answer, and one, under a rule, to talk it over. Neither is an option.
 const OWN: &str = "Type something.";
@@ -317,6 +334,26 @@ mod tests {
                 ],
             }])
         );
+    }
+
+    #[test]
+    fn a_questions_choices_are_its_labels_and_several_answers_are_typed() {
+        let text = format!("{ABOVE}{QUESTION}").replace('\r', "");
+        assert_eq!(
+            choices(&text),
+            Some(vec!["Clerk".into(), "Supabase".into()])
+        );
+        let multi = text
+            .replace("1. Clerk", "1. [ ] Clerk")
+            .replace("2. Supabase", "2. [ ] Supabase");
+        assert_eq!(
+            choices(&multi),
+            None,
+            "several choices are typed, not numbered"
+        );
+        // A permission prompt is a question of one choice too.
+        let permission = "Bash command\n  npm test\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n";
+        assert_eq!(choices(permission), Some(vec!["Yes".into(), "No".into()]));
     }
 
     #[test]

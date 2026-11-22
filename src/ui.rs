@@ -219,6 +219,7 @@ pub fn draw(
                     match (panel, app.viewed_trees()) {
                         (Panel::Trees, Some(trees)) => draw_viewed(frame, app, body, &trees),
                         (Panel::Trees, None) => draw_table(frame, app, body, false, true),
+                        (Panel::Waiting, _) => draw_waiting(frame, app, body, focused),
                         _ => {}
                     }
                 }
@@ -985,6 +986,54 @@ fn columns(app: &App, compact: bool) -> Vec<(&'static str, Constraint, usize)> {
         .collect()
 }
 
+/// [1] Waiting: what needs you in every workspace, the oldest first, each
+/// its mark, where it is, its ticket and branch, why and for how long; the
+/// one under its cursor marked while it has the keys.
+fn draw_waiting(frame: &mut Frame, app: &App, area: Rect, has_keys: bool) {
+    let t = theme();
+    let (items, _) = app.notes_list();
+    if items.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::styled(" nothing waits on you", fg(t.success))),
+            area,
+        );
+        return;
+    }
+    let rows: Vec<Row> = items
+        .iter()
+        .map(|entry| {
+            let (mark, color) = mark_of(entry.kind);
+            let place = inbox::place_of(entry);
+            let what = entry.title.clone().unwrap_or_else(|| entry.what.clone());
+            Row::new(vec![
+                Cell::from(mark).style(fg(color).add_modifier(Modifier::BOLD)),
+                Cell::from(place).style(fg(t.muted)),
+                Cell::from(what),
+                Cell::from(waits_for(entry.kind)).style(fg(color)),
+                Cell::from(entry.at.map(reports::age).unwrap_or_default()).style(fg(t.muted)),
+            ])
+        })
+        .collect();
+    // Where each is, whole: another workspace's carries its name.
+    let place = items
+        .iter()
+        .map(|e| inbox::place_of(e).chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(20);
+    let widths = [
+        Constraint::Length(1),
+        Constraint::Length(u16::try_from(place).unwrap_or(20)),
+        Constraint::Fill(1),
+        Constraint::Length(13),
+        Constraint::Length(4),
+    ];
+    let table = Table::new(rows, widths).row_highlight_style(t.cursor);
+    let selected = has_keys.then_some(app.waiting_at.min(items.len() - 1));
+    let mut state = TableState::default().with_selected(selected);
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
 /// Only the cells of the columns drawn, a heading's missing ones blank.
 fn pick_cells(
     columns: &[(&'static str, Constraint, usize)],
@@ -1588,6 +1637,9 @@ fn badge(app: &App, is_panels: bool) -> String {
 /// window's, [2] Trees', and only the panel keys for the panels still
 /// empty.
 fn panel_keys(app: &App) -> &'static [(&'static str, &'static str)] {
+    if app.is_window_focused && app.dialog.is_some() {
+        return &[("1-9", "answer"), ("i", "type"), ("Esc", "back")];
+    }
     if app.is_window_focused {
         return &[
             ("i", "insert"),
@@ -1610,8 +1662,16 @@ fn panel_keys(app: &App) -> &'static [(&'static str, &'static str)] {
             ("Esc", "back"),
             ("[ ]", "workspaces"),
         ],
+        Panel::Waiting => &[
+            ("j/k", "move"),
+            ("Enter", "open it"),
+            ("w", "next"),
+            ("0", "window"),
+            ("1-4", "panels"),
+        ],
         Panel::Trees => &[
             ("[ ]", "workspaces"),
+            ("w", "next waiting"),
             ("j/k", "move"),
             ("Enter", "chat"),
             ("n", "new agent"),
@@ -1962,28 +2022,21 @@ fn screen_rows(screen: Rect) -> ScreenRows {
 /// that opens them. None with neither.
 fn notes_count(app: &App) -> Option<Vec<Span<'static>>> {
     let t = theme();
-    let (needs, done) = app.notes_list();
-    if needs.is_empty() && done.is_empty() {
+    // What waits on you alone: what is done is the tree's status, and
+    // `e` still lists it.
+    let (needs, _) = app.notes_list();
+    if needs.is_empty() {
         return None;
     }
-    let bold = Modifier::BOLD;
-    let mut spans = vec![Span::raw(" ")];
-    if !needs.is_empty() {
-        spans.push(Span::styled(
+    Some(vec![
+        Span::raw(" "),
+        Span::styled(
             format!("● {}", needs.len()),
-            fg(t.warning).add_modifier(bold),
-        ));
-        spans.push(Span::raw(" needs action  "));
-    }
-    if !done.is_empty() {
-        spans.push(Span::styled(
-            format!("✓ {}", done.len()),
-            fg(t.success).add_modifier(bold),
-        ));
-        spans.push(Span::raw(" done  "));
-    }
-    spans.push(Span::styled("e ", fg(t.muted)));
-    Some(spans)
+            fg(t.warning).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" needs action  "),
+        Span::styled("e ", fg(t.muted)),
+    ])
 }
 
 /// Where the count sits on `main`, the screen above the bar: the Trees
@@ -2462,7 +2515,30 @@ fn draw_window(frame: &mut Frame, app: &App, area: Rect, pane: &Pane, chat: Opti
             format!(" {number}")
         }
     });
-    let block = window_block(pane.has_keys.then_some(mode)).title(title);
+    let mut block = window_block(pane.has_keys.then_some(mode)).title(title);
+    // A question its chat asks, its choices on the number keys.
+    if let Some(choices) = app
+        .dialog
+        .as_ref()
+        .filter(|_| pane.is_cursor && !number.is_empty())
+    {
+        let mut answer = vec![Span::styled(
+            " ▲ answer ",
+            fg(theme().warning).add_modifier(Modifier::BOLD),
+        )];
+        for (n, choice) in choices.iter().enumerate() {
+            answer.push(Span::styled(
+                format!(" {} ", n + 1),
+                Style::new()
+                    .fg(theme().badge.fg.unwrap_or(theme().text))
+                    .bg(theme().warning)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            answer.push(Span::raw(format!(" {choice}  ")));
+        }
+        answer.push(Span::styled("i types instead ", fg(theme().muted)));
+        block = block.title_bottom(Line::from(answer));
+    }
     frame.render_widget(block, area);
     let [bar, body] = window_areas(area);
     let Some(tree) = tree else {
@@ -6307,7 +6383,7 @@ mod count_tests {
     }
 
     #[test]
-    fn the_count_at_the_top_right_reads_what_needs_action_and_what_is_done() {
+    fn the_count_at_the_top_right_reads_what_needs_action_and_not_what_is_done() {
         let mut app = app();
         let top = &screen(&app, 200, 30)[0];
         assert!(
@@ -6315,7 +6391,7 @@ mod count_tests {
             "no banner over the table: {top}"
         );
         assert!(
-            top.contains("─ ● 4 needs action  ✓ 1 done  e ┐┌ Usage"),
+            top.contains("─ ● 4 needs action  e ┐┌ Usage") && !top.contains("done"),
             "at the right of the table's window: {top}"
         );
         let at = top.chars().position(|c| c == '●').unwrap();
@@ -8136,7 +8212,7 @@ mod window_tests {
         // The count on a row of its own at the top, then the table's header,
         // unboxed, as it always was.
         assert!(
-            shown[0].starts_with(' ') && shown[0].contains("● 4 needs action  ✓ 1 done  e"),
+            shown[0].starts_with(' ') && shown[0].contains("● 4 needs action  e"),
             "{}",
             shown[0]
         );
@@ -8478,6 +8554,66 @@ mod panels_tests {
         let all = screen(&app, 160, 46).join("\n");
         assert!(all.contains("free       ○ 5"), "{all}");
         assert!(!all.contains("not leased"), "{all}");
+    }
+
+    #[test]
+    fn waiting_lists_what_needs_you_with_where_why_and_how_long() {
+        let shown = screen(&panels(), 160, 46);
+        // [1]'s own columns, left of the window beside it.
+        let width = shown
+            .iter()
+            .find_map(|l| l.find("┌ [0]"))
+            .map(|at| shown[0][..at].chars().count())
+            .unwrap_or_else(|| panic!("no window:\n{}", shown.join("\n")));
+        let rows: Vec<String> = shown
+            .iter()
+            .skip_while(|l| !l.contains("[1] Waiting"))
+            .take_while(|l| !l.contains("[2] Trees"))
+            .map(|l| l.chars().take(width).collect())
+            .collect();
+        let all = rows.join("\n");
+        // Where, why and how long; another workspace's by its name. A PR's
+        // failure carries no time until treetop has watched it.
+        for (place, what, why, age) in [
+            (" 9 ", "port-menu", "agent died", " 31m"),
+            ("endodeals-web:12", "END-88", "needs you", " 6m"),
+            (" 4 ", "ANB-41", "needs you", " 2m"),
+            (" 7 ", "fix-login", "checks failed", ""),
+        ] {
+            assert!(
+                rows.iter()
+                    .any(|l| [place, what, why, age].iter().all(|part| l.contains(part))),
+                "{place} {why} {age}:\n{all}"
+            );
+        }
+        // Tree 2's agent finished: done is its row's status, not news.
+        assert!(!all.contains("help-columns"), "{all}");
+        assert!(all.contains("needs action"), "the count is on [1]:\n{all}");
+        let mut nothing = panels();
+        nothing.trees.clear();
+        nothing.pools.clear();
+        let shown = screen(&nothing, 160, 46).join("\n");
+        assert!(shown.contains("nothing waits on you"), "{shown}");
+    }
+
+    #[test]
+    fn a_question_in_the_windows_chat_offers_its_choices_on_its_border() {
+        let mut app = panels();
+        app.selected = 1;
+        app.window_rows = 40;
+        app.is_window_focused = true;
+        app.dialog = Some(vec!["Clerk".into(), "Supabase".into()]);
+        let shown = screen(&app, 160, 46);
+        let bottom = shown
+            .iter()
+            .find(|l| l.contains("▲ answer"))
+            .unwrap_or_else(|| panic!("no answer row:\n{}", shown.join("\n")));
+        assert!(
+            bottom.contains(" 1  Clerk") && bottom.contains(" 2  Supabase"),
+            "{bottom}"
+        );
+        app.dialog = None;
+        assert!(!screen(&app, 160, 46).join("\n").contains("▲ answer"));
     }
 
     #[test]
