@@ -424,6 +424,9 @@ fn run(
                     if !news.is_empty() {
                         announce(&news)?;
                     }
+                    for line in news {
+                        app.add_news(None, line, None);
+                    }
                 }
                 Update::Sidecars(sidecars) => app.apply_sidecars(sidecars),
                 Update::Ship(answer) => {
@@ -464,7 +467,12 @@ fn run(
                     if job.kind == Kind::Ship {
                         refresher.refresh_ship();
                     }
+                    let before = app.message.clone();
                     app.job_finished(job, is_ok, output);
+                    // What it came to, kept in [4] News past the next key.
+                    if let Some(said) = app.message.clone().filter(|m| Some(m) != before.as_ref()) {
+                        app.add_news(None, said, None);
+                    }
                     if !is_preview {
                         refresher.refresh();
                     }
@@ -1231,7 +1239,10 @@ fn run(
                 *term = enter_screen()?;
                 refresher.refresh();
             }
-            Outcome::Send { to, text } => send(term, app, chats, &worker, to, &text)?,
+            Outcome::Send { to, text } => {
+                app.note_sent(&to, &text);
+                send(term, app, chats, &worker, to, &text)?;
+            }
             Outcome::Editor => {
                 let text = app
                     .prompt

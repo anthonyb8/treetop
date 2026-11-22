@@ -220,7 +220,8 @@ pub fn draw(
                         (Panel::Trees, Some(trees)) => draw_viewed(frame, app, body, &trees),
                         (Panel::Trees, None) => draw_table(frame, app, body, false, true),
                         (Panel::Waiting, _) => draw_waiting(frame, app, body, focused),
-                        _ => {}
+                        (Panel::Ship, _) => draw_ship(frame, app, body, focused),
+                        (Panel::News, _) => draw_news(frame, app, body),
                     }
                 }
             } else if is_classic(app) {
@@ -1034,6 +1035,100 @@ fn draw_waiting(frame: &mut Frame, app: &App, area: Rect, has_keys: bool) {
     frame.render_stateful_widget(table, area, &mut state);
 }
 
+/// The one key that moves a PR on at `stage`, for [3] Ship, with what it
+/// does; None while it moves on by itself.
+fn ship_key(stage: Stage) -> Option<(&'static str, &'static str)> {
+    match stage {
+        Stage::CiFailed | Stage::Failed | Stage::Changes => Some(("F", "send it")),
+        Stage::Gate => Some(("S", "the run")),
+        Stage::Approved => Some(("M", "merge")),
+        Stage::Merged | Stage::Closed => Some(("r", "return")),
+        _ => None,
+    }
+}
+
+/// [3] Ship: this workspace's PRs, each its tree, branch, the plugin's
+/// label in the stage's colour, and the key that moves it on.
+fn draw_ship(frame: &mut Frame, app: &App, area: Rect, has_keys: bool) {
+    let t = theme();
+    let rows = app.ship_rows();
+    if rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::styled(" no PRs here yet", fg(t.muted))),
+            area,
+        );
+        return;
+    }
+    let lines: Vec<Row> = rows
+        .iter()
+        .filter_map(|tree| {
+            let ship = tree.ship.as_ref()?;
+            let key = match ship_key(ship.stage) {
+                Some((key, does)) => Line::from(vec![
+                    Span::styled(key, fg(t.info).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!(" {does}"), fg(t.muted)),
+                ]),
+                None => Line::styled("wait", fg(t.muted)),
+            };
+            Some(Row::new(vec![
+                Cell::from(tree.name.clone()).style(fg(t.muted)),
+                Cell::from(tree.branch.clone().unwrap_or_default()),
+                pr_cell(tree),
+                Cell::from(key),
+            ]))
+        })
+        .collect();
+    let widths = [
+        Constraint::Length(3),
+        Constraint::Fill(1),
+        Constraint::Length(14),
+        Constraint::Length(9),
+    ];
+    let table = Table::new(lines, widths).row_highlight_style(t.cursor);
+    let selected = has_keys.then_some(app.ship_at.min(rows.len() - 1));
+    let mut state = TableState::default().with_selected(selected);
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
+/// [4] News: what happened in every workspace, newest first, as long ago
+/// as it was, where, and what; it stays however many keys go by.
+fn draw_news(frame: &mut Frame, app: &App, area: Rect) {
+    let t = theme();
+    let news = app.news();
+    if news.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                " nothing new since treetop opened",
+                fg(t.muted),
+            )),
+            area,
+        );
+        return;
+    }
+    let lines: Vec<Line> = news
+        .iter()
+        .take(usize::from(area.height))
+        .map(|line| {
+            let (said, color) = match line.kind {
+                Some(Kind::Done) => ("done", t.success),
+                Some(Kind::Merged) => ("merged", t.special),
+                Some(kind) => (waits_for(kind), mark_of(kind).1),
+                None => ("", t.text),
+            };
+            let mut spans = vec![
+                Span::styled(format!("{:>4} ", reports::age(line.at)), fg(t.muted)),
+                Span::styled(format!("{} ", line.place), fg(t.muted)),
+            ];
+            if !said.is_empty() {
+                spans.push(Span::styled(format!("{said} "), fg(color)));
+            }
+            spans.push(Span::raw(line.what.clone()));
+            Line::from(spans)
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 /// Only the cells of the columns drawn, a heading's missing ones blank.
 fn pick_cells(
     columns: &[(&'static str, Constraint, usize)],
@@ -1661,6 +1756,15 @@ fn panel_keys(app: &App) -> &'static [(&'static str, &'static str)] {
             ("Enter", "switch there"),
             ("Esc", "back"),
             ("[ ]", "workspaces"),
+        ],
+        Panel::Ship => &[
+            ("j/k", "move"),
+            ("F", "send failure"),
+            ("M", "merge"),
+            ("r", "return"),
+            ("v", "PR"),
+            ("0", "window"),
+            ("1-4", "panels"),
         ],
         Panel::Waiting => &[
             ("j/k", "move"),
@@ -8616,12 +8720,102 @@ mod panels_tests {
         assert!(!screen(&app, 160, 46).join("\n").contains("▲ answer"));
     }
 
+    /// The rows of the panel titled `title`, cut to its width.
+    fn panel_rows(shown: &[String], title: &str) -> Vec<String> {
+        let top = shown.iter().find(|l| l.contains(title)).unwrap();
+        let width = top.chars().position(|c| c == '┐').unwrap() + 1;
+        shown
+            .iter()
+            .skip_while(|l| !l.contains(title))
+            .skip(1)
+            .take_while(|l| !l.starts_with('└'))
+            .map(|l| l.chars().take(width).collect())
+            .collect()
+    }
+
+    #[test]
+    fn ship_lists_this_workspaces_prs_with_the_key_that_moves_each_on() {
+        let mut app = panels();
+        // Tree 7's failed; tree 2's approved; tree 4's merged; tree 9's has
+        // nothing to say.
+        let ship = app.trees[2].ship.clone().unwrap();
+        app.trees[1].ship = Some(Box::new(crate::ship::Ship {
+            stage: Stage::Approved,
+            label: "#64 ✓".into(),
+            ..*ship.clone()
+        }));
+        app.trees[0].ship = Some(Box::new(crate::ship::Ship {
+            stage: Stage::Merged,
+            label: "#57 merged".into(),
+            ..*ship.clone()
+        }));
+        app.trees[3].ship = Some(Box::new(crate::ship::Ship {
+            stage: Stage::Idle,
+            label: "idle".into(),
+            ..*ship
+        }));
+        let rows = panel_rows(&screen(&app, 160, 46), "[3] Ship");
+        let row = |label: &str| {
+            rows.iter()
+                .find(|l| l.contains(label))
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert!(row("#212 ✗ e2e").contains("F send it"), "{rows:?}");
+        assert!(row("#64 ✓").contains("M merge"), "{rows:?}");
+        assert!(row("#57 merged").contains("r return"), "{rows:?}");
+        assert!(!rows.iter().any(|l| l.contains("idle")), "{rows:?}");
+        app.trees.iter_mut().for_each(|t| t.ship = None);
+        let rows = panel_rows(&screen(&app, 160, 46), "[3] Ship");
+        assert!(rows[0].contains("no PRs here yet"), "{rows:?}");
+    }
+
+    #[test]
+    fn news_shows_how_long_ago_where_and_what_newest_first() {
+        let mut app = panels();
+        let rows = panel_rows(&screen(&app, 160, 46), "[4] News");
+        assert!(
+            rows[0].contains("nothing new since treetop opened"),
+            "{rows:?}"
+        );
+        app.add_news(
+            Some("api:2".into()),
+            "END-212 fix-login".into(),
+            Some(Kind::Failed),
+        );
+        app.add_news(None, "you: retry → me/fix-login".into(), None);
+        let rows = panel_rows(&screen(&app, 160, 46), "[4] News");
+        assert!(rows[0].contains("you: retry → me/fix-login"), "{rows:?}");
+        assert!(
+            rows[1].contains("api:2")
+                && rows[1].contains("checks failed")
+                && rows[1].contains("END-212"),
+            "{rows:?}"
+        );
+        assert!(
+            rows[1]
+                .trim_start_matches('│')
+                .trim_start()
+                .starts_with("now"),
+            "{rows:?}"
+        );
+    }
+
     #[test]
     fn the_bar_names_the_panel_with_the_keys_and_shows_only_its_keys() {
         let mut app = panels();
         app.panel = Panel::Ship;
         let bar = screen(&app, 160, 46).pop().unwrap();
         assert!(bar.starts_with(" PANEL 3 "), "{bar}");
+        assert!(
+            bar.contains("F send failure") && bar.contains("M merge"),
+            "{bar}"
+        );
+        assert!(!bar.contains("n new agent"), "not Trees' keys: {bar}");
+        // [4] News takes no keys of its own: the panel keys alone.
+        app.panel = Panel::News;
+        let bar = screen(&app, 160, 46).pop().unwrap();
+        assert!(bar.starts_with(" PANEL 4 "), "{bar}");
         assert!(
             bar.contains("0 window") && bar.contains("1-4 panels"),
             "{bar}"

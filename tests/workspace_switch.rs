@@ -534,3 +534,44 @@ fn an_ask_in_another_workspace_is_listed_in_waiting_and_enter_goes_there() {
     drop(screen);
     let _ = fs::remove_dir_all(&root);
 }
+
+/// ANB-105: in the panels layout an agent starting to ask in another
+/// workspace is a line in [4] News, which stays however many keys go by.
+#[test]
+fn an_ask_in_another_workspace_is_news_that_stays() {
+    let Workspaces {
+        root, mut screen, ..
+    } = two_workspaces("news", "layout = \"panels\"\n");
+    screen.wait_on("here");
+    screen.wait_for("nothing new yet", |text| {
+        text.contains("nothing new since treetop opened")
+    });
+    // Its first read is done before the agent asks, so the ask is new.
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    let asker = Asker(Command::new("sleep").arg("600").spawn().unwrap());
+    let git_dir = Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--git-dir"])
+        .current_dir(root.join("there-trees/1"))
+        .output()
+        .unwrap();
+    let git_dir = PathBuf::from(String::from_utf8(git_dir.stdout).unwrap().trim());
+    fs::write(
+        git_dir.join("agent.json"),
+        serde_json::json!({ "name": "asker", "pid": asker.0.id(), "status": "waiting" })
+            .to_string(),
+    )
+    .unwrap();
+    let is_news = |text: &str| {
+        text.lines()
+            .skip_while(|l| !l.contains("[4] News"))
+            .any(|l| l.contains("there:1") && l.contains("needs you"))
+    };
+    screen.wait_for("there's ask in [4] News", is_news);
+    for key in ["j", "k", "3", "2"] {
+        screen.press(key);
+    }
+    assert!(is_news(&screen.text()), "{}", screen.text());
+    drop(asker);
+    drop(screen);
+    let _ = fs::remove_dir_all(&root);
+}

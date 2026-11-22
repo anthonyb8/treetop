@@ -198,9 +198,11 @@ on_return = ["harness", "stack", "down"]
 
 A hook is a command and its arguments, run in the tree with `TREETOP_TREE`, `TREETOP_BRANCH` and `TREETOP_TICKET` set, and given two minutes.
 
-`layout = "panels"` lays the Trees screen out in numbered panels down the left, with the tree under the cursor in a window on the right, [0]: [1] Waiting, [2] Trees, which holds the table, [3] Ship and [4] News, the last three still being built.
+`layout = "panels"` lays the Trees screen out in numbered panels down the left, with the tree under the cursor in a window on the right, [0]: [1] Waiting, [2] Trees, which holds the table, [3] Ship and [4] News.
 The number keys give a panel the keys, from the table or the window in Normal, and 0 gives them to the window; the bar names the panel with the keys and shows its keys.
 [1] Waiting lists what needs you in every workspace, the oldest first: an agent asking, wanting permission or dead, or a PR whose checks failed, each with where it is and how long it has waited; Enter opens it, another workspace's switched to first, and `w` from the panels opens the next one. When the window's agent shows a question with choices, its bottom border offers them on the number keys, and pressing one answers it; sending a failure with `F` or resuming with `R` takes what waited off the list at once too.
+[3] Ship lists this workspace's PRs with the key that moves each on: `F` sends a failure to its agent, `M` asks an approved PR's agent to `/merge squash` it, `r` returns a merged or closed one's tree, that tree alone whatever is marked, and `S` shows a ship run waiting on you; `v` shows the PR, and the window follows the PR under its cursor.
+[4] News keeps what happened, newest first, for as long as treetop runs, whatever keys go by: what started waiting, failed, died, finished or merged in any workspace, what you sent an agent, and what an action came to.
 [2] Trees shows one workspace at a time, every workspace a tab in its title in name order, with `▲` and how many wait on you there; `[` and `]` step through them, showing another workspace at once from its last read, only to look at: Esc comes back, and Enter, or any key that acts on a tree, such as `n`, `r` or `z`, switches there.
 Its trees come first, then those parked or on the Backburner, then the free ones as one row of numbers, where `n` starts an agent in the lowest.
 With trees marked, `z` and `x` park them or put them on the Backburner together, or bring them all back when all are there already, and the bar shows what the marked trees can be given.

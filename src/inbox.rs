@@ -615,7 +615,7 @@ pub mod tests {
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
     use std::time::Duration;
 
-    fn agent(name: &str, job: &str, status: Status) -> Agent {
+    pub fn agent(name: &str, job: &str, status: Status) -> Agent {
         Agent {
             name: name.into(),
             pid: Some(1),

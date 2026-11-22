@@ -1,7 +1,7 @@
 //! What the screen shows and what each key does, kept free of terminal I/O so
 //! the rules about what may be returned or destroyed are testable.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -569,7 +569,29 @@ pub enum Outcome {
 #[derive(Debug, Clone, Default)]
 pub struct Watch {
     since: HashMap<crate::inbox::About, std::time::SystemTime>,
+    /// [4] News, newest first, kept across a switch as what waits is.
+    news: VecDeque<News>,
+    /// What waited or was done at the last look, for what is new since;
+    /// None before the first, which is no news.
+    news_seen: Option<HashSet<crate::inbox::About>>,
+    /// The workspace on screen and the others read, at the last look: one
+    /// read for the first time since, or a switch, is no news either, as
+    /// what it holds was already there, as the desktop is not told of it.
+    news_read: (PathBuf, HashSet<PathBuf>),
 }
+
+/// A line of [4] News: when, where, and what happened; `kind` for the
+/// inbox's, None for treetop's own and what you sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct News {
+    pub at: std::time::SystemTime,
+    pub place: String,
+    pub what: String,
+    pub kind: Option<crate::inbox::Kind>,
+}
+
+/// The most lines [4] News keeps, the oldest going first.
+const NEWS_KEPT: usize = 300;
 
 #[derive(Default)]
 pub struct App {
@@ -802,6 +824,8 @@ pub struct App {
     pub dialog: Option<Vec<String>>,
     /// In [1] Waiting, the item under its cursor.
     pub waiting_at: usize,
+    /// In [3] Ship, the PR under its cursor.
+    pub ship_at: usize,
     /// The command palette, while Ctrl+P has it open.
     pub palette: Option<Palette>,
     /// In a double, the side of the window the cursor drives, the one that
@@ -1720,6 +1744,158 @@ impl App {
             _ => return None,
         }
         Some(Outcome::Continue)
+    }
+
+    /// [4] News, newest first.
+    pub fn news(&self) -> &VecDeque<News> {
+        &self.watch.news
+    }
+
+    /// Adds a line to [4] News, in this workspace unless `place` says
+    /// where.
+    pub fn add_news(
+        &mut self,
+        place: Option<String>,
+        what: String,
+        kind: Option<crate::inbox::Kind>,
+    ) {
+        let place = place.unwrap_or_else(|| crate::workspaces::name(&self.checkout));
+        self.watch.news.push_front(News {
+            at: std::time::SystemTime::now(),
+            place,
+            what,
+            kind,
+        });
+        self.watch.news.truncate(NEWS_KEPT);
+    }
+
+    /// What you sent each of `to`, into [4] News: its first line, and the
+    /// branch it went to, else its tree's number.
+    pub fn note_sent(&mut self, to: &[Recipient], text: &str) {
+        let said = text.lines().next().unwrap_or_default();
+        for recipient in to {
+            let to = self
+                .trees
+                .iter()
+                .find(|t| t.name == recipient.tree)
+                .and_then(|t| t.branch.clone())
+                .unwrap_or_else(|| format!("tree {}", recipient.tree));
+            self.add_news(None, format!("you: {said} → {to}"), None);
+        }
+    }
+
+    /// What started waiting, or was done or merged, in any workspace since
+    /// the last look goes into [4] News; what already was at the first look
+    /// is not news, as the bell does not ring for it.
+    fn look_for_news(&mut self) {
+        let entries = crate::inbox::entries(self);
+        let now: HashSet<crate::inbox::About> = entries.iter().map(|e| e.about()).collect();
+        let read = (
+            self.checkout.clone(),
+            self.away_live.keys().cloned().collect::<HashSet<_>>(),
+        );
+        let (here, was_read) = std::mem::replace(&mut self.watch.news_read, read);
+        let Some(seen) = self.watch.news_seen.replace(now) else {
+            return;
+        };
+        let new: Vec<crate::inbox::Entry> = entries
+            .into_iter()
+            .filter(|e| !seen.contains(&e.about()))
+            .filter(|e| match &e.away {
+                None => here == self.checkout,
+                Some(away) => was_read.contains(&away.checkout),
+            })
+            .collect();
+        for entry in new {
+            let place = match &entry.away {
+                Some(away) => format!("{}:{}", away.name, entry.tree),
+                None => format!("{}:{}", crate::workspaces::name(&self.checkout), entry.tree),
+            };
+            let what = entry.title.clone().unwrap_or_else(|| entry.what.clone());
+            self.add_news(Some(place), what, Some(entry.kind));
+        }
+    }
+
+    /// The PRs [3] Ship lists: this workspace's trees whose ship plugin
+    /// has something to say.
+    pub fn ship_rows(&self) -> Vec<&Tree> {
+        self.trees
+            .iter()
+            .filter(|t| {
+                t.ship
+                    .as_ref()
+                    .is_some_and(|s| s.stage != crate::ship::Stage::Idle)
+            })
+            .collect()
+    }
+
+    /// [3] Ship's keys in the panels layout: j and k move among its PRs,
+    /// and a key acts on the PR under its cursor's tree as it would on the
+    /// table's, the table's cursor going to it so the window shows it:
+    /// `F` sends the failure, `S` the ship run, `v` and `O` the PR, `r`
+    /// returns that tree alone whatever is marked, and `M` asks its agent
+    /// to merge it. None for a key it leaves to the rest.
+    fn handle_ship_key(&mut self, key: KeyEvent) -> Option<Outcome> {
+        if !self.shows_panels()
+            || self.panel != Panel::Ship
+            || self.is_window_focused
+            || !key.modifiers.is_empty()
+            || self.is_typing()
+        {
+            return None;
+        }
+        let rows: Vec<PathBuf> = self.ship_rows().iter().map(|t| t.path.clone()).collect();
+        let last = rows.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => self.ship_at = (self.ship_at + 1).min(last),
+            KeyCode::Char('k') | KeyCode::Up => self.ship_at = self.ship_at.saturating_sub(1),
+            KeyCode::Char('F' | 'S' | 'v' | 'O' | 'r' | 'M') | KeyCode::Enter => {
+                let path = rows.get(self.ship_at.min(last))?.clone();
+                // Unfolded and unfiltered if need be, so the cursor lands on it.
+                self.reveal(path);
+                if key.code == KeyCode::Char('M') {
+                    return Some(self.ask_to_merge());
+                }
+                // As on the table, with the marks set aside so `r` takes
+                // this tree alone.
+                let marked = std::mem::take(&mut self.marked);
+                self.panel = Panel::Trees;
+                let outcome = self.handle_key(key);
+                self.panel = Panel::Ship;
+                if self.marked.is_empty() {
+                    self.marked = marked;
+                }
+                return Some(outcome);
+            }
+            _ => return None,
+        }
+        Some(Outcome::Continue)
+    }
+
+    /// `M` on an approved PR: types `/merge squash` to the tree's agent,
+    /// whose merge skill does it, so treetop stays read-only toward the
+    /// PR and the method is named every time.
+    fn ask_to_merge(&mut self) -> Outcome {
+        let Some(tree) = self.current() else {
+            return Outcome::Continue;
+        };
+        let name = tree.name.clone();
+        if tree.ship.as_ref().map(|s| s.stage) != Some(crate::ship::Stage::Approved) {
+            self.message = Some(format!("tree {name}'s PR is not approved yet"));
+            return Outcome::Continue;
+        }
+        let Some(to) = tree
+            .agents
+            .iter()
+            .find_map(|a| Recipient::of(a, &tree.name))
+        else {
+            self.message = Some(format!("no agent in tree {name} to merge it"));
+            return Outcome::Continue;
+        };
+        Outcome::Send {
+            to: vec![to],
+            text: "/merge squash".into(),
+        }
     }
 
     /// Something takes typed text or keys of its own, so the panels' keys
@@ -3391,6 +3567,7 @@ impl App {
         if !self.is_read() {
             return None;
         }
+        self.look_for_news();
         let waiting = crate::inbox::needs_action(self);
         let now = std::time::SystemTime::now();
         let is_new = self.has_looked
@@ -4972,6 +5149,9 @@ impl App {
         if let Some(outcome) = self.handle_waiting_key(key) {
             return outcome;
         }
+        if let Some(outcome) = self.handle_ship_key(key) {
+            return outcome;
+        }
         if let Some(outcome) = self.handle_tab_key(key) {
             return outcome;
         }
@@ -5598,6 +5778,177 @@ mod tests {
         };
         assert_eq!(shelve(&mut app), [Some(Shelf::Parked); 2]);
         assert_eq!(shelve(&mut app), [None; 2], "all parked, so all come back");
+    }
+
+    #[test]
+    fn what_already_waits_in_a_workspace_read_for_the_first_time_is_not_news() {
+        use crate::inbox::tests::{agent, tree};
+        let mut app = crate::inbox::tests::with_workspaces();
+        app.is_loaded = true;
+        app.is_agents_read = true;
+        let asking = |path: &str, name: &str| {
+            tree(
+                path,
+                name,
+                "zeta-work",
+                vec![agent("asker", name, crate::agents::Status::Waiting)],
+            )
+        };
+        app.watch_waiting();
+        let at_first = app.news().len();
+        // Zeta's first read lands, an agent there already asking.
+        app.away_live.insert(
+            PathBuf::from("/code/zeta"),
+            vec![asking("/code/zeta-trees/1", "1")],
+        );
+        app.watch_waiting();
+        assert_eq!(app.news().len(), at_first, "{:?}", app.news());
+        // Another there starts asking, a tree its pool lists: that is news.
+        let zeta = app
+            .pools
+            .iter_mut()
+            .find(|p| p.away.name == "zeta")
+            .unwrap();
+        zeta.trees
+            .push(tree("/code/zeta-trees/3", "3", "zeta-work", Vec::new()));
+        app.away_live.insert(
+            PathBuf::from("/code/zeta"),
+            vec![
+                asking("/code/zeta-trees/1", "1"),
+                asking("/code/zeta-trees/3", "3"),
+            ],
+        );
+        app.watch_waiting();
+        assert_eq!(app.news().len(), at_first + 1, "{:?}", app.news());
+        assert_eq!(app.news()[0].place, "zeta:3");
+    }
+
+    #[test]
+    fn what_already_waits_in_the_workspace_switched_to_is_not_news() {
+        let mut app = crate::inbox::tests::app();
+        app.is_loaded = true;
+        app.is_agents_read = true;
+        app.checkout = PathBuf::from("/code/main-app");
+        app.watch_waiting();
+        let at_first = app.news().len();
+        // A switch: a new App, the watch kept, its own trees already asking.
+        let mut there = crate::inbox::tests::app();
+        there.is_loaded = true;
+        there.is_agents_read = true;
+        there.checkout = PathBuf::from("/code/api");
+        for tree in &mut there.trees {
+            tree.path = PathBuf::from("/code/api-trees").join(&tree.name);
+        }
+        there.keep_watch(app.take_watch());
+        there.watch_waiting();
+        assert_eq!(there.news().len(), at_first, "{:?}", there.news());
+    }
+
+    #[test]
+    fn what_you_send_is_news_by_the_branch_it_went_to() {
+        let mut app = crate::inbox::tests::app();
+        let seven = app.trees.iter().find(|t| t.name == "7").unwrap();
+        let to = seven
+            .agents
+            .iter()
+            .find_map(|a| Recipient::of(a, &seven.name))
+            .unwrap();
+        let unknown = Recipient {
+            tree: "99".into(),
+            ..to.clone()
+        };
+        app.note_sent(&[to, unknown], "retry the e2e\nwith the log below");
+        let lines: Vec<&str> = app.news().iter().map(|n| n.what.as_str()).collect();
+        assert_eq!(
+            lines,
+            [
+                "you: retry the e2e → tree 99",
+                "you: retry the e2e → me/fix-login"
+            ]
+        );
+    }
+
+    #[test]
+    fn r_on_a_ship_row_returns_its_tree_even_when_the_table_hides_it() {
+        let mut app = crate::inbox::tests::app();
+        let seven = app.trees.iter_mut().find(|t| t.name == "7").unwrap();
+        seven.ship.as_mut().unwrap().stage = crate::ship::Stage::Merged;
+        app.look = crate::config::Look::Panels;
+        app.show_panels(true);
+        select(&mut app, "4");
+        // A filter left on the table hides tree 7, Ship's only row.
+        app.filter = "ANB-41".into();
+        app.panel = Panel::Ship;
+        press(&mut app, KeyCode::Char('r'));
+        let names: Vec<&str> = app
+            .pending
+            .as_ref()
+            .map(|p| p.trees.iter().map(|t| t.name.as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(names, ["7"], "the row's tree, not the table cursor's");
+    }
+
+    #[test]
+    fn r_on_a_ship_row_takes_its_tree_alone_and_the_marks_stay() {
+        let mut app = crate::inbox::tests::app();
+        let seven = app.trees.iter_mut().find(|t| t.name == "7").unwrap();
+        seven.ship.as_mut().unwrap().stage = crate::ship::Stage::Merged;
+        let marked: BTreeSet<PathBuf> = app.trees[..2].iter().map(|t| t.path.clone()).collect();
+        app.marked = marked.clone();
+        app.look = crate::config::Look::Panels;
+        app.show_panels(true);
+        app.panel = Panel::Ship;
+        press(&mut app, KeyCode::Char('r'));
+        let names: Vec<&str> = app
+            .pending
+            .as_ref()
+            .map(|p| p.trees.iter().map(|t| t.name.as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(names, ["7"], "not the marked trees");
+        assert_eq!(app.marked, marked, "the marks are kept for later");
+        assert_eq!(app.panel, Panel::Ship, "[3] keeps the keys");
+    }
+
+    #[test]
+    fn m_asks_an_approved_prs_agent_to_merge_it_and_nothing_else() {
+        let mut app = crate::inbox::tests::app();
+        app.look = crate::config::Look::Panels;
+        app.show_panels(true);
+        app.panel = Panel::Ship;
+        // Tree 7's PR failed: nothing to merge.
+        assert_eq!(press(&mut app, KeyCode::Char('M')), Outcome::Continue);
+        assert!(app.message.as_deref().unwrap().contains("not approved"));
+        let seven = app.trees.iter_mut().find(|t| t.name == "7").unwrap();
+        seven.ship.as_mut().unwrap().stage = crate::ship::Stage::Approved;
+        let Outcome::Send { to, text } = press(&mut app, KeyCode::Char('M')) else {
+            panic!("M sends");
+        };
+        assert_eq!(text, "/merge squash", "the method named every time");
+        assert_eq!(
+            to.iter().map(|r| r.tree.as_str()).collect::<Vec<_>>(),
+            ["7"]
+        );
+    }
+
+    #[test]
+    fn news_keeps_what_happened_newest_first_capped_and_across_a_switch() {
+        let mut app = crate::inbox::tests::app();
+        app.add_news(None, "first".into(), None);
+        app.add_news(Some("api:2".into()), "second".into(), None);
+        assert_eq!(app.news()[0].what, "second");
+        assert_eq!(app.news()[0].place, "api:2");
+        for n in 0..NEWS_KEPT {
+            app.add_news(None, format!("{n}"), None);
+        }
+        assert_eq!(app.news().len(), NEWS_KEPT);
+        assert!(
+            app.news().iter().all(|n| n.what != "first"),
+            "the oldest go"
+        );
+        // A switch builds a new App; the log rides along with what waits.
+        let mut next = App::new(None);
+        next.keep_watch(app.take_watch());
+        assert_eq!(next.news().len(), NEWS_KEPT);
     }
 
     #[test]
