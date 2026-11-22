@@ -39,12 +39,12 @@ Pushing a `v*` tag by hand still releases that tag, refused when it does not mat
 
 Run `treetop` from anywhere inside a pooled repository; run anywhere else, it opens the workspace you used last (see [Workspaces](#workspaces)).
 
-treetop opens on the Trees screen, laid out in numbered panels down the left, with the tree under the cursor in a window on the right, [0]: [1] Waiting, [2] Trees, which holds the table, [3] Ship and [4] News.
-Its top row has the three screens, Trees, Plan and Issues, with `▲` and how many planning chats ask you by Plan, and at its right every workspace with how many wait on you there, `▲2`, or `✓`.
+treetop opens on the Trees screen, laid out in numbered panels down the left, with the tree under the cursor in a window on the right, [0]: [1] Ship, [2] Trees, which holds the table, and [3] News.
+Its top row has the three screens, Trees, Plan and Issues, with `▲` and how many planning chats ask you by Plan, and at its right how many things need you in every workspace, `● 3 need you  e`, left out when nothing does.
 The number keys give a panel the keys, from a panel or the window in Normal, and 0 gives them to the window; the bar names the panel with the keys, such as `PANEL 2`, and shows its keys.
-[1] Waiting lists what needs you in every workspace, the oldest first: an agent asking, wanting permission or dead, or a PR whose checks failed, each with where it is and how long it has waited; Enter opens it, another workspace's switched to first, and `w` from the panels or a window in Normal opens the next one; a key that acts on a tree, such as `F` or `r`, acts on the item's, gone to first where it is in another workspace. When the window's agent shows a question with choices, its bottom border offers them on the number keys, and pressing one answers it and takes it off the list, back on it if the agent still asks ten seconds later, whatever workspace you are on by then, and a question that has just opened by itself takes no number for a moment; so does typing an answer and Enter in the chat, and sending a failure with `F` or resuming with `R` takes what waited off the list at once too, until it fails again or could not be sent.
-[3] Ship lists the PRs of the workspace [2]'s tab shows, with the key that moves each on: `F` sends a failure to its agent, `M` asks an approved PR's agent to `/merge squash` it, `r` returns a merged or closed one's tree, that tree alone whatever is marked, and `S` shows a ship run waiting on you; `v` shows the PR, and the window follows the PR under its cursor to its tree.
-[4] News keeps what happened, newest first, each with the time by the clock, for as long as treetop runs, whatever keys go by: what started waiting, failed, died, finished or merged in any workspace, what you sent or answered an agent, and what an action came to; `j`, `k`, `g` and `G` scroll it, and Enter goes to what a line is about.
+That counts an agent asking, wanting permission or dead, and a PR whose checks failed: `e`, or a click on it, lists them, the oldest first, with what is done, each with where it is and how long it has waited, and Enter opens one, another workspace's switched to first; `W` from a panel, Plan or a window in Normal opens the next one. On Issues, where `e` edits the issue, the count shows alone. When the window's agent shows a question with choices, its bottom border offers them on the number keys, and pressing one answers it and takes it off what needs you, back on it if the agent still asks ten seconds later, whatever workspace you are on by then, and a question that has just opened by itself takes no number for a moment; so does typing an answer and Enter in the chat, and sending a failure with `F` or resuming with `R` takes what waited off at once too, until it fails again or could not be sent.
+[1] Ship lists the PRs of the workspace [2]'s tab shows, with the key that moves each on: `F` sends a failure to its agent, `M` asks an approved PR's agent to `/merge squash` it, `r` returns a merged or closed one's tree, that tree alone whatever is marked, and `S` shows a ship run waiting on you; `v` shows the PR, and the window follows the PR under its cursor to its tree.
+[3] News keeps what happened, newest first, each with the time by the clock, for as long as treetop runs, whatever keys go by: what started waiting, failed, died, finished or merged in any workspace, what you sent or answered an agent, and what an action came to; `j`, `k`, `g` and `G` scroll it, and Enter goes to what a line is about.
 [2] Trees shows one workspace at a time, every workspace a tab in its title in name order, with `▲` and how many wait on you there; `[` and `]` step through them, showing another workspace at once from its last read, only to look at: Esc comes back, and Enter, or any key that acts on a tree, such as `n`, `r` or `z`, switches there, to the tree under the cursor.
 Its trees come first, then those on the Backburner or parked, then the free ones as one row of numbers, where `n` starts an agent in the lowest.
 Its table keeps only the `#`, STATUS, BRANCH, PORTS and GIT columns, narrowed to fit beside the window, which shows the rest, and STATUS says why each held tree waits, `asks you`, `ci failed` or `agent died`, that it is `done` or `merged`, or what its agent is doing.
@@ -58,7 +58,7 @@ On a screen under 120 columns or 31 rows the table layout shows instead, the tab
 |---|---|
 | Enter, `l` | give the keys to the chat of the agent in the tree under the cursor, in the window, in Normal, where Enter again starts Insert, starting a cold one again, else go to the tree itself (see [Agent chats](#agent-chats) and [Entering a tree](#entering-a-tree)); on a group's heading, fold the group or open it again, and on the main checkout's, open the chat of its agent when it has one |
 | `i` | as Enter, but the chat's window gets the keys in Insert, ready to type to the agent at once |
-| `0` to `4` | give the keys to the window, [0], or to [1] Waiting, [2] Trees, [3] Ship or [4] News, from a panel or the window in Normal; while the window's agent shows a question with choices, `1` to `9` from the window answer it instead; the table layout has no panels |
+| `0` to `3` | give the keys to the window, [0], or to [1] Ship, [2] Trees or [3] News, from a panel or the window in Normal; while the window's agent shows a question with choices, `1` to `9` from the window answer it instead; the table layout has no panels |
 | Ctrl+Q | (or F13 to F24, such as a Caps Lock remapped to F19) give the keys to the window, in Normal; from Insert, drop to Normal; from Normal, give them back to the panel that had them, or the table in the table layout; in the table layout with two windows, move them round the table, the left window and the right one (see [Normal and Insert](#normal-and-insert)) |
 | Alt+J Alt+K (`M-j` `M-k`) | as vim's Ctrl+W `j` and `k`: Alt+J gives the keys to the window, in Normal, as Ctrl+Q does, and Alt+K from a window in Normal gives them back to the panels, or the table in the table layout |
 | Alt+H Alt+L (`M-h` `M-l`) | in the table layout, with two windows, give the keys to the left one or the right one, in Normal, from the table or from a window in Normal |
@@ -71,7 +71,7 @@ On a screen under 120 columns or 31 rows the table layout shows instead, the tab
 | `n` | start a new agent in the tree under the cursor: a free one is leased for it, on a branch named for the task, and a held one keeps its branch; on the main checkout's heading, start one in the main checkout, for work that needs no tree |
 | `N` | start a new agent in a fresh tree, on a branch named for the task (see [New agents](#new-agents)) |
 | `m` | write a message to the agents in the marked trees, or the tree under the cursor |
-| `e` | open the notifications, what needs action and what is done, from the panels, the table or a chat in Normal (see [What waits on you](#what-waits-on-you)) |
+| `e` | open the notifications, what needs action and what is done, from the panels, Plan, the table or a chat in Normal (see [What waits on you](#what-waits-on-you)) |
 | `:` | ask the assistant about the tree under the cursor, or write `@17 ...` for that tree's agent (see [The assistant](#the-assistant)) |
 | `A` | open the assistant's chat, where it answers, starting it if there is none |
 | `D` | show the side-by-side diff of the tree under the cursor in the window's diff tab, with the keys |
@@ -91,7 +91,8 @@ On a screen under 120 columns or 31 rows the table layout shows instead, the tab
 | `H` | hand the work of the tree's agent to a new agent in the same tree, on a handoff the old one writes and you read over first (see [Handoffs](#handoffs)) |
 | `S` | start a ship run of the tree's branch, such as no-mistakes', after a dialog; on a run under way, show it |
 | `b` | rename the branch of the tree under the cursor |
-| `w` | open the next thing waiting on you, as [1] Waiting lists them, from the panels or a window in Normal; in the table layout, switch to another workspace: the pool of another repository treetop has been opened in |
+| `W` | open the next thing that needs you, as `e` lists them, from the panels, Plan or a window in Normal; the table layout has no such key |
+| `w` | switch to another workspace: the pool of another repository treetop has been opened in |
 | `C` | scratch chats, tied to no tree: start one, open one, or delete one (see [Scratch chats](#scratch-chats)) |
 | Tab | go on to the next screen, Trees, Plan, then Issues, and from Issues back to Trees; in the table layout, to the Issues screen and back (see [Issues](#issues)) |
 | `j` `k`, `g` `G` | move; the arrows do nothing on the table |
@@ -217,7 +218,7 @@ A hook is a command and its arguments, run in the tree with `TREETOP_TREE`, `TRE
 `layout = "table"` brings back the layout treetop had before the panels: the table across the top, as tall as its rows up to just under half the screen, and under it the window on the tree under the cursor, which takes four fifths of the screen while it has the keys (see [Agent chats](#agent-chats)).
 The default, `layout = "panels"`, is the one [Use](#use) describes, and a screen under 120 columns or 31 rows gets the table layout whatever the config says.
 The table layout has what the panels leave out: the table's every column, two windows side by side with Ctrl+\\, zoom with Ctrl+F, the Usage column beside the table from 180 columns, the PR tab's sections on `1` to `4`, and the Alt+H, Alt+L, `a` and `f` moves between those windows and the column.
-It has no Waiting, Ship or News panel and no Plan screen: Tab goes from Trees straight to Issues and back, `w` from the table opens the workspaces, `[` and `]` step the window's tabs, and the count of what needs action sits at the right of the table's top border.
+It has no Ship or News panel and no Plan screen: Tab goes from Trees straight to Issues and back, `[` and `]` step the window's tabs, and the count of what needs action sits at the right of the table's top border.
 Being a top-level key, it goes above the first `[section]` heading in the file:
 
 ```toml
@@ -425,7 +426,7 @@ The tree treetop was started in is never a target, because returning or destroyi
 ## Agent chats
 
 The Trees screen has a window on the tree under the cursor: [0], on the right of the panels (see [Use](#use)), or in the table layout under the table.
-The [count](#what-waits-on-you) sits at the right of [1] Waiting's top border while anything needs action, or of the table's in the table layout.
+The [count](#what-waits-on-you) sits at the right of the top row while anything needs action, or of the table's top border in the table layout.
 In the table layout the table's window is as tall as its rows, up to just under half the screen; the window under it takes the rest.
 While the window under the table has the keys, the table shrinks to a fifth of the screen, scrolling to keep the cursor's row in view, so the window gets the other four fifths; giving the keys back to the table puts both back.
 Whatever has the keys has its border in Normal's green, a panel, the table and the Usage column too, and a window in Insert has it in Insert's colour; the bottom bar names the mode (see [Normal and Insert](#normal-and-insert)).
@@ -513,8 +514,8 @@ In the panels layout the bar lists the keys of what has them; in the table layou
 `[` and `]`, or `←` and `→`, step through the window's tabs, from a chat as from any other.
 `j` and `k` scroll a line and `d` and `u` half a page, on the chat's history as on the diff and the PR, whose other keys work as ever.
 `i` or Enter on a chat or shell starts Insert.
-`w` opens the next thing waiting on you from any tab, or the workspaces in the table layout, giving the keys back to the table.
-`1` to `4` give the keys to that panel, as from the panels.
+`W` in the panels opens the next thing that needs you from any tab, and `w` the workspaces, giving the keys back to the table.
+`1` to `3` give the keys to that panel, as from the panels.
 Esc, `q`, Alt+K or Ctrl+Q gives the keys back to the panel that had them, or the table in the table layout; with two windows, Ctrl+Q moves them on to the other one first.
 Alt+H, Alt+J, Alt+K and Alt+L move the keys as vim's Ctrl+W does between its windows: Alt+K back to the panels or up to the table, Alt+J from there into the window, and in the table layout with two windows Alt+H and Alt+L to the left one and the right one.
 With two windows, `a` and `f` in a window's Normal go to the left and right one too, as on the table; on the PR tab `f` sends the selected item instead, and `a` still goes left.
@@ -701,9 +702,9 @@ An agent still asking is the one ask however often it writes, so it rings once.
 So there is nothing to dismiss, and an agent that finished or a PR that merged never waits: it is done instead.
 An agent whose turn has ended, its session idle, has finished, though it never wrote a report saying so; and a report that it was waiting on you stops counting once its session has run a turn past it, answered since, so a question answered days ago no longer waits, while one nobody answered still does, however long ago.
 
-While anything needs action, a count sits at the right of [1] Waiting's top border, such as `● 2 needs action  e`, or of the table's in the table layout; what is done shows on its tree's row and in the notifications `e` opens, not in the count.
+While anything needs action, a count sits at the right of the top row, such as `● 2 need you  e`, or of the table's top border in the table layout, `● 2 needs action  e`; what is done shows on its tree's row and in the notifications `e` opens, not in the count.
 It never takes the keys, so what you type keeps going where it was, a chat in Insert included, and it stays bright over a popup.
-`e` from the panels or the table, or from a chat or shell in Normal, or a click on the count, opens the notifications under it: Needs action, what is stopped until you act, then Done, what finished or merged and is not working, the newest first.
+`e` from the panels, Plan or the table, or from a chat or shell in Normal, or a click on the count, opens the notifications under it: Needs action, what is stopped until you act, then Done, what finished or merged and is not working, the newest first.
 They keep to the right of the screen, over the Usage column where it shows, so a wider terminal never moves them.
 Each shows its tree, its ticket and branch, how long ago, and what it is about in full, such as the agent's whole question.
 ↑↓ pick one and Enter or `l` opens it: an agent's chat, with its question at the bottom; for a PR, the cursor on its tree with its checks in the info tab, where `F` sends a failure to its agent; for a dead agent, the cursor on its tree, where `R` resumes it.
@@ -722,7 +723,7 @@ Inside tmux it needs `allow-passthrough` set to `all` (`tmux set -g allow-passth
 Another workspace's entries carry its name, such as `keel:3`, and opening one switches there first; an agent with no chat, such as `claude` in a tmux pane, is gone to inside tmux, as `t` does.
 Its background agents are placed in their trees by the workspace's last listing; its agents waiting at a prompt in a tmux pane, and those that died, come from a read of its pool as often as the open workspace's agents are read, every few seconds, and its PRs that failed from a read every three minutes, since that runs its ship plugins, for the workspaces opened in the last week.
 With only one workspace nothing extra is read.
-The workspaces picker, `w` in the table layout, counts what waits in each workspace after its held trees, `●` for what needs you and `✗` for what failed.
+The workspaces picker, `w`, counts what waits in each workspace after its held trees, `●` for what needs you and `✗` for what failed.
 
 ### The info tab
 
@@ -854,7 +855,7 @@ prompt = "Work on {id}: {title}\n\n{description}\n\n{url}"
 ## Workspaces
 
 A workspace is a repository with a treehouse pool, shown by its main checkout.
-In the panels `[` and `]` on [2] Trees go through every workspace; in the table layout `w` opens a list of every repository treetop has been opened in, most recent first, with how many trees each holds and the one on screen marked; the cursor starts on the last other one, so `w` and Enter go back and forth between two.
+In the panels `[` and `]` on [2] Trees go through every workspace; `w` opens a list of every repository treetop has been opened in, most recent first, with how many trees each holds and the one on screen marked; the cursor starts on the last other one, so `w` and Enter go back and forth between two.
 Enter or `l` switches the whole screen to that pool, Esc or `h` closes the list, and the badge at the end of the bottom bar names the workspace on screen.
 
 treetop adds a repository to the list the first time it is opened there, so run it once in each pooled repository to make it a workspace.

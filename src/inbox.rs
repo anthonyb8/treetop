@@ -571,7 +571,7 @@ pub fn needs_action(app: &App) -> Vec<Entry> {
             .cmp(&b.at.is_none())
             .then(a.at.cmp(&b.at))
             // Together, the panels have them in one order from every
-            // workspace, so `w` goes round them all; the table this one's
+            // workspace, so `W` goes round them all; the table this one's
             // first.
             .then_with(|| {
                 if app.look == crate::config::Look::Panels {
