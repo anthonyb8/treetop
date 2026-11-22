@@ -612,6 +612,9 @@ pub struct Watch {
     /// read for the first time since, or a switch, is no news either, as
     /// what it holds was already there, as the desktop is not told of it.
     news_read: NewsRead,
+    /// The item of [1] Waiting gone to in another workspace, until it is
+    /// listed there for the cursor to be on.
+    gone_to: Option<crate::inbox::About>,
     /// What was answered in the window, and when, until its agent moves on.
     answered: HashMap<crate::inbox::About, Instant>,
 }
@@ -1046,6 +1049,11 @@ impl issues::Host for App {
 /// Shift, so Shift is no modifier here.
 fn is_plain(key: KeyEvent) -> bool {
     (key.modifiers - KeyModifiers::SHIFT).is_empty()
+}
+
+/// What tells an item of [1] Waiting apart.
+fn waiting_key(entry: &crate::inbox::Entry) -> String {
+    format!("{:?} {}", entry.kind, entry.path.display())
 }
 
 /// Where a panel's cursor was, and on what.
@@ -2170,10 +2178,15 @@ impl App {
                 self.message = Some("nothing waits on you".into());
                 return Some(Outcome::Continue);
             }
+            // On from the item under the cursor while the window is on its
+            // tree, which can have two, else from the window's tree.
             let here = self.window_tree().map(|t| t.path.clone());
+            let is_here = |e: &crate::inbox::Entry| Some(&e.path) == here.as_ref();
             let next = items
-                .iter()
-                .position(|e| Some(&e.path) == here.as_ref())
+                .get(self.waiting_at)
+                .filter(|e| is_here(e))
+                .map(|_| self.waiting_at)
+                .or_else(|| items.iter().position(is_here))
                 .map_or(0, |at| (at + 1) % items.len());
             self.waiting_at = next;
             return Some(self.go_to(items[next].clone()));
@@ -2182,6 +2195,16 @@ impl App {
             return None;
         }
         let last = items.len().saturating_sub(1);
+        if matches!(
+            key.code,
+            KeyCode::Char('g' | 'G' | 'j' | 'k')
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::Up
+                | KeyCode::Down
+        ) {
+            self.watch.gone_to = None;
+        }
         match key.code {
             KeyCode::Char('g') | KeyCode::Home => self.waiting_at = 0,
             KeyCode::Char('G') | KeyCode::End => self.waiting_at = last,
@@ -2204,6 +2227,15 @@ impl App {
             }
             // Everything the table does to the tree under its cursor.
             code if acts_on_tree(code) => {
+                // The one gone to here, not listed yet.
+                if let Some((_, path)) = self.watch.gone_to.clone() {
+                    let is_listed = self.trees.iter().any(|t| t.path == path);
+                    return Some(if is_listed {
+                        self.act_on(path, key)
+                    } else {
+                        Outcome::Continue
+                    });
+                }
                 return Some(match items.into_iter().nth(self.waiting_at.min(last)) {
                     Some(entry) if entry.away.is_some() => self.go_to(entry),
                     Some(entry) => self.act_on(entry.path, key),
@@ -4444,6 +4476,13 @@ impl App {
             self.message = Some(self.says_busy());
             return Outcome::Continue;
         }
+        // Ship and News act on their own rows, not on what is gone to.
+        if matches!(self.panel, Panel::Ship | Panel::News) {
+            self.panel = Panel::Trees;
+        }
+        if entry.away.is_some() {
+            self.watch.gone_to = Some(entry.about());
+        }
         if let Some(away) = entry.away {
             return Outcome::SwitchTo {
                 checkout: away.checkout,
@@ -6106,13 +6145,9 @@ impl App {
     /// moved it, so what a key acts on is what was picked. An item gone, its
     /// cursor stays in place, and Ship's window goes on with it.
     pub fn hold_cursors(&mut self) {
-        let waiting: Vec<String> = self
-            .notes_list()
-            .0
-            .iter()
-            .map(|e| format!("{:?} {}", e.kind, e.path.display()))
-            .collect();
+        let waiting: Vec<String> = self.notes_list().0.iter().map(waiting_key).collect();
         hold(&mut self.waiting_at, &mut self.held.waiting, waiting);
+        self.find_gone_to();
         let ships: Vec<String> = self
             .ship_rows()
             .iter()
@@ -6144,6 +6179,34 @@ impl App {
         hold(&mut self.made_at, &mut self.held.made, made);
         let ready: Vec<String> = self.ready_issues().iter().map(|i| i.id.clone()).collect();
         hold(&mut self.ready_at, &mut self.held.ready, ready);
+    }
+
+    /// Waiting's cursor on the item gone to here from another workspace, once
+    /// it is listed; forgotten once what would list it is read without it.
+    fn find_gone_to(&mut self) {
+        let Some(about) = self.watch.gone_to.clone() else {
+            return;
+        };
+        let (items, _) = self.notes_list();
+        // Until the switch, it is listed as another workspace's still.
+        match items
+            .iter()
+            .position(|e| e.away.is_none() && e.about() == about)
+        {
+            Some(at) => {
+                self.waiting_at = at;
+                self.held.waiting = Held {
+                    at,
+                    on: Some(waiting_key(&items[at])),
+                };
+                self.watch.gone_to = None;
+            }
+            // Its tree here too, or it is still another workspace's.
+            None if self.trees.iter().any(|t| t.path == about.1) && self.is_read_of(&about) => {
+                self.watch.gone_to = None;
+            }
+            None => {}
+        }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Outcome {
@@ -7867,6 +7930,46 @@ pub(crate) mod tests {
             app.is_window_focused = true;
             assert_eq!(press(&mut app, KeyCode::Tab), Outcome::Plan, "{tab:?}");
             assert!(!app.is_window_focused);
+        }
+    }
+
+    #[test]
+    fn w_goes_round_everything_waiting_though_one_tree_has_two() {
+        let mut app = crate::inbox::tests::with_workspaces();
+        app.pools.clear();
+        // Tree 4 asks and its PR failed too.
+        let ship = app.trees[2].ship.clone();
+        app.trees[0].ship = ship;
+        app.watch_waiting();
+        let all: Vec<crate::inbox::About> = app.notes_list().0.iter().map(|e| e.about()).collect();
+        assert!(all.len() >= 4, "{all:?}");
+        let mut seen = HashSet::new();
+        for _ in 0..all.len() {
+            app.is_window_focused = false;
+            press(&mut app, KeyCode::Char('w'));
+            seen.insert(app.notes_list().0[app.waiting_at].about());
+        }
+        assert_eq!(seen.len(), all.len(), "{seen:?}");
+    }
+
+    #[test]
+    fn w_from_ship_or_news_leaves_the_keys_on_the_tree_it_shows() {
+        for panel in [Panel::Ship, Panel::News] {
+            let mut app = crate::inbox::tests::with_workspaces();
+            app.pools.clear();
+            app.reports.clear();
+            // Tree 2's PR is another, under Ship's cursor.
+            let mut ship = app.trees[2].ship.clone().unwrap();
+            ship.stage = Stage::Merged;
+            app.trees[1].ship = Some(ship);
+            app.panel = panel;
+            app.hold_cursors();
+            press(&mut app, KeyCode::Char('w'));
+            assert_eq!(app.window_tree().map(|t| t.name.as_str()), Some("7"));
+            let Outcome::Queue(jobs) = press(&mut app, KeyCode::Char('F')) else {
+                panic!("F sends it: {panel:?} {:?}", app.message);
+            };
+            assert_eq!(jobs[0].tree.name, "7", "{panel:?}");
         }
     }
 

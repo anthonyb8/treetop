@@ -1434,3 +1434,112 @@ fn waitings_cursor_stays_on_what_it_was_on_as_another_resolves() {
     drop(screen);
     let _ = fs::remove_dir_all(&root);
 }
+
+/// ANB-104: gone to from Waiting, another workspace's item keeps Waiting's
+/// cursor, so the next key acts on its tree and not on the first row's.
+#[test]
+fn waitings_cursor_is_on_the_item_it_took_you_to_in_another_workspace() {
+    let Workspaces {
+        root, mut screen, ..
+    } = two_workspaces("jump", "");
+    add_tree(&root, "there", "2", Some("there-second"));
+    screen.wait_for("the panels", |text| text.contains("[2] Trees"));
+    screen.press("]");
+    screen.wait_for("there's trees", |text| text.contains("there-work"));
+    screen.press("\r");
+    screen.wait_on("there");
+    screen.wait_for("both", |text| text.contains("there-second"));
+    screen.press("]");
+    screen.wait_for("here's trees", |text| text.contains("here-work"));
+    screen.press("\r");
+    screen.wait_on("here");
+    let askers = [(); 2].map(|()| Asker(Command::new("sleep").arg("600").spawn().unwrap()));
+    for n in [1, 2] {
+        asking_in(&root.join(format!("there-trees/{n}")), &askers[n - 1]);
+        screen.wait_for("the ask", |text| {
+            text.contains(&format!("{n} needs action"))
+        });
+    }
+    let rows = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter_map(|l| Some(l[l.find("● there:")?..].chars().skip(8).take(1).collect()))
+            .collect()
+    };
+    let last = rows(&screen.text())[1].clone();
+    screen.press("1");
+    screen.press("G");
+    screen.press("\r");
+    screen.wait_on("there");
+    screen.wait_for("the tree picked", |text| {
+        text.contains(&format!("[0] Tree {last} ·"))
+    });
+    std::thread::sleep(Duration::from_secs(1));
+    screen.press("x");
+    screen.wait_for("that tree shelved", |text| {
+        text.lines()
+            .last()
+            .is_some_and(|bar| bar.contains(&format!("tree {last} is on the Backburner")))
+    });
+    drop(askers);
+    drop(screen);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// ANB-104: `w` goes round everything waiting, in every workspace.
+#[test]
+fn w_reaches_everything_waiting_across_workspaces() {
+    let Workspaces {
+        root, mut screen, ..
+    } = two_workspaces("round", "");
+    add_tree(&root, "there", "2", Some("there-second"));
+    add_tree(&root, "here", "2", Some("here-second"));
+    let askers = [(); 4].map(|()| Asker(Command::new("sleep").arg("600").spawn().unwrap()));
+    let trees = [
+        "here-trees/1",
+        "here-trees/2",
+        "there-trees/1",
+        "there-trees/2",
+    ];
+    screen.wait_for("the panels", |text| text.contains("[2] Trees"));
+    // Away and back, so there's second tree is known.
+    screen.press("]");
+    screen.wait_for("there's trees", |text| text.contains("there-work"));
+    screen.press("\r");
+    screen.wait_on("there");
+    screen.wait_for("both", |text| text.contains("there-second"));
+    for (tree, asker) in trees.iter().zip(&askers) {
+        // With a chat, as an agent has, for `w` to open.
+        let file = asking_in(&root.join(tree), asker);
+        fs::write(
+            file,
+            serde_json::json!({ "name": "asker", "pid": asker.0.id(), "status": "waiting",
+                "attach": ["sh", "-c", "echo asks; exec sleep 600"] })
+            .to_string(),
+        )
+        .unwrap();
+    }
+    screen.wait_for("all four", |text| text.contains("4 needs action"));
+    let place = |text: &str| -> Option<String> {
+        let title = text.lines().find(|l| l.contains("[0] Tree "))?;
+        let at = title.find("[0] Tree ")?;
+        Some(title[at..].chars().take(40).collect())
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..4 {
+        screen.press("w");
+        std::thread::sleep(Duration::from_secs(6));
+        screen.wait_for("all four still waiting", |text| {
+            text.contains("4 needs action")
+        });
+        let title = place(&screen.text()).unwrap();
+        let branch = ["here-work", "here-second", "there-work", "there-second"]
+            .into_iter()
+            .find(|b| title.contains(&format!("· {b} ")))
+            .unwrap();
+        seen.insert(branch);
+    }
+    assert_eq!(seen.len(), 4, "{seen:?}");
+    drop(askers);
+    drop(screen);
+    let _ = fs::remove_dir_all(&root);
+}

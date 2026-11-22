@@ -570,7 +570,20 @@ pub fn needs_action(app: &App) -> Vec<Entry> {
         a.at.is_none()
             .cmp(&b.at.is_none())
             .then(a.at.cmp(&b.at))
-            .then(a.away.is_some().cmp(&b.away.is_some()))
+            // Together, the panels have them in one order from every
+            // workspace, so `w` goes round them all; the table this one's
+            // first.
+            .then_with(|| {
+                if app.look == crate::config::Look::Panels {
+                    let checkout = |e: &Entry| match &e.away {
+                        Some(away) => away.checkout.clone(),
+                        None => app.checkout.clone(),
+                    };
+                    checkout(a).cmp(&checkout(b))
+                } else {
+                    a.away.is_some().cmp(&b.away.is_some())
+                }
+            })
             .then(a.tree.cmp(&b.tree))
     });
     waiting
@@ -1218,6 +1231,49 @@ pub mod tests {
             Some(Stage::CiFailed)
         );
         assert!(read.ships_read.contains(&checkout));
+    }
+
+    #[test]
+    fn what_started_waiting_together_is_in_one_order_from_every_workspace() {
+        // The same four, seen from each of the two they are in.
+        let order_from = |here: &str, there: &str| {
+            let mut app = App::new(None);
+            app.look = crate::config::Look::Panels;
+            app.checkout = PathBuf::from(format!("/code/{here}"));
+            app.is_loaded = true;
+            app.is_agents_read = true;
+            let asking = |ws: &str| -> Vec<Tree> {
+                ["1", "2"]
+                    .iter()
+                    .map(|n| Tree {
+                        leased_at: Some("2026-01-01T09:00:00-05:00".into()),
+                        ..tree(
+                            &format!("/code/{ws}-trees/{n}"),
+                            n,
+                            "b",
+                            vec![agent("a", &format!("{ws}{n}"), Status::Waiting)],
+                        )
+                    })
+                    .collect()
+            };
+            app.trees = asking(here);
+            let checkout = PathBuf::from(format!("/code/{there}"));
+            app.pools = vec![Pool {
+                away: Away {
+                    name: there.into(),
+                    checkout: checkout.clone(),
+                },
+                trees: asking(there),
+                sidecars: Default::default(),
+            }];
+            app.away_live.insert(checkout, asking(there));
+            app.apply_reports(Vec::new());
+            app.watch_waiting();
+            let order: Vec<PathBuf> = needs_action(&app).into_iter().map(|e| e.path).collect();
+            assert_eq!(order.len(), 4);
+            order
+        };
+        assert_eq!(order_from("api", "web"), order_from("web", "api"));
     }
 
     #[test]
