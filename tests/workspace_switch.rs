@@ -1123,3 +1123,37 @@ fn a_message_on_the_bar_gives_way_to_the_keys_at_the_next_one() {
     drop(screen);
     let _ = fs::remove_dir_all(&root);
 }
+
+/// ANB-106: a planning chat left starting with Esc is on Plan's list once it
+/// is up, to open from there.
+#[test]
+fn a_planning_chat_left_starting_joins_the_list_on_plan() {
+    let Workspaces {
+        root, mut screen, ..
+    } = two_workspaces("plan-esc", "");
+    write_script(
+        &root.join("bin/claude"),
+        "case \"$1\" in\n--bg) sleep 2; echo 'claude attach new1' ;;\n\
+         agents) echo '[{\"id\":\"new1\"}]' ;;\n\
+         attach) echo \"chat $2 is open\"; exec sleep 600 ;;\n*) exit 1 ;;\nesac\n",
+    );
+    screen.wait_for("the panels", |text| text.contains("[2] Trees"));
+    screen.press("\t");
+    screen.wait_for("Plan", |text| text.contains("none yet: n starts one"));
+    screen.press("n");
+    screen.wait_for("it starting", |text| {
+        text.contains("starting") || text.contains("opening")
+    });
+    screen.press("\x1b");
+    screen.wait_for("it in the list, said so", |text| {
+        text.contains("○ plan 1")
+            && text
+                .lines()
+                .last()
+                .is_some_and(|bar| bar.contains("plan 1 is ready; Enter on it opens it"))
+    });
+    screen.press("\r");
+    screen.wait_for("its chat", |text| text.contains("chat new1 is open"));
+    drop(screen);
+    let _ = fs::remove_dir_all(&root);
+}

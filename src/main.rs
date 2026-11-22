@@ -459,6 +459,7 @@ fn run(
                     // Another workspace leases trees as its agents start, so
                     // its cache is read again to place their reports.
                     app.pools = inbox::other_pools(checkout);
+                    app.planning = scratch::planning_jobs();
                     let news = app.apply_reports(reports);
                     if !news.is_empty() {
                         announce(&news)?;
@@ -641,8 +642,20 @@ fn run(
             is_stale = true;
             match result {
                 // Esc while it started leaves it for C to open.
-                Ok(chat) if app.opening.is_none() => {
+                Ok(chat) if app.opening.is_none() && !is_planning => {
                     app.message = Some(format!("{} is ready; C opens it", chat.name));
+                }
+                // A planning chat's joins Plan's list, to open from there.
+                Ok(chat) if app.opening.is_none() => {
+                    let chats = scratch::planning(checkout);
+                    let said = if app.is_plan {
+                        app.open_plan(chats);
+                        "Enter on it opens it"
+                    } else {
+                        app.plan_chats = chats;
+                        "it is on Plan"
+                    };
+                    app.message = Some(format!("{} is ready; {said}", chat.name));
                 }
                 Ok(chat) => {
                     app.opening = None;

@@ -736,7 +736,12 @@ fn summary(app: &App, is_compact: bool) -> Vec<Span<'static>> {
                 fg(t.special).add_modifier(Modifier::BOLD),
             ));
         }
-        if let n @ 1.. = app.elsewhere() {
+        let elsewhere = if is_said {
+            app.nowhere()
+        } else {
+            app.elsewhere()
+        };
+        if let n @ 1.. = elsewhere {
             spans.push(Span::styled(
                 format!("  elsewhere: {n} need you"),
                 fg(t.warning),
@@ -1198,17 +1203,17 @@ fn draw_waiting(frame: &mut Frame, app: &App, area: Rect, has_keys: bool) {
         .map(|e| inbox::place_of(e).chars().count())
         .max()
         .unwrap_or(0)
-        .min(20);
+        .min(usize::from(area.width) * 3 / 10);
     let what_room = usize::from(area.width).saturating_sub(1 + place + 13 + 4 + 4);
     let rows: Vec<Row> = items
         .iter()
         .map(|entry| {
             let (mark, color) = mark_of(entry.kind);
-            let place = inbox::place_of(entry);
+            let at = inbox::place_of(entry);
             let what = entry.title.clone().unwrap_or_else(|| entry.what.clone());
             Row::new(vec![
                 Cell::from(mark).style(fg(color).add_modifier(Modifier::BOLD)),
-                Cell::from(place).style(fg(t.muted)),
+                Cell::from(fit_place(&at, place)).style(fg(t.muted)),
                 Cell::from(fit(&what, what_room)),
                 Cell::from(asks_for(entry.kind)).style(fg(color)),
                 Cell::from(entry.at.map(reports::age).unwrap_or_default()).style(fg(t.muted)),
@@ -1345,6 +1350,19 @@ fn fit_news(what: &str, room: usize) -> String {
             format!("{said}{to}")
         }
         _ => fit(what, room),
+    }
+}
+
+/// Where an entry is cut to `room` columns, its tree's number kept:
+/// `endodeals…:12`.
+fn fit_place(place: &str, room: usize) -> String {
+    match place.rsplit_once(':') {
+        Some((name, tree)) => {
+            let tree = format!(":{tree}");
+            let name = fit(name, room.saturating_sub(Line::raw(tree.as_str()).width()));
+            format!("{name}{tree}")
+        }
+        None => fit(place, room),
     }
 }
 
@@ -1967,9 +1985,14 @@ fn footer_left(app: &App, is_panels: bool, room: usize) -> Line<'static> {
             app.filter
         )));
     } else if let Some(err) = &app.error {
-        spans.push(Span::styled(format!(" {err}"), fg(t.danger)));
+        let room = room.saturating_sub(Line::from(spans.clone()).width() + 1);
+        spans.push(Span::styled(format!(" {}", fit(err, room)), fg(t.danger)));
     } else if let Some(message) = &app.message {
-        spans.push(Span::styled(format!(" {message}"), fg(t.warning)));
+        let room = room.saturating_sub(Line::from(spans.clone()).width() + 1);
+        spans.push(Span::styled(
+            format!(" {}", fit(message, room)),
+            fg(t.warning),
+        ));
     } else if !app.filter.is_empty() {
         spans.push(Span::styled(
             format!(" filter: {}", app.filter),
@@ -2069,6 +2092,9 @@ fn panel_keys(app: &App) -> &'static [(&'static str, &'static str)] {
             ("Tab", "Issues"),
         ];
     }
+    if app.is_window_focused && !matches!(app.shown_tab(), WindowTab::Chat | WindowTab::Shell) {
+        return &[("[ ]", "tabs"), ("Esc", "back"), ("1-4", "panels")];
+    }
     if app.is_window_focused {
         return &[
             ("i", "insert"),
@@ -2107,6 +2133,12 @@ fn panel_keys(app: &App) -> &'static [(&'static str, &'static str)] {
             ("0", "window"),
             ("1-4", "panels"),
         ],
+        Panel::News => &[
+            ("j/k", "move"),
+            ("Enter", "go to it"),
+            ("0", "window"),
+            ("1-4", "panels"),
+        ],
         Panel::Trees => &[
             ("[ ]", "workspaces"),
             ("w", "next waiting"),
@@ -2119,7 +2151,6 @@ fn panel_keys(app: &App) -> &'static [(&'static str, &'static str)] {
             ("0", "window"),
             ("1-4", "panels"),
         ],
-        _ => &[("0", "window"), ("1-4", "panels")],
     }
 }
 
@@ -2524,6 +2555,7 @@ fn draw_made(frame: &mut Frame, app: &App, area: Rect, keys: Option<Mode>) {
             let pad = " ".repeat(title_width.saturating_sub(Span::raw(title.as_str()).width()));
             let (said, said_color) = match app.tree_of_ticket(&issue.id) {
                 Some(tree) => (format!("tree {}", tree.name), t.info),
+                None if app.picking.contains(&issue.id) => ("starting".into(), t.info),
                 None if app.is_ready(issue) => ("ready".into(), t.success),
                 None => match issue.blocked_by.first() {
                     Some(by) if issue.stage == Stage::NotStarted => (format!("⊘ {by}"), t.danger),
@@ -9784,6 +9816,29 @@ mod panels_tests {
     }
 
     #[test]
+    fn a_long_message_is_shortened_whole_and_a_long_workspace_name_leaves_waiting_room() {
+        let mut app = panels();
+        app.message = Some(format!("{} the end", "a long story ".repeat(20)));
+        let bar = screen(&app, 160, 46).pop().unwrap();
+        assert!(bar.contains('…') && bar.contains("treetop"), "{bar}");
+        app.message = None;
+        app.pools[0].away.name = "a-workspace-name-too-long".into();
+        let rows = panel_rows(&screen(&app, 120, 45), "[1] Waiting");
+        let here = rows.iter().find(|l| l.contains("4 ")).unwrap();
+        assert!(here.contains("ANB-41 inb"), "{here}");
+        let there = rows.iter().find(|l| l.contains("END-88")).unwrap();
+        assert!(there.contains("…:12 "), "{there}");
+    }
+
+    #[test]
+    fn the_bar_lists_newss_own_keys() {
+        let mut app = panels();
+        app.panel = Panel::News;
+        let bar = screen(&app, 160, 46).pop().unwrap();
+        assert!(bar.contains("j/k move  Enter go to it  0 window"), "{bar}");
+    }
+
+    #[test]
     fn the_bar_counts_nobody_the_waiting_panel_does_not() {
         let mut app = panels();
         app.trees[0].agents[0].status = Some(Status::Waiting);
@@ -9792,6 +9847,8 @@ mod panels_tests {
             !bar.contains("1 waiting") && !bar.contains("  2 need you"),
             "{bar}"
         );
+        // Another workspace's ask is the top row's, not the bar's.
+        assert!(!bar.contains("elsewhere"), "{bar}");
         app.look = Look::Table;
         app.show_panels(false);
         let bar = screen(&app, 220, 46).pop().unwrap();
@@ -10072,14 +10129,5 @@ mod panels_tests {
             "{bar}"
         );
         assert!(!bar.contains("n new agent"), "not Trees' keys: {bar}");
-        // [4] News takes no keys of its own: the panel keys alone.
-        app.panel = Panel::News;
-        let bar = screen(&app, 160, 46).pop().unwrap();
-        assert!(bar.starts_with(" PANEL 4 "), "{bar}");
-        assert!(
-            bar.contains("0 window") && bar.contains("1-4 panels"),
-            "{bar}"
-        );
-        assert!(!bar.contains("j/k move"), "{bar}");
     }
 }

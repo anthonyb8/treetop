@@ -101,6 +101,15 @@ pub fn planning(checkout: &Path) -> Vec<Scratch> {
         .unwrap_or_default()
 }
 
+/// The jobs of every planning chat, in any workspace.
+pub fn planning_jobs() -> std::collections::HashSet<String> {
+    list()
+        .into_iter()
+        .filter(|chat| chat.checkout.is_some())
+        .map(|chat| chat.job)
+        .collect()
+}
+
 fn planning_in(root: &Path, checkout: &Path) -> Vec<Scratch> {
     list_in(root)
         .into_iter()
