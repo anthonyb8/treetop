@@ -34,6 +34,10 @@ pub struct Scratch {
     /// record without it, written before planning chats, can be either.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub scratch: bool,
+    /// The Linear issues a planning chat has created, as its transcript
+    /// shows `keel linear create` saying, in the order it made them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issues: Vec<String>,
     /// Its record's file; not written, since it is where the record is.
     #[serde(skip)]
     pub record: PathBuf,
@@ -158,10 +162,16 @@ pub fn start(checkout: Option<&Path>) -> Result<Scratch, String> {
         record: root.join(format!("{number}.json")),
         checkout: checkout.map(Path::to_path_buf),
         scratch: checkout.is_none(),
+        issues: Vec::new(),
     };
-    let text = serde_json::to_string(&chat).map_err(|err| err.to_string())?;
-    fs::write(&chat.record, text).map_err(|err| format!("{}: {err}", chat.record.display()))?;
+    save(&chat)?;
     Ok(chat)
+}
+
+/// Writes the chat's record again, as it now stands.
+pub fn save(chat: &Scratch) -> Result<(), String> {
+    let text = serde_json::to_string(chat).map_err(|err| err.to_string())?;
+    fs::write(&chat.record, text).map_err(|err| format!("{}: {err}", chat.record.display()))
 }
 
 /// Deletes a scratch chat: its session, with `claude rm`, then its record.

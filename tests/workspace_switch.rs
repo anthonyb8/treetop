@@ -620,3 +620,104 @@ fn n_on_the_plan_screen_starts_a_planning_chat_that_can_read_the_repository() {
     drop(screen);
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn what_a_planning_chat_made_fills_its_bar_and_p_picks_up_the_ready_one_on_trees() {
+    let Workspaces {
+        root, mut screen, ..
+    } = two_workspaces("planned", "layout = \"panels\"\n");
+    screen.wait_on("here");
+    let here = root.join("here").canonicalize().unwrap();
+    // Linear as a ticket plugin: ANB-90 in Backlog, ANB-91 blocked by it.
+    let plugins = root.join("config/treetop/plugins");
+    fs::create_dir_all(&plugins).unwrap();
+    write_script(
+        &plugins.join("tix"),
+        r#"read -r request
+case "$request" in
+*'"describe"'*) echo '{"ok":true,"result":{"protocol":1,"name":"tix","kind":"tickets","ops":["list","get"]}}' ;;
+*'"ANB-90"'*) echo '{"ok":true,"result":{"id":"ANB-90","title":"Read what chats made","state":"Backlog","project":"treetop panels"}}' ;;
+*'"ANB-91"'*) echo '{"ok":true,"result":{"id":"ANB-91","title":"Pick up from Plan","state":"Backlog","project":"treetop panels","links":[{"id":"ANB-90","kind":"blocked by"}]}}' ;;
+*) echo '{"ok":true,"result":{"tickets":[]}}' ;;
+esac
+"#,
+    );
+    fs::write(
+        root.join("config/treetop/config.toml"),
+        format!(
+            "layout = \"panels\"\n[issues.tix]\nplugin = \"tix\"\n[repos.\"{}\"]\nissues = \"tix\"\n",
+            here.display()
+        ),
+    )
+    .unwrap();
+    // A planning chat for this workspace, whose transcript shows
+    // `keel linear create` making both, and a create line it only read.
+    let records = root.join("state/treetop/scratch");
+    fs::create_dir_all(&records).unwrap();
+    fs::write(
+        records.join("1.json"),
+        serde_json::json!({"job": "j1", "name": "plan 1", "created": 1, "checkout": here})
+            .to_string(),
+    )
+    .unwrap();
+    let claude = root.join("home/.claude");
+    fs::create_dir_all(claude.join("jobs/j1")).unwrap();
+    fs::write(claude.join("jobs/j1/state.json"), r#"{"sessionId":"s1"}"#).unwrap();
+    fs::create_dir_all(claude.join("projects/here")).unwrap();
+    let call = |id: &str, command: &str, output: &str| {
+        let used = serde_json::json!({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": command}}
+        ]}});
+        let result = serde_json::json!({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": id, "content": output}
+        ]}});
+        format!("{used}\n{result}\n")
+    };
+    let made =
+        |id: &str| format!("{id} https://linear.app/a/issue/{id}/x (team ANB, workspace anb)");
+    fs::write(
+        claude.join("projects/here/s1.jsonl"),
+        call("t1", "cat notes.md", &made("ANB-7"))
+            + &call("t2", "keel linear create --title a", &made("ANB-90"))
+            + &call("t3", "keel linear create --title b", &made("ANB-91")),
+    )
+    .unwrap();
+
+    screen.press("\t");
+    screen.wait_for(
+        "the chat's issues on [2] and the ready one on [3]",
+        |text| {
+            text.contains("project treetop panels")
+                && text.contains("░░░░░░░░░░░░░░░░ 0 done · 0 going · 2")
+                && text.contains("⊘ ANB-90")
+                && text.contains("[3] Ready to pick up 1")
+        },
+    );
+    let shown = screen.text();
+    assert!(
+        !shown.contains("ANB-7 "),
+        "a create line only read: {shown}"
+    );
+    let ready_row = shown
+        .lines()
+        .find(|l| l.contains("Read what chats made") && l.contains("ready"));
+    assert!(ready_row.is_some(), "{shown}");
+    // The record keeps what the transcript showed.
+    let record = fs::read_to_string(records.join("1.json")).unwrap();
+    assert!(
+        record.contains(r#""issues":["ANB-90","ANB-91"]"#),
+        "{record}"
+    );
+
+    screen.press("3");
+    screen.press("p");
+    // It goes to Trees and leases a fresh tree for it, which the stand-in
+    // treehouse cannot give.
+    screen.wait_for("the pick up starting a tree, on the Trees screen", |text| {
+        text.contains("[2] Trees")
+            && !text.contains("[1] Planning chats")
+            && text.contains("start of tree new failed: lease")
+    });
+    drop(screen);
+    let _ = fs::remove_dir_all(&root);
+}

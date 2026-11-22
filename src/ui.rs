@@ -1747,6 +1747,14 @@ fn badge(app: &App, is_panels: bool) -> String {
 /// window's, [2] Trees', and only the panel keys for the panels still
 /// empty.
 fn panel_keys(app: &App) -> &'static [(&'static str, &'static str)] {
+    if app.is_plan && app.plan_focus >= 2 {
+        return &[
+            ("j/k", "move"),
+            ("p", "pick it up"),
+            ("1-3", "panels"),
+            ("Tab", "Issues"),
+        ];
+    }
     if app.is_plan {
         return &[
             ("j/k", "move"),
@@ -1754,6 +1762,7 @@ fn panel_keys(app: &App) -> &'static [(&'static str, &'static str)] {
             ("Enter", "open"),
             ("D", "draft issues"),
             ("S", "create in Linear"),
+            ("1-3", "panels"),
             ("Tab", "Issues"),
         ];
     }
@@ -2120,6 +2129,138 @@ fn plan_areas(main: Rect) -> (Rect, Rect) {
     (left, window)
 }
 
+/// A planned issue's mark and colour by where it stands.
+fn planned_mark(app: &App, issue: &crate::planned::Planned) -> (&'static str, Color) {
+    use crate::planned::Stage;
+    let t = theme();
+    match issue.stage {
+        Stage::Done => ("●", t.success),
+        Stage::Canceled => ("×", t.muted),
+        Stage::Going => ("◑", t.warning),
+        Stage::NotStarted if app.tree_of_ticket(&issue.id).is_some() => ("◑", t.warning),
+        Stage::NotStarted => ("○", t.muted),
+    }
+}
+
+/// [2] Made from it: the project the chat under [1]'s cursor made, under a
+/// bar of its issues done, going and not started, then each with where it
+/// stands: in which tree, ready, waiting on another, or its status.
+fn draw_made(frame: &mut Frame, app: &App, area: Rect, keys: Option<Mode>) {
+    use crate::planned::Stage;
+    let t = theme();
+    let block = window_block(keys).title(" [2] Made from it ");
+    let body = block.inner(area);
+    frame.render_widget(block, area);
+    let made = app.made();
+    if made.is_empty() {
+        let said = app
+            .plan_error
+            .clone()
+            .unwrap_or_else(|| " nothing yet: D drafts issues, S creates them".into());
+        frame.render_widget(
+            Paragraph::new(Line::styled(said, fg(t.muted))).wrap(Wrap { trim: false }),
+            body,
+        );
+        return;
+    }
+    let is_going = |i: &&crate::planned::Planned| {
+        i.stage == Stage::Going
+            || (i.stage == Stage::NotStarted && app.tree_of_ticket(&i.id).is_some())
+    };
+    let counted: Vec<_> = made.iter().filter(|i| i.stage != Stage::Canceled).collect();
+    let done = counted.iter().filter(|i| i.stage == Stage::Done).count();
+    let going = counted.iter().filter(|i| is_going(i)).count();
+    let all = counted.len().max(1);
+    const BAR: usize = 16;
+    let (full, half) = (BAR * done / all, BAR * going / all);
+    let project = made
+        .iter()
+        .find_map(|i| i.project.clone())
+        .unwrap_or_else(|| "its issues".into());
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(" project ", fg(t.muted)),
+            Span::styled(project, fg(t.special).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::raw(" "),
+            Span::styled("█".repeat(full), fg(t.success)),
+            Span::styled("▓".repeat(half), fg(t.warning)),
+            Span::styled("░".repeat(BAR - full - half), fg(t.border)),
+            Span::styled(
+                format!(" {done} done · {going} going · {}", counted.len()),
+                fg(t.muted),
+            ),
+        ]),
+    ];
+    // Each title padded to the longest that fits, so where each stands
+    // reads down one column.
+    let widest_said = 12;
+    let room = usize::from(body.width).saturating_sub(3 + 8 + 2 + widest_said);
+    let title_width = made
+        .iter()
+        .map(|i| i.title.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(room);
+    for (at, issue) in made.iter().enumerate() {
+        let (mark, color) = planned_mark(app, issue);
+        let title: String = issue.title.chars().take(title_width).collect();
+        let (said, said_color) = match app.tree_of_ticket(&issue.id) {
+            Some(tree) => (format!("tree {}", tree.name), t.info),
+            None if app.is_ready(issue) => ("ready".into(), t.success),
+            None => match issue.blocked_by.first() {
+                Some(by) => (format!("⊘ {by}"), t.danger),
+                None => (issue.state.clone(), t.muted),
+            },
+        };
+        let mut line = Line::from(vec![
+            Span::styled(format!(" {mark} "), fg(color).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{:<8}", issue.id), fg(t.muted)),
+            Span::raw(format!("{title:<title_width$}  ")),
+            Span::styled(said, fg(said_color).add_modifier(Modifier::BOLD)),
+        ]);
+        if keys.is_some() && at == app.made_at {
+            line = line.style(t.cursor);
+        }
+        lines.push(line);
+    }
+    frame.render_widget(Paragraph::new(lines), body);
+}
+
+/// [3] Ready to pick up: every planning chat's issues nothing holds up,
+/// for `p`.
+fn draw_ready(frame: &mut Frame, app: &App, area: Rect, keys: Option<Mode>) {
+    let t = theme();
+    let ready = app.ready_issues();
+    let block = window_block(keys).title(format!(" [3] Ready to pick up {} ", ready.len()));
+    let body = block.inner(area);
+    frame.render_widget(block, area);
+    if ready.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::styled(" nothing yet", fg(t.muted))),
+            body,
+        );
+        return;
+    }
+    let lines: Vec<Line> = ready
+        .iter()
+        .enumerate()
+        .map(|(at, issue)| {
+            let line = Line::from(vec![
+                Span::styled(format!(" {:<8}", issue.id), fg(t.muted)),
+                Span::raw(issue.title.clone()),
+            ]);
+            if keys.is_some() && at == app.ready_at {
+                line.style(t.cursor)
+            } else {
+                line
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), body);
+}
+
 /// The Plan screen: [1] Planning chats, [2] what the chat under the
 /// cursor made and [3] what is ready to pick up down the left, and [0], the
 /// chat itself, on the right, where it opens in place.
@@ -2141,7 +2282,8 @@ fn draw_plan(frame: &mut Frame, app: &App, main: Rect, chat: Option<&Chat>) {
             fg(t.warning).add_modifier(Modifier::BOLD),
         ));
     }
-    let block = window_block((!is_open).then_some(Mode::Normal)).title(Line::from(title));
+    let focused = |n: u8| (!is_open && app.plan_focus.max(1) == n).then_some(Mode::Normal);
+    let block = window_block(focused(1)).title(Line::from(title));
     let body = block.inner(chats);
     frame.render_widget(block, chats);
     if app.plan_chats.is_empty() {
@@ -2179,19 +2321,8 @@ fn draw_plan(frame: &mut Frame, app: &App, main: Rect, chat: Option<&Chat>) {
             TableState::default().with_selected(Some(app.plan_at.min(app.plan_chats.len() - 1)));
         frame.render_stateful_widget(table, body, &mut state);
     }
-    for (area, title, empty) in [
-        (
-            made,
-            " [2] Made from it ",
-            " nothing yet: D drafts issues, S creates them",
-        ),
-        (ready, " [3] Ready to pick up ", " nothing yet"),
-    ] {
-        let block = window_block(None).title(title);
-        let body = block.inner(area);
-        frame.render_widget(block, area);
-        frame.render_widget(Paragraph::new(Line::styled(empty, fg(t.muted))), body);
-    }
+    draw_made(frame, app, made, focused(2));
+    draw_ready(frame, app, ready, focused(3));
     // The chat draws itself here once open; until then what it last said.
     if is_open {
         return;
@@ -2757,7 +2888,19 @@ fn draw_window(frame: &mut Frame, app: &App, area: Rect, pane: &Pane, chat: Opti
         if tree.is_main {
             format!(" {number}{mark}{alone}main checkout · {branch} ")
         } else {
-            format!(" {number}{mark}{alone}Tree {} · {branch} ", tree.name)
+            // A tree a planning chat's issue went to names the chat, for `I`.
+            let planned = tree
+                .sidecar
+                .as_ref()
+                .and_then(|s| s.ticket.as_deref())
+                .and_then(|ticket| app.planned_in(ticket))
+                .filter(|_| !number.is_empty())
+                .map(|chat| format!("· from {} (I) ", chat.name))
+                .unwrap_or_default();
+            format!(
+                " {number}{mark}{alone}Tree {} · {branch} {planned}",
+                tree.name
+            )
         }
     });
     let mode = if pane.is_inserting {
@@ -8963,6 +9106,7 @@ mod panels_tests {
             record: std::path::PathBuf::from(format!("/state/scratch/{job}.json")),
             checkout: None,
             scratch: false,
+            issues: Vec::new(),
         }
     }
 
@@ -9024,6 +9168,74 @@ mod panels_tests {
         ));
         let bar = screen(&app, 160, 46).pop().unwrap();
         assert!(bar.contains("▲1 planning"), "{bar}");
+    }
+
+    #[test]
+    fn made_from_it_shows_the_project_filling_in_and_each_issue_where_it_stands() {
+        use crate::planned::{Planned, Stage};
+        let mut app = panels();
+        let mut chat = plan_chat("j1", "plan 1");
+        chat.issues = vec![
+            "ANB-41".into(),
+            "ANB-90".into(),
+            "ANB-91".into(),
+            "ANB-92".into(),
+            "ANB-93".into(),
+        ];
+        app.open_plan(vec![chat.clone()]);
+        let issue = |id: &str, stage, by: &[&str]| Planned {
+            id: id.into(),
+            title: format!("title of {id}"),
+            project: Some("treetop panels".into()),
+            state: "Backlog".into(),
+            stage,
+            blocked_by: by.iter().map(|b| b.to_string()).collect(),
+        };
+        app.apply_plan_read(
+            vec![chat],
+            Ok((
+                "work".into(),
+                [(
+                    "j1".to_string(),
+                    vec![
+                        issue("ANB-41", Stage::NotStarted, &[]),
+                        issue("ANB-90", Stage::NotStarted, &[]),
+                        issue("ANB-91", Stage::NotStarted, &["ANB-90"]),
+                        issue("ANB-92", Stage::Done, &[]),
+                        issue("ANB-93", Stage::Canceled, &[]),
+                    ],
+                )]
+                .into(),
+            )),
+        );
+        let made = panel_rows(&screen(&app, 160, 46), "[2] Made from it");
+        let all = made.join("\n");
+        assert!(made[0].contains("project treetop panels"), "{all}");
+        // 1 of 4 done, 1 going (ANB-41 in tree 4), ANB-93 canceled and left
+        // out: 4 full, 4 half, 8 empty.
+        assert!(
+            made[1].contains("████▓▓▓▓░░░░░░░░ 1 done · 1 going · 4"),
+            "{all}"
+        );
+        let row = |id: &str| {
+            made.iter()
+                .find(|l| l.contains(id))
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert!(row("ANB-41").contains("tree 4"), "{all}");
+        assert!(row("ANB-90").contains("ready"), "{all}");
+        assert!(row("ANB-91").contains("⊘ ANB-90"), "{all}");
+        let ready = panel_rows(&screen(&app, 160, 46), "[3] Ready to pick up");
+        assert!(
+            ready[0].contains("ANB-90") && !ready.join("").contains("ANB-91"),
+            "{ready:?}"
+        );
+        // On Trees, tree 4's window names the chat its issue came from.
+        app.is_plan = false;
+        app.selected = 1;
+        let shown = screen(&app, 160, 46).join("\n");
+        assert!(shown.contains("· from plan 1 (I)"), "{shown}");
     }
 
     #[test]

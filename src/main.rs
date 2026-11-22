@@ -34,6 +34,7 @@ mod naming;
 mod nomistakes_plugin;
 mod notify;
 mod phone;
+mod planned;
 mod plugin;
 mod pool;
 mod popup;
@@ -91,6 +92,23 @@ const WINDOW_REST: Duration = Duration::from_millis(300);
 /// How long before the second window of a double tries again to start a
 /// chat that would not start.
 const OTHER_RETRY: Duration = Duration::from_secs(5);
+/// How often the Plan screen reads again what its planning chats made,
+/// their transcripts and the issues in Linear, while it is shown.
+const PLAN_READ: Duration = Duration::from_secs(30);
+
+/// What a read of the planning chats found: the chats with the issues their
+/// transcripts showed made, and each one's issues as the workspace's issue
+/// source has them, with its name, or why there is none.
+type PlanRead = (
+    Vec<scratch::Scratch>,
+    Result<
+        (
+            String,
+            std::collections::HashMap<String, Vec<planned::Planned>>,
+        ),
+        String,
+    >,
+);
 /// How often the screen is drawn when nothing has changed, for the listing's
 /// age in the summary.
 const REDRAW: Duration = Duration::from_secs(1);
@@ -388,6 +406,11 @@ fn run(
     let mut starting_scratch: Option<mpsc::Receiver<Result<scratch::Scratch, String>>> = None;
     // The chat starting is a planning chat, for where its outcome is said.
     let mut is_planning = false;
+    // The Plan screen's read of what its chats made, off this thread, and
+    // when the last began; each transcript read on from where it stopped.
+    let mut plan_reading: Option<mpsc::Receiver<PlanRead>> = None;
+    let mut plan_read_at: Option<Instant> = None;
+    let transcripts = std::sync::Arc::new(std::sync::Mutex::new(planned::Reader::default()));
     let mut removing_scratch: Vec<mpsc::Receiver<Result<String, String>>> = Vec::new();
     // URLs a configured browser is opening, off this thread, each with
     // whether the Issues screen asked, so its outcome is said there.
@@ -724,6 +747,53 @@ fn run(
                 }
                 _ => {}
             }
+        }
+        // What the planning chats made, while the Plan screen shows.
+        if let Some((chats, made)) = plan_reading.as_ref().and_then(|r| r.try_recv().ok()) {
+            plan_reading = None;
+            is_stale = true;
+            app.apply_plan_read(chats, made);
+        }
+        if app.is_plan
+            && plan_reading.is_none()
+            && plan_read_at.is_none_or(|at| at.elapsed() >= PLAN_READ)
+        {
+            plan_read_at = Some(Instant::now());
+            let (done, result) = mpsc::channel();
+            let mut chats = app.plan_chats.clone();
+            let here = checkout.to_path_buf();
+            let transcripts = std::sync::Arc::clone(&transcripts);
+            std::thread::spawn(move || {
+                for chat in &mut chats {
+                    let Some(path) = agents::claude::job_transcript(&chat.job) else {
+                        continue;
+                    };
+                    let found = transcripts
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .new_ids(&path);
+                    let fresh: Vec<String> = found
+                        .into_iter()
+                        .filter(|id| !chat.issues.contains(id))
+                        .collect();
+                    if !fresh.is_empty() {
+                        chat.issues.extend(fresh);
+                        // Not for a chat deleted while this read ran.
+                        if chat.record.exists() {
+                            let _ = scratch::save(chat);
+                        }
+                    }
+                }
+                let made = tickets::own(&here).map(|backend| {
+                    let made = chats
+                        .iter()
+                        .map(|chat| (chat.job.clone(), planned::read(&*backend, &chat.issues)))
+                        .collect();
+                    (backend.name().to_string(), made)
+                });
+                let _ = done.send((chats, made));
+            });
+            plan_reading = Some(result);
         }
         // The other workspaces' agents and PRs, as their own reader last
         // found them.
@@ -1126,7 +1196,11 @@ fn run(
             Outcome::Quit => return Ok(Exit::Quit),
             Outcome::Workspaces => app.open_picker(choices()),
             Outcome::Scratches => app.open_scratch_menu(scratch::list()),
-            Outcome::Plan => app.open_plan(scratch::planning(checkout)),
+            Outcome::Plan => {
+                app.open_plan(scratch::planning(checkout));
+                // Read at once on coming to Plan.
+                plan_read_at = None;
+            }
             Outcome::NewPlan => {
                 app.opening = Some(Opening {
                     agent: "a planning chat".into(),

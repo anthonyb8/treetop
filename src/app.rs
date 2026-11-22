@@ -845,6 +845,18 @@ pub struct App {
     /// them, and the one under its cursor.
     pub plan_chats: Vec<crate::scratch::Scratch>,
     pub plan_at: usize,
+    /// What each planning chat made, by its job, as Linear last said, and
+    /// the issue source that said it, for picking up; or why it could not.
+    pub plan_made: HashMap<String, Vec<crate::planned::Planned>>,
+    pub plan_source: Option<String>,
+    pub plan_error: Option<String>,
+    /// The Plan screen's panel with the keys, 1 to 3, and the issue under
+    /// [2]'s and [3]'s cursors.
+    pub plan_focus: u8,
+    pub made_at: usize,
+    pub ready_at: usize,
+    /// The planning chat to put the cursor on once Plan opens, by job.
+    pub plan_wanted: Option<String>,
     /// The command palette, while Ctrl+P has it open.
     pub palette: Option<Palette>,
     /// In a double, the side of the window the cursor drives, the one that
@@ -1795,7 +1807,110 @@ impl App {
         self.is_plan = true;
         self.is_issues = false;
         self.plan_chats = chats;
+        if let Some(job) = self.plan_wanted.take()
+            && let Some(at) = self.plan_chats.iter().position(|c| c.job == job)
+        {
+            self.plan_at = at;
+            self.plan_focus = 1;
+        }
         self.plan_at = self.plan_at.min(self.plan_chats.len().saturating_sub(1));
+    }
+
+    /// What a read of the planning chats found: each chat's issues merged
+    /// into the list as it now stands, by job, so chats started or deleted
+    /// meanwhile are left as they are, and each one's issues as Linear has
+    /// them, or why it could not say; the cursors on [2] and [3] kept on a
+    /// row.
+    pub fn apply_plan_read(
+        &mut self,
+        chats: Vec<crate::scratch::Scratch>,
+        made: Result<(String, HashMap<String, Vec<crate::planned::Planned>>), String>,
+    ) {
+        for chat in chats {
+            if let Some(kept) = self.plan_chats.iter_mut().find(|c| c.job == chat.job) {
+                kept.issues = chat.issues;
+            }
+        }
+        match made {
+            Ok((source, made)) => {
+                self.plan_source = Some(source);
+                self.plan_error = None;
+                self.plan_made = made;
+            }
+            Err(why) => {
+                self.plan_source = None;
+                self.plan_error = Some(why);
+            }
+        }
+        self.made_at = self.made_at.min(self.made().len().saturating_sub(1));
+        self.ready_at = self
+            .ready_at
+            .min(self.ready_issues().len().saturating_sub(1));
+    }
+
+    /// What the planning chat under [1]'s cursor made, as Linear said.
+    pub fn made(&self) -> &[crate::planned::Planned] {
+        self.plan_chats
+            .get(self.plan_at)
+            .and_then(|c| self.plan_made.get(&c.job))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// A planned issue can be picked up: not started, in no tree, and
+    /// nothing blocking it that is not done.
+    pub fn is_ready(&self, issue: &crate::planned::Planned) -> bool {
+        issue.stage == crate::planned::Stage::NotStarted
+            && issue.blocked_by.is_empty()
+            && self.tree_of_ticket(&issue.id).is_none()
+    }
+
+    /// Every planning chat's issues ready to pick up, in the chats' order.
+    pub fn ready_issues(&self) -> Vec<&crate::planned::Planned> {
+        self.plan_chats
+            .iter()
+            .filter_map(|c| self.plan_made.get(&c.job))
+            .flatten()
+            .filter(|i| self.is_ready(i))
+            .collect()
+    }
+
+    /// The planning chat that made the issue `ticket`, by its record.
+    pub fn planned_in(&self, ticket: &str) -> Option<&crate::scratch::Scratch> {
+        self.plan_chats
+            .iter()
+            .find(|c| c.issues.iter().any(|i| i.eq_ignore_ascii_case(ticket)))
+    }
+
+    /// `p` on the Plan screen: picks the issue under [2]'s or [3]'s cursor
+    /// up as the Issues screen does, a fresh tree and an agent on it, and
+    /// goes to the Trees screen, where it lands; one not ready says why.
+    fn pick_planned(&mut self) -> Outcome {
+        let issue = match self.plan_focus {
+            2 => self.made().get(self.made_at).cloned(),
+            3 => self.ready_issues().get(self.ready_at).map(|i| (*i).clone()),
+            _ => None,
+        };
+        let Some(issue) = issue else {
+            self.message = Some("pick an issue in [2] or [3] to pick it up".into());
+            return Outcome::Continue;
+        };
+        let Some(source) = self.plan_source.clone() else {
+            self.message = Some(
+                self.plan_error
+                    .clone()
+                    .unwrap_or_else(|| "Linear is not read yet".into()),
+            );
+            return Outcome::Continue;
+        };
+        if self.tree_of_ticket(&issue.id).is_none() && !self.is_ready(&issue) {
+            self.message = Some(match issue.blocked_by.first() {
+                Some(by) => format!("{} waits on {by}; pick that up first", issue.id),
+                None => format!("{} is {}", issue.id, issue.state.to_lowercase()),
+            });
+            return Outcome::Continue;
+        }
+        self.is_plan = false;
+        self.pick(issue.id, source)
     }
 
     /// A planning chat's state, by its report: asking you, talking, or idle.
@@ -1844,8 +1959,26 @@ impl App {
                 self.is_plan = false;
                 self.is_issues = true;
             }
-            KeyCode::Char('j') | KeyCode::Down => self.plan_at = (self.plan_at + 1).min(last),
-            KeyCode::Char('k') | KeyCode::Up => self.plan_at = self.plan_at.saturating_sub(1),
+            KeyCode::Char(c @ '1'..='3') => self.plan_focus = c as u8 - b'0',
+            KeyCode::Char('j' | 'k') | KeyCode::Down | KeyCode::Up => {
+                let down = matches!(key.code, KeyCode::Char('j') | KeyCode::Down);
+                let step = |at: usize, len: usize| {
+                    if down {
+                        (at + 1).min(len.saturating_sub(1))
+                    } else {
+                        at.saturating_sub(1)
+                    }
+                };
+                match self.plan_focus {
+                    2 => self.made_at = step(self.made_at, self.made().len()),
+                    3 => self.ready_at = step(self.ready_at, self.ready_issues().len()),
+                    _ => {
+                        self.plan_at = step(self.plan_at, last + 1);
+                        self.made_at = 0;
+                    }
+                }
+            }
+            KeyCode::Char('p') => return self.pick_planned(),
             KeyCode::Char('n') => return Outcome::NewPlan,
             KeyCode::Enter | KeyCode::Char('i' | 'l') => {
                 if let Some(chat) = chat {
@@ -5526,6 +5659,18 @@ impl App {
                 let opened = self.open_agent();
                 return Self::typing_to(opened);
             }
+            // A planned tree's issue opens the chat that planned it.
+            KeyCode::Char('I')
+                if self.shows_panels()
+                    && let Some(job) = self
+                        .current()
+                        .and_then(|t| t.sidecar.as_ref()?.ticket.clone())
+                        .and_then(|ticket| self.planned_in(&ticket))
+                        .map(|c| c.job.clone()) =>
+            {
+                self.plan_wanted = Some(job);
+                return Outcome::Plan;
+            }
             KeyCode::Char('I') => self.show_issue(),
             KeyCode::Char('e') => self.notes = Some(0),
             KeyCode::Char('m') => self.open_message(),
@@ -5997,6 +6142,7 @@ mod tests {
             record: PathBuf::from("/state/scratch/1.json"),
             checkout: Some(PathBuf::from("/code/here")),
             scratch: false,
+            issues: Vec::new(),
         }]);
         app.checkout = PathBuf::from("/code/here");
         app
@@ -6056,6 +6202,149 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("create nothing yet"), "{text}");
+    }
+
+    fn planned(
+        id: &str,
+        stage: crate::planned::Stage,
+        blocked_by: &[&str],
+    ) -> crate::planned::Planned {
+        crate::planned::Planned {
+            id: id.into(),
+            title: format!("{id}'s title"),
+            project: Some("treetop panels".into()),
+            state: "Backlog".into(),
+            stage,
+            blocked_by: blocked_by.iter().map(|b| b.to_string()).collect(),
+        }
+    }
+
+    /// The Plan screen with its chat's issues read: ANB-41 in tree 4, ANB-90
+    /// ready, ANB-91 waiting on ANB-90, ANB-92 done.
+    fn with_made() -> App {
+        use crate::planned::Stage;
+        let mut app = on_plan();
+        app.plan_chats[0].issues = vec![
+            "ANB-41".into(),
+            "ANB-90".into(),
+            "ANB-91".into(),
+            "ANB-92".into(),
+        ];
+        app.apply_plan_read(
+            app.plan_chats.clone(),
+            Ok((
+                "work".into(),
+                [(
+                    "j1".to_string(),
+                    vec![
+                        planned("ANB-41", Stage::NotStarted, &[]),
+                        planned("ANB-90", Stage::NotStarted, &[]),
+                        planned("ANB-91", Stage::NotStarted, &["ANB-90"]),
+                        planned("ANB-92", Stage::Done, &[]),
+                    ],
+                )]
+                .into(),
+            )),
+        );
+        app
+    }
+
+    #[test]
+    fn ready_is_not_started_in_no_tree_and_held_up_by_nothing() {
+        let app = with_made();
+        let ready: Vec<&str> = app.ready_issues().iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ready, ["ANB-90"], "41 is in tree 4, 91 waits, 92 is done");
+    }
+
+    #[test]
+    fn p_picks_a_ready_issue_up_and_goes_to_the_trees_and_says_why_not_for_one_held_up() {
+        let mut app = with_made();
+        press(&mut app, KeyCode::Char('2'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(press(&mut app, KeyCode::Char('p')), Outcome::Continue);
+        assert!(app.message.as_deref().unwrap().contains("waits on ANB-90"));
+        assert!(app.is_plan, "still on Plan");
+        press(&mut app, KeyCode::Char('3'));
+        let Outcome::Queue(jobs) = press(&mut app, KeyCode::Char('p')) else {
+            panic!("p picks it up");
+        };
+        assert_eq!(jobs[0].kind, Kind::Start);
+        let launch = jobs[0].launch.as_ref().unwrap();
+        assert!(launch.is_new_tree);
+        let ticket = launch.ticket.as_ref().unwrap();
+        assert_eq!(
+            (ticket.id.as_str(), ticket.source.as_deref()),
+            ("ANB-90", Some("work")),
+            "the ready issue, from the source that read it"
+        );
+        assert!(
+            !app.is_plan,
+            "it goes to the Trees screen, where the tree lands"
+        );
+    }
+
+    #[test]
+    fn p_waits_for_the_issue_source_and_a_read_keeps_the_cursors_on_a_row() {
+        let mut app = with_made();
+        app.made_at = 3;
+        app.apply_plan_read(
+            Vec::new(),
+            Err("no issue source for this repository".into()),
+        );
+        assert_eq!(app.plan_source, None);
+        press(&mut app, KeyCode::Char('3'));
+        press(&mut app, KeyCode::Char('p'));
+        assert_eq!(
+            app.message.as_deref(),
+            Some("no issue source for this repository")
+        );
+        // A shorter read: the cursor stays on its last row.
+        let mut app = with_made();
+        app.made_at = 3;
+        app.ready_at = 3;
+        app.apply_plan_read(
+            Vec::new(),
+            Ok((
+                "work".into(),
+                [(
+                    "j1".to_string(),
+                    vec![planned("ANB-90", crate::planned::Stage::NotStarted, &[])],
+                )]
+                .into(),
+            )),
+        );
+        assert_eq!((app.made_at, app.ready_at), (0, 0));
+        assert_eq!(
+            app.plan_chats[0].issues.len(),
+            4,
+            "a read with no chats leaves theirs"
+        );
+    }
+
+    #[test]
+    fn i_on_a_tree_a_planning_chat_made_opens_that_chat_on_plan() {
+        let mut app = with_made();
+        app.is_plan = false;
+        app.plan_chats.insert(
+            0,
+            crate::scratch::Scratch {
+                job: "j0".into(),
+                name: "plan 0".into(),
+                created: 0,
+                record: PathBuf::from("/state/scratch/0.json"),
+                checkout: None,
+                scratch: false,
+                issues: Vec::new(),
+            },
+        );
+        app.reselect(Some(app.trees[0].path.clone()));
+        assert_eq!(press(&mut app, KeyCode::Char('I')), Outcome::Plan);
+        app.open_plan(app.plan_chats.clone());
+        assert_eq!(
+            app.plan_chats[app.plan_at].job, "j1",
+            "the chat that made ANB-41"
+        );
     }
 
     #[test]
@@ -7183,6 +7472,7 @@ mod tests {
             record: PathBuf::from(format!("/state/scratch/{name}.json")),
             checkout: None,
             scratch: true,
+            issues: Vec::new(),
         }
     }
 
