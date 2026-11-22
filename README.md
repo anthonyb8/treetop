@@ -200,6 +200,9 @@ A hook is a command and its arguments, run in the tree with `TREETOP_TREE`, `TRE
 
 `layout = "panels"` lays the Trees screen out in numbered panels down the left, with the tree under the cursor in a window on the right, [0]: [1] Waiting, [2] Trees, which holds the table, [3] Ship and [4] News, the last three still being built.
 The number keys give a panel the keys, from the table or the window in Normal, and 0 gives them to the window; the bar names the panel with the keys and shows its keys.
+[2] Trees shows one workspace at a time, every workspace a tab in its title in name order, with `▲` and how many wait on you there; `[` and `]` step through them, showing another workspace at once from its last read, only to look at: Esc comes back, and Enter, or any key that acts on a tree, such as `n`, `r` or `z`, switches there.
+Its trees come first, then those parked or on the Backburner, then the free ones as one row of numbers, where `n` starts an agent in the lowest.
+With trees marked, `z` and `x` park them or put them on the Backburner together, or bring them all back when all are there already, and the bar shows what the marked trees can be given.
 In it the PR tab's sections step with `h` and `l` only, and the double and zoom are off.
 On a screen under 120 columns or 30 rows the table layout shows instead, and `layout = "table"`, the default, keeps it.
 

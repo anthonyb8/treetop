@@ -747,6 +747,48 @@ pub mod tests {
         app
     }
 
+    /// `app` in the panels layout, on screen, in `/code/main-app`, with two
+    /// other workspaces, `zeta` and `api`, in place of its one: each with a
+    /// held tree 1 and a free tree 2, and api's agent waiting on you.
+    pub fn with_workspaces() -> App {
+        let mut app = app();
+        app.checkout = PathBuf::from("/code/main-app");
+        app.look = crate::config::Look::Panels;
+        app.show_panels(true);
+        app.pools = ["zeta", "api"]
+            .into_iter()
+            .map(|name| {
+                let mut free = tree(&format!("/code/{name}-trees/2"), "2", "", Vec::new());
+                free.status = "available".into();
+                let held = Tree {
+                    leased_at: Some("2026-01-01T09:00:00-05:00".into()),
+                    ..tree(
+                        &format!("/code/{name}-trees/1"),
+                        "1",
+                        &format!("{name}-work"),
+                        Vec::new(),
+                    )
+                };
+                Pool {
+                    away: Away {
+                        name: name.into(),
+                        checkout: PathBuf::from(format!("/code/{name}")),
+                    },
+                    trees: vec![held, free],
+                    sidecars: Default::default(),
+                }
+            })
+            .collect();
+        app.reports.push(report(
+            "japi",
+            "/code/api-trees/1",
+            State::Blocked,
+            "Which endpoint?",
+            60,
+        ));
+        app
+    }
+
     /// Settles everything in `app` that waits on you: the asks and the
     /// dead agent reported, tree 7's failed PR and the other workspace.
     pub fn nothing_waits(app: &mut App) {

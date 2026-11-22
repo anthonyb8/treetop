@@ -18,7 +18,8 @@ use ratatui::widgets::{
 use crate::agents::{Agent, Status};
 use crate::app::{
     App, DiffView, Group, Item, JobState, ListRow, LogEntry, Opening, Outcome, Panel, Pending,
-    Phone, Picker, PortMenu, Reach, Review, SCRATCH, ScratchMenu, Shipping, WindowTab, Zoom,
+    Phone, Picker, PortMenu, Reach, Review, SCRATCH, ScratchMenu, Shipping, WindowTab,
+    WorkspaceTab, Zoom,
 };
 use crate::assistant;
 use crate::chat::Chat;
@@ -35,6 +36,7 @@ use crate::popup;
 use crate::pr_view::{self, PrPopup, Tab};
 use crate::reports::{self, State};
 use crate::ship::{Outcome as CheckOutcome, PrView, Stage};
+use crate::sidecar::Shelf;
 use crate::syntax;
 use crate::theme::theme;
 
@@ -200,15 +202,24 @@ pub fn draw(
                 ];
                 for (panel, area) in boxes {
                     let focused = has_keys && app.panel == panel;
-                    let block = window_block(focused.then_some(Mode::Normal)).title(format!(
+                    let mut title = vec![Span::raw(format!(
                         " [{}] {} ",
                         panel.number(),
                         panel.title()
-                    ));
+                    ))];
+                    if panel == Panel::Trees {
+                        // What the title and the corners leave.
+                        let room = usize::from(area.width).saturating_sub(14);
+                        title.extend(workspace_tab_spans(app, room));
+                    }
+                    let block =
+                        window_block(focused.then_some(Mode::Normal)).title(Line::from(title));
                     let body = block.inner(area);
                     frame.render_widget(block, area);
-                    if panel == Panel::Trees {
-                        draw_table(frame, app, body, false, true);
+                    match (panel, app.viewed_trees()) {
+                        (Panel::Trees, Some(trees)) => draw_viewed(frame, app, body, &trees),
+                        (Panel::Trees, None) => draw_table(frame, app, body, false, true),
+                        _ => {}
                     }
                 }
             } else if is_classic(app) {
@@ -974,17 +985,161 @@ fn columns(app: &App, compact: bool) -> Vec<(&'static str, Constraint, usize)> {
         .collect()
 }
 
+/// Only the cells of the columns drawn, a heading's missing ones blank.
+fn pick_cells(
+    columns: &[(&'static str, Constraint, usize)],
+    mut cells: Vec<Cell<'static>>,
+) -> Vec<Cell<'static>> {
+    columns
+        .iter()
+        .map(|(.., at)| cells.get_mut(*at).map(std::mem::take).unwrap_or_default())
+        .collect()
+}
+
+/// [2] Trees' tabs, after its title, in `room` columns: every workspace by
+/// name, the one shown in the workspace colour, each with how many wait on
+/// you there. Too many for the room, they scroll to keep the one shown in
+/// view, an ellipsis at each end cut.
+fn workspace_tab_spans(app: &App, room: usize) -> Vec<Span<'static>> {
+    let t = theme();
+    let shown = app.viewing.as_ref().unwrap_or(&app.checkout);
+    let tabs = app.workspace_tabs();
+    if tabs.len() < 2 {
+        return Vec::new();
+    }
+    let text = |tab: &WorkspaceTab| match tab.waiting {
+        0 => format!(" {} ", tab.name),
+        n => format!(" {} ▲{n} ", tab.name),
+    };
+    let width = |tab: &WorkspaceTab| text(tab).chars().count() + 1;
+    let at = tabs
+        .iter()
+        .position(|tab| &tab.checkout == shown)
+        .unwrap_or(0);
+    // Out from the one shown, right then left, while they fit with room
+    // for an ellipsis at each end.
+    let (mut first, mut last) = (at, at);
+    let mut used = width(&tabs[at]) + 2;
+    loop {
+        let mut grew = false;
+        if last + 1 < tabs.len() && used + width(&tabs[last + 1]) <= room {
+            last += 1;
+            used += width(&tabs[last]);
+            grew = true;
+        }
+        if first > 0 && used + width(&tabs[first - 1]) <= room {
+            first -= 1;
+            used += width(&tabs[first]);
+            grew = true;
+        }
+        if !grew {
+            break;
+        }
+    }
+    let mut spans = Vec::new();
+    if first > 0 {
+        spans.push(Span::styled("…", fg(t.muted)));
+    }
+    for (n, tab) in tabs[first..=last].iter().enumerate() {
+        if n > 0 {
+            spans.push(Span::styled("│", fg(t.border)));
+        }
+        spans.push(if &tab.checkout == shown {
+            Span::styled(
+                text(tab),
+                Style::new()
+                    .fg(t.badge.fg.unwrap_or(t.text))
+                    .bg(t.special)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else if tab.waiting > 0 {
+            Span::styled(text(tab), fg(t.warning).add_modifier(Modifier::BOLD))
+        } else {
+            Span::styled(text(tab), fg(t.muted))
+        });
+    }
+    if last + 1 < tabs.len() {
+        spans.push(Span::styled("…", fg(t.muted)));
+    }
+    spans.push(Span::raw(" "));
+    spans
+}
+
+/// Another workspace's trees on its tab, as their last read found them:
+/// those held, worked on then shelved, the cursor among them, then its free
+/// trees on one row. Only looked at: a key that acts switches there.
+fn draw_viewed(frame: &mut Frame, app: &App, area: Rect, trees: &[&Tree]) {
+    let t = theme();
+    let columns = columns(app, true);
+    let header = Row::new(columns.iter().map(|(title, ..)| *title)).style(t.header);
+    let heading = |glyph: &'static str, label: &'static str| {
+        Row::new(pick_cells(
+            &columns,
+            vec![
+                Cell::from(glyph).style(fg(t.accent)),
+                Cell::from(""),
+                Cell::from(label).style(fg(t.muted)),
+            ],
+        ))
+    };
+    let mut rows = Vec::new();
+    let mut selected = None;
+    let mut shown = None;
+    for (at, tree) in trees.iter().enumerate() {
+        let shelf = app.viewed_shelf(tree);
+        if at == 0 || shelf != shown {
+            if at > 0 {
+                rows.push(Row::new(Vec::<Cell>::new()));
+            }
+            rows.push(heading(
+                "▾",
+                match shelf {
+                    Some(Shelf::Parked) => "parked",
+                    Some(Shelf::Backburner) => "backburner",
+                    None => "trees",
+                },
+            ));
+            shown = shelf;
+        }
+        if at == app.viewed {
+            selected = Some(rows.len());
+        }
+        rows.push(Row::new(pick_cells(&columns, row(app, tree))));
+    }
+    let free = app.viewed_free();
+    if !free.is_empty() {
+        rows.push(Row::new(Vec::<Cell>::new()));
+        let numbers: Vec<Span> = free
+            .iter()
+            .map(|tree| Span::styled(format!("○ {}  ", tree.name), fg(t.muted)))
+            .collect();
+        rows.push(Row::new(pick_cells(
+            &columns,
+            vec![
+                Cell::from("▸").style(fg(t.accent)),
+                Cell::from(""),
+                Cell::from("free").style(fg(t.muted)),
+                Cell::from(""),
+                Cell::from(Line::from(numbers)),
+            ],
+        )));
+    }
+    if trees.is_empty() && free.is_empty() {
+        rows.push(heading("", "not read yet"));
+    }
+    let widths: Vec<Constraint> = columns.iter().map(|(_, width, _)| *width).collect();
+    let table = Table::new(rows, widths)
+        .header(header)
+        .row_highlight_style(t.cursor);
+    let mut state = TableState::default().with_selected(selected);
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
 fn draw_table(frame: &mut Frame, app: &App, area: Rect, fold: bool, compact: bool) {
     let t = theme();
     let columns = columns(app, compact);
     let header = Row::new(columns.iter().map(|(title, ..)| *title)).style(t.header);
-    // Only the columns drawn, a heading's missing ones left blank.
-    let pick = |mut cells: Vec<Cell<'static>>| -> Vec<Cell<'static>> {
-        columns
-            .iter()
-            .map(|(.., at)| cells.get_mut(*at).map(std::mem::take).unwrap_or_default())
-            .collect()
-    };
+    let pick = |cells| pick_cells(&columns, cells);
     // A blank line sets each heading apart from the trees above it. The
     // cursor never lands on one, so each pushes the rows below it one
     // further down the table.
@@ -1081,6 +1236,14 @@ fn heading_row(
         Group::Backburner => (
             "backburner",
             vec![Span::styled(format!("{count} not now"), fg(t.muted))],
+        ),
+        // The panels layout keeps the free trees on one row, by number.
+        Group::Free if app.shows_panels() => (
+            "free",
+            app.free_trees()
+                .iter()
+                .map(|tree| Span::styled(format!("○ {}  ", tree.name), fg(t.muted)))
+                .collect(),
         ),
         Group::Free => (
             "free",
@@ -1413,6 +1576,9 @@ fn footer_left(app: &App, is_panels: bool) -> Line<'static> {
 /// the keys where the table's would say TABLE.
 fn badge(app: &App, is_panels: bool) -> String {
     match Mode::of(app) {
+        Mode::Table if is_panels && !app.marked.is_empty() => {
+            format!(" {} MARKED ", app.marked.len())
+        }
         Mode::Table if is_panels => format!(" PANEL {} ", app.panel.number()),
         mode => mode.label().to_string(),
     }
@@ -1431,7 +1597,21 @@ fn panel_keys(app: &App) -> &'static [(&'static str, &'static str)] {
         ];
     }
     match app.panel {
+        Panel::Trees if !app.marked.is_empty() => &[
+            ("r", "return them"),
+            ("m", "message them"),
+            ("z", "park"),
+            ("x", "backburner"),
+            ("Esc", "clear marks"),
+        ],
+        Panel::Trees if app.viewing.is_some() => &[
+            ("j/k", "move"),
+            ("Enter", "switch there"),
+            ("Esc", "back"),
+            ("[ ]", "workspaces"),
+        ],
         Panel::Trees => &[
+            ("[ ]", "workspaces"),
             ("j/k", "move"),
             ("Enter", "chat"),
             ("n", "new agent"),
@@ -1733,6 +1913,12 @@ pub fn usage_overflow(app: &App, screen: Rect) -> u16 {
         .saturating_sub(inner.height)
 }
 
+/// The panels layout is on `screen`: the config asks for it and it fits,
+/// for its keys and rows.
+pub fn has_panels(app: &App, screen: Rect) -> bool {
+    !app.is_issues && windows(app, screen_rows(screen).main).panels.is_some()
+}
+
 /// The Usage column is on `screen` beside the table, for its keys.
 pub fn has_usage_column(app: &App, screen: Rect) -> bool {
     !app.is_issues && windows(app, screen_rows(screen).main).usage.is_some()
@@ -1801,12 +1987,14 @@ fn notes_count(app: &App) -> Option<Vec<Span<'static>>> {
 }
 
 /// Where the count sits on `main`, the screen above the bar: the Trees
-/// window's top row, at its right, inside the corner.
+/// window's top row, at its right, inside the corner, or in the panels
+/// layout [1] Waiting's, so it leaves [2]'s title to its tabs.
 fn count_area(app: &App, main: Rect) -> Option<Rect> {
     if app.is_issues {
         return None;
     }
-    let top = windows(app, main).top;
+    let windows = windows(app, main);
+    let top = windows.panels.map_or(windows.top, |p| p.waiting);
     let width = u16::try_from(Line::from(notes_count(app)?).width()).unwrap_or(u16::MAX);
     let width = width.min(top.width.saturating_sub(2));
     Some(Rect {
@@ -2278,7 +2466,15 @@ fn draw_window(frame: &mut Frame, app: &App, area: Rect, pane: &Pane, chat: Opti
     frame.render_widget(block, area);
     let [bar, body] = window_areas(area);
     let Some(tree) = tree else {
+        // Another workspace's tab is only looked at.
+        let viewing = app.viewing.as_deref().map(|checkout| {
+            format!(
+                "{} is only looked at here: Enter, or a key that acts on a tree, switches there; Esc comes back",
+                crate::workspaces::name(checkout)
+            )
+        });
         let text = match app.current_heading() {
+            _ if viewing.is_some() => viewing.as_deref().unwrap_or_default(),
             Some(_) => "a group's heading: Enter folds it or opens it again",
             None if app.is_loaded => "no trees match",
             None => "",
@@ -8126,6 +8322,7 @@ mod panels_tests {
     fn panels() -> App {
         let mut app = app();
         app.look = Look::Panels;
+        app.show_panels(true);
         app
     }
 
@@ -8209,6 +8406,78 @@ mod panels_tests {
             bar.starts_with(" NORMAL ") && bar.contains("i insert"),
             "{bar}"
         );
+    }
+
+    use crate::inbox::tests::with_workspaces;
+
+    fn text(spans: &[Span]) -> String {
+        spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn the_trees_title_has_every_workspace_as_a_tab_in_name_order() {
+        let app = with_workspaces();
+        let shown = screen(&app, 160, 46);
+        let title = shown.iter().find(|l| l.contains("[2] Trees")).unwrap();
+        // Here tree 4 asks, 7's PR failed and 9 died; in api tree 1 asks.
+        let tabs = " api ▲1 │ main-app ▲3 │ zeta ";
+        assert!(title.contains(tabs), "{title}");
+        assert!(
+            !title.contains("needs action"),
+            "the count is in [1]: {title}"
+        );
+    }
+
+    #[test]
+    fn tabs_too_wide_for_the_panel_keep_the_one_shown_in_view() {
+        let mut app = with_workspaces();
+        app.viewing = Some(std::path::PathBuf::from("/code/zeta"));
+        let fitted = text(&workspace_tab_spans(&app, 16));
+        assert!(
+            fitted.starts_with("…") && fitted.contains("zeta"),
+            "{fitted}"
+        );
+        assert!(!fitted.contains("api"), "{fitted}");
+        let all = text(&workspace_tab_spans(&app, 200));
+        assert!(
+            !all.contains('…') && all.contains("api") && all.contains("zeta"),
+            "{all}"
+        );
+    }
+
+    #[test]
+    fn another_workspaces_tab_shows_its_trees_and_free_row_not_this_ones() {
+        let mut app = with_workspaces();
+        app.viewing = Some(std::path::PathBuf::from("/code/zeta"));
+        let all = screen(&app, 160, 46).join("\n");
+        assert!(all.contains("zeta-work") && all.contains("○ 2"), "{all}");
+        assert!(
+            !all.contains("me/help-columns"),
+            "this workspace's trees are not shown:\n{all}"
+        );
+        assert!(all.contains("zeta is only looked at here"), "{all}");
+    }
+
+    #[test]
+    fn with_trees_marked_the_bar_says_how_many_and_what_they_can_be_given() {
+        let mut app = panels();
+        app.marked
+            .extend(app.trees[..2].iter().map(|t| t.path.clone()));
+        let bar = screen(&app, 160, 46).pop().unwrap();
+        assert!(bar.starts_with(" 2 MARKED "), "{bar}");
+        for keys in ["r return them", "m message them", "z park", "x backburner"] {
+            assert!(bar.contains(keys), "{keys}: {bar}");
+        }
+    }
+
+    #[test]
+    fn this_workspaces_free_trees_are_one_row_of_numbers_after_the_shelved() {
+        let mut app = panels();
+        app.trees[1].status = "available".into();
+        app.trees[1].name = "5".into();
+        let all = screen(&app, 160, 46).join("\n");
+        assert!(all.contains("free       ○ 5"), "{all}");
+        assert!(!all.contains("not leased"), "{all}");
     }
 
     #[test]

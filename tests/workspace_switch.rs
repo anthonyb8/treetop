@@ -433,3 +433,49 @@ fn the_panels_layout_opens_on_numbered_panels_and_number_keys_move_the_keys() {
     drop(screen);
     let _ = fs::remove_dir_all(&root);
 }
+
+/// ANB-103: in the panels layout `]` shows the next workspace's trees on
+/// [2] Trees at once, only to look at, and Enter switches there.
+#[test]
+fn a_bracket_shows_another_workspace_on_the_trees_panel_and_enter_switches_there() {
+    let Workspaces {
+        root, mut screen, ..
+    } = two_workspaces("tabs", "layout = \"panels\"\n");
+    screen.wait_on("here");
+    // There is listed once it has been opened: over with `w`, and back.
+    screen.press("w");
+    screen.press("j\r");
+    screen.wait_on("there");
+    screen.press("w");
+    screen.press("j\r");
+    screen.wait_on("here");
+    screen.wait_for("here's tree in the window", |text| {
+        text.contains("[0] Tree 1 · here-work")
+    });
+    screen.wait_for("both workspaces as tabs", |text| {
+        text.lines()
+            .any(|l| l.contains("[2] Trees") && l.contains("here") && l.contains("there"))
+    });
+
+    screen.press("]");
+    screen.wait_for("there's trees, only looked at", |text| {
+        text.contains("there-work") && text.contains("there is only looked at here")
+    });
+    // Still here: nothing switched, and here's tree is not on the panel.
+    assert!(
+        screen
+            .text()
+            .lines()
+            .last()
+            .unwrap()
+            .contains("treetop · here")
+    );
+
+    screen.press("\r");
+    screen.wait_on("there");
+    screen.wait_for("there's tree in the window", |text| {
+        text.contains("[0] Tree 1 · there-work")
+    });
+    drop(screen);
+    let _ = fs::remove_dir_all(&root);
+}

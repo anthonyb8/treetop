@@ -865,6 +865,10 @@ fn run(
                 app,
                 Rect::new(0, 0, size.width, size.height),
             ));
+            app.show_panels(ui::has_panels(
+                app,
+                Rect::new(0, 0, size.width, size.height),
+            ));
             let other = app
                 .other_chat()
                 .and_then(|(command, ..)| chats.running(&command));
@@ -1162,6 +1166,13 @@ fn run(
                     app.message = Some(format!("could not record it: {err}"));
                 }
             }
+            Outcome::Records(records) => {
+                for (path, record) in records {
+                    if let Err(err) = sidecar::write(&path, &record) {
+                        app.message = Some(format!("could not record it: {err}"));
+                    }
+                }
+            }
             Outcome::OpenUrl(url) => {
                 let opening = actions::open_url(&url);
                 app.message = Some(opening.said_now());
@@ -1252,6 +1263,8 @@ fn show(
     let mut here = Some(start);
     // What waits, as the last workspace looked, so `e` keeps its place.
     let mut watch = app::Watch::default();
+    // The panel with the keys in the panels layout, kept across a switch.
+    let mut panel = app::Panel::default();
     // What the desktop has been told of, kept across a switch too, so a
     // reminder still comes.
     let mut desktop = notify::Desktop::default();
@@ -1263,6 +1276,7 @@ fn show(
         workspaces::record(&checkout);
         let mut app = App::new(here.take());
         app.keep_watch(std::mem::take(&mut watch));
+        app.panel = panel;
         app.is_in_tmux = tmux::is_inside();
         app.checkout = checkout.clone();
         app.user = branch::user();
@@ -1293,6 +1307,7 @@ fn show(
         let exit = run(term, &mut app, &checkout, &mut desktop, &mut chats);
         desktop.switched();
         watch = app.take_watch();
+        panel = app.panel;
         // Leaving treetop takes what waits off tmux's status line; a switch
         // shows the next workspace's at once.
         if app.is_in_tmux && !matches!(exit, Ok(Exit::Switch(..))) {

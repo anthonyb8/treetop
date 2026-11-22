@@ -418,6 +418,15 @@ pub enum Zoom {
     Windows,
 }
 
+/// A workspace as a tab of [2] Trees in the panels layout: its name, its
+/// checkout, and how many of its trees wait on you.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceTab {
+    pub name: String,
+    pub checkout: PathBuf,
+    pub waiting: usize,
+}
+
 /// A numbered panel on the left of the panels layout, on its number key;
 /// the window on the right is 0.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -525,6 +534,8 @@ pub enum Outcome {
         path: PathBuf,
         record: Sidecar,
     },
+    /// Write each tree's record, as `Record` does for one.
+    Records(Vec<(PathBuf, Sidecar)>),
     /// Open `command`, agent `agent`'s chat in tree `tree`, in a popup over
     /// treetop until Ctrl+Q or until it exits.
     Chat {
@@ -773,6 +784,16 @@ pub struct App {
     /// In the panels layout, the panel on the left that has the keys while
     /// the window, [0], does not.
     pub panel: Panel,
+    /// The panels layout is on screen, as last drawn: the config asks for
+    /// it and the screen has room. Its keys and rows follow this, so a
+    /// screen too small for it keeps the table layout's.
+    pub is_panels_shown: bool,
+    /// In the panels layout, another workspace whose tab [2] Trees shows,
+    /// from its last read, until a key that acts switches there; None for
+    /// this one's.
+    pub viewing: Option<PathBuf>,
+    /// The tree under the cursor on that tab, among `viewed_trees`.
+    pub viewed: usize,
     /// The command palette, while Ctrl+P has it open.
     pub palette: Option<Palette>,
     /// In a double, the side of the window the cursor drives, the one that
@@ -983,8 +1004,21 @@ impl App {
     pub fn is_folded(&self, group: &Group) -> bool {
         match group {
             Group::Parked => !self.is_parked_open,
+            // One row of numbers in the panels layout, never opened.
+            Group::Free if self.shows_panels() => true,
             _ => self.folded.contains(group),
         }
+    }
+
+    /// The trees nobody holds, lowest numbered first.
+    pub fn free_trees(&self) -> Vec<&Tree> {
+        let mut free: Vec<&Tree> = self
+            .trees
+            .iter()
+            .filter(|t| self.group_of(t) == Some(Group::Free))
+            .collect();
+        free.sort_by_key(|t| (t.name.parse::<u32>().ok(), t.name.clone()));
+        free
     }
 
     fn toggle_fold(&mut self, group: &Group) {
@@ -1024,11 +1058,16 @@ impl App {
     pub fn rows(&self) -> Vec<ListRow<'_>> {
         let needle = self.filter.to_lowercase();
         let bases = self.bases_in_use();
+        // The panels layout puts the free trees last, after those shelved.
+        let is_panels = self.shows_panels();
+        let shelved = if is_panels {
+            [Group::Backburner, Group::Parked, Group::Free]
+        } else {
+            [Group::Backburner, Group::Free, Group::Parked]
+        };
         let rank = |group: &Group| match group {
             Group::Base(base) => bases.iter().position(|b| b == base).unwrap_or(0),
-            Group::Backburner => bases.len(),
-            Group::Free => bases.len() + 1,
-            Group::Parked => bases.len() + 2,
+            other => bases.len() + shelved.iter().position(|g| g == other).unwrap_or(0),
         };
         let mut trees: Vec<(Group, &Tree)> = self
             .trees
@@ -1042,11 +1081,10 @@ impl App {
             .iter()
             .find(|t| t.is_main)
             .and_then(|t| t.branch.clone());
-        let groups = bases.iter().map(|b| Group::Base(b.clone())).chain([
-            Group::Backburner,
-            Group::Free,
-            Group::Parked,
-        ]);
+        let groups = bases
+            .iter()
+            .map(|b| Group::Base(b.clone()))
+            .chain(shelved.clone());
         let mut rows = Vec::new();
         for group in groups {
             let members: Vec<&Tree> = trees
@@ -1125,6 +1163,9 @@ impl App {
     /// opens for it if folded, since its trees are worked on; Parked alone
     /// stays folded, its trees out of sight.
     fn toggle_shelf(&mut self, shelf: Shelf) -> Outcome {
+        if !self.marked.is_empty() {
+            return self.shelve_marked(shelf);
+        }
         let Some(tree) = self.current() else {
             return Outcome::Continue;
         };
@@ -1166,6 +1207,51 @@ impl App {
         self.selected = self.selected.min(last);
         self.reselect(Some(path.clone()));
         Outcome::Record { path, record }
+    }
+
+    /// Puts every marked tree on `shelf`, or brings them all back from it
+    /// when all of them are already there, and clears the marks. A marked
+    /// tree nobody holds, or the main checkout, is left as it is.
+    fn shelve_marked(&mut self, shelf: Shelf) -> Outcome {
+        let held: Vec<PathBuf> = self
+            .trees
+            .iter()
+            .filter(|t| self.marked.contains(&t.path) && t.is_held() && !t.is_main)
+            .map(|t| t.path.clone())
+            .collect();
+        self.marked.clear();
+        if held.is_empty() {
+            self.message = Some("none of the marked trees is leased".into());
+            return Outcome::Continue;
+        }
+        let record_of = |tree: &Tree| {
+            tree.sidecar
+                .as_deref()
+                .cloned()
+                .unwrap_or_else(Sidecar::leased_now)
+        };
+        let is_all_there = self
+            .trees
+            .iter()
+            .filter(|t| held.contains(&t.path))
+            .all(|t| record_of(t).shelf() == Some(shelf));
+        let to = (!is_all_there).then_some(shelf);
+        let mut records = Vec::new();
+        for tree in self.trees.iter_mut().filter(|t| held.contains(&t.path)) {
+            let mut record = record_of(tree);
+            record.shelve(to);
+            tree.sidecar = Some(Box::new(record.clone()));
+            records.push((tree.path.clone(), record));
+        }
+        let n = records.len();
+        self.message = Some(match to {
+            Some(Shelf::Parked) => format!("parked {n} trees; Z opens Parked"),
+            Some(Shelf::Backburner) => format!("{n} trees are on the Backburner"),
+            None => format!("{n} trees are back from {}", shelf.name()),
+        });
+        let last = self.rows().len().saturating_sub(1);
+        self.selected = self.selected.min(last);
+        Outcome::Records(records)
     }
 
     /// When the tree's agents last worked: their latest report, or what
@@ -1214,6 +1300,10 @@ impl App {
     /// The tree the window under the table shows: the one under the
     /// cursor, or the main checkout on its heading.
     pub fn window_tree(&self) -> Option<&Tree> {
+        // Another workspace's tab is only looked at: its trees open nothing.
+        if self.viewing.is_some() {
+            return None;
+        }
         self.current().or(self.main_under_cursor())
     }
 
@@ -1402,6 +1492,161 @@ impl App {
         Outcome::Continue
     }
 
+    /// Every workspace as a tab, this one among them, in name order so
+    /// stepping through them keeps its place; each with what waits there.
+    pub fn workspace_tabs(&self) -> Vec<WorkspaceTab> {
+        let waiting = crate::inbox::needs_action(self);
+        let count = |checkout: &std::path::Path| {
+            waiting
+                .iter()
+                .filter(|e| match &e.away {
+                    Some(away) => away.checkout == checkout,
+                    None => checkout == self.checkout,
+                })
+                .count()
+        };
+        let mut tabs: Vec<WorkspaceTab> = std::iter::once((
+            crate::workspaces::name(&self.checkout),
+            self.checkout.clone(),
+        ))
+        .chain(
+            self.pools
+                .iter()
+                .map(|p| (p.away.name.clone(), p.away.checkout.clone())),
+        )
+        .map(|(name, checkout)| WorkspaceTab {
+            waiting: count(&checkout),
+            name,
+            checkout,
+        })
+        .collect();
+        tabs.sort_by(|a, b| a.name.cmp(&b.name).then(a.checkout.cmp(&b.checkout)));
+        tabs
+    }
+
+    /// The held trees of the workspace whose tab is shown, while it is
+    /// another's, as its last read found them, else as its cache lists
+    /// them: those worked on first, then those shelved.
+    pub fn viewed_trees(&self) -> Option<Vec<&Tree>> {
+        let mut trees = self.viewed_pool()?;
+        trees.retain(|t| t.is_held());
+        // Worked on, then the Backburner, then Parked, as the table has them.
+        trees.sort_by_key(|t| match self.viewed_shelf(t) {
+            None => 0,
+            Some(Shelf::Backburner) => 1,
+            Some(Shelf::Parked) => 2,
+        });
+        Some(trees)
+    }
+
+    /// The free trees of the workspace whose tab is shown, lowest first.
+    pub fn viewed_free(&self) -> Vec<&Tree> {
+        let mut free = self.viewed_pool().unwrap_or_default();
+        free.retain(|t| !t.is_held());
+        free.sort_by_key(|t| (t.name.parse::<u32>().ok(), t.name.clone()));
+        free
+    }
+
+    /// Every tree of the workspace whose tab is shown but its main
+    /// checkout, in pool order.
+    fn viewed_pool(&self) -> Option<Vec<&Tree>> {
+        let checkout = self.viewing.as_ref()?;
+        let pool = self.pools.iter().find(|p| &p.away.checkout == checkout);
+        let trees: Vec<&Tree> = match self.away_live.get(checkout) {
+            Some(live) => live.iter().collect(),
+            None => pool.map(|p| p.trees.iter().collect()).unwrap_or_default(),
+        };
+        Some(trees.into_iter().filter(|t| !t.is_main).collect())
+    }
+
+    /// The shelf of a tree on another workspace's tab, for its heading.
+    pub fn viewed_shelf(&self, tree: &Tree) -> Option<Shelf> {
+        let checkout = self.viewing.as_ref()?;
+        tree.sidecar
+            .as_deref()
+            .or_else(|| {
+                self.pools
+                    .iter()
+                    .find(|p| &p.away.checkout == checkout)
+                    .and_then(|p| p.sidecars.get(&tree.path))
+            })
+            .and_then(Sidecar::shelf)
+    }
+
+    /// [2] Trees' keys for its tabs in the panels layout: `[` and `]` step
+    /// through the workspaces, and on another's tab the cursor moves among
+    /// its trees, Esc comes back, a key that acts switches there for real,
+    /// refused while an action runs, and the rest do nothing, so none acts
+    /// on a tree of this workspace's that is not on screen. None for a key
+    /// it leaves to the table.
+    fn handle_tab_key(&mut self, key: KeyEvent) -> Option<Outcome> {
+        let is_trees = self.shows_panels()
+            && self.panel == Panel::Trees
+            && !self.is_window_focused
+            && self.prompt.is_none()
+            && self.picker.is_none()
+            && self.port_menu.is_none()
+            && self.phone.is_none()
+            && self.scratch_menu.is_none()
+            && !self.is_notes_shown()
+            && !self.is_filtering
+            && !self.is_help
+            && self.reviews.is_empty()
+            && self.pending.is_none()
+            && self.shipping.is_none();
+        if !is_trees || !key.modifiers.is_empty() {
+            return None;
+        }
+        if let KeyCode::Char(step @ ('[' | ']')) = key.code {
+            let tabs = self.workspace_tabs();
+            let here = self.viewing.as_ref().unwrap_or(&self.checkout);
+            let at = tabs.iter().position(|t| &t.checkout == here).unwrap_or(0);
+            // The open workspace is always among them, so there is one.
+            let n = tabs.len();
+            let next = if step == ']' {
+                (at + 1) % n
+            } else {
+                (at + n - 1) % n
+            };
+            if let Some(tab) = tabs.get(next) {
+                self.viewing = (tab.checkout != self.checkout).then(|| tab.checkout.clone());
+                self.viewed = 0;
+                self.marked.clear();
+            }
+            return Some(Outcome::Continue);
+        }
+        let checkout = self.viewing.clone()?;
+        let last = self.viewed_trees().map_or(0, |t| t.len().saturating_sub(1));
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => self.viewed = (self.viewed + 1).min(last),
+            KeyCode::Char('k') | KeyCode::Up => self.viewed = self.viewed.saturating_sub(1),
+            KeyCode::Char('g') | KeyCode::Home => self.viewed = 0,
+            KeyCode::Char('G') | KeyCode::End => self.viewed = last,
+            KeyCode::Esc => self.viewing = None,
+            KeyCode::Enter | KeyCode::Char('l' | 'i' | 'n' | 'r' | 'm' | 'z' | 'x' | 't') => {
+                return Some(match self.active_jobs() {
+                    0 => {
+                        self.viewing = None;
+                        Outcome::Switch(checkout)
+                    }
+                    n => {
+                        self.message = Some(format!(
+                            "{n} action(s) still running here; switch once they finish"
+                        ));
+                        Outcome::Continue
+                    }
+                });
+            }
+            // What works anywhere still does: help, quit, the notifications,
+            // the assistant and the other screens.
+            // `:` is left out: it asks about the tree under this workspace's
+            // cursor, which is not the one shown.
+            KeyCode::Char('?' | 'q' | 'e' | 'w' | 'A' | 'C') | KeyCode::Tab => return None,
+            _ => {}
+        }
+        Some(Outcome::Continue)
+    }
+
     /// In the panels layout, a number key from the table or a window in
     /// Normal: 1 to 4 give the keys to that panel, 0 to the window, as
     /// lazygit numbers its panels, so they win over the PR tab's own 1 to 4,
@@ -1422,7 +1667,7 @@ impl App {
             || !self.reviews.is_empty()
             || self.pending.is_some()
             || self.shipping.is_some();
-        if self.look != crate::config::Look::Panels || !key.modifiers.is_empty() || is_taken {
+        if !self.shows_panels() || !key.modifiers.is_empty() || is_taken {
             return false;
         }
         match Panel::ALL
@@ -1434,8 +1679,16 @@ impl App {
                 self.is_inserting = false;
                 self.is_usage_focused = false;
                 self.panel = panel;
+                // Another workspace's tab is [2]'s alone: leaving it comes
+                // back, so no key acts on a tree here that is not shown.
+                if panel != Panel::Trees {
+                    self.viewing = None;
+                }
             }
-            None if !self.is_window_focused => self.cycle_keys(),
+            None if !self.is_window_focused => {
+                self.viewing = None;
+                self.cycle_keys();
+            }
             None => {}
         }
         true
@@ -1445,7 +1698,7 @@ impl App {
     /// a window with the keys, or zooms back out.
     pub fn toggle_zoom(&mut self, what: Zoom) {
         // The panels layout has no zoom yet: its panels and window stay put.
-        if self.look == crate::config::Look::Panels {
+        if self.shows_panels() {
             return;
         }
         self.zoom = match self.zoom {
@@ -1459,7 +1712,7 @@ impl App {
     /// tree down; or back to one, keeping the window that had the keys.
     pub fn toggle_double(&mut self) {
         // The panels layout shows one tree in its window, for now.
-        if self.look == crate::config::Look::Panels {
+        if self.shows_panels() {
             return;
         }
         // A double whose other tree has left the pool counts as none, so
@@ -1578,6 +1831,20 @@ impl App {
 
     /// Takes whether the Usage column is on screen as just drawn; gone, it
     /// gives up the keys to the table.
+    /// The panels layout is drawn, rather than the table layout it falls
+    /// back to on a small screen; another workspace's tab ends without it.
+    pub fn show_panels(&mut self, is_shown: bool) {
+        self.is_panels_shown = is_shown;
+        if !is_shown {
+            self.viewing = None;
+        }
+    }
+
+    /// The panels layout is what is on screen.
+    pub fn shows_panels(&self) -> bool {
+        self.look == crate::config::Look::Panels && self.is_panels_shown
+    }
+
     pub fn show_usage(&mut self, is_shown: bool) {
         self.is_usage_shown = is_shown;
         if !is_shown {
@@ -3024,6 +3291,7 @@ impl App {
 
     /// Opens `entry`, as Enter on its tree's row would.
     fn go_to(&mut self, entry: crate::inbox::Entry) -> Outcome {
+        self.viewing = None;
         self.is_window_focused = false;
         self.is_inserting = false;
         if let Some(away) = entry.away {
@@ -3861,7 +4129,16 @@ impl App {
     /// a free one is leased for it, a held one keeps its branch. On the main
     /// checkout's heading it starts there, on whatever it has checked out.
     fn open_start(&mut self) {
-        let Some(tree) = self.current().or(self.main_under_cursor()).cloned() else {
+        // On the panels layout's row of free trees, the lowest numbered.
+        let free = (self.shows_panels() && self.current_heading() == Some(Group::Free))
+            .then(|| self.free_trees().first().copied())
+            .flatten();
+        let Some(tree) = self
+            .current()
+            .or(self.main_under_cursor())
+            .or(free)
+            .cloned()
+        else {
             return;
         };
         if self.jobs.get(&tree.path).is_some_and(|s| s.is_active()) {
@@ -4612,6 +4889,9 @@ impl App {
         if self.focus_by_number(key) {
             return Outcome::Continue;
         }
+        if let Some(outcome) = self.handle_tab_key(key) {
+            return outcome;
+        }
         if self.view.is_some() && self.has_keys_on(WindowTab::Diff) {
             return self.handle_view_key(key);
         }
@@ -5018,6 +5298,9 @@ mod tests {
         assert_eq!(app.panel, Panel::Trees, "the table layout has no panels");
         app.look = crate::config::Look::Panels;
         press(&mut app, KeyCode::Char('3'));
+        assert_eq!(app.panel, Panel::Trees, "nor a screen too small for them");
+        app.show_panels(true);
+        press(&mut app, KeyCode::Char('3'));
         assert_eq!((app.panel, app.is_window_focused), (Panel::Ship, false));
         press(&mut app, KeyCode::Char('0'));
         assert!(app.is_window_focused, "0 gives the window the keys");
@@ -5031,6 +5314,148 @@ mod tests {
         assert_eq!((app.panel, app.filter.as_str()), (Panel::Trees, "1"));
     }
 
+    use crate::inbox::tests::with_workspaces;
+
+    #[test]
+    fn brackets_step_the_workspaces_in_name_order_and_show_another_only_to_look_at() {
+        let mut app = with_workspaces();
+        // This workspace's cursor on a tree, which the window would open.
+        app.reselect(Some(app.trees[0].path.clone()));
+        assert!(app.window_tree().is_some());
+        let names = |app: &App| -> Vec<String> {
+            app.workspace_tabs().into_iter().map(|t| t.name).collect()
+        };
+        assert_eq!(names(&app), ["api", "main-app", "zeta"]);
+        press(&mut app, KeyCode::Char(']'));
+        assert_eq!(app.viewing, Some(PathBuf::from("/code/zeta")));
+        assert_eq!(app.window_tree(), None, "nothing of this workspace opens");
+        let shown: Vec<_> = app
+            .viewed_trees()
+            .unwrap()
+            .iter()
+            .map(|t| t.name.clone())
+            .collect();
+        assert_eq!(shown, ["1"]);
+        assert_eq!(app.viewed_free().len(), 1);
+        // Past the last it wraps to the first, and back home.
+        press(&mut app, KeyCode::Char(']'));
+        assert_eq!(app.viewing, Some(PathBuf::from("/code/api")));
+        press(&mut app, KeyCode::Char(']'));
+        assert_eq!(app.viewing, None);
+        press(&mut app, KeyCode::Char('['));
+        assert_eq!(app.viewing, Some(PathBuf::from("/code/api")));
+    }
+
+    #[test]
+    fn on_another_workspaces_tab_only_a_key_that_acts_does_anything_and_it_switches() {
+        let mut app = with_workspaces();
+        // This workspace's cursor on a tree, hidden while another is shown.
+        app.reselect(Some(app.trees[0].path.clone()));
+        press(&mut app, KeyCode::Char(']'));
+        // A key that acts on this workspace's trees does nothing here: not
+        // its diff, nor renaming its branch.
+        for key in ['D', 'b'] {
+            assert_eq!(press(&mut app, KeyCode::Char(key)), Outcome::Continue);
+        }
+        assert!(app.view.is_none() && app.prompt.is_none() && app.pending.is_none());
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('n')),
+            Outcome::Switch(path) if path == std::path::Path::new("/code/zeta")
+        ));
+        assert_eq!(app.viewing, None);
+        // Esc comes back; so does leaving [2] for another panel.
+        press(&mut app, KeyCode::Char(']'));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.viewing, None);
+        press(&mut app, KeyCode::Char(']'));
+        press(&mut app, KeyCode::Char('3'));
+        assert_eq!(app.viewing, None, "no other panel shows another workspace");
+        // A screen too small for the panels keeps the table's keys.
+        app.panel = Panel::Trees;
+        app.show_panels(false);
+        press(&mut app, KeyCode::Char(']'));
+        assert_eq!(app.viewing, None);
+    }
+
+    #[test]
+    fn another_workspaces_tab_will_not_switch_while_an_action_runs_here() {
+        let mut app = with_workspaces();
+        app.reselect(Some(app.trees[0].path.clone()));
+        press(&mut app, KeyCode::Char('r'));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.active_jobs() > 0, "a return runs");
+        press(&mut app, KeyCode::Char(']'));
+        assert_eq!(press(&mut app, KeyCode::Enter), Outcome::Continue);
+        assert!(
+            app.message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("still running here"),
+            "{:?}",
+            app.message
+        );
+        assert!(app.viewing.is_some(), "the tab stays shown");
+    }
+
+    #[test]
+    fn marked_trees_are_shelved_together_and_come_back_together() {
+        let mut app = crate::inbox::tests::app();
+        let two: Vec<PathBuf> = app.trees[..2].iter().map(|t| t.path.clone()).collect();
+        let shelve = |app: &mut App| {
+            app.marked.extend(two.iter().cloned());
+            let Outcome::Records(records) = press(app, KeyCode::Char('z')) else {
+                panic!("one record each");
+            };
+            assert!(app.marked.is_empty(), "the marks clear");
+            let mut paths: Vec<_> = records.iter().map(|(p, _)| p.clone()).collect();
+            paths.sort();
+            let mut want = two.clone();
+            want.sort();
+            assert_eq!(paths, want);
+            records
+                .into_iter()
+                .map(|(_, r)| r.shelf())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shelve(&mut app), [Some(Shelf::Parked); 2]);
+        assert_eq!(shelve(&mut app), [None; 2], "all parked, so all come back");
+    }
+
+    #[test]
+    fn n_on_the_panels_row_of_free_trees_starts_in_the_lowest() {
+        let mut app = crate::inbox::tests::app();
+        for (tree, name) in app.trees.iter_mut().take(2).zip(["12", "3"]) {
+            tree.status = "available".into();
+            tree.name = name.into();
+        }
+        app.look = crate::config::Look::Panels;
+        app.show_panels(true);
+        app.selected = app
+            .rows()
+            .iter()
+            .position(|r| {
+                matches!(
+                    r,
+                    ListRow::Heading {
+                        group: Group::Free,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert!(
+            !app.rows()
+                .iter()
+                .any(|r| matches!(r, ListRow::Tree(t) if !t.is_held())),
+            "the free trees are one row"
+        );
+        press(&mut app, KeyCode::Char('n'));
+        let Some(crate::dispatch::Purpose::Start { tree }) = app.prompt.map(|p| p.purpose) else {
+            panic!("n starts an agent");
+        };
+        assert_eq!(tree.name, "3");
+    }
+
     #[test]
     fn the_panels_layout_has_no_zoom_or_double_yet() {
         // On a tree, so the table layout opens both and only the layout
@@ -5042,6 +5467,7 @@ mod tests {
             let mut app = crate::inbox::tests::app();
             app.reselect(Some(app.trees[0].path.clone()));
             app.look = look;
+            app.show_panels(true);
             app.toggle_zoom(Zoom::Table);
             app.toggle_double();
             assert_eq!(
