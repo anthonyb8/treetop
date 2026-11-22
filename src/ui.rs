@@ -126,6 +126,98 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
     ),
 ];
 
+/// The same for the panels layout, whose keys differ: its panels, the
+/// workspaces' tabs and Plan in place of the table's windows and zoom.
+const PANELS_HELP: [(&str, &[(&str, &str)]); 8] = [
+    (
+        "Agents",
+        &[
+            ("Enter l", "open, fold heading"),
+            ("i", "type to agent"),
+            ("i Enter", "Insert in window"),
+            ("^Q", "window, Normal, panel"),
+            ("1-9", "answer its question"),
+            ("w", "next waiting"),
+            ("n", "new agent here"),
+            ("N", "agent in new tree"),
+            ("m", "message agents"),
+            (":", "ask the assistant"),
+            ("A", "assistant's chat"),
+            ("R", "resume agent"),
+            ("H", "hand off work"),
+            ("e", "notifications"),
+            ("^P", "command palette"),
+        ],
+    ),
+    (
+        "Panels",
+        &[
+            ("0", "the window"),
+            ("1-4", "a panel"),
+            ("M-j M-k", "window, panel"),
+            ("[ ]", "workspaces, window tabs"),
+            ("j k", "move"),
+            ("g G", "top, bottom"),
+            ("d u", "half page in a window"),
+        ],
+    ),
+    (
+        "Trees",
+        &[
+            ("t", "go to tree"),
+            ("D", "diff vs base"),
+            ("Space", "mark"),
+            ("r", "return tree"),
+            ("x X", "backburner, fold it"),
+            ("z Z", "park, fold Parked"),
+            ("b", "rename branch"),
+            ("/", "filter"),
+            ("Esc", "clear filter, marks"),
+        ],
+    ),
+    (
+        "Plan",
+        &[
+            ("n", "new planning chat"),
+            ("D S", "draft, create issues"),
+            ("p", "pick an issue up"),
+            ("1-3", "its panels"),
+        ],
+    ),
+    (
+        "Ports",
+        &[
+            ("o", "open in browser"),
+            ("p", "share to phone"),
+            ("P", "public link"),
+            ("Q", "show share code"),
+        ],
+    ),
+    (
+        "Ship",
+        &[
+            ("S", "ship branch"),
+            ("v", "view PR"),
+            ("O", "open PR"),
+            ("F", "send CI failures"),
+            ("M", "merge, from Ship"),
+        ],
+    ),
+    (
+        "Screens",
+        &[("Tab", "Plan, Issues"), ("I", "tree's plan, issue")],
+    ),
+    (
+        "treetop",
+        &[
+            ("C", "scratch chats"),
+            ("U", "update treetop"),
+            ("?", "this help"),
+            ("q", "quit"),
+        ],
+    ),
+];
+
 /// How many of HELP's groups go down each column of the `?` overlay, left
 /// to right, so the columns come out about as tall as each other. Where
 /// four do not fit, neighbours share a column: two, else one.
@@ -343,7 +435,11 @@ pub fn draw(
     } else if let Some(pending) = &app.pending {
         draw_confirm(frame, pending);
     } else if app.is_help {
-        draw_help(frame, &HELP);
+        if app.shows_panels() {
+            draw_help(frame, &PANELS_HELP);
+        } else {
+            draw_help(frame, &HELP);
+        }
     } else if app.is_notes_shown() {
         draw_notes(frame, app);
     }
@@ -9426,6 +9522,37 @@ mod panels_tests {
         assert!(
             top.contains("api ▲1") && top.trim_end().ends_with('…'),
             "{top}"
+        );
+    }
+
+    #[test]
+    fn the_help_in_the_panels_is_theirs_and_in_the_table_layout_its_own() {
+        let mut app = panels();
+        app.is_help = true;
+        let shown = screen(&app, 220, 60).join("\n");
+        for (key, does) in [
+            ("0", "the window"),
+            ("1-4", "a panel"),
+            ("[ ]", "workspaces"),
+            ("w", "next waiting"),
+            ("Tab", "Plan, Issues"),
+            ("M", "merge"),
+            ("D S", "draft, create issues"),
+        ] {
+            assert!(
+                shown.contains(&format!(" {key:<7} {does}")),
+                "{key} {does}:\n{shown}"
+            );
+        }
+        for gone in ["two windows", "zoom table", "switch workspace"] {
+            assert!(!shown.contains(gone), "{gone}:\n{shown}");
+        }
+        app.look = Look::Table;
+        app.show_panels(false);
+        let shown = screen(&app, 220, 60).join("\n");
+        assert!(
+            shown.contains("zoom table") && !shown.contains("next waiting"),
+            "{shown}"
         );
     }
 

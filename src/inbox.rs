@@ -491,7 +491,35 @@ pub fn answered_keys(app: &App) -> Vec<String> {
     read.filter(|t| !t.agents.iter().any(|a| a.status == Some(Status::Waiting)))
         .map(|t| key(Kind::NeedsYou, &t.path, AT_A_PROMPT))
         .filter(|k| app.put_away.contains(k))
+        .chain(recovered_keys(app))
         .collect()
+}
+
+/// The keys put away of failed PRs, whose PR, as last read, is past that
+/// failure: failing again, with the same line, is a new one. A PR not read
+/// says nothing either way.
+fn recovered_keys(app: &App) -> Vec<String> {
+    app.trees
+        .iter()
+        .chain(app.away_live.values().flatten())
+        .filter(|t| {
+            t.ship
+                .as_ref()
+                .is_some_and(|s| pr_kind(s.stage) != Some(Kind::Failed))
+        })
+        .flat_map(|t| {
+            app.put_away
+                .iter()
+                .filter(|k| is_key_of(k, Kind::Failed, &t.path))
+                .cloned()
+        })
+        .collect()
+}
+
+/// `key` is one put away of `kind` in the tree at `path`.
+pub fn is_key_of(key: &str, kind: Kind, path: &Path) -> bool {
+    key.strip_prefix(&format!("{kind:?} {} ", path.display()))
+        .is_some()
 }
 
 /// The entries put away as they stand, which leave the notifications.
@@ -921,13 +949,13 @@ pub mod tests {
             Outcome::SwitchTo {
                 checkout: "/code/endodeals-web".into(),
                 tree: "/other/12/web".into(),
-                kind: Kind::NeedsYou,
+                kind: Some(Kind::NeedsYou),
             }
         );
 
         // The pool of endodeals-web, as the switch opens it.
         let mut there = App::new(None);
-        there.arriving = Some(("/other/12/web".into(), Kind::NeedsYou));
+        there.arriving = Some(("/other/12/web".into(), Some(Kind::NeedsYou)));
         there.trees = vec![tree(
             "/other/12/web",
             "12",
@@ -1043,7 +1071,7 @@ pub mod tests {
                 matches!(
                     o,
                     Outcome::SwitchTo {
-                        kind: Kind::Failed,
+                        kind: Some(Kind::Failed),
                         ..
                     }
                 )
@@ -1051,7 +1079,7 @@ pub mod tests {
             Outcome::SwitchTo {
                 checkout: "/code/endodeals-web".into(),
                 tree: "/other/7/web".into(),
-                kind: Kind::Failed,
+                kind: Some(Kind::Failed),
             }
         );
 
@@ -1059,7 +1087,7 @@ pub mod tests {
         let mut there = App::new(None);
         there.trees = vec![tree("/other/7/web", "7", "me/END-91-fix-login", Vec::new())];
         there.is_agents_read = true;
-        there.arriving = Some(("/other/7/web".into(), Kind::Failed));
+        there.arriving = Some(("/other/7/web".into(), Some(Kind::Failed)));
         assert_eq!(there.arrival(), None, "no chat opens for a PR");
         assert_eq!(there.current().map(|t| t.name.as_str()), Some("7"));
         assert!(
@@ -1101,7 +1129,7 @@ pub mod tests {
             there.is_in_tmux = is_in_tmux;
             there.trees = vec![tree("/other/5/web", "5", "me/seo-meta", vec![pane.clone()])];
             there.is_agents_read = true;
-            there.arriving = Some(("/other/5/web".into(), Kind::NeedsYou));
+            there.arriving = Some(("/other/5/web".into(), Some(Kind::NeedsYou)));
             (there.arrival(), there.message)
         };
         assert!(matches!(arrive(true).0, Some(Outcome::Enter(t)) if t.name == "5"));

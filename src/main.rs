@@ -357,7 +357,7 @@ enum Exit {
     Quit,
     /// Show the pool of the repository checked out here instead, and open
     /// what waits in the tree at the second path, once it is read.
-    Switch(PathBuf, Option<(PathBuf, inbox::Kind)>),
+    Switch(PathBuf, Option<(PathBuf, Option<inbox::Kind>)>),
     /// Start the treetop installed over this one, on this workspace.
     Restart,
 }
@@ -644,8 +644,10 @@ fn run(
                 }
                 Ok(chat) => {
                     app.opening = None;
-                    // A planning chat joins the Plan screen's list.
+                    // A planning chat joins the Plan screen's list, and goes
+                    // under its cursor.
                     if app.is_plan {
+                        app.plan_wanted = Some(chat.job.clone());
                         app.open_plan(scratch::planning(checkout));
                     }
                     open_chat(
@@ -742,6 +744,7 @@ fn run(
             open_chat(term, app, chats, &command, agent, tree)?;
             is_stale = true;
         }
+        app.land_pick();
         // What waits in another workspace, gone to from here, opens its
         // agent once the pool is read, before any ask takes the screen.
         if !chat_has_keys(chats, app) {
@@ -938,6 +941,7 @@ fn run(
             is_stale = true;
         }
         for (agent, tree, _) in &pumped.failed {
+            app.unsent(tree);
             app.handoff_unsent(agent, tree);
         }
         if let Some((agent, _)) = &pumped.kept {
