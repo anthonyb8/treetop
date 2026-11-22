@@ -2093,11 +2093,17 @@ fn panel_keys(app: &App) -> &'static [(&'static str, &'static str)] {
         ];
     }
     if app.is_window_focused && !matches!(app.shown_tab(), WindowTab::Chat | WindowTab::Shell) {
-        return &[("[ ]", "tabs"), ("Esc", "back"), ("1-4", "panels")];
+        return &[
+            ("w", "next waiting"),
+            ("[ ]", "tabs"),
+            ("Esc", "back"),
+            ("1-4", "panels"),
+        ];
     }
     if app.is_window_focused {
         return &[
             ("i", "insert"),
+            ("w", "next waiting"),
             ("[ ]", "tabs"),
             ("Esc", "back"),
             ("1-4", "panels"),

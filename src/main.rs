@@ -537,6 +537,7 @@ fn run(
             snapshot::write(checkout, &status);
         }
         if let Some(Outcome::Send { to, text }) = app.ready_failure() {
+            app.note_sent(&to, &text);
             send(term, app, chats, &worker, to, &text)?;
             refresher.refresh_ship();
         }
@@ -1507,6 +1508,12 @@ fn show(
             app.keep_asked_in(file);
         }
         app.look = config::load().map(|c| c.layout).unwrap_or_default();
+        // As the first draw will have it, so the cursor is placed by it.
+        let size = term.size()?;
+        app.show_panels(ui::has_panels(
+            &app,
+            Rect::new(0, 0, size.width, size.height),
+        ));
         // For the planning chats' count on every screen.
         app.plan_chats = scratch::planning(&checkout);
         // The panels layout shows one tree, so a double kept from the table

@@ -42,7 +42,7 @@ Run `treetop` from anywhere inside a pooled repository; run anywhere else, it op
 treetop opens on the Trees screen, laid out in numbered panels down the left, with the tree under the cursor in a window on the right, [0]: [1] Waiting, [2] Trees, which holds the table, [3] Ship and [4] News.
 Its top row has the three screens, Trees, Plan and Issues, with `▲` and how many planning chats ask you by Plan, and at its right every workspace with how many wait on you there, `▲2`, or `✓`.
 The number keys give a panel the keys, from a panel or the window in Normal, and 0 gives them to the window; the bar names the panel with the keys, such as `PANEL 2`, and shows its keys.
-[1] Waiting lists what needs you in every workspace, the oldest first: an agent asking, wanting permission or dead, or a PR whose checks failed, each with where it is and how long it has waited; Enter opens it, another workspace's switched to first, and `w` from the panels opens the next one; a key that acts on a tree, such as `F` or `r`, acts on the item's, gone to first where it is in another workspace. When the window's agent shows a question with choices, its bottom border offers them on the number keys, and pressing one answers it and takes it off the list; so does typing an answer and Enter in the chat, and sending a failure with `F` or resuming with `R` takes what waited off the list at once too, until it fails again or could not be sent.
+[1] Waiting lists what needs you in every workspace, the oldest first: an agent asking, wanting permission or dead, or a PR whose checks failed, each with where it is and how long it has waited; Enter opens it, another workspace's switched to first, and `w` from the panels or a window in Normal opens the next one; a key that acts on a tree, such as `F` or `r`, acts on the item's, gone to first where it is in another workspace. When the window's agent shows a question with choices, its bottom border offers them on the number keys, and pressing one answers it and takes it off the list; so does typing an answer and Enter in the chat, and sending a failure with `F` or resuming with `R` takes what waited off the list at once too, until it fails again or could not be sent.
 [3] Ship lists the PRs of the workspace [2]'s tab shows, with the key that moves each on: `F` sends a failure to its agent, `M` asks an approved PR's agent to `/merge squash` it, `r` returns a merged or closed one's tree, that tree alone whatever is marked, and `S` shows a ship run waiting on you; `v` shows the PR, and the window follows the PR under its cursor to its tree.
 [4] News keeps what happened, newest first, each with the time by the clock, for as long as treetop runs, whatever keys go by: what started waiting, failed, died, finished or merged in any workspace, what you sent an agent, and what an action came to; `j`, `k`, `g` and `G` scroll it, and Enter goes to what a line is about.
 [2] Trees shows one workspace at a time, every workspace a tab in its title in name order, with `▲` and how many wait on you there; `[` and `]` step through them, showing another workspace at once from its last read, only to look at: Esc comes back, and Enter, or any key that acts on a tree, such as `n`, `r` or `z`, switches there, to the tree under the cursor.
@@ -91,7 +91,7 @@ On a screen under 120 columns or 31 rows the table layout shows instead, the tab
 | `H` | hand the work of the tree's agent to a new agent in the same tree, on a handoff the old one writes and you read over first (see [Handoffs](#handoffs)) |
 | `S` | start a ship run of the tree's branch, such as no-mistakes', after a dialog; on a run under way, show it |
 | `b` | rename the branch of the tree under the cursor |
-| `w` | from the panels, open the next thing waiting on you, as [1] Waiting lists them; from a window in Normal, or the table in the table layout, switch to another workspace: the pool of another repository treetop has been opened in |
+| `w` | open the next thing waiting on you, as [1] Waiting lists them, from the panels or a window in Normal; in the table layout, switch to another workspace: the pool of another repository treetop has been opened in |
 | `C` | scratch chats, tied to no tree: start one, open one, or delete one (see [Scratch chats](#scratch-chats)) |
 | Tab | go on to the next screen, Trees, Plan, then Issues, and from Issues back to Trees; in the table layout, to the Issues screen and back (see [Issues](#issues)) |
 | `j` `k`, `g` `G` | move; the arrows do nothing on the table |
@@ -513,7 +513,7 @@ In the panels layout the bar lists the keys of what has them; in the table layou
 `[` and `]`, or `←` and `→`, step through the window's tabs, from a chat as from any other.
 `j` and `k` scroll a line and `d` and `u` half a page, on the chat's history as on the diff and the PR, whose other keys work as ever.
 `i` or Enter on a chat or shell starts Insert.
-`w` opens the workspaces from any tab, giving the keys back to the panels, or the table in the table layout.
+`w` opens the next thing waiting on you from any tab, or the workspaces in the table layout, giving the keys back to the table.
 `1` to `4` give the keys to that panel, as from the panels.
 Esc, `q`, Alt+K or Ctrl+Q gives the keys back to the panel that had them, or the table in the table layout; with two windows, Ctrl+Q moves them on to the other one first.
 Alt+H, Alt+J, Alt+K and Alt+L move the keys as vim's Ctrl+W does between its windows: Alt+K back to the panels or up to the table, Alt+J from there into the window, and in the table layout with two windows Alt+H and Alt+L to the left one and the right one.
@@ -722,7 +722,7 @@ Inside tmux it needs `allow-passthrough` set to `all` (`tmux set -g allow-passth
 Another workspace's entries carry its name, such as `keel:3`, and opening one switches there first; an agent with no chat, such as `claude` in a tmux pane, is gone to inside tmux, as `t` does.
 Its background agents are placed in their trees by the workspace's last listing; its agents waiting at a prompt in a tmux pane, and those that died, come from a read of its pool as often as the open workspace's agents are read, every few seconds, and its PRs that failed from a read every three minutes, since that runs its ship plugins, for the workspaces opened in the last week.
 With only one workspace nothing extra is read.
-The workspaces picker, `w` from a window in Normal or the table in the table layout, counts what waits in each workspace after its held trees, `●` for what needs you and `✗` for what failed.
+The workspaces picker, `w` in the table layout, counts what waits in each workspace after its held trees, `●` for what needs you and `✗` for what failed.
 
 ### The info tab
 
@@ -854,7 +854,7 @@ prompt = "Work on {id}: {title}\n\n{description}\n\n{url}"
 ## Workspaces
 
 A workspace is a repository with a treehouse pool, shown by its main checkout.
-`w`, from a window in Normal, or the table in the table layout, opens a list of every repository treetop has been opened in, most recent first, with how many trees each holds and the one on screen marked; the cursor starts on the last other one, so `w` and Enter go back and forth between two.
+In the panels `[` and `]` on [2] Trees go through every workspace; in the table layout `w` opens a list of every repository treetop has been opened in, most recent first, with how many trees each holds and the one on screen marked; the cursor starts on the last other one, so `w` and Enter go back and forth between two.
 Enter or `l` switches the whole screen to that pool, Esc or `h` closes the list, and the badge at the end of the bottom bar names the workspace on screen.
 
 treetop adds a repository to the list the first time it is opened there, so run it once in each pooled repository to make it a workspace.

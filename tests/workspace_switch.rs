@@ -962,30 +962,28 @@ fn n_on_plan_opens_the_chat_it_started_not_the_one_under_the_cursor() {
     let _ = fs::remove_dir_all(&root);
 }
 
-/// A second tree, 2, on `branch`, in the pool of the workspace `name`, in
-/// its cached listing and what the stand-in treehouse says.
-fn add_tree(root: &Path, name: &str, branch: &str) {
+/// Another tree, `number`, in the pool of the workspace `name`, in its cached
+/// listing and what the stand-in treehouse says: held on `branch`, or free.
+fn add_tree(root: &Path, name: &str, number: &str, branch: Option<&str>) {
     let checkout = root.join(name);
-    let tree = root.join(format!("{name}-trees/2"));
-    git(
-        &checkout,
-        &[
-            "worktree",
-            "add",
-            "-q",
-            "-b",
-            branch,
-            tree.to_str().unwrap(),
-        ],
-    );
+    let tree = root.join(format!("{name}-trees/{number}"));
+    let path = tree.to_str().unwrap();
+    match branch {
+        Some(branch) => git(&checkout, &["worktree", "add", "-q", "-b", branch, path]),
+        None => git(&checkout, &["worktree", "add", "-q", "--detach", path]),
+    }
     let cache = root.join(format!("cache/treetop/{}.json", cache_key(&checkout)));
     let before = fs::read_to_string(&cache).unwrap();
     let mut trees: serde_json::Value = serde_json::from_str(&before).unwrap();
-    let mut second = trees[0].clone();
-    second["name"] = "2".into();
-    second["branch"] = branch.into();
-    second["path"] = tree.to_str().unwrap().into();
-    trees.as_array_mut().unwrap().push(second);
+    let mut added = trees[0].clone();
+    added["name"] = number.into();
+    added["branch"] = branch.into();
+    added["path"] = path.into();
+    if branch.is_none() {
+        added["status"] = "available".into();
+        added["lease_holder"] = serde_json::Value::Null;
+    }
+    trees.as_array_mut().unwrap().push(added);
     fs::write(&cache, trees.to_string()).unwrap();
     let stub = root.join("bin/treehouse");
     let said = fs::read_to_string(&stub).unwrap();
@@ -1004,7 +1002,7 @@ fn enter_on_another_workspaces_tree_lands_on_it() {
     let Workspaces {
         root, mut screen, ..
     } = two_workspaces("land", "");
-    add_tree(&root, "there", "there-second");
+    add_tree(&root, "there", "2", Some("there-second"));
     screen.wait_for("the panels", |text| text.contains("[2] Trees"));
     // Away and back, so there's listing is read with its second tree.
     screen.press("]");
@@ -1089,6 +1087,9 @@ esac
     });
     screen.press("3");
     screen.press("F");
+    screen.wait_for("what was sent, in News", |text| {
+        text.contains("you: CI failed on") && text.contains("→ here-work")
+    });
     screen.wait_for("the send failing", |text| {
         text.contains("not sent to fixer in 1")
     });
@@ -1154,6 +1155,56 @@ fn a_planning_chat_left_starting_joins_the_list_on_plan() {
     });
     screen.press("\r");
     screen.wait_for("its chat", |text| text.contains("chat new1 is open"));
+    drop(screen);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// ANB-103: Enter on another workspace's parked tree lands on it too.
+#[test]
+fn enter_on_another_workspaces_parked_tree_lands_on_it() {
+    let Workspaces {
+        root, mut screen, ..
+    } = two_workspaces("land-shelf", "");
+    add_tree(&root, "there", "2", Some("there-second"));
+    add_tree(&root, "there", "3", None);
+    let git_dir = Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--git-dir"])
+        .current_dir(root.join("there-trees/2"))
+        .output()
+        .unwrap();
+    let git_dir = PathBuf::from(String::from_utf8(git_dir.stdout).unwrap().trim());
+    fs::write(
+        git_dir.join("treetop.json"),
+        serde_json::json!({ "version": 1, "parked": true, "leased_at": 1 }).to_string(),
+    )
+    .unwrap();
+    screen.wait_for("the panels", |text| text.contains("[2] Trees"));
+    // Away and back, so there's listing is read with its second tree.
+    screen.press("]");
+    screen.wait_for("there's trees", |text| text.contains("there-work"));
+    screen.press("\r");
+    screen.wait_on("there");
+    screen.wait_for("its parked tree, under Parked", |text| {
+        text.contains("there-second") && text.contains("▾      parked ")
+    });
+    screen.press("]");
+    screen.wait_for("here's trees", |text| text.contains("here-work"));
+    screen.press("\r");
+    screen.wait_on("here");
+    screen.press("]");
+    screen.wait_for("there's trees again", |text| text.contains("there-second"));
+    screen.press("j");
+    screen.press("\r");
+    screen.wait_on("there");
+    screen.wait_for("tree 2 in the window", |text| {
+        text.contains("[0] Tree 2 · there-second")
+    });
+    std::thread::sleep(Duration::from_secs(5));
+    assert!(
+        screen.text().contains("[0] Tree 2 · there-second"),
+        "{}",
+        screen.text()
+    );
     drop(screen);
     let _ = fs::remove_dir_all(&root);
 }

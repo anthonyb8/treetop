@@ -1138,6 +1138,15 @@ impl App {
         })
     }
 
+    /// What `Z` does to Parked as it stands.
+    fn says_parked(&self) -> &'static str {
+        if self.is_folded(&Group::Parked) {
+            "Z opens Parked"
+        } else {
+            "Z folds Parked"
+        }
+    }
+
     /// Folds Parked, or opens it again.
     fn toggle_parked(&mut self) {
         if self.shows_panels() {
@@ -1337,7 +1346,7 @@ impl App {
         let to = (record.shelf() != Some(shelf)).then_some(shelf);
         record.shelve(to);
         self.message = Some(match to {
-            Some(Shelf::Parked) => format!("parked tree {name}; Z opens Parked"),
+            Some(Shelf::Parked) => format!("parked tree {name}; {}", self.says_parked()),
             Some(Shelf::Backburner) => format!("tree {name} is on the Backburner"),
             None => format!("tree {name} is back from {}", shelf.name()),
         });
@@ -1395,7 +1404,7 @@ impl App {
         }
         let n = records.len();
         self.message = Some(match to {
-            Some(Shelf::Parked) => format!("parked {n} trees; Z opens Parked"),
+            Some(Shelf::Parked) => format!("parked {n} trees; {}", self.says_parked()),
             Some(Shelf::Backburner) => format!("{n} trees are on the Backburner"),
             None => format!("{n} trees are back from {}", shelf.name()),
         });
@@ -2022,7 +2031,7 @@ impl App {
         }
         // What needs you in every workspace, the oldest first.
         let (items, _) = self.notes_list();
-        if key.code == KeyCode::Char('w') && !self.is_window_focused {
+        if key.code == KeyCode::Char('w') {
             if items.is_empty() {
                 self.message = Some("nothing waits on you".into());
                 return Some(Outcome::Continue);
@@ -2765,7 +2774,18 @@ impl App {
     /// The panels layout is drawn, rather than the table layout it falls
     /// back to on a small screen; another workspace's tab ends without it.
     pub fn show_panels(&mut self, is_shown: bool) {
+        // The list's groups stand in another order there, the cursor on the
+        // same tree.
+        let cursor = self
+            .current()
+            .filter(|_| is_shown != self.is_panels_shown)
+            .map(|t| t.path.clone());
         self.is_panels_shown = is_shown;
+        self.reselect(cursor);
+        if !is_shown && self.is_plan {
+            self.leave_plan_window();
+            self.is_plan = false;
+        }
         if is_shown {
             // Set on a screen too small for the panels, which have neither.
             self.zoom = None;
@@ -3056,9 +3076,14 @@ impl App {
     /// Takes the sidecars read on the git clock. A tree absent from the map
     /// has none.
     pub fn apply_sidecars(&mut self, mut sidecars: HashMap<PathBuf, Sidecar>) {
+        let cursor = self
+            .current()
+            .filter(|_| self.is_cursor_held)
+            .map(|t| t.path.clone());
         for tree in &mut self.trees {
             tree.sidecar = sidecars.remove(&tree.path).map(Box::new);
         }
+        self.reselect(cursor);
     }
 
     /// Takes the agents read on the git clock. A tree absent from the map has
@@ -4284,16 +4309,38 @@ impl App {
         // `waiting` already carries each one's time from the last look, or
         // its own for one seen first now; so does what is done, for a merge,
         // which carries none.
-        self.watch.since = waiting
-            .iter()
-            .chain(&crate::inbox::done(self))
-            .map(|e| (e.about(), e.at.unwrap_or(now)))
-            .collect();
+        // One whose workspace is not read yet keeps its time: after a switch
+        // each starts unread, and nothing says it has stopped.
+        let mut since = std::mem::take(&mut self.watch.since);
+        since.retain(|about, _| !self.is_read_of(about));
+        since.extend(
+            waiting
+                .iter()
+                .chain(&crate::inbox::done(self))
+                .map(|e| (e.about(), e.at.unwrap_or(now))),
+        );
+        self.watch.since = since;
         // What waits on you alone, as the count has it: what is done needs
         // nothing, so it is the tree's status, not news to act on.
         let (needs, _) = self.notes_list();
         let line = (!needs.is_empty()).then(|| format!("● {} needs action", needs.len()));
         Some((is_new, line))
+    }
+
+    /// What says whether `about` still waits has been read: its workspace's
+    /// PRs for one of a PR's, else its agents.
+    fn is_read_of(&self, about: &crate::inbox::About) -> bool {
+        let (kind, path) = about;
+        let has = |trees: &[Tree]| trees.iter().any(|t| &t.path == path);
+        if let Some(pool) = self.pools.iter().find(|p| has(&p.trees)) {
+            let checkout = &pool.away.checkout;
+            return if kind.is_pr() {
+                self.away_ships.contains(checkout)
+            } else {
+                self.away_live.contains_key(checkout)
+            };
+        }
+        !has(&self.trees) || !kind.is_pr() || self.is_ships_read
     }
 
     /// Since when `about` has waited, as the last look saw it.
@@ -7094,6 +7141,82 @@ pub(crate) mod tests {
         assert!(app.is_folded(&Group::Parked), "the table's starts folded");
         press(&mut app, KeyCode::Char('Z'));
         assert!(!app.is_folded(&Group::Parked));
+    }
+
+    #[test]
+    fn the_cursor_put_on_a_tree_follows_it_into_parked_as_records_are_read() {
+        let mut app = crate::inbox::tests::with_workspaces();
+        let path = app.trees[0].path.clone();
+        app.arriving = Some((path.clone(), None));
+        app.arrival();
+        let parked = Sidecar {
+            parked: true,
+            ..Sidecar::leased_now()
+        };
+        app.apply_sidecars(HashMap::from([(path.clone(), parked)]));
+        assert_eq!(app.current().map(|t| t.path.clone()), Some(path));
+    }
+
+    #[test]
+    fn w_opens_the_next_waiting_from_the_window_too() {
+        let mut app = crate::inbox::tests::with_workspaces();
+        app.reselect(Some(app.trees[1].path.clone()));
+        app.is_window_focused = true;
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('w')),
+            Outcome::Chat { .. } | Outcome::SwitchTo { .. } | Outcome::Continue
+        ));
+        assert!(app.picker.is_none());
+        assert_ne!(
+            app.window_tree().map(|t| t.name.clone()),
+            Some("2".into()),
+            "on to one that waits"
+        );
+    }
+
+    #[test]
+    fn a_failed_prs_age_outlives_a_switch_until_its_workspaces_prs_are_read_again() {
+        let mut app = crate::inbox::tests::with_workspaces();
+        let zeta = PathBuf::from("/code/zeta");
+        let mut tree = app
+            .pools
+            .iter()
+            .find(|p| p.away.checkout == zeta)
+            .unwrap()
+            .trees[0]
+            .clone();
+        let mut ship = app.trees[2].ship.clone().unwrap();
+        ship.branch = "zeta-work".into();
+        tree.ship = Some(ship);
+        let about = (crate::inbox::Kind::Failed, tree.path.clone());
+        app.away_live.insert(zeta.clone(), vec![tree.clone()]);
+        app.away_ships.insert(zeta.clone());
+        app.watch_waiting();
+        let since = std::time::SystemTime::now() - Duration::from_secs(600);
+        app.watch.since.insert(about.clone(), since);
+        // A switch elsewhere: the next workspace reads from nothing.
+        let mut next = crate::inbox::tests::with_workspaces();
+        next.keep_watch(app.take_watch());
+        next.watch_waiting();
+        next.away_live.insert(zeta.clone(), vec![tree.clone()]);
+        next.away_ships.insert(zeta.clone());
+        next.watch_waiting();
+        assert_eq!(next.waiting_since(&about), Some(since));
+        // Read and passing, it is forgotten.
+        tree.ship = None;
+        next.away_live.insert(zeta, vec![tree]);
+        next.watch_waiting();
+        assert_eq!(next.waiting_since(&about), None);
+    }
+
+    #[test]
+    fn plan_gives_way_to_trees_on_a_screen_too_small_for_the_panels() {
+        let mut app = on_plan();
+        app.is_window_focused = true;
+        app.show_panels(false);
+        assert!(!app.is_plan && !app.is_window_focused);
+        app.show_panels(true);
+        assert!(!app.is_plan, "Tab goes there again");
     }
 
     #[test]
