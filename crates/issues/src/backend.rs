@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use linear::{Change, Client, Comment, Detail, Issue, NewIssue, Standing, Team};
+use linear::{Change, Client, Comment, Detail, Issue, NewIssue, Project, Standing, Team};
 
 use crate::Filters;
 
@@ -48,6 +48,28 @@ pub trait Backend: Send + Sync {
             Some(why) if found.is_empty() => Err(why),
             _ => Ok(found),
         }
+    }
+
+    /// Each of the issues `ids` it has, by reading each in turn unless the
+    /// source can read them at once. An error only where none could be read.
+    fn issues(&self, ids: &[String]) -> Result<Vec<Issue>, String> {
+        let mut found = Vec::new();
+        let mut failed = None;
+        for id in ids {
+            match self.detail(id) {
+                Ok(detail) => found.push(detail.issue),
+                Err(why) => failed = failed.or(Some(why)),
+            }
+        }
+        match failed {
+            Some(why) if found.is_empty() => Err(why),
+            _ => Ok(found),
+        }
+    }
+
+    /// The project `id`, with its text and where its issues stand.
+    fn project(&self, _id: &str) -> Result<Project, String> {
+        Err("this source's plugin cannot read projects".into())
     }
 
     /// What its issues can be set to; None for a source that cannot change
@@ -212,6 +234,14 @@ impl Backend for Linear {
 
     fn standings(&self, ids: &[String]) -> Result<Vec<Standing>, String> {
         self.client()?.standings(ids).map_err(|err| err.message)
+    }
+
+    fn issues(&self, ids: &[String]) -> Result<Vec<Issue>, String> {
+        self.client()?.issues_by_id(ids).map_err(|err| err.message)
+    }
+
+    fn project(&self, id: &str) -> Result<Project, String> {
+        self.client()?.project(id).map_err(|err| err.message)
     }
 
     fn team(&self) -> Result<Option<Arc<Team>>, String> {

@@ -7,6 +7,7 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::pool::Tree;
+use crate::tree_issues::Key;
 
 /// Where the text goes: to the assistant, or to a new agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +80,8 @@ pub enum Purpose {
     /// The text is the handoff `from` wrote, the task of the new agent that
     /// takes over its work in this tree.
     Handoff { tree: Box<Tree>, from: Recipient },
+    /// The text is a comment on this issue.
+    Comment { key: Key, issue: Box<linear::Issue> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,13 +194,25 @@ impl Prompt {
         }
     }
 
+    /// A comment on `issue`, which is `key`'s, starting from `text`.
+    pub fn comment(key: Key, issue: linear::Issue, text: String) -> Self {
+        Prompt {
+            text,
+            ..Prompt::new(Purpose::Comment {
+                key,
+                issue: Box::new(issue),
+            })
+        }
+    }
+
     pub fn target(&self) -> Option<Target> {
         match &self.purpose {
             Purpose::Dispatch { target } => Some(*target),
             Purpose::Message { .. }
             | Purpose::Rename { .. }
             | Purpose::Start { .. }
-            | Purpose::Handoff { .. } => None,
+            | Purpose::Handoff { .. }
+            | Purpose::Comment { .. } => None,
         }
     }
 

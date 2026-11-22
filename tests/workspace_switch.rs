@@ -173,6 +173,14 @@ impl Screen {
         }
     }
 
+    /// Goes to the workspace `to`, the other of the two, as `w` then Enter does.
+    fn switch_to(&mut self, to: &str) {
+        self.press("w");
+        self.wait_for("the workspaces", |text| text.contains(" Workspaces "));
+        self.press("\r");
+        self.wait_on(to);
+    }
+
     /// Waits until the bottom bar's badge names `workspace`.
     fn wait_on(&self, workspace: &str) {
         let badge = format!("treetop · {workspace}");
@@ -440,10 +448,10 @@ fn with_no_layout_set_treetop_opens_on_numbered_panels_and_number_keys_move_the_
     } = two_workspaces("panels", "");
     screen.wait_for("the numbered panels and the window", |text| {
         [
-            "[1] Waiting",
+            "[1] Ship",
             "[2] Trees",
-            "[3] Ship",
-            "[4] News",
+            "[3] Linear",
+            "[4] Keel",
             "[0] Tree 1 · here-work",
         ]
         .iter()
@@ -466,50 +474,267 @@ fn with_no_layout_set_treetop_opens_on_numbered_panels_and_number_keys_move_the_
     let _ = fs::remove_dir_all(&root);
 }
 
-/// ANB-103: in the panels layout `]` shows the next workspace's trees on
-/// [2] Trees at once, only to look at, and Enter switches there.
+/// ANB-113: Plan's steps follow what was typed to the chat, its record keeps
+/// where it is, and with no chats the window explains them.
 #[test]
-fn a_bracket_shows_another_workspace_on_the_trees_panel_and_enter_switches_there() {
+fn plans_steps_follow_the_chat_and_are_kept_with_it() {
     let Workspaces {
         root, mut screen, ..
-    } = two_workspaces("tabs", "layout = \"panels\"\n");
-    screen.wait_on("here");
-    screen.wait_for("here's tree in the window", |text| {
-        text.contains("[0] Tree 1 · here-work")
+    } = two_workspaces("plan-steps", "");
+    screen.wait_for("the panels", |text| text.contains("[2] Trees"));
+    screen.press("\t");
+    screen.wait_for("the steps explained", |text| {
+        text.contains("No planning chats for here yet.")
+            && text.contains("4 Pick one up            p gives one a fresh tree and an agent")
     });
-    screen.wait_for("both workspaces as tabs", |text| {
-        text.lines()
-            .any(|l| l.contains("[2] Trees") && l.contains("here") && l.contains("there"))
-    });
-
-    screen.press("]");
-    screen.wait_for("there's trees, only looked at", |text| {
-        text.contains("there-work") && text.contains("there is only looked at here")
-    });
-    // Still here: nothing switched, and here's tree is not on the panel.
-    assert!(
-        screen
-            .text()
-            .lines()
-            .last()
-            .unwrap()
-            .contains("treetop · here")
+    screen.press("\t\t");
+    screen.wait_for("Trees", |text| text.contains("[2] Trees"));
+    let here = root.join("here").canonicalize().unwrap();
+    let records = root.join("state/treetop/scratch");
+    fs::create_dir_all(&records).unwrap();
+    let record = records.join("1.json");
+    fs::write(
+        &record,
+        serde_json::json!({"job": "j1", "name": "plan 1", "created": 1, "checkout": here})
+            .to_string(),
+    )
+    .unwrap();
+    // A chat with an input box, emptied as each message is sent.
+    write_script(
+        &root.join("bin/claude"),
+        "[ \"$1\" = attach ] || exit 1\n\
+         box() { printf '\\033[2J\\033[H%s\\n❯ \\n\\n\\n\\n\\n%s\\n\\033[2;3H' ────── ──────; }\n\
+         box\nwhile IFS= read -r line; do box; done\n",
     );
+    screen.press("\t");
+    screen.wait_for("the first step", |text| {
+        text.contains("▸ 1 Talk it through ─ 2 Draft the issues")
+    });
+    for (key, step, kept) in [
+        ("D", "✓ 1 Talk it through ─ ▸ 2 Draft the issues", "draft"),
+        (
+            "S",
+            "✓ 2 Draft the issues ─ ▸ 3 Create them in Linear",
+            "create",
+        ),
+    ] {
+        screen.press(key);
+        screen.wait_for(step, |text| text.contains(step));
+        let record = fs::read_to_string(&record).unwrap();
+        assert!(record.contains(&format!(r#""asked":"{kept}""#)), "{record}");
+    }
+    // Away and back reads its record again.
+    screen.press("\t\t");
+    screen.wait_for("Trees", |text| text.contains("[2] Trees"));
+    screen.press("\t");
+    screen.wait_for("the same step", |text| {
+        text.contains("▸ 3 Create them in Linear")
+    });
+    drop(screen);
+    let _ = fs::remove_dir_all(&root);
+}
 
+/// ANB-112: the Linear panel shows the issue of the tree under the cursor, and
+/// the next tree's as the cursor moves, with no Enter; Enter reads it in the
+/// window and Esc gives the keys back.
+#[test]
+fn the_linear_panel_follows_the_cursor_and_its_issue_is_read_in_the_window() {
+    let Workspaces {
+        root, mut screen, ..
+    } = two_workspaces_with("linear", "", |root| {
+        add_tree(root, "here", "2", Some("me/anb-91-second"));
+        add_tree(root, "here", "3", Some("here-third"));
+        // Linear as a ticket plugin, which can be read and not changed.
+        let plugins = root.join("config/treetop/plugins");
+        fs::create_dir_all(&plugins).unwrap();
+        write_script(
+            &plugins.join("tix"),
+            r#"read -r request
+case "$request" in
+*'"describe"'*) echo '{"ok":true,"result":{"protocol":1,"name":"tix","kind":"tickets","ops":["list","get"]}}' ;;
+*'"ANB-90"'*) echo '{"ok":true,"result":{"id":"ANB-90","title":"Show the rail","state":"In Progress","project":"Inbox","labels":["Bug"],"description":"Draw it as a rail."}}' ;;
+*'"ANB-91"'*) echo '{"ok":true,"result":{"id":"ANB-91","title":"Keep the rail","state":"Todo"}}' ;;
+*) echo '{"ok":true,"result":{"tickets":[]}}' ;;
+esac
+"#,
+        );
+        let here = root.join("here").canonicalize().unwrap();
+        fs::write(
+            root.join("config/treetop/config.toml"),
+            format!(
+                "[issues.tix]\nplugin = \"tix\"\nteam = \"ANB\"\n[repos.\"{}\"]\nissues = \"tix\"\n",
+                here.display()
+            ),
+        )
+        .unwrap();
+        // Tree 1 was picked up from an issue; tree 2's branch names one.
+        let git_dir = Command::new("git")
+            .args(["rev-parse", "--path-format=absolute", "--git-dir"])
+            .current_dir(root.join("here-trees/1"))
+            .output()
+            .unwrap();
+        let git_dir = PathBuf::from(String::from_utf8(git_dir.stdout).unwrap().trim());
+        fs::write(
+            git_dir.join("treetop.json"),
+            serde_json::json!({ "version": 1, "ticket": "ANB-90", "source": "tix", "leased_at": 1 })
+                .to_string(),
+        )
+        .unwrap();
+    });
+    let linear = |text: &str| -> String {
+        let rows = text.lines().skip_while(|l| !l.contains("[3] Linear"));
+        rows.take(7)
+            .map(|l| l.chars().take(72).collect::<String>() + "\n")
+            .collect()
+    };
+    let bar_is =
+        |mode: &'static str| move |text: &str| text.lines().last().unwrap_or("").starts_with(mode);
+    screen.wait_for("tree 1's issue", |text| {
+        let rows = linear(text);
+        rows.contains("[3] Linear · ANB-90 ")
+            && rows.contains("bug  Show the rail")
+            && rows.contains("In Progress")
+            && rows.contains("Inbox")
+    });
+    // Back and forth, each at once: no key but the cursor's.
+    for (tree, has) in [("2", "Keep the rail"), ("3", "no issue on this tree")] {
+        screen.press("j");
+        screen.wait_for(tree, |text| {
+            text.contains(&format!("[0] Tree {tree} ·")) && linear(text).contains(has)
+        });
+    }
+    screen.press("kk");
+    screen.press("3");
+    screen.press("\r");
+    screen.wait_for("it in the window, with the keys", |text| {
+        text.contains("ANB-90  Show the rail")
+            && text.contains("Draw it as a rail.")
+            && bar_is(" NORMAL ")(text)
+    });
+    screen.press("l");
+    screen.wait_for("its project", |text| {
+        text.contains("this source's plugin cannot read projects")
+    });
+    screen.press("\x1b");
+    screen.wait_for("the keys back on [3]", bar_is(" PANEL 3 "));
+    screen.press("s");
+    screen.wait_for("why not", |text| {
+        text.lines()
+            .last()
+            .is_some_and(|bar| bar.contains("can list and read issues, not change them"))
+    });
+    drop(screen);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// ANB-111: the Keel panel shows the run of the tree under the cursor, and the
+/// next tree's as the cursor moves, with no Enter; a tree's keys there act on
+/// none, and Enter shows the run in the window.
+#[test]
+fn the_keel_panel_follows_the_cursor_from_tree_to_tree() {
+    let Workspaces {
+        root, mut screen, ..
+    } = two_workspaces_with("keel", "", |root| {
+        add_tree(root, "here", "2", Some("here-second"));
+        let steps: Vec<_> = (1..12)
+            .map(|n| {
+                let state = match n {
+                    1..5 => "done",
+                    5 => "doing",
+                    _ => "pending",
+                };
+                serde_json::json!({ "title": format!("Step number {n}"), "state": state })
+            })
+            .collect();
+        let runs = serde_json::json!([{ "version": 1, "tree": root.join("here-trees/1"),
+            "playbook": "issue", "goal": "ANB-41", "state": "active", "steps": steps,
+            "current": 5, "attention": 1, "stale": false }]);
+        write_script(&root.join("bin/keel"), &format!("echo '{runs}'\n"));
+    });
+    let keel = |text: &str| -> String {
+        let rows = text.lines().skip_while(|l| !l.contains("[4] Keel"));
+        rows.map(|l| l.chars().take(72).collect::<String>() + "\n")
+            .collect()
+    };
+    screen.wait_for("tree 1's run", |text| {
+        let rows = keel(text);
+        text.contains("[0] Tree 1 · here-work")
+            && rows.contains("[4] Keel · tree 1 ")
+            && rows.contains("issue █████▓░░░░░░░░ 5 of 11 !1 flagged")
+            && rows.contains("✓ 4  Step number 4")
+            && rows.contains("▸ 5  Step number 5")
+    });
+    screen.press("j");
+    screen.wait_for("tree 2, with none", |text| {
+        let rows = keel(text);
+        rows.contains("[4] Keel · tree 2 ") && rows.contains("no keel run in this tree")
+    });
+    screen.press("k");
+    screen.press("4");
+    // Enter is taken after the rest, so what they did shows by then.
+    for key in ["r", "F", "x", "\r"] {
+        screen.press(key);
+    }
+    screen.wait_for("the run in the window", |text| {
+        text.contains("keel run · issue · ANB-41")
+            && text.lines().last().unwrap_or("").starts_with(" NORMAL ")
+    });
+    let shown = screen.text();
+    assert!(!shown.contains("backburner"), "x put it there:\n{shown}");
+    drop(screen);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// ANB-110: `w` lists the workspaces from the panels and from a window in
+/// Normal, `/` narrows them, Enter switches, and the next key acts on the tree
+/// under the cursor there.
+#[test]
+fn w_lists_the_workspaces_and_enter_switches_to_the_one_picked() {
+    let Workspaces {
+        root, mut screen, ..
+    } = two_workspaces_with("list", "", |root| {
+        add_tree(root, "there", "2", None);
+    });
+    screen.wait_for("here's project in the title", |text| {
+        text.contains("[2] Trees · here ─") && text.contains("[0] Tree 1 · here-work")
+    });
+    // From a window in Normal, and Esc closes it.
+    screen.press("]");
+    screen.press("0");
+    screen.wait_for("the window with the keys", |text| {
+        text.lines().last().unwrap_or("").starts_with(" NORMAL ")
+    });
+    screen.press("w");
+    screen.wait_for("both workspaces", |text| {
+        text.contains(" Workspaces ") && text.contains("1 held · 1 free")
+    });
+    screen.press("\x1b");
+    screen.wait_for("it closed", |text| !text.contains(" Workspaces "));
+    // From another panel, whose keys are not what the next workspace opens on.
+    screen.press("1");
+    screen.wait_for("Ship with the keys", |text| text.contains("PANEL 1"));
+    screen.press("w");
+    screen.wait_for("both again", |text| text.contains(" Workspaces "));
+    screen.press("/the");
+    screen.wait_for("there alone", |text| text.contains(" Workspaces /the "));
     screen.press("\r");
     screen.wait_on("there");
     screen.wait_for("there's tree in the window", |text| {
-        text.contains("[0] Tree 1 · there-work")
+        text.contains("[2] Trees · there ─") && text.contains("[0] Tree 1 · there-work")
+    });
+    screen.press("r");
+    screen.wait_for("the box to return there's tree", |text| {
+        text.contains("there-work") && text.contains("Return")
     });
     drop(screen);
     let _ = fs::remove_dir_all(&root);
 }
 
 /// ANB-104: in the panels layout an agent asking in another workspace is
-/// listed in [1] Waiting with where it is, and Enter on it switches there
-/// with its tree in the window.
+/// counted on the top row and listed by `e` with where it is, and Enter on
+/// it switches there with its tree in the window.
 #[test]
-fn an_ask_in_another_workspace_is_listed_in_waiting_and_enter_goes_there() {
+fn an_ask_in_another_workspace_is_listed_by_e_and_enter_goes_there() {
     let Workspaces {
         root, mut screen, ..
     } = two_workspaces("waiting", "layout = \"panels\"\n");
@@ -530,57 +755,19 @@ fn an_ask_in_another_workspace_is_listed_in_waiting_and_enter_goes_there() {
             .to_string(),
     )
     .unwrap();
-    screen.wait_for("there's ask in [1] Waiting", |text| {
-        text.lines()
-            .any(|l| l.contains("there:1") && l.contains("asks you"))
+    screen.wait_for("there's ask on the top row", |text| {
+        text.lines().next().is_some_and(|top| {
+            top.split_whitespace()
+                .eq(["Trees", "Plan", "Issues", "●", "1", "needs", "you", "e"])
+        })
     });
-    screen.press("1");
+    screen.press("e");
+    screen.wait_for("it in the list", |text| text.contains("● there 1"));
     screen.press("\r");
     screen.wait_on("there");
     screen.wait_for("there's tree in the window", |text| {
         text.contains("[0] Tree 1 · there-work")
     });
-    drop(asker);
-    drop(screen);
-    let _ = fs::remove_dir_all(&root);
-}
-
-/// ANB-105: in the panels layout an agent starting to ask in another
-/// workspace is a line in [4] News, which stays however many keys go by.
-#[test]
-fn an_ask_in_another_workspace_is_news_that_stays() {
-    let Workspaces {
-        root, mut screen, ..
-    } = two_workspaces("news", "layout = \"panels\"\n");
-    screen.wait_on("here");
-    screen.wait_for("nothing new yet", |text| {
-        text.contains("nothing new since treetop opened")
-    });
-    // Its first read is done before the agent asks, so the ask is new.
-    std::thread::sleep(std::time::Duration::from_secs(5));
-    let asker = Asker(Command::new("sleep").arg("600").spawn().unwrap());
-    let git_dir = Command::new("git")
-        .args(["rev-parse", "--path-format=absolute", "--git-dir"])
-        .current_dir(root.join("there-trees/1"))
-        .output()
-        .unwrap();
-    let git_dir = PathBuf::from(String::from_utf8(git_dir.stdout).unwrap().trim());
-    fs::write(
-        git_dir.join("agent.json"),
-        serde_json::json!({ "name": "asker", "pid": asker.0.id(), "status": "waiting" })
-            .to_string(),
-    )
-    .unwrap();
-    let is_news = |text: &str| {
-        text.lines()
-            .skip_while(|l| !l.contains("[4] News"))
-            .any(|l| l.contains("there:1") && l.contains("asks you"))
-    };
-    screen.wait_for("there's ask in [4] News", is_news);
-    for key in ["j", "k", "3", "2"] {
-        screen.press(key);
-    }
-    assert!(is_news(&screen.text()), "{}", screen.text());
     drop(asker);
     drop(screen);
     let _ = fs::remove_dir_all(&root);
@@ -796,12 +983,8 @@ fn an_agents_ask_shows_within_seconds_while_its_workspaces_prs_are_slow_to_read(
     write_script(&root.join("bin/gh"), "sleep 9\nexit 1\n");
     screen.wait_for("the panels", |text| text.contains("[2] Trees"));
     // Off to there and back starts the reader again, with the slow PRs.
-    screen.press("]");
-    screen.press("\r");
-    screen.wait_on("there");
-    screen.press("]");
-    screen.press("\r");
-    screen.wait_on("here");
+    screen.switch_to("there");
+    screen.switch_to("here");
     std::thread::sleep(Duration::from_millis(1500));
     let asker = Asker(Command::new("sleep").arg("600").spawn().unwrap());
     let git_dir = Command::new("git")
@@ -817,7 +1000,7 @@ fn an_agents_ask_shows_within_seconds_while_its_workspaces_prs_are_slow_to_read(
     )
     .unwrap();
     let asked = Instant::now();
-    while !screen.text().contains("1 needs action") {
+    while !screen.text().contains("1 needs you") {
         assert!(
             asked.elapsed() < Duration::from_secs(5),
             "there's ask did not show within 5 s:\n{}",
@@ -894,35 +1077,13 @@ fn a_planning_chat_opens_in_the_window_with_normal_and_insert() {
     screen.press("\t");
     screen.wait_for("Issues", |text| {
         text.contains("no issue source for this repository")
-            && text.starts_with(" treetop    Trees   Plan   Issues ")
+            && text.starts_with("  Trees   Plan   Issues ")
             && !text.contains("chat j2 is open")
     });
     screen.press("\t");
     screen.wait_for("Trees, the planning chat gone", |text| {
         text.contains("[2] Trees") && !text.contains("chat j2 is open") && bar_is(" PANEL 2 ")(text)
     });
-    drop(screen);
-    let _ = fs::remove_dir_all(&root);
-}
-
-/// ANB-103: on another workspace's tab a capital, which a terminal sends
-/// with Shift, acts on no tree of this one's.
-#[test]
-fn a_capital_on_another_workspaces_tab_acts_on_nothing_here() {
-    let Workspaces {
-        root, mut screen, ..
-    } = two_workspaces("capital", "");
-    screen.wait_for("the panels", |text| text.contains("[2] Trees"));
-    screen.press("]");
-    screen.wait_for("there's trees", |text| text.contains("there-work"));
-    // N would open a new agent's form for this workspace, which takes the
-    // keys; `?` after it opens the help only if nothing did.
-    screen.press("N");
-    screen.press("?");
-    screen.wait_for("the help, so no form had opened", |text| {
-        text.contains("show every key") || text.contains("Keys")
-    });
-    assert!(!screen.text().contains("New agent"), "{}", screen.text());
     drop(screen);
     let _ = fs::remove_dir_all(&root);
 }
@@ -1007,45 +1168,7 @@ fn add_tree(root: &Path, name: &str, number: &str, branch: Option<&str>) {
     );
 }
 
-/// ANB-103: Enter on another workspace's tree lands on that tree.
-#[test]
-fn enter_on_another_workspaces_tree_lands_on_it() {
-    let Workspaces {
-        root, mut screen, ..
-    } = two_workspaces_with("land", "", |root| {
-        add_tree(root, "there", "2", Some("there-second"));
-    });
-    screen.wait_for("the panels", |text| text.contains("[2] Trees"));
-    // Away and back, so there's listing is read with its second tree.
-    screen.press("]");
-    screen.wait_for("there's trees", |text| text.contains("there-work"));
-    screen.press("\r");
-    screen.wait_on("there");
-    screen.wait_for("both its trees", |text| text.contains("there-second"));
-    screen.press("]");
-    screen.wait_for("here's trees", |text| text.contains("here-work"));
-    screen.press("\r");
-    screen.wait_on("here");
-    screen.press("]");
-    screen.wait_for("there's trees again", |text| text.contains("there-second"));
-    screen.press("j");
-    screen.press("\r");
-    screen.wait_on("there");
-    screen.wait_for("tree 2 in the window", |text| {
-        text.contains("[0] Tree 2 · there-second")
-    });
-    // Nor does what is read next move it.
-    std::thread::sleep(Duration::from_secs(5));
-    assert!(
-        screen.text().contains("[0] Tree 2 · there-second"),
-        "{}",
-        screen.text()
-    );
-    drop(screen);
-    let _ = fs::remove_dir_all(&root);
-}
-
-/// ANB-104, ANB-105: `F` on [3] Ship acts on the PR under its cursor, and a
+/// ANB-104, ANB-105: `F` on [1] Ship acts on the PR under its cursor, and a
 /// failure that never reached its agent waits on you again.
 #[test]
 fn a_failure_sent_from_ship_that_never_arrives_waits_again() {
@@ -1086,27 +1209,18 @@ esac
     )
     .unwrap();
     // Away and back reads the plugins.
-    screen.press("]");
-    screen.wait_for("there's trees", |text| text.contains("there-work"));
-    screen.press("\r");
-    screen.wait_on("there");
-    screen.press("]");
-    screen.wait_for("here's trees", |text| text.contains("here-work"));
-    screen.press("\r");
-    screen.wait_on("here");
+    screen.switch_to("there");
+    screen.switch_to("here");
     screen.wait_for("the failed PR, on you and in Ship", |text| {
-        text.contains("1 needs action") && text.contains("#65 x e2e") && text.contains("F send it")
+        text.contains("1 needs you") && text.contains("#65 x e2e") && text.contains("F send it")
     });
-    screen.press("3");
+    screen.press("1");
     screen.press("F");
-    screen.wait_for("what was sent, in News", |text| {
-        text.contains("you: CI failed on") && text.contains("→ here-work")
-    });
     screen.wait_for("the send failing", |text| {
         text.contains("not sent to fixer in 1")
     });
     screen.wait_for("the failure on you again", |text| {
-        text.contains("1 needs action") && text.contains("checks failed")
+        text.contains("1 needs you") && text.contains("ci failed")
     });
     drop(screen);
     let _ = fs::remove_dir_all(&root);
@@ -1153,33 +1267,30 @@ esac
     )
     .unwrap();
     // Away and back reads the plugins.
-    screen.press("]");
-    screen.wait_for("there's trees", |text| text.contains("there-work"));
-    screen.press("\r");
-    screen.wait_on("there");
-    screen.press("]");
-    screen.wait_for("here's trees", |text| text.contains("here-work"));
-    screen.press("\r");
-    screen.wait_on("here");
+    screen.switch_to("there");
+    screen.switch_to("here");
     screen.wait_for("the failed PR, on you and in Ship", |text| {
-        text.contains("1 needs action") && text.contains("#65 x e2e") && text.contains("F send it")
+        text.contains("1 needs you") && text.contains("#65 x e2e") && text.contains("F send it")
     });
-    screen.press("3");
+    screen.press("1");
     screen.press("F");
-    screen.wait_for("what was sent, in News", |text| {
-        text.contains("you: CI failed on") && text.contains("→ here-work")
+    // A switch waits for the failure to be read; then it is being typed in.
+    screen.wait_for("the failure read, and sent", |text| {
+        text.lines()
+            .map(|l| l.chars().take(50).collect::<String>())
+            .any(|l| l.contains("idle") && l.contains("here-work"))
     });
     screen.press("2");
-    screen.press("]");
-    screen.wait_for("there's trees", |text| text.contains("there-work"));
-    screen.press("\r");
-    screen.wait_on("there");
-    screen.wait_for("the failure on you again, and why, in News", |text| {
-        text.contains("here:1")
-            && text.contains("checks failed")
-            && text.contains("1 needs action")
-            && text.contains("not sent to fixer")
+    screen.switch_to("there");
+    screen.wait_for("the failure on you again, and why, on the bar", |text| {
+        text.contains("1 needs you")
+            && text
+                .lines()
+                .last()
+                .is_some_and(|bar| bar.contains("not sent to fixer in here:1, you switched"))
     });
+    screen.press("e");
+    screen.wait_for("which it is", |text| text.contains("✗ here 1"));
     drop(screen);
     let _ = fs::remove_dir_all(&root);
 }
@@ -1198,7 +1309,7 @@ fn a_message_on_the_bar_gives_way_to_the_keys_at_the_next_one() {
     screen.press("F");
     screen.wait_for("why not", bar_has("nothing has failed on tree 1's PR"));
     screen.press("1");
-    screen.wait_for("[1]'s keys", bar_has("Enter open it"));
+    screen.wait_for("[1]'s keys", bar_has("F send failure"));
     screen.press("\t");
     screen.wait_for("Plan", bar_has("new chat"));
     screen.press("D");
@@ -1243,101 +1354,6 @@ fn a_planning_chat_left_starting_joins_the_list_on_plan() {
     let _ = fs::remove_dir_all(&root);
 }
 
-/// ANB-103: it lands there though another agent in that pool is asking.
-#[test]
-fn enter_on_another_workspaces_tree_lands_on_it_while_another_there_asks() {
-    let Workspaces {
-        root, mut screen, ..
-    } = two_workspaces_with("land-ask", "", |root| {
-        add_tree(root, "there", "2", Some("there-second"));
-    });
-    // Tree 1's agent asks, with a chat that would open.
-    let plugins = root.join("config/treetop/plugins");
-    fs::create_dir_all(&plugins).unwrap();
-    write_script(
-        &plugins.join("ag"),
-        &format!(
-            r#"read -r request
-case "$request" in
-*'"describe"'*) echo '{{"ok":true,"result":{{"protocol":1,"name":"ag","kind":"agent","ops":["find"]}}}}' ;;
-*) echo '{{"ok":true,"result":{{"agents":[{{"id":"a1","name":"asker","dir":"{}","live":true,"status":"waiting","background":true,"attach":["sh","-c","echo asks; sleep 600"]}}]}}}}' ;;
-esac
-"#,
-            root.join("there-trees/1").display()
-        ),
-    );
-    screen.wait_for("the ask", |text| {
-        text.contains("[2] Trees") && text.contains("1 needs action")
-    });
-    screen.press("]");
-    screen.wait_for("there's trees", |text| text.contains("there-second"));
-    screen.press("j");
-    screen.press("\r");
-    screen.wait_on("there");
-    screen.wait_for("tree 2 in the window", |text| {
-        text.contains("[0] Tree 2 · there-second")
-    });
-    std::thread::sleep(Duration::from_secs(5));
-    assert!(
-        screen.text().contains("[0] Tree 2 · there-second"),
-        "{}",
-        screen.text()
-    );
-    drop(screen);
-    let _ = fs::remove_dir_all(&root);
-}
-
-/// ANB-103: Enter on another workspace's parked tree lands on it too.
-#[test]
-fn enter_on_another_workspaces_parked_tree_lands_on_it() {
-    let Workspaces {
-        root, mut screen, ..
-    } = two_workspaces_with("land-shelf", "", |root| {
-        add_tree(root, "there", "2", Some("there-second"));
-        add_tree(root, "there", "3", None);
-    });
-    let git_dir = Command::new("git")
-        .args(["rev-parse", "--path-format=absolute", "--git-dir"])
-        .current_dir(root.join("there-trees/2"))
-        .output()
-        .unwrap();
-    let git_dir = PathBuf::from(String::from_utf8(git_dir.stdout).unwrap().trim());
-    fs::write(
-        git_dir.join("treetop.json"),
-        serde_json::json!({ "version": 1, "parked": true, "leased_at": 1 }).to_string(),
-    )
-    .unwrap();
-    screen.wait_for("the panels", |text| text.contains("[2] Trees"));
-    // Away and back, so there's listing is read with its second tree.
-    screen.press("]");
-    screen.wait_for("there's trees", |text| text.contains("there-work"));
-    screen.press("\r");
-    screen.wait_on("there");
-    screen.wait_for("its parked tree, under Parked", |text| {
-        text.contains("there-second") && text.contains("▾      parked ")
-    });
-    screen.press("]");
-    screen.wait_for("here's trees", |text| text.contains("here-work"));
-    screen.press("\r");
-    screen.wait_on("here");
-    screen.press("]");
-    screen.wait_for("there's trees again", |text| text.contains("there-second"));
-    screen.press("j");
-    screen.press("\r");
-    screen.wait_on("there");
-    screen.wait_for("tree 2 in the window", |text| {
-        text.contains("[0] Tree 2 · there-second")
-    });
-    std::thread::sleep(Duration::from_secs(5));
-    assert!(
-        screen.text().contains("[0] Tree 2 · there-second"),
-        "{}",
-        screen.text()
-    );
-    drop(screen);
-    let _ = fs::remove_dir_all(&root);
-}
-
 /// ANB-108: a palette command is on the tree it names, whichever panel has
 /// the keys. A rename, since treetop returns no tree it was started in.
 #[test]
@@ -1350,7 +1366,7 @@ fn the_palettes_rename_is_of_the_tree_it_names_from_any_panel() {
     });
     let bar_is =
         |mode: String| move |text: &str| text.lines().last().unwrap_or("").starts_with(&mode);
-    for panel in ["4", "3", "1"] {
+    for panel in ["4", "3", "1", "2"] {
         screen.press(panel);
         screen.press("\x10");
         screen.wait_for("the palette", |text| {
@@ -1364,6 +1380,11 @@ fn the_palettes_rename_is_of_the_tree_it_names_from_any_panel() {
     }
     drop(screen);
     let _ = fs::remove_dir_all(&root);
+}
+
+/// The top row's count of `n` that need you.
+fn count(n: usize) -> String {
+    format!("{n} need{} you", if n == 1 { "s" } else { "" })
 }
 
 /// An agent in the tree at `tree` starts asking, until the file returned is
@@ -1384,10 +1405,10 @@ fn asking_in(tree: &Path, asker: &Asker) -> PathBuf {
     file
 }
 
-/// ANB-104: [1] Waiting's cursor stays on its item as one above it resolves,
+/// ANB-104: the list's cursor stays on its item as one above it resolves,
 /// so Enter goes to what was picked.
 #[test]
-fn waitings_cursor_stays_on_what_it_was_on_as_another_resolves() {
+fn the_lists_cursor_stays_on_what_it_was_on_as_another_resolves() {
     let Workspaces {
         root, mut screen, ..
     } = two_workspaces_with("hold", "", |root| {
@@ -1396,49 +1417,42 @@ fn waitings_cursor_stays_on_what_it_was_on_as_another_resolves() {
     });
     screen.wait_for("the panels", |text| text.contains("[2] Trees"));
     // Away and back, so there's trees are known.
-    screen.press("]");
-    screen.wait_for("there's trees", |text| text.contains("there-work"));
-    screen.press("\r");
-    screen.wait_on("there");
+    screen.switch_to("there");
     screen.wait_for("all three", |text| text.contains("there-third"));
-    screen.press("]");
-    screen.wait_for("here's trees", |text| text.contains("here-work"));
-    screen.press("\r");
-    screen.wait_on("here");
+    screen.switch_to("here");
     // One process each: one is one agent, wherever it is said to be.
     let askers = [(); 3].map(|()| Asker(Command::new("sleep").arg("600").spawn().unwrap()));
     let files = [1, 2, 3].map(|n| {
         let file = asking_in(&root.join(format!("there-trees/{n}")), &askers[n - 1]);
-        screen.wait_for("the ask", |text| {
-            text.contains(&format!("{n} needs action"))
-        });
+        screen.wait_for("the ask", |text| text.contains(&count(n)));
         file
     });
     // Onto the second of them, whichever it is in the list.
     let on = |text: &str, n: usize| {
         text.lines()
-            .filter(|l| l.contains("● there:"))
+            .filter(|l| l.contains("● there "))
             .nth(n)
             .unwrap_or("")
             .to_string()
     };
-    screen.press("1");
+    screen.press("e");
     screen.press("j");
-    let picked = ["there:1", "there:2", "there:3"]
+    screen.wait_for("the list", |text| text.contains("● there "));
+    let picked = ["there 1", "there 2", "there 3"]
         .into_iter()
         .find(|place| on(&screen.text(), 1).contains(place))
         .unwrap();
-    let above = ["there:1", "there:2", "there:3"]
+    let above = ["there 1", "there 2", "there 3"]
         .into_iter()
         .find(|place| on(&screen.text(), 0).contains(place))
         .unwrap();
     // The one above it resolves.
-    let number: usize = above.trim_start_matches("there:").parse().unwrap();
+    let number: usize = above.trim_start_matches("there ").parse().unwrap();
     fs::remove_file(&files[number - 1]).unwrap();
-    screen.wait_for("it gone", |text| text.contains("2 needs action"));
+    screen.wait_for("it gone", |text| text.contains("2 need you"));
     screen.press("\r");
     screen.wait_on("there");
-    let number = picked.trim_start_matches("there:");
+    let number = picked.trim_start_matches("there ");
     let title = format!("[0] Tree {number} ·");
     screen.wait_for("the tree picked", |text| text.contains(&title));
     drop(askers);
@@ -1446,40 +1460,33 @@ fn waitings_cursor_stays_on_what_it_was_on_as_another_resolves() {
     let _ = fs::remove_dir_all(&root);
 }
 
-/// ANB-104: gone to from Waiting, another workspace's item keeps Waiting's
-/// cursor, so the next key acts on its tree and not on the first row's.
+/// ANB-104: gone to from the list, another workspace's item has its tree under
+/// the cursor there, so the next key acts on that tree.
 #[test]
-fn waitings_cursor_is_on_the_item_it_took_you_to_in_another_workspace() {
+fn the_key_after_going_to_another_workspaces_item_acts_on_its_tree() {
     let Workspaces {
         root, mut screen, ..
     } = two_workspaces_with("jump", "", |root| {
         add_tree(root, "there", "2", Some("there-second"));
     });
     screen.wait_for("the panels", |text| text.contains("[2] Trees"));
-    screen.press("]");
-    screen.wait_for("there's trees", |text| text.contains("there-work"));
-    screen.press("\r");
-    screen.wait_on("there");
+    screen.switch_to("there");
     screen.wait_for("both", |text| text.contains("there-second"));
-    screen.press("]");
-    screen.wait_for("here's trees", |text| text.contains("here-work"));
-    screen.press("\r");
-    screen.wait_on("here");
+    screen.switch_to("here");
     let askers = [(); 2].map(|()| Asker(Command::new("sleep").arg("600").spawn().unwrap()));
     for n in [1, 2] {
         asking_in(&root.join(format!("there-trees/{n}")), &askers[n - 1]);
-        screen.wait_for("the ask", |text| {
-            text.contains(&format!("{n} needs action"))
-        });
+        screen.wait_for("the ask", |text| text.contains(&count(n)));
     }
     let rows = |text: &str| -> Vec<String> {
         text.lines()
-            .filter_map(|l| Some(l[l.find("● there:")?..].chars().skip(8).take(1).collect()))
+            .filter_map(|l| Some(l[l.find("● there ")?..].chars().skip(8).take(1).collect()))
             .collect()
     };
+    screen.press("e");
+    screen.wait_for("both in the list", |text| rows(text).len() == 2);
     let last = rows(&screen.text())[1].clone();
-    screen.press("1");
-    screen.press("G");
+    screen.press("j");
     screen.press("\r");
     screen.wait_on("there");
     screen.wait_for("the tree picked", |text| {
@@ -1497,9 +1504,9 @@ fn waitings_cursor_is_on_the_item_it_took_you_to_in_another_workspace() {
     let _ = fs::remove_dir_all(&root);
 }
 
-/// ANB-104: `w` goes round everything waiting, in every workspace.
+/// ANB-104: `W` goes round everything that needs you, in every workspace.
 #[test]
-fn w_reaches_everything_waiting_across_workspaces() {
+fn shift_w_reaches_everything_that_needs_you_across_workspaces() {
     let Workspaces {
         root, mut screen, ..
     } = two_workspaces_with("round", "", |root| {
@@ -1515,13 +1522,10 @@ fn w_reaches_everything_waiting_across_workspaces() {
     ];
     screen.wait_for("the panels", |text| text.contains("[2] Trees"));
     // Away and back, so there's second tree is known.
-    screen.press("]");
-    screen.wait_for("there's trees", |text| text.contains("there-work"));
-    screen.press("\r");
-    screen.wait_on("there");
+    screen.switch_to("there");
     screen.wait_for("both", |text| text.contains("there-second"));
     for (tree, asker) in trees.iter().zip(&askers) {
-        // With a chat, as an agent has, for `w` to open.
+        // With a chat, as an agent has, for `W` to open.
         let file = asking_in(&root.join(tree), asker);
         fs::write(
             file,
@@ -1531,7 +1535,7 @@ fn w_reaches_everything_waiting_across_workspaces() {
         )
         .unwrap();
     }
-    screen.wait_for("all four", |text| text.contains("4 needs action"));
+    screen.wait_for("all four", |text| text.contains("4 need you"));
     let place = |text: &str| -> Option<String> {
         let title = text.lines().find(|l| l.contains("[0] Tree "))?;
         let at = title.find("[0] Tree ")?;
@@ -1539,11 +1543,9 @@ fn w_reaches_everything_waiting_across_workspaces() {
     };
     let mut seen = std::collections::BTreeSet::new();
     for _ in 0..4 {
-        screen.press("w");
+        screen.press("W");
         std::thread::sleep(Duration::from_secs(6));
-        screen.wait_for("all four still waiting", |text| {
-            text.contains("4 needs action")
-        });
+        screen.wait_for("all four still waiting", |text| text.contains("4 need you"));
         let title = place(&screen.text()).unwrap();
         let branch = ["here-work", "here-second", "there-work", "there-second"]
             .into_iter()

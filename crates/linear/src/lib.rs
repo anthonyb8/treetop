@@ -21,9 +21,9 @@ use serde_json::{Value, json};
 
 pub use edit::{Change, NewIssue};
 pub use filter::{ANY_STATE, Filter, ME, UNASSIGNED, priority};
-pub use model::{Comment, Cycle, Detail, Issue, Link, Named, Standing, State, Team};
+pub use model::{Comment, Cycle, Detail, Issue, Link, Named, Project, Standing, State, Team};
 
-use model::{ISSUE_FIELDS, RawIssue, RawStanding, RawTeam, STANDING_FIELDS};
+use model::{ISSUE_FIELDS, PROJECT_FIELDS, RawIssue, RawStanding, RawTeam, STANDING_FIELDS};
 
 const API: &str = "https://api.linear.app/graphql";
 
@@ -135,13 +135,7 @@ impl Client {
             &query,
             json!({ "filter": filter.to_value(team), "first": PAGE }),
         )?;
-        let nodes = data
-            .pointer("/issues/nodes")
-            .cloned()
-            .unwrap_or(Value::Array(Vec::new()));
-        let raw: Vec<RawIssue> = serde_json::from_value(nodes)
-            .map_err(|err| Error::failed(format!("unreadable issues: {err}")))?;
-        Ok(raw.into_iter().map(Issue::from).collect())
+        issues_in(&data)
     }
 
     /// One issue, by its id or uuid, with its description, comments, and the
@@ -174,6 +168,33 @@ impl Client {
             found.extend(standings(&data)?);
         }
         Ok(found)
+    }
+
+    /// Each of the issues `ids`, as the list has them, in one request for
+    /// every STANDINGS of them; one Linear does not have is left out.
+    pub fn issues_by_id(&self, ids: &[String]) -> Result<Vec<Issue>, Error> {
+        let query = format!(
+            "query($filter: IssueFilter, $first: Int) {{ issues(filter: $filter, first: $first, \
+             includeArchived: true) {{ nodes {{ {ISSUE_FIELDS} }} }} }}"
+        );
+        let mut found = Vec::new();
+        for ids in ids.chunks(STANDINGS) {
+            let filter = by_identifier(ids);
+            // None is an issue's id, and a filter of nothing asks for them all.
+            if filter["or"].as_array().is_none_or(Vec::is_empty) {
+                continue;
+            }
+            let data = self.query(&query, json!({ "filter": filter, "first": STANDINGS }))?;
+            found.extend(issues_in(&data)?);
+        }
+        Ok(found)
+    }
+
+    /// The project `id`, with its text and where its issues stand.
+    pub fn project(&self, id: &str) -> Result<Project, Error> {
+        let query = format!("query($id: String!) {{ project(id: $id) {{ {PROJECT_FIELDS} }} }}");
+        let data = self.query(&query, json!({ "id": id }))?;
+        project_in(&data, id)
     }
 
     /// The file at `url`, such as an image in a description. Linear's own
@@ -466,6 +487,28 @@ fn reply(body: &[u8]) -> Result<Value, Error> {
         .unwrap_or(Value::Null))
 }
 
+/// The issues a reply lists.
+fn issues_in(data: &Value) -> Result<Vec<Issue>, Error> {
+    let nodes = data
+        .pointer("/issues/nodes")
+        .cloned()
+        .unwrap_or(Value::Array(Vec::new()));
+    let raw: Vec<RawIssue> = serde_json::from_value(nodes)
+        .map_err(|err| Error::failed(format!("unreadable issues: {err}")))?;
+    Ok(raw.into_iter().map(Issue::from).collect())
+}
+
+/// The project a reply gives, asked for by `id`.
+fn project_in(data: &Value, id: &str) -> Result<Project, Error> {
+    let raw = data
+        .get("project")
+        .filter(|p| !p.is_null())
+        .ok_or_else(|| Error::new(ErrorKind::NotFound, format!("no project {id}")))?;
+    serde_json::from_value::<model::RawProject>(raw.clone())
+        .map(Project::from)
+        .map_err(|err| Error::failed(format!("unreadable project: {err}")))
+}
+
 /// The filter for exactly the issues `ids`, such as `END-123`, which Linear
 /// keeps as a team's key and a number.
 fn by_identifier(ids: &[String]) -> Value {
@@ -512,6 +555,31 @@ mod tests {
         "state":{"id":"s1","name":"Todo"},"assignee":null,
         "labels":{"nodes":[{"id":"l1","name":"Bug"}]},"project":{"id":"p1","name":"Auth"},
         "cycle":{"number":12,"name":null}}"#;
+
+    #[test]
+    fn ids_that_are_no_issues_ask_linear_for_nothing() {
+        // With no key and no network it would fail.
+        let client = Client::new("none");
+        let ids = ["notes".to_string(), "a-b".to_string()];
+        assert_eq!(client.issues_by_id(&ids), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn reads_a_project_with_its_text_and_its_issues_by_number() {
+        let data = json!({ "project": { "id": "p1", "name": "Panels", "description": "One line",
+            "content": " ", "issues": { "nodes": [
+                { "identifier": "ANB-10", "title": "Ten", "state": { "name": "Done", "type": "completed" } },
+                { "identifier": "ANB-9", "title": "Nine", "state": { "name": "Todo", "type": "unstarted" } } ] } } });
+        let project = project_in(&data, "p1").unwrap();
+        assert_eq!(project.name, "Panels");
+        assert_eq!(project.summary.as_deref(), Some("One line"));
+        assert_eq!(project.content, None, "blank text is none");
+        let ids: Vec<&str> = project.issues.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, ["ANB-9", "ANB-10"]);
+        assert_eq!(project.issues[1].kind.as_deref(), Some("completed"));
+        let none = project_in(&json!({ "project": null }), "p1").unwrap_err();
+        assert_eq!(none.kind, ErrorKind::NotFound);
+    }
 
     #[test]
     fn reads_an_issue_with_names_to_show_and_ids_to_change() {
@@ -755,6 +823,8 @@ mod tests {
         let results = [
             ("issues", client.issues(Some("END"), &all).err()),
             ("detail", client.detail("END-1").err()),
+            ("issues by id", client.issues_by_id(&["END-1".into()]).err()),
+            ("project", client.project("p").err()),
             ("team", client.team("END").err()),
             ("update", client.update("u", &change).err()),
             (
@@ -856,6 +926,15 @@ mod tests {
             client
                 .detail(&first.id)
                 .unwrap_or_else(|err| panic!("detail of {}: {err}", first.id));
+            let by_id = client
+                .issues_by_id(std::slice::from_ref(&first.id))
+                .unwrap_or_else(|err| panic!("{} by id: {err}", first.id));
+            assert_eq!(by_id.first().map(|i| &i.id), Some(&first.id));
+        }
+        if let Some(id) = issues.iter().find_map(|i| i.project_id.as_ref()) {
+            client
+                .project(id)
+                .unwrap_or_else(|err| panic!("project {id}: {err}"));
         }
     }
 }

@@ -22,6 +22,7 @@ use crate::reports::{Report, State};
 use crate::scratch::Scratch;
 use crate::ship::{self, Answer, PrView, Stage};
 use crate::sidecar::{Shelf, Sidecar};
+use crate::tree_issues::{Asked, Key, Said, TreeIssues};
 
 /// Where a tree's latest job stands, shown in its STATUS cell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,14 +134,36 @@ impl<'a> Item<'a> {
 pub struct Choice {
     pub checkout: PathBuf,
     pub name: String,
-    pub held: Option<usize>,
+    /// Its trees held and free, as last listed.
+    pub trees: Option<(usize, usize)>,
 }
 
 /// The workspace picker `w` opens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Picker {
     pub choices: Vec<Choice>,
+    /// The one under the cursor, among those shown.
     pub selected: usize,
+    /// What narrows it, by name, while `/` has the keys.
+    pub query: Option<String>,
+}
+
+impl Picker {
+    /// Its workspaces, those `query` leaves.
+    pub fn shown(&self) -> Vec<&Choice> {
+        let query = self.query.as_deref().unwrap_or_default().to_lowercase();
+        self.choices
+            .iter()
+            .filter(|c| c.name.to_lowercase().contains(&query))
+            .collect()
+    }
+
+    /// Puts the cursor on the first shown that is not `here`, since going
+    /// there is all Enter does.
+    fn select_other(&mut self, here: &std::path::Path) {
+        let shown = self.shown();
+        self.selected = shown.iter().position(|c| c.checkout != here).unwrap_or(0);
+    }
 }
 
 /// The command palette Ctrl+P opens: what has been typed to narrow it,
@@ -166,7 +189,6 @@ pub struct Command {
 enum Run {
     Key(KeyEvent),
     Open(String),
-    Workspaces,
     Issues,
     Plan,
 }
@@ -214,15 +236,15 @@ const POOL_COMMANDS: [(&str, &str); 12] = [
 ];
 
 /// The same in the panels, where some of those keys do something else: no
-/// double and no zoom, `w` the next waiting and Tab to Plan.
+/// double and no zoom, `W` the next that needs you and Tab to Plan.
 const PANELS_COMMANDS: [(&str, &str); 12] = [
     ("New agent in a fresh tree", "N"),
     ("Ask the assistant", ":"),
     ("Open the assistant's chat", "A"),
-    ("Next thing waiting on you", "w"),
+    ("Next thing that needs you", "W"),
     ("Planning chats", "Tab"),
     ("Issues", ""),
-    ("Switch workspace", ""),
+    ("Switch workspace", "w"),
     ("Scratch chats", "C"),
     ("Filter the trees", "/"),
     ("Notifications", "e"),
@@ -423,6 +445,8 @@ pub enum WindowTab {
     Diff,
     /// Its PR: checks, review threads and CodeRabbit, as `v` shows it.
     Pr,
+    /// The issue it works on, and that issue's project.
+    Issue,
     /// The steps of the keel run that holds it.
     Run,
     /// Where it is, its agents, ports and processes, and what its agent
@@ -438,45 +462,36 @@ pub enum Zoom {
     Windows,
 }
 
-/// A workspace as a tab of [2] Trees in the panels layout: its name, its
-/// checkout, and how many of its trees wait on you.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkspaceTab {
-    pub name: String,
-    pub checkout: PathBuf,
-    pub waiting: usize,
-}
-
 /// A numbered panel on the left of the panels layout, on its number key;
 /// the window on the right is 0.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Panel {
-    Waiting,
+    Ship,
     #[default]
     Trees,
-    Ship,
-    News,
+    Linear,
+    Keel,
 }
 
 impl Panel {
-    pub const ALL: [Panel; 4] = [Panel::Waiting, Panel::Trees, Panel::Ship, Panel::News];
+    pub const ALL: [Panel; 4] = [Panel::Ship, Panel::Trees, Panel::Linear, Panel::Keel];
 
     /// Its number key and title.
     pub fn number(self) -> u8 {
         match self {
-            Panel::Waiting => 1,
+            Panel::Ship => 1,
             Panel::Trees => 2,
-            Panel::Ship => 3,
-            Panel::News => 4,
+            Panel::Linear => 3,
+            Panel::Keel => 4,
         }
     }
 
     pub fn title(self) -> &'static str {
         match self {
-            Panel::Waiting => "Waiting",
-            Panel::Trees => "Trees",
             Panel::Ship => "Ship",
-            Panel::News => "News",
+            Panel::Trees => "Trees",
+            Panel::Linear => "Linear",
+            Panel::Keel => "Keel",
         }
     }
 }
@@ -523,14 +538,16 @@ pub enum Outcome {
     Switch(PathBuf),
     /// Show the pool of the repository checked out at `checkout`, and open
     /// what waits, of `kind`, in the tree at `tree` once it is read: what
-    /// waits in another workspace; with no kind, only put the cursor on it.
+    /// waits in another workspace.
     SwitchTo {
         checkout: PathBuf,
         tree: PathBuf,
-        kind: Option<crate::inbox::Kind>,
+        kind: crate::inbox::Kind,
     },
     /// Start the newer treetop installed over this one, on this workspace.
     Restart,
+    /// Make this change to an issue, or comment on it.
+    Edit(crate::tree_issues::Asked),
     /// Install the newer release, then restart on it.
     Update,
     /// Open `http://localhost:<port>`, served from tree `tree`, in the browser.
@@ -588,32 +605,12 @@ pub enum Outcome {
     Editor,
 }
 
-/// What had been read at a look for news: the workspace on screen, whether
-/// its PRs had been, and the other workspaces.
-#[derive(Debug, Clone, Default)]
-struct NewsRead {
-    here: PathBuf,
-    is_ships_read: bool,
-    away: HashSet<PathBuf>,
-    away_ships: HashSet<PathBuf>,
-}
-
 /// What waits on you as treetop last looked, kept across a switch of
 /// workspace: since when each has waited, so each keeps its age.
 #[derive(Debug, Clone, Default)]
 pub struct Watch {
     since: HashMap<crate::inbox::About, std::time::SystemTime>,
-    /// [4] News, newest first, kept across a switch as what waits is.
-    news: VecDeque<News>,
-    /// What waited or was done at the last look, for what is new since;
-    /// None before the first, which is no news.
-    news_seen: Option<HashSet<crate::inbox::About>>,
-    /// The workspace on screen and the others read, at the last look: one
-    /// read for the first time since, or a switch, is no news either, as
-    /// what it holds was already there, as the desktop is not told of it.
-    news_read: NewsRead,
-    /// The item of [1] Waiting gone to in another workspace, until it is
-    /// listed there for the cursor to be on.
+    /// What was last gone to of what waits, which `W` goes on from.
     gone_to: Option<crate::inbox::About>,
     /// What was answered in the window, and when, until its agent moves on.
     answered: HashMap<crate::inbox::About, Instant>,
@@ -632,16 +629,19 @@ pub enum PlanState {
     Idle,
 }
 
-/// A line of [4] News: when, where, and what happened; `kind` for the
-/// inbox's, None for treetop's own and what you sent.
+/// The status list, over the issue it is of, whatever the cursor does.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct News {
-    pub at: std::time::SystemTime,
-    pub place: String,
-    pub what: String,
-    pub kind: Option<crate::inbox::Kind>,
-    /// What it is about, for Enter to go to.
-    pub entry: Option<crate::inbox::Entry>,
+pub struct Statuses {
+    pub key: Key,
+    pub issue: linear::Issue,
+    pub picker: issues::Picker,
+}
+
+/// What the issue tab shows: the issue or its project, scrolled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IssueView {
+    pub is_project: bool,
+    pub scroll: u16,
 }
 
 /// How long an answer has to show in what its agent does: past it, an ask
@@ -651,9 +651,6 @@ const ANSWER_TAKES: Duration = Duration::from_secs(10);
 /// How long a question that opened by itself takes no number: one pressed as
 /// it opened was for something else.
 const ASK_SETTLES: Duration = Duration::from_millis(1500);
-
-/// The most lines [4] News keeps, the oldest going first.
-const NEWS_KEPT: usize = 300;
 
 #[derive(Default)]
 pub struct App {
@@ -880,35 +877,42 @@ pub struct App {
     /// it and the screen has room. Its keys and rows follow this, so a
     /// screen too small for it keeps the table layout's.
     pub is_panels_shown: bool,
-    /// In the panels layout, another workspace whose tab [2] Trees shows,
-    /// from its last read, until a key that acts switches there; None for
-    /// this one's.
-    pub viewing: Option<PathBuf>,
-    /// The tree under the cursor on that tab, among `viewed_trees`.
-    pub viewed: usize,
     /// The question dialog the window's chat shows, as its choices, while
     /// one has its keys and treetop can read it: one question, one choice.
     /// main reads it off the chat's screen each pass.
     pub dialog: Option<Vec<String>>,
     /// What each panel's cursor was on.
     held: HeldCursors,
-    /// In [1] Waiting, the item under its cursor.
-    pub waiting_at: usize,
-    /// In [3] Ship, the PR under its cursor.
+    /// In [1] Ship, the PR under its cursor.
     pub ship_at: usize,
     /// The tree whose chat was last typed into, and how many characters of
     /// that are in its box still, since its last Enter.
     pub typed: (PathBuf, usize),
     /// The window's chat shows a draft in its input box, as last drawn.
     pub is_draft_shown: bool,
-    /// In [4] News, the line under its cursor.
-    pub news_at: usize,
+    /// The issues the trees work on, for [3] Linear and the issue tab.
+    pub tree_issues: TreeIssues,
+    /// When a comment refused was last put back in its box by itself.
+    comment_reopened: Option<Instant>,
+    /// The status list open over the panels, and whose it is.
+    pub statuses: Option<Statuses>,
+    /// What the issue tab shows of the issue it was last on.
+    issue_view: Option<(Key, IssueView)>,
+    /// The furthest the issue tab scrolls, as last drawn.
+    pub issue_rows: std::cell::Cell<u16>,
+    /// In [4] Keel, the step under its cursor, and the tree whose run it is
+    /// of: another tree's starts on its current step, as does the same one's
+    /// once another panel has had the keys.
+    keel_at: Option<(PathBuf, usize)>,
     /// The Plan screen is shown, in the panels layout: Tab goes Trees,
     /// Plan, Issues. Never with `is_issues`.
     pub is_plan: bool,
     /// The open workspace's planning chats, as the Plan screen last read
     /// them, and the one under its cursor.
     pub plan_chats: Vec<crate::scratch::Scratch>,
+    /// What `D` and `S` asked planning chats for, by name, and not yet
+    /// delivered.
+    plan_asks: Vec<(String, crate::scratch::PlanAsk)>,
     pub plan_at: usize,
     /// What each planning chat made, by its job, as Linear last said, and
     /// the issue source that said it, for picking up; or why it could not.
@@ -940,7 +944,7 @@ pub struct App {
     returning: Option<OtherWindow>,
     /// The tree whose agent opens once this workspace's agents are read:
     /// what waits there, gone to from another workspace.
-    pub arriving: Option<(PathBuf, Option<crate::inbox::Kind>)>,
+    pub arriving: Option<(PathBuf, crate::inbox::Kind)>,
     /// The cursor was put on its tree, so it stays on it as the list is
     /// first sorted by what its reads find.
     pub is_cursor_held: bool,
@@ -1051,11 +1055,6 @@ fn is_plain(key: KeyEvent) -> bool {
     (key.modifiers - KeyModifiers::SHIFT).is_empty()
 }
 
-/// What tells an item of [1] Waiting apart.
-fn waiting_key(entry: &crate::inbox::Entry) -> String {
-    format!("{:?} {}", entry.kind, entry.path.display())
-}
-
 /// Where a panel's cursor was, and on what.
 #[derive(Debug, Clone, Default)]
 struct Held {
@@ -1066,10 +1065,8 @@ struct Held {
 /// Every panel's cursor, as last held.
 #[derive(Debug, Clone, Default)]
 struct HeldCursors {
-    waiting: Held,
+    notes: Held,
     ship: Held,
-    news: Held,
-    viewed: Held,
     made: Held,
     ready: Held,
 }
@@ -1542,9 +1539,8 @@ impl App {
     /// The tree the window under the table shows: the one under the
     /// cursor, or the main checkout on its heading.
     pub fn window_tree(&self) -> Option<&Tree> {
-        // Another workspace's tab is only looked at: its trees open nothing.
-        // Nor does the Plan screen, whose window is its planning chat's.
-        if self.viewing.is_some() || self.is_plan {
+        // The Plan screen's window is its planning chat's.
+        if self.is_plan {
             return None;
         }
         self.current().or(self.main_under_cursor())
@@ -1572,8 +1568,9 @@ impl App {
     }
 
     /// The tabs a window on `tree` has: the chat where an agent offers one,
-    /// a shell in a held tree, the diff and PR of a held tree, the run while
-    /// keel has one holding it, and its info.
+    /// a shell in a held tree, the diff and PR of a held tree, in the panels
+    /// the issue it works on, the run while keel has one holding it, and its
+    /// info.
     pub fn tabs_of(&self, tree: &Tree) -> Vec<WindowTab> {
         let mut tabs = Vec::new();
         if Self::chat_agent(tree).is_some() {
@@ -1587,6 +1584,9 @@ impl App {
         // only on a tree's own row.
         if tree.is_held() && !tree.is_main {
             tabs.extend([WindowTab::Diff, WindowTab::Pr]);
+        }
+        if self.shows_panels() && self.issue_on(tree).is_some() {
+            tabs.push(WindowTab::Issue);
         }
         if crate::keel::holding(&self.runs, &tree.path).is_some() {
             tabs.push(WindowTab::Run);
@@ -1669,7 +1669,6 @@ impl App {
                 key: key.to_string(),
                 run: match (*label, *key) {
                     ("Issues", "") => Run::Issues,
-                    ("Switch workspace", "") => Run::Workspaces,
                     ("Planning chats", _) => Run::Plan,
                     _ => Run::Key(key_event(key)),
                 },
@@ -1728,7 +1727,6 @@ impl App {
                         // On the tree it names, from whichever panel.
                         Run::Key(key) if self.shows_panels() => self.run_on_trees(key),
                         Run::Key(key) => self.handle_key(key),
-                        Run::Workspaces => Outcome::Workspaces,
                         Run::Plan => Outcome::Plan,
                         Run::Issues => {
                             self.is_issues = true;
@@ -1754,88 +1752,7 @@ impl App {
         Outcome::Continue
     }
 
-    /// Every workspace as a tab, this one among them, in name order so
-    /// stepping through them keeps its place; each with what waits there.
-    pub fn workspace_tabs(&self) -> Vec<WorkspaceTab> {
-        let (waiting, _) = self.notes_list();
-        let count = |checkout: &std::path::Path| {
-            waiting
-                .iter()
-                .filter(|e| match &e.away {
-                    Some(away) => away.checkout == checkout,
-                    None => checkout == self.checkout,
-                })
-                .count()
-        };
-        let mut tabs: Vec<WorkspaceTab> = std::iter::once((
-            crate::workspaces::name(&self.checkout),
-            self.checkout.clone(),
-        ))
-        .chain(
-            self.pools
-                .iter()
-                .map(|p| (p.away.name.clone(), p.away.checkout.clone())),
-        )
-        .map(|(name, checkout)| WorkspaceTab {
-            waiting: count(&checkout),
-            name,
-            checkout,
-        })
-        .collect();
-        tabs.sort_by(|a, b| a.name.cmp(&b.name).then(a.checkout.cmp(&b.checkout)));
-        tabs
-    }
-
-    /// The held trees of the workspace whose tab is shown, while it is
-    /// another's, as its last read found them, else as its cache lists
-    /// them: those worked on first, then those shelved.
-    pub fn viewed_trees(&self) -> Option<Vec<&Tree>> {
-        let mut trees = self.viewed_pool()?;
-        trees.retain(|t| t.is_held());
-        // Worked on, then the Backburner, then Parked, as the table has them.
-        trees.sort_by_key(|t| match self.viewed_shelf(t) {
-            None => 0,
-            Some(Shelf::Backburner) => 1,
-            Some(Shelf::Parked) => 2,
-        });
-        Some(trees)
-    }
-
-    /// The free trees of the workspace whose tab is shown, lowest first.
-    pub fn viewed_free(&self) -> Vec<&Tree> {
-        let mut free = self.viewed_pool().unwrap_or_default();
-        free.retain(|t| !t.is_held());
-        free.sort_by_key(|t| (t.name.parse::<u32>().ok(), t.name.clone()));
-        free
-    }
-
-    /// Every tree of the workspace whose tab is shown but its main
-    /// checkout, in pool order.
-    fn viewed_pool(&self) -> Option<Vec<&Tree>> {
-        let checkout = self.viewing.as_ref()?;
-        let pool = self.pools.iter().find(|p| &p.away.checkout == checkout);
-        let trees: Vec<&Tree> = match self.away_live.get(checkout) {
-            Some(live) => live.iter().collect(),
-            None => pool.map(|p| p.trees.iter().collect()).unwrap_or_default(),
-        };
-        Some(trees.into_iter().filter(|t| !t.is_main).collect())
-    }
-
-    /// The shelf of a tree on another workspace's tab, for its heading.
-    pub fn viewed_shelf(&self, tree: &Tree) -> Option<Shelf> {
-        let checkout = self.viewing.as_ref()?;
-        tree.sidecar
-            .as_deref()
-            .or_else(|| {
-                self.pools
-                    .iter()
-                    .find(|p| &p.away.checkout == checkout)
-                    .and_then(|p| p.sidecars.get(&tree.path))
-            })
-            .and_then(Sidecar::shelf)
-    }
-
-    /// The window follows the PR under [3] Ship's cursor, where its tree is
+    /// The window follows the PR under [1] Ship's cursor, where its tree is
     /// in [2]'s list: moving unfolds and unfilters nothing.
     fn follow_ship(&mut self) {
         let rows = self.ship_rows();
@@ -1844,113 +1761,349 @@ impl App {
         self.reselect(path);
     }
 
-    /// [4] News' keys in the panels layout: j, k, g and G move its cursor,
-    /// which scrolls it, and Enter goes to what its line is about. None for a key it leaves to the rest.
-    fn handle_news_key(&mut self, key: KeyEvent) -> Option<Outcome> {
+    /// The step under [4] Keel's cursor, counted from none: the run's current
+    /// one until it is moved, or its last where none is.
+    pub fn keel_step(&self, run: &crate::keel::Run) -> usize {
+        let last = run.steps.len().saturating_sub(1);
+        self.keel_at
+            .as_ref()
+            .filter(|(tree, _)| *tree == run.tree)
+            .map(|(_, at)| *at)
+            .or(run.current.and_then(|at| at.checked_sub(1)))
+            .unwrap_or(last)
+            .min(last)
+    }
+
+    /// The issue `tree` works on: the one recorded on it, else the one its
+    /// keel run's goal or its branch names.
+    pub fn issue_on(&self, tree: &Tree) -> Option<Key> {
+        if !tree.is_held() || tree.is_main {
+            return None;
+        }
+        let record = tree.sidecar.as_deref();
+        let goal = crate::keel::holding(&self.runs, &tree.path).map(|run| run.goal.as_str());
+        self.tree_issues.on(
+            record.and_then(|r| r.ticket.as_deref()),
+            record.and_then(|r| r.source.as_deref()),
+            goal,
+            tree.branch.as_deref(),
+        )
+    }
+
+    /// The issue of the tree under the cursor.
+    pub fn shown_issue(&self) -> Option<Key> {
+        self.issue_on(self.window_tree()?)
+    }
+
+    /// The read of the trees' issues that is due, by source.
+    pub fn wanted_issues(&mut self) -> Option<Vec<(Option<String>, Vec<String>)>> {
+        if !self.shows_panels() {
+            return None;
+        }
+        let keys = self
+            .trees
+            .iter()
+            .filter_map(|tree| self.issue_on(tree))
+            .collect();
+        self.tree_issues.wanted(&keys)
+    }
+
+    /// The issue whose text the issue tab, shown, wants read.
+    pub fn wanted_detail(&mut self) -> Option<Key> {
+        if self.shown_tab() != WindowTab::Issue || self.is_issues || self.is_plan {
+            return None;
+        }
+        let key = self.shown_issue()?;
+        self.tree_issues.wanted_detail(&key)
+    }
+
+    /// What the issue tab shows of `key`'s issue.
+    pub fn issue_view(&self, key: &Key) -> IssueView {
+        self.issue_view
+            .as_ref()
+            .filter(|(on, _)| on == key)
+            .map(|(_, view)| *view)
+            .unwrap_or_default()
+    }
+
+    /// Shows the issue of the tree under the cursor, or its project, in the
+    /// window, with the keys.
+    pub fn open_issue_tab(&mut self, is_project: bool) {
+        let Some(key) = self.shown_issue() else {
+            self.message = Some("no issue on this tree: I picks one".into());
+            return;
+        };
+        let view = IssueView {
+            is_project,
+            scroll: 0,
+        };
+        self.issue_view = Some((key, view));
+        self.show_tab(WindowTab::Issue);
+    }
+
+    /// `s` on [3] Linear or the issue tab: the statuses of its issue, for
+    /// one to be picked.
+    pub fn open_statuses(&mut self) {
+        let Some((key, issue)) = self.issue_to_edit() else {
+            return;
+        };
+        self.message = match self.tree_issues.team(&key.source) {
+            None => {
+                let why = self.tree_issues.team_error(&key.source).map(str::to_string);
+                self.tree_issues.read_again();
+                Some(match why {
+                    Some(why) => format!("its statuses could not be read: {why}"),
+                    None => "reading the team's statuses; try again in a moment".into(),
+                })
+            }
+            Some(None) => Some(issues::READ_ONLY.into()),
+            Some(Some(team)) if issue.team_id.as_ref() != Some(&team.id) => Some(format!(
+                "{} is not in {}, whose statuses this source has",
+                issue.id, team.key
+            )),
+            Some(Some(team)) => {
+                let picker = issues::Picker::new(issues::PickerKind::Status, &issue, team);
+                self.statuses = Some(Statuses { key, issue, picker });
+                None
+            }
+        };
+    }
+
+    /// `c` on [3] Linear or the issue tab: a comment on its issue.
+    fn open_comment(&mut self) {
+        let Some((key, issue)) = self.issue_to_edit() else {
+            return;
+        };
+        if self.tree_issues.team(&key.source) == Some(None) {
+            self.message = Some(issues::READ_ONLY.into());
+            return;
+        }
+        self.prompt = Some(Prompt::comment(key, issue, String::new()));
+    }
+
+    /// The issue an edit here is of, as last read; says why there is none.
+    fn issue_to_edit(&mut self) -> Option<(Key, linear::Issue)> {
+        let Some(key) = self.shown_issue() else {
+            self.message = Some("no issue on this tree: I picks one".into());
+            return None;
+        };
+        match self.tree_issues.issue(&key).cloned() {
+            Some(issue) => Some((key, issue)),
+            None => {
+                self.message = Some(format!("{} is not read yet", key.id));
+                None
+            }
+        }
+    }
+
+    /// The keys of the status list: a status picked shows at once, and goes
+    /// to the issue the list was opened on.
+    fn handle_statuses_key(&mut self, key: KeyEvent) -> Outcome {
+        let Some(statuses) = self.statuses.as_mut() else {
+            return Outcome::Continue;
+        };
+        match statuses.picker.handle_key(key, &statuses.issue) {
+            issues::Picked::Continue => Outcome::Continue,
+            issues::Picked::Cancel => {
+                self.statuses = None;
+                Outcome::Continue
+            }
+            issues::Picked::Apply(change, after) => {
+                let Some(statuses) = self.statuses.take() else {
+                    return Outcome::Continue;
+                };
+                if after.state_id == statuses.issue.state_id {
+                    return Outcome::Continue;
+                }
+                // As it stands now, with its status alone changed.
+                let now = self.tree_issues.issue(&statuses.key);
+                let mut issue = now.cloned().unwrap_or(statuses.issue);
+                issue.state = after.state;
+                issue.state_id = after.state_id;
+                let Some(before) = self.tree_issues.change(&statuses.key, issue) else {
+                    return Outcome::Continue;
+                };
+                Outcome::Edit(Asked {
+                    key: statuses.key,
+                    issue: Box::new(before),
+                    what: crate::tree_issues::Edit::Change(change),
+                })
+            }
+        }
+    }
+
+    /// An edit made here has been answered: one refused is put back and
+    /// says why.
+    pub fn edit_answered(&mut self, asked: Asked, said: Said) {
+        let id = asked.key.id.clone();
+        match said {
+            Said::Changed(said) => {
+                self.tree_issues.changed(&asked.key, &said);
+                if let Err(why) = said {
+                    self.message = Some(format!("status of {id} not changed: {why}"));
+                }
+            }
+            Said::Commented(Ok(comment)) => {
+                self.tree_issues.commented(&asked.key, comment);
+                self.message = Some(format!("commented on {id}"));
+            }
+            Said::Commented(Err(why)) => {
+                self.message = Some(format!("not commented on {id}: {why}"));
+            }
+        }
+    }
+
+    /// Nothing is under way that a comment's box opening would take over:
+    /// the panels have the keys, or the issue tab in the window.
+    pub fn can_reopen_comment(&self) -> bool {
+        let is_reading_issue = self.has_keys_on(WindowTab::Issue)
+            && !self.is_typing()
+            && self.palette.is_none()
+            && self.opening.is_none()
+            && !self.is_issues
+            && !self.is_plan
+            && !self.is_quitting;
+        self.is_free() || is_reading_issue
+    }
+
+    /// A comment refused, in its box again to send once more.
+    pub fn reopen_comment(&mut self, asked: Asked) {
+        if let crate::tree_issues::Edit::Comment(text) = asked.what {
+            self.comment_reopened = Some(Instant::now());
+            self.prompt = Some(Prompt::comment(asked.key, *asked.issue, text));
+        }
+    }
+
+    /// Opens the issue of the tree under the cursor in the browser.
+    fn open_issue_url(&mut self) -> Outcome {
+        let Some((_, issue)) = self.issue_to_edit() else {
+            return Outcome::Continue;
+        };
+        match issue.url {
+            Some(url) => Outcome::OpenUrl(url),
+            None => {
+                self.message = Some(format!("{} has no address", issue.id));
+                Outcome::Continue
+            }
+        }
+    }
+
+    /// What [3] Linear and the issue tab's keys share: `s` the status, `c`
+    /// a comment, `O` the browser. None for any other.
+    fn edit_issue_by(&mut self, code: KeyCode) -> Option<Outcome> {
+        match code {
+            KeyCode::Char('s') => self.open_statuses(),
+            KeyCode::Char('c') => self.open_comment(),
+            KeyCode::Char('O') => return Some(self.open_issue_url()),
+            _ => return None,
+        }
+        Some(Outcome::Continue)
+    }
+
+    /// [3] Linear's keys in the panels layout: Enter shows the issue in the
+    /// window, `s`, `c` and `O` are of the issue, and a key that acts on a
+    /// tree does nothing. None for a key it leaves to the rest, `I` among
+    /// them.
+    fn handle_linear_key(&mut self, key: KeyEvent) -> Option<Outcome> {
         if !self.shows_panels()
-            || self.panel != Panel::News
+            || self.panel != Panel::Linear
+            || self.is_window_focused
+            || !is_plain(key)
+            || self.is_typing()
+            // A start in a popup over it has the keys.
+            || self.opening.as_ref().is_some_and(|o| o.key.is_none())
+        {
+            return None;
+        }
+        if let Some(outcome) = self.edit_issue_by(key.code) {
+            return Some(outcome);
+        }
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('l') => self.open_issue_tab(false),
+            KeyCode::Char('I') => return None,
+            KeyCode::Char('j' | 'k' | 'g' | 'G' | ' ') | KeyCode::Up | KeyCode::Down => {}
+            code if acts_on_tree(code) => {}
+            _ => return None,
+        }
+        Some(Outcome::Continue)
+    }
+
+    /// The issue tab's own keys, with the window's: `h` and `l` go between
+    /// the issue and its project, j, k, d, u, g and G scroll, and `s`, `c`
+    /// and `O` are of the issue. None for what every tab takes.
+    fn handle_issue_key(&mut self, key: KeyEvent) -> Option<Outcome> {
+        if self.shown_tab() != WindowTab::Issue || !is_plain(key) {
+            return None;
+        }
+        if let Some(outcome) = self.edit_issue_by(key.code) {
+            return Some(outcome);
+        }
+        let on = self.shown_issue()?;
+        let mut view = self.issue_view(&on);
+        let last = self.issue_rows.get();
+        let half = (self.window_rows / 2).max(1);
+        let at = view.scroll.min(last);
+        match key.code {
+            KeyCode::Char('h' | 'l') => {
+                view = IssueView {
+                    is_project: key.code == KeyCode::Char('l'),
+                    scroll: 0,
+                };
+            }
+            KeyCode::Char('j') | KeyCode::Down => view.scroll = (at + 1).min(last),
+            KeyCode::Char('k') | KeyCode::Up => view.scroll = at.saturating_sub(1),
+            KeyCode::Char('d') => view.scroll = (at + half).min(last),
+            KeyCode::Char('u') => view.scroll = at.saturating_sub(half),
+            KeyCode::Char('g') | KeyCode::Home => view.scroll = 0,
+            KeyCode::Char('G') | KeyCode::End => view.scroll = last,
+            _ => return None,
+        }
+        self.issue_view = Some((on, view));
+        Some(Outcome::Continue)
+    }
+
+    /// [4] Keel's keys in the panels layout: j, k, g and G move among the
+    /// steps of the run it shows, and Enter shows that run in the window; a
+    /// key that acts on a tree does nothing. None for a key it leaves to the
+    /// rest.
+    fn handle_keel_key(&mut self, key: KeyEvent) -> Option<Outcome> {
+        if !self.shows_panels()
+            || self.panel != Panel::Keel
             || self.is_window_focused
             || !is_plain(key)
             || self.is_typing()
         {
             return None;
         }
-        let last = self.news().len().saturating_sub(1);
-        let at = self.news_at.min(last);
-        self.news_at = match key.code {
+        let run = self.window_tree().and_then(|tree| self.run_of(tree));
+        let (tree, at, last) = match run {
+            Some(run) => (
+                run.tree.clone(),
+                self.keel_step(run),
+                run.steps.len().saturating_sub(1),
+            ),
+            None => (PathBuf::new(), 0, 0),
+        };
+        let to = match key.code {
             KeyCode::Char('j') | KeyCode::Down => (at + 1).min(last),
             KeyCode::Char('k') | KeyCode::Up => at.saturating_sub(1),
             KeyCode::Char('g') | KeyCode::Home => 0,
             KeyCode::Char('G') | KeyCode::End => last,
             KeyCode::Enter | KeyCode::Char('l') => {
-                let entry = self.news().get(at).and_then(|n| n.entry.clone());
-                return Some(match entry {
-                    Some(entry) => self.go_to(entry),
-                    None => Outcome::Continue,
-                });
+                if self.window_tabs().contains(&WindowTab::Run) {
+                    self.tab = WindowTab::Run;
+                    self.focus_window();
+                } else {
+                    self.message = Some("no keel run holds this tree".into());
+                }
+                return Some(Outcome::Continue);
             }
-            // It lists no trees for them.
+            KeyCode::Char('I') => return None,
             KeyCode::Char(' ') => return Some(Outcome::Continue),
             code if acts_on_tree(code) => return Some(Outcome::Continue),
             _ => return None,
         };
-        Some(Outcome::Continue)
-    }
-
-    /// [2] Trees' keys for its tabs in the panels layout: `[` and `]` step
-    /// through the workspaces, and on another's tab the cursor moves among
-    /// its trees, Esc comes back, a key that acts switches there for real,
-    /// refused while an action runs, and the rest do nothing, so none acts
-    /// on a tree of this workspace's that is not on screen. None for a key
-    /// it leaves to the table.
-    fn handle_tab_key(&mut self, key: KeyEvent) -> Option<Outcome> {
-        let is_trees = self.shows_panels()
-            && self.panel == Panel::Trees
-            && !self.is_window_focused
-            && !self.is_typing();
-        // The palette lists this workspace's trees, which are not shown.
-        if is_trees && self.viewing.is_some() && crate::chat::is_palette(key) {
-            self.message = Some("Esc comes back to this workspace's trees first".into());
-            return Some(Outcome::Continue);
-        }
-        if !is_trees || !is_plain(key) {
-            return None;
-        }
-        if let KeyCode::Char(step @ ('[' | ']')) = key.code {
-            let tabs = self.workspace_tabs();
-            let here = self.viewing.as_ref().unwrap_or(&self.checkout);
-            let at = tabs.iter().position(|t| &t.checkout == here).unwrap_or(0);
-            // The open workspace is always among them, so there is one.
-            let n = tabs.len();
-            let next = if step == ']' {
-                (at + 1) % n
-            } else {
-                (at + n - 1) % n
-            };
-            if let Some(tab) = tabs.get(next) {
-                self.viewing = (tab.checkout != self.checkout).then(|| tab.checkout.clone());
-                self.viewed = 0;
-                self.marked.clear();
-            }
-            return Some(Outcome::Continue);
-        }
-        let checkout = self.viewing.clone()?;
-        let last = self.viewed_trees().map_or(0, |t| t.len().saturating_sub(1));
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => self.viewed = (self.viewed + 1).min(last),
-            KeyCode::Char('k') | KeyCode::Up => self.viewed = self.viewed.saturating_sub(1),
-            KeyCode::Char('g') | KeyCode::Home => self.viewed = 0,
-            KeyCode::Char('G') | KeyCode::End => self.viewed = last,
-            KeyCode::Esc => self.viewing = None,
-            KeyCode::Enter | KeyCode::Char('l' | 'i' | 'n' | 'r' | 'm' | 'z' | 'x' | 't') => {
-                return Some(match self.active_jobs() {
-                    0 => {
-                        let tree = self
-                            .viewed_trees()
-                            .and_then(|trees| trees.get(self.viewed).map(|t| t.path.clone()));
-                        self.viewing = None;
-                        match tree {
-                            Some(tree) => Outcome::SwitchTo {
-                                checkout,
-                                tree,
-                                kind: None,
-                            },
-                            None => Outcome::Switch(checkout),
-                        }
-                    }
-                    _ => {
-                        self.message = Some(self.says_busy());
-                        Outcome::Continue
-                    }
-                });
-            }
-            // What works anywhere still does: help, quit, the notifications,
-            // the assistant and the other screens.
-            // `:` is left out: it asks about the tree under this workspace's
-            // cursor, which is not the one shown.
-            KeyCode::Char('?' | 'q' | 'e' | 'w' | 'A' | 'C') | KeyCode::Tab => return None,
-            _ => {}
-        }
+        self.keel_at = Some((tree, to));
         Some(Outcome::Continue)
     }
 
@@ -1982,20 +2135,6 @@ impl App {
             .filter(|_| !self.is_plan)
             .map(|t| t.path.clone())
         {
-            let picked = self
-                .dialog
-                .as_ref()
-                .and_then(|choices| choices.get(n - 1).cloned())
-                .unwrap_or_default();
-            let to = self
-                .window_tree()
-                .map(|t| {
-                    t.branch
-                        .clone()
-                        .unwrap_or_else(|| format!("tree {}", t.name))
-                })
-                .unwrap_or_default();
-            self.add_news(None, format!("you: {c} {picked} → {to}"), None);
             self.put_away_kind(&path, crate::inbox::Kind::NeedsYou);
         }
         Some(Outcome::Answer(c))
@@ -2120,7 +2259,10 @@ impl App {
     /// cursor alone, whatever is marked, then back to the panel it was run
     /// from, unless it went somewhere.
     fn run_on_trees(&mut self, key: KeyEvent) -> Outcome {
-        self.viewing = None;
+        // It goes somewhere, whichever panel has the keys.
+        if key.code == KeyCode::Char('W') {
+            return self.handle_key(key);
+        }
         match self.current().map(|t| t.path.clone()) {
             Some(path) if acts_on_tree(key.code) => self.act_on(path, key),
             Some(path) if key.code == KeyCode::Char(' ') => {
@@ -2160,115 +2302,32 @@ impl App {
         }
     }
 
-    /// [1] Waiting's keys in the panels layout: j and k move among what
-    /// waits, and Enter or l opens it as the notifications do, its tree in
-    /// the window, another workspace's switched to first. `w` from anywhere
-    /// in the panels layout opens the next one after the tree under the
-    /// cursor. A key that acts on a tree acts on the item's, gone to first
-    /// where it is in another workspace. None for a key it leaves to the
-    /// rest.
-    fn handle_waiting_key(&mut self, key: KeyEvent) -> Option<Outcome> {
-        if !self.shows_panels() || !is_plain(key) || self.is_typing() {
+    /// `W` anywhere in the panels layout: goes to the next thing that needs
+    /// you in any workspace, the oldest first and round again, on from what
+    /// was last gone to while the window is on its tree, which can have two,
+    /// or on none yet, else from the window's tree. None for any other key.
+    fn handle_next_key(&mut self, key: KeyEvent) -> Option<Outcome> {
+        if key.code != KeyCode::Char('W')
+            || !self.shows_panels()
+            || !is_plain(key)
+            || self.is_typing()
+            || self.opening.is_some() && self.is_plan
+        {
             return None;
         }
-        // What needs you in every workspace, the oldest first.
         let (items, _) = self.notes_list();
-        if key.code == KeyCode::Char('w') {
-            if items.is_empty() {
-                self.message = Some("nothing waits on you".into());
-                return Some(Outcome::Continue);
-            }
-            // On from the item under the cursor while the window is on its
-            // tree, which can have two, else from the window's tree.
-            let here = self.window_tree().map(|t| t.path.clone());
-            let is_here = |e: &crate::inbox::Entry| Some(&e.path) == here.as_ref();
-            let next = items
-                .get(self.waiting_at)
-                .filter(|e| is_here(e))
-                .map(|_| self.waiting_at)
-                .or_else(|| items.iter().position(is_here))
-                .map_or(0, |at| (at + 1) % items.len());
-            self.waiting_at = next;
-            return Some(self.go_to(items[next].clone()));
+        if items.is_empty() {
+            self.message = Some("nothing needs you".into());
+            return Some(Outcome::Continue);
         }
-        if self.panel != Panel::Waiting || self.is_window_focused {
-            return None;
-        }
-        let last = items.len().saturating_sub(1);
-        if matches!(
-            key.code,
-            KeyCode::Char('g' | 'G' | 'j' | 'k')
-                | KeyCode::Home
-                | KeyCode::End
-                | KeyCode::Up
-                | KeyCode::Down
-        ) {
-            self.watch.gone_to = None;
-        }
-        match key.code {
-            KeyCode::Char('g') | KeyCode::Home => self.waiting_at = 0,
-            KeyCode::Char('G') | KeyCode::End => self.waiting_at = last,
-            KeyCode::Char('j') | KeyCode::Down => self.waiting_at = (self.waiting_at + 1).min(last),
-            KeyCode::Char('k') | KeyCode::Up => self.waiting_at = self.waiting_at.saturating_sub(1),
-            KeyCode::Enter | KeyCode::Char('l') => {
-                return Some(match items.into_iter().nth(self.waiting_at.min(last)) {
-                    Some(entry) => self.go_to(entry),
-                    None => Outcome::Continue,
-                });
-            }
-            // Space marks the item's tree, the other marks as they are.
-            KeyCode::Char(' ') => {
-                if let Some(entry) = items.into_iter().nth(self.waiting_at.min(last)) {
-                    if entry.away.is_some() {
-                        return Some(self.go_to(entry));
-                    }
-                    self.toggle_mark(entry.path);
-                }
-            }
-            // Everything the table does to the tree under its cursor.
-            code if acts_on_tree(code) => {
-                // The one gone to here, not listed yet.
-                if let Some((_, path)) = self.watch.gone_to.clone() {
-                    let is_listed = self.trees.iter().any(|t| t.path == path);
-                    return Some(if is_listed {
-                        self.act_on(path, key)
-                    } else {
-                        Outcome::Continue
-                    });
-                }
-                return Some(match items.into_iter().nth(self.waiting_at.min(last)) {
-                    Some(entry) if entry.away.is_some() => self.go_to(entry),
-                    Some(entry) => self.act_on(entry.path, key),
-                    None => Outcome::Continue,
-                });
-            }
-            _ => return None,
-        }
-        Some(Outcome::Continue)
-    }
-
-    /// [4] News, newest first.
-    pub fn news(&self) -> &VecDeque<News> {
-        &self.watch.news
-    }
-
-    /// Adds a line to [4] News, in this workspace unless `place` says
-    /// where.
-    pub fn add_news(
-        &mut self,
-        place: Option<String>,
-        what: String,
-        kind: Option<crate::inbox::Kind>,
-    ) {
-        let place = place.unwrap_or_else(|| crate::workspaces::name(&self.checkout));
-        self.watch.news.push_front(News {
-            at: std::time::SystemTime::now(),
-            place,
-            what,
-            kind,
-            entry: None,
-        });
-        self.watch.news.truncate(NEWS_KEPT);
+        let here = self.window_tree().map(|t| t.path.clone());
+        let is_here = |e: &crate::inbox::Entry| Some(&e.path) == here.as_ref();
+        let next = items
+            .iter()
+            .position(|e| (here.is_none() || is_here(e)) && Some(e.about()) == self.watch.gone_to)
+            .or_else(|| items.iter().position(is_here))
+            .map_or(0, |at| (at + 1) % items.len());
+        Some(self.go_to(items[next].clone()))
     }
 
     /// Shows the Plan screen with `chats`, the open workspace's planning
@@ -2410,8 +2469,8 @@ impl App {
     /// The Plan screen's window in Normal, on its planning chat, as a
     /// tree's chat tab has it: `i` or Enter types to it, j, k, d and u
     /// scroll it, and Esc, `q` or Ctrl+Q gives the keys back to the panels.
-    /// None for what the screen's own keys take: the panels' numbers and
-    /// Tab.
+    /// None for what the screen's own keys take: the panels' numbers, `e`,
+    /// `w` and Tab.
     fn handle_plan_window_key(&mut self, key: KeyEvent) -> Option<Outcome> {
         let half = isize::try_from(self.window_rows / 2).map_or(1, |h| h.max(1));
         match key.code {
@@ -2422,7 +2481,7 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => return Some(Outcome::ScrollChat(-1)),
             KeyCode::Char('d') => return Some(Outcome::ScrollChat(half)),
             KeyCode::Char('u') => return Some(Outcome::ScrollChat(-half)),
-            KeyCode::Char('1'..='3') | KeyCode::Tab => return None,
+            KeyCode::Char('1'..='3' | 'e' | 'w') | KeyCode::Tab => return None,
             _ => {}
         }
         Some(Outcome::Continue)
@@ -2492,6 +2551,49 @@ impl App {
         }
     }
 
+    /// What `D` or `S` asked the planning chat `name` for has been typed to
+    /// it: its record's file, and what to keep there.
+    pub fn plan_delivered(&mut self, name: &str) -> Option<(PathBuf, crate::scratch::PlanAsk)> {
+        let asked = self.take_plan_ask(name)?;
+        let chat = self.plan_chats.iter_mut().find(|c| c.name == name)?;
+        chat.asked = Some(asked);
+        Some((chat.record.clone(), asked))
+    }
+
+    /// What was asked of the planning chat `name` never reached it.
+    pub fn plan_undelivered(&mut self, name: &str) {
+        self.take_plan_ask(name);
+    }
+
+    fn take_plan_ask(&mut self, name: &str) -> Option<crate::scratch::PlanAsk> {
+        let at = self.plan_asks.iter().position(|(n, _)| n == name)?;
+        Some(self.plan_asks.remove(at).1)
+    }
+
+    /// Which of Plan's four steps `chat` is on, from 1: talking, its issues
+    /// drafted, being created, or made, to pick up; past the last once one
+    /// has been picked up.
+    pub fn plan_step(&self, chat: &crate::scratch::Scratch) -> usize {
+        use crate::planned::Stage;
+        use crate::scratch::PlanAsk;
+        if chat.issues.is_empty() {
+            return match chat.asked {
+                None => 1,
+                Some(PlanAsk::Draft) => 2,
+                Some(PlanAsk::Create) => 3,
+            };
+        }
+        let is_started =
+            |i: &crate::planned::Planned| matches!(i.stage, Stage::Going | Stage::Done);
+        let read = self.plan_made.get(&chat.job);
+        let is_picked = chat
+            .issues
+            .iter()
+            .any(|id| self.tree_of_ticket(id).is_some())
+            || read.is_some_and(|made| made.iter().any(is_started));
+        if is_picked { 5 } else { 4 }
+    }
+
     /// The planning chats asking you, for the Plan screen's count.
     pub fn plan_asking(&self) -> usize {
         self.plan_chats
@@ -2503,9 +2605,10 @@ impl App {
     /// The Plan screen's keys: j and k move among its planning chats, `n`
     /// starts one for this workspace, Enter or `i` opens the one under the
     /// cursor in the window, `D` asks it to draft its plan as issues and
-    /// `S` to create them in Linear, as `/spec` does, and Tab goes on to
-    /// Issues. Every other key, the Trees screen's and Ctrl's among them,
-    /// does nothing here, so none acts on a tree.
+    /// `S` to create them in Linear, as `/spec` does, `e` lists what needs
+    /// you, `w` the workspaces, and Tab goes on to Issues. Every other key,
+    /// the Trees screen's and Ctrl's among them, does nothing here, so none
+    /// acts on a tree.
     fn handle_plan_key(&mut self, key: KeyEvent) -> Outcome {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return self.quit();
@@ -2566,6 +2669,14 @@ impl App {
             }
             KeyCode::Char('p') => return self.pick_planned(),
             KeyCode::Char('n') => return Outcome::NewPlan,
+            KeyCode::Char('e') => {
+                self.leave_plan_window();
+                self.notes = Some(0);
+            }
+            KeyCode::Char('w') => {
+                self.leave_plan_window();
+                return Outcome::Workspaces;
+            }
             KeyCode::Enter | KeyCode::Char('i' | 'l' | '0') => {
                 if let Some(chat) = chat {
                     let opened = Outcome::Chat {
@@ -2597,6 +2708,12 @@ impl App {
                 };
                 let to =
                     crate::dispatch::Recipient::of_job(&chat.name, SCRATCH.into(), &chat.job, true);
+                let asked = if c == 'D' {
+                    crate::scratch::PlanAsk::Draft
+                } else {
+                    crate::scratch::PlanAsk::Create
+                };
+                self.plan_asks.push((chat.name, asked));
                 return Outcome::Send { to: vec![to], text };
             }
             KeyCode::Char('q') => return self.quit(),
@@ -2605,71 +2722,11 @@ impl App {
         Outcome::Continue
     }
 
-    /// What you sent each of `to`, into [4] News: its first line, and the
-    /// branch it went to, else its tree's number.
-    pub fn note_sent(&mut self, to: &[Recipient], text: &str) {
-        let said = text.lines().next().unwrap_or_default();
-        for recipient in to {
-            let to = self
-                .trees
-                .iter()
-                .find(|t| t.name == recipient.tree)
-                .and_then(|t| t.branch.clone())
-                .unwrap_or_else(|| match recipient.tree.as_str() {
-                    SCRATCH => recipient.agent.clone(),
-                    tree => format!("tree {tree}"),
-                });
-            self.add_news(None, format!("you: {said} → {to}"), None);
-        }
-    }
-
-    /// What started waiting, or was done or merged, in any workspace since
-    /// the last look goes into [4] News; what already was at the first look
-    /// is not news, as the bell does not ring for it.
-    fn look_for_news(&mut self) {
-        let entries = crate::inbox::entries(self);
-        let now: HashSet<crate::inbox::About> = entries.iter().map(|e| e.about()).collect();
-        let read = NewsRead {
-            here: self.checkout.clone(),
-            is_ships_read: self.is_ships_read,
-            away: self.away_live.keys().cloned().collect(),
-            away_ships: self.away_ships.clone(),
-        };
-        let was = std::mem::replace(&mut self.watch.news_read, read);
-        let Some(seen) = self.watch.news_seen.replace(now) else {
-            return;
-        };
-        let new: Vec<crate::inbox::Entry> = entries
-            .into_iter()
-            .filter(|e| !seen.contains(&e.about()))
-            .filter(|e| match &e.away {
-                None => was.here == self.checkout && (was.is_ships_read || !e.kind.is_pr()),
-                Some(away) if e.kind.is_pr() => was.away_ships.contains(&away.checkout),
-                Some(away) => was.away.contains(&away.checkout),
-            })
-            .collect();
-        for entry in new {
-            let place = match &entry.away {
-                Some(away) => format!("{}:{}", away.name, entry.tree),
-                None => format!("{}:{}", crate::workspaces::name(&self.checkout), entry.tree),
-            };
-            let what = entry.title.clone().unwrap_or_else(|| entry.what.clone());
-            self.add_news(Some(place), what, Some(entry.kind));
-            if let Some(line) = self.watch.news.front_mut() {
-                line.entry = Some(entry);
-            }
-        }
-    }
-
-    /// The PRs [3] Ship lists: this workspace's trees whose ship plugin
+    /// The PRs [1] Ship lists: this workspace's trees whose ship plugin
     /// has something to say.
     pub fn ship_rows(&self) -> Vec<&Tree> {
-        Self::with_prs(self.trees.iter())
-    }
-
-    /// The trees of `trees` with a PR under way.
-    pub fn with_prs<'a>(trees: impl Iterator<Item = &'a Tree>) -> Vec<&'a Tree> {
-        trees
+        self.trees
+            .iter()
             .filter(|t| {
                 t.ship
                     .as_ref()
@@ -2678,7 +2735,7 @@ impl App {
             .collect()
     }
 
-    /// [3] Ship's keys in the panels layout: j and k move among its PRs,
+    /// [1] Ship's keys in the panels layout: j and k move among its PRs,
     /// and a key acts on the PR under its cursor's tree as it would on the
     /// table's, the table's cursor going to it so the window shows it:
     /// `F` sends the failure, `S` the ship run, `v` and `O` the PR, `r`
@@ -2768,6 +2825,7 @@ impl App {
     pub fn is_typing(&self) -> bool {
         self.prompt.is_some()
             || self.picker.is_some()
+            || self.statuses.is_some()
             || self.port_menu.is_some()
             || self.phone.is_some()
             || self.scratch_menu.is_some()
@@ -2800,17 +2858,11 @@ impl App {
                 self.is_inserting = false;
                 self.is_usage_focused = false;
                 self.panel = panel;
-                // Another workspace's tab is [2]'s alone: leaving it comes
-                // back, so no key acts on a tree here that is not shown.
-                if panel != Panel::Trees {
-                    self.viewing = None;
-                }
                 if panel == Panel::Ship {
                     self.follow_ship();
                 }
             }
-            None if !self.is_window_focused => {
-                self.viewing = None;
+            None if c == '0' && !self.is_window_focused => {
                 self.focus_window();
             }
             None => {}
@@ -2956,7 +3008,7 @@ impl App {
     /// Takes whether the Usage column is on screen as just drawn; gone, it
     /// gives up the keys to the table.
     /// The panels layout is drawn, rather than the table layout it falls
-    /// back to on a small screen; another workspace's tab ends without it.
+    /// back to on a small screen.
     pub fn show_panels(&mut self, is_shown: bool) {
         // The list's groups stand in another order there, the cursor on the
         // same tree.
@@ -2975,8 +3027,6 @@ impl App {
             self.zoom = None;
             self.other = None;
             self.side = 0;
-        } else {
-            self.viewing = None;
         }
     }
 
@@ -3041,7 +3091,7 @@ impl App {
         }
         let can_take = match self.shown_tab() {
             WindowTab::Chat | WindowTab::Shell => self.window_chat().is_some(),
-            WindowTab::Diff | WindowTab::Pr => true,
+            WindowTab::Diff | WindowTab::Pr | WindowTab::Issue => true,
             WindowTab::Run | WindowTab::Info => false,
         };
         if can_take {
@@ -3709,6 +3759,10 @@ impl App {
             match self.shown_tab() {
                 WindowTab::Diff if self.view.is_some() => self.handle_view_key(key),
                 WindowTab::Pr if self.pr_popup.is_some() => self.handle_pr_key(key),
+                WindowTab::Issue => {
+                    self.handle_issue_key(key);
+                    continue;
+                }
                 _ => return,
             };
         }
@@ -4169,6 +4223,12 @@ impl App {
     /// id to attach to, else once it has shown up in its tree with a chat to
     /// open. Gives up after AWAIT_CHAT, saying so.
     pub fn ready_chat(&mut self) -> Option<Outcome> {
+        // What is typed for an issue, its status or a comment, never goes to
+        // a chat opened under it.
+        let is_commenting = |p: &Prompt| matches!(p.purpose, Purpose::Comment { .. });
+        if self.statuses.is_some() || self.prompt.as_ref().is_some_and(is_commenting) {
+            return None;
+        }
         // A tree's chat opens in the window under the table, on its tree, so
         // a new tree's waits until the pool lists it, as long as AWAIT_CHAT.
         if let Some(Outcome::Chat { tree, .. }) = &self.started_chat
@@ -4263,6 +4323,7 @@ impl App {
             && self.prompt.is_none()
             && self.palette.is_none()
             && self.picker.is_none()
+            && self.statuses.is_none()
             && self.port_menu.is_none()
             && self.phone.is_none()
             && self.scratch_menu.is_none()
@@ -4276,7 +4337,6 @@ impl App {
             && !self.is_filtering
             && !self.is_issues
             && !self.is_plan
-            && self.viewing.is_none()
             && !self.is_quitting
     }
 
@@ -4353,7 +4413,8 @@ impl App {
 
     /// The list is on screen with nothing over it but a dialog, and the
     /// count over it, so a click can open what it counts, or the Usage
-    /// column runs past its foot, for the wheel. Elsewhere the
+    /// column runs past its foot, for the wheel, or the panels are shown,
+    /// where a click on the project's name lists the workspaces. Elsewhere the
     /// mouse is left to the terminal, so text selects as it always has.
     pub fn wants_mouse(&self) -> bool {
         // A chat or shell read in Normal takes the wheel, to scroll it, and
@@ -4361,13 +4422,18 @@ impl App {
         let is_reading = self.is_window_focused
             && (self.is_plan || matches!(self.shown_tab(), WindowTab::Chat | WindowTab::Shell));
         let (needs, done) = self.notes_list();
-        (is_reading || !needs.is_empty() || !done.is_empty() || self.usage_overflow > 0)
+        (is_reading
+            || !needs.is_empty()
+            || !done.is_empty()
+            || self.usage_overflow > 0
+            || self.shows_panels())
             && !self.is_issues
-            && (!self.is_plan || is_reading)
+            && (!self.is_plan || is_reading || !needs.is_empty())
             && !self.has_keys_on(WindowTab::Diff)
             && !self.has_keys_on(WindowTab::Pr)
             && self.prompt.is_none()
             && self.picker.is_none()
+            && self.statuses.is_none()
             && self.port_menu.is_none()
             && self.phone.is_none()
             && self.scratch_menu.is_none()
@@ -4385,7 +4451,7 @@ impl App {
 
     /// The notifications are on screen: open, with the table's keys.
     pub fn is_notes_shown(&self) -> bool {
-        self.notes.is_some() && self.is_on_table() && !self.is_issues
+        self.notes.is_some() && !self.is_issues && (self.is_plan || self.is_on_table())
     }
 
     /// What the notifications list, leaving out what is put away: what
@@ -4420,7 +4486,6 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => self.notes = Some(at.saturating_sub(1)),
             KeyCode::Enter | KeyCode::Char('l') => {
                 if let Some(entry) = items.into_iter().nth(at) {
-                    self.notes = None;
                     if matches!(
                         entry.kind,
                         crate::inbox::Kind::Done | crate::inbox::Kind::Merged
@@ -4468,7 +4533,7 @@ impl App {
 
     /// Opens `entry`, as Enter on its tree's row would.
     fn go_to(&mut self, entry: crate::inbox::Entry) -> Outcome {
-        self.viewing = None;
+        self.notes = None;
         self.is_window_focused = false;
         self.is_inserting = false;
         // A switch would lose what an action here came to.
@@ -4476,18 +4541,19 @@ impl App {
             self.message = Some(self.says_busy());
             return Outcome::Continue;
         }
-        // Ship and News act on their own rows, not on what is gone to.
-        if matches!(self.panel, Panel::Ship | Panel::News) {
-            self.panel = Panel::Trees;
+        self.is_plan = false;
+        // What is gone to is what the next key acts on: not another panel's
+        // row, nor what is marked.
+        self.panel = Panel::Trees;
+        if self.shows_panels() {
+            self.marked.clear();
         }
-        if entry.away.is_some() {
-            self.watch.gone_to = Some(entry.about());
-        }
+        self.watch.gone_to = Some(entry.about());
         if let Some(away) = entry.away {
             return Outcome::SwitchTo {
                 checkout: away.checkout,
                 tree: entry.path,
-                kind: Some(entry.kind),
+                kind: entry.kind,
             };
         }
         self.open_tree(entry.path, entry.kind)
@@ -4500,7 +4566,6 @@ impl App {
         if !self.is_read() {
             return None;
         }
-        self.look_for_news();
         let waiting = crate::inbox::needs_action(self);
         // An answer that took shows as its agent moving on; an ask still
         // there after that is the next one, or was not answered.
@@ -4627,23 +4692,18 @@ impl App {
     /// runs in. Outside tmux an agent with no chat is left for `t`, rather
     /// than a shell opening by itself.
     pub fn arrival(&mut self) -> Option<Outcome> {
-        // Only looked at: the cursor goes there as soon as it is listed, so
-        // no key lands on another tree meanwhile.
-        if let Some((path, None)) = &self.arriving {
-            if !self.is_loaded && self.trees.is_empty() {
-                return None;
-            }
-            let path = path.clone();
-            self.arriving = None;
-            self.has_landed = true;
-            self.reveal(path);
-            return None;
+        // The cursor goes there as soon as it is listed, so no key lands on
+        // another tree while the agents are read.
+        if let Some((path, _)) = &self.arriving
+            && !self.is_cursor_held
+            && self.trees.iter().any(|t| &t.path == path)
+        {
+            self.reveal(path.clone());
         }
         if !self.is_agents_read || !self.is_free() {
             return None;
         }
         let (path, kind) = self.arriving.take()?;
-        let kind = kind?;
         self.has_landed = true;
         if !self.trees.iter().any(|t| t.path == path) {
             self.message = Some(format!("{} is no longer in this pool", path.display()));
@@ -5628,6 +5688,17 @@ impl App {
                 self.message = Some(why);
                 Outcome::Continue
             }
+            // One pressed as its box came back was for something else, and
+            // would post it again.
+            Edit::Submit
+                if matches!(prompt.purpose, Purpose::Comment { .. })
+                    && self
+                        .comment_reopened
+                        .is_some_and(|at| at.elapsed() < ASK_SETTLES) =>
+            {
+                self.message = Some("this comment just came back: Enter again posts it".into());
+                Outcome::Continue
+            }
             Edit::Submit => match self.prompt.take() {
                 Some(prompt) => self.submit(prompt),
                 None => Outcome::Continue,
@@ -5675,6 +5746,18 @@ impl App {
                 self.start(*tree, launch)
             }
             Purpose::Handoff { tree, from } => self.take_over(*tree, from, text),
+            Purpose::Comment { key, issue } => {
+                if text.is_empty() {
+                    self.message = Some("nothing to post".into());
+                    return Outcome::Continue;
+                }
+                self.message = Some(format!("commenting on {}...", key.id));
+                Outcome::Edit(Asked {
+                    key,
+                    issue,
+                    what: crate::tree_issues::Edit::Comment(text),
+                })
+            }
             Purpose::Dispatch { target } => match target {
                 Target::Ask => self.ask(text),
                 Target::NewTree => self.dispatch(text, branch, base),
@@ -5814,38 +5897,68 @@ impl App {
             );
             return;
         }
-        let selected = choices
-            .iter()
-            .position(|c| c.checkout != self.checkout)
-            .unwrap_or(0);
-        self.picker = Some(Picker { choices, selected });
+        let mut picker = Picker {
+            choices,
+            selected: 0,
+            query: None,
+        };
+        picker.select_other(&self.checkout);
+        self.picker = Some(picker);
     }
 
     fn handle_picker_key(&mut self, key: KeyEvent) -> Outcome {
         let Some(picker) = self.picker.as_mut() else {
             return Outcome::Continue;
         };
-        let last = picker.choices.len().saturating_sub(1);
+        let last = picker.shown().len().saturating_sub(1);
+        if let Some(query) = picker.query.as_mut() {
+            let is_narrowed = match key.code {
+                KeyCode::Esc => {
+                    picker.query = None;
+                    true
+                }
+                KeyCode::Backspace => {
+                    query.pop();
+                    true
+                }
+                KeyCode::Char(c) if is_plain(key) => {
+                    query.push(c);
+                    true
+                }
+                // The list's letters are typed here, so with Ctrl or Alt
+                // they do nothing.
+                KeyCode::Char(_) => return Outcome::Continue,
+                _ => false,
+            };
+            if is_narrowed {
+                picker.select_other(&self.checkout);
+                return Outcome::Continue;
+            }
+        }
         match key.code {
+            KeyCode::Char('/') => {
+                picker.query = Some(String::new());
+                picker.select_other(&self.checkout);
+            }
             KeyCode::Down | KeyCode::Char('j') => picker.selected = (picker.selected + 1).min(last),
             KeyCode::Up | KeyCode::Char('k') => picker.selected = picker.selected.saturating_sub(1),
             KeyCode::Enter | KeyCode::Char('l') => {
-                let chosen = picker
-                    .choices
+                let Some(chosen) = picker
+                    .shown()
                     .get(picker.selected)
-                    .map(|c| c.checkout.clone());
+                    .map(|c| c.checkout.clone())
+                else {
+                    return Outcome::Continue;
+                };
                 self.picker = None;
-                match chosen {
-                    Some(path) if path == self.checkout => {}
-                    Some(_) if self.active_jobs() > 0 => {
-                        self.message = Some(format!(
-                            "{} action(s) still running here; switch once they finish",
-                            self.active_jobs()
-                        ));
-                    }
-                    Some(path) => return Outcome::Switch(path),
-                    None => {}
+                if chosen == self.checkout {
+                    return Outcome::Continue;
                 }
+                if self.active_jobs() > 0 {
+                    self.message = Some(self.says_busy());
+                    return Outcome::Continue;
+                }
+                return Outcome::Switch(chosen);
             }
             KeyCode::Esc | KeyCode::Char('q' | 'h' | 'w') => self.picker = None,
             _ => {}
@@ -5859,7 +5972,9 @@ impl App {
         let Some(tree) = self.current() else {
             return;
         };
-        match tree.sidecar.as_ref().and_then(|s| s.ticket.clone()) {
+        let named = self.shows_panels().then(|| self.issue_on(tree)).flatten();
+        let ticket = tree.sidecar.as_ref().and_then(|s| s.ticket.clone());
+        match ticket.or(named.map(|key| key.id)) {
             Some(ticket) => {
                 self.open_issue = Some(ticket);
                 self.is_issues = true;
@@ -6145,9 +6260,16 @@ impl App {
     /// moved it, so what a key acts on is what was picked. An item gone, its
     /// cursor stays in place, and Ship's window goes on with it.
     pub fn hold_cursors(&mut self) {
-        let waiting: Vec<String> = self.notes_list().0.iter().map(waiting_key).collect();
-        hold(&mut self.waiting_at, &mut self.held.waiting, waiting);
-        self.find_gone_to();
+        if let Some(mut at) = self.notes {
+            let (needs, done) = self.notes_list();
+            let items = needs.iter().chain(&done);
+            let items = items.map(|e| format!("{:?}", e.about())).collect();
+            hold(&mut at, &mut self.held.notes, items);
+            self.notes = Some(at);
+        } else {
+            // Opened again, they start at the top.
+            self.held.notes = Held::default();
+        }
         let ships: Vec<String> = self
             .ship_rows()
             .iter()
@@ -6157,56 +6279,13 @@ impl App {
         if is_gone && self.panel == Panel::Ship && self.shows_panels() && !self.is_window_focused {
             self.follow_ship();
         }
-        // Not looked at, News stays at its newest.
-        if self.panel == Panel::News || self.news_at > 0 {
-            let news: Vec<String> = self
-                .news()
-                .iter()
-                .map(|n| format!("{:?} {} {}", n.at, n.place, n.what))
-                .collect();
-            hold(&mut self.news_at, &mut self.held.news, news);
+        if self.panel != Panel::Keel {
+            self.keel_at = None;
         }
-        // Another workspace's tab, whose paths are its own, so one tab's
-        // cursor is never put by another's.
-        let viewed: Vec<String> = self
-            .viewed_trees()
-            .unwrap_or_default()
-            .iter()
-            .map(|t| t.path.display().to_string())
-            .collect();
-        hold(&mut self.viewed, &mut self.held.viewed, viewed);
         let made: Vec<String> = self.made().iter().map(|i| i.id.clone()).collect();
         hold(&mut self.made_at, &mut self.held.made, made);
         let ready: Vec<String> = self.ready_issues().iter().map(|i| i.id.clone()).collect();
         hold(&mut self.ready_at, &mut self.held.ready, ready);
-    }
-
-    /// Waiting's cursor on the item gone to here from another workspace, once
-    /// it is listed; forgotten once what would list it is read without it.
-    fn find_gone_to(&mut self) {
-        let Some(about) = self.watch.gone_to.clone() else {
-            return;
-        };
-        let (items, _) = self.notes_list();
-        // Until the switch, it is listed as another workspace's still.
-        match items
-            .iter()
-            .position(|e| e.away.is_none() && e.about() == about)
-        {
-            Some(at) => {
-                self.waiting_at = at;
-                self.held.waiting = Held {
-                    at,
-                    on: Some(waiting_key(&items[at])),
-                };
-                self.watch.gone_to = None;
-            }
-            // Its tree here too, or it is still another workspace's.
-            None if self.trees.iter().any(|t| t.path == about.1) && self.is_read_of(&about) => {
-                self.watch.gone_to = None;
-            }
-            None => {}
-        }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Outcome {
@@ -6241,22 +6320,31 @@ impl App {
         if let Some(outcome) = self.answer_by_number(key) {
             return outcome;
         }
+        if self.statuses.is_some() {
+            return self.handle_statuses_key(key);
+        }
+        if let Some(outcome) = self.handle_next_key(key) {
+            return outcome;
+        }
+        if self.is_plan && self.picker.is_some() {
+            return self.handle_picker_key(key);
+        }
+        if self.is_plan && self.is_notes_shown() {
+            return self.handle_notes_key(key);
+        }
         if self.is_plan {
             return self.handle_plan_key(key);
         }
         if self.focus_by_number(key) {
             return Outcome::Continue;
         }
-        if let Some(outcome) = self.handle_waiting_key(key) {
-            return outcome;
-        }
         if let Some(outcome) = self.handle_ship_key(key) {
             return outcome;
         }
-        if let Some(outcome) = self.handle_news_key(key) {
+        if let Some(outcome) = self.handle_linear_key(key) {
             return outcome;
         }
-        if let Some(outcome) = self.handle_tab_key(key) {
+        if let Some(outcome) = self.handle_keel_key(key) {
             return outcome;
         }
         if self.view.is_some() && self.has_keys_on(WindowTab::Diff) {
@@ -6384,6 +6472,9 @@ impl App {
         // or a chat not open yet, keeps them from the table, so typing meant
         // for it never runs a table command.
         if self.is_window_focused {
+            if let Some(outcome) = self.handle_issue_key(key) {
+                return outcome;
+            }
             return self.handle_window_key(key);
         }
         if self.has_usage_keys() {
@@ -6668,19 +6759,21 @@ pub(crate) mod tests {
         let mut app = crate::inbox::tests::app();
         app.reselect(Some(app.trees[0].path.clone()));
         app.tab = WindowTab::Diff;
-        press(&mut app, KeyCode::Char('3'));
+        press(&mut app, KeyCode::Char('1'));
         assert_eq!(app.panel, Panel::Trees, "the table layout has no panels");
         app.look = crate::config::Look::Panels;
-        press(&mut app, KeyCode::Char('3'));
+        press(&mut app, KeyCode::Char('1'));
         assert_eq!(app.panel, Panel::Trees, "nor a screen too small for them");
         app.show_panels(true);
-        press(&mut app, KeyCode::Char('3'));
+        press(&mut app, KeyCode::Char('1'));
         assert_eq!((app.panel, app.is_window_focused), (Panel::Ship, false));
+        press(&mut app, KeyCode::Char('3'));
+        assert_eq!(app.panel, Panel::Linear);
         press(&mut app, KeyCode::Char('0'));
         assert!(app.is_window_focused, "0 gives the window the keys");
         // From the window in Normal a panel number takes them back.
         press(&mut app, KeyCode::Char('4'));
-        assert_eq!((app.panel, app.is_window_focused), (Panel::News, false));
+        assert_eq!((app.panel, app.is_window_focused), (Panel::Keel, false));
         // Typing a filter keeps its digits.
         press(&mut app, KeyCode::Char('2'));
         press(&mut app, KeyCode::Char('/'));
@@ -6689,87 +6782,6 @@ pub(crate) mod tests {
     }
 
     use crate::inbox::tests::with_workspaces;
-
-    #[test]
-    fn brackets_step_the_workspaces_in_name_order_and_show_another_only_to_look_at() {
-        let mut app = with_workspaces();
-        // This workspace's cursor on a tree, which the window would open.
-        app.reselect(Some(app.trees[0].path.clone()));
-        assert!(app.window_tree().is_some());
-        let names = |app: &App| -> Vec<String> {
-            app.workspace_tabs().into_iter().map(|t| t.name).collect()
-        };
-        assert_eq!(names(&app), ["api", "main-app", "zeta"]);
-        press(&mut app, KeyCode::Char(']'));
-        assert_eq!(app.viewing, Some(PathBuf::from("/code/zeta")));
-        assert_eq!(app.window_tree(), None, "nothing of this workspace opens");
-        let shown: Vec<_> = app
-            .viewed_trees()
-            .unwrap()
-            .iter()
-            .map(|t| t.name.clone())
-            .collect();
-        assert_eq!(shown, ["1"]);
-        assert_eq!(app.viewed_free().len(), 1);
-        // Past the last it wraps to the first, and back home.
-        press(&mut app, KeyCode::Char(']'));
-        assert_eq!(app.viewing, Some(PathBuf::from("/code/api")));
-        press(&mut app, KeyCode::Char(']'));
-        assert_eq!(app.viewing, None);
-        press(&mut app, KeyCode::Char('['));
-        assert_eq!(app.viewing, Some(PathBuf::from("/code/api")));
-    }
-
-    #[test]
-    fn on_another_workspaces_tab_only_a_key_that_acts_does_anything_and_it_switches() {
-        let mut app = with_workspaces();
-        // This workspace's cursor on a tree, hidden while another is shown.
-        app.reselect(Some(app.trees[0].path.clone()));
-        press(&mut app, KeyCode::Char(']'));
-        // A key that acts on this workspace's trees does nothing here: not
-        // its diff, nor renaming its branch.
-        for key in ['D', 'b'] {
-            assert_eq!(press(&mut app, KeyCode::Char(key)), Outcome::Continue);
-        }
-        assert!(app.view.is_none() && app.prompt.is_none() && app.pending.is_none());
-        assert!(matches!(
-            press(&mut app, KeyCode::Char('n')),
-            Outcome::SwitchTo { checkout, kind: None, .. } if checkout == std::path::Path::new("/code/zeta")
-        ));
-        assert_eq!(app.viewing, None);
-        // Esc comes back; so does leaving [2] for another panel.
-        press(&mut app, KeyCode::Char(']'));
-        press(&mut app, KeyCode::Esc);
-        assert_eq!(app.viewing, None);
-        press(&mut app, KeyCode::Char(']'));
-        press(&mut app, KeyCode::Char('3'));
-        assert_eq!(app.viewing, None, "no other panel shows another workspace");
-        // A screen too small for the panels keeps the table's keys.
-        app.panel = Panel::Trees;
-        app.show_panels(false);
-        press(&mut app, KeyCode::Char(']'));
-        assert_eq!(app.viewing, None);
-    }
-
-    #[test]
-    fn another_workspaces_tab_will_not_switch_while_an_action_runs_here() {
-        let mut app = with_workspaces();
-        app.reselect(Some(app.trees[0].path.clone()));
-        press(&mut app, KeyCode::Char('r'));
-        press(&mut app, KeyCode::Char('y'));
-        assert!(app.active_jobs() > 0, "a return runs");
-        press(&mut app, KeyCode::Char(']'));
-        assert_eq!(press(&mut app, KeyCode::Enter), Outcome::Continue);
-        assert!(
-            app.message
-                .as_deref()
-                .unwrap_or_default()
-                .contains("still running here"),
-            "{:?}",
-            app.message
-        );
-        assert!(app.viewing.is_some(), "the tab stays shown");
-    }
 
     #[test]
     fn a_digit_typed_into_a_prompt_never_answers_the_windows_dialog() {
@@ -6805,7 +6817,7 @@ pub(crate) mod tests {
         assert!(!asks(&app), "answered, it waits on you no more");
         // Its question gone, the number keys give the panels the keys again.
         app.dialog = None;
-        assert_eq!(press(&mut app, KeyCode::Char('3')), Outcome::Continue);
+        assert_eq!(press(&mut app, KeyCode::Char('1')), Outcome::Continue);
         assert_eq!((app.panel, app.is_window_focused), (Panel::Ship, false));
         // The table layout has no number keys for it.
         app.look = crate::config::Look::Table;
@@ -6814,7 +6826,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn waiting_opens_what_waits_and_w_goes_to_the_next() {
+    fn the_notifications_open_what_needs_you_and_shift_w_goes_to_the_next() {
         let mut app = crate::inbox::tests::app();
         app.look = crate::config::Look::Panels;
         app.show_panels(true);
@@ -6827,21 +6839,21 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(items[..2], [("9".into(), false), ("12".into(), true)]);
         let at = |app: &App| app.current().map(|t| t.name.clone());
-        press(&mut app, KeyCode::Char('1'));
+        press(&mut app, KeyCode::Char('e'));
         press(&mut app, KeyCode::Enter);
         assert_eq!(at(&app).as_deref(), Some("9"), "Enter opens it here");
-        press(&mut app, KeyCode::Char('1'));
+        press(&mut app, KeyCode::Char('e'));
         press(&mut app, KeyCode::Char('j'));
         assert!(
             matches!(press(&mut app, KeyCode::Enter), Outcome::SwitchTo { .. }),
             "another workspace's is switched to first"
         );
-        // `w` from the panels opens the one after the tree under the cursor.
+        // `W` from the panels opens the one after the tree under the cursor.
         app.panel = Panel::Trees;
         app.is_window_focused = false;
         app.reselect(Some(app.trees[0].path.clone()));
         assert_eq!(at(&app).as_deref(), Some("4"));
-        press(&mut app, KeyCode::Char('w'));
+        press(&mut app, KeyCode::Char('W'));
         assert_eq!(at(&app).as_deref(), Some("7"));
     }
 
@@ -6894,94 +6906,6 @@ pub(crate) mod tests {
         assert_eq!(shelve(&mut app), [None; 2], "all parked, so all come back");
     }
 
-    #[test]
-    fn what_already_waits_in_a_workspace_read_for_the_first_time_is_not_news() {
-        use crate::inbox::tests::{agent, tree};
-        let mut app = crate::inbox::tests::with_workspaces();
-        app.is_loaded = true;
-        app.is_agents_read = true;
-        let asking = |path: &str, name: &str| {
-            tree(
-                path,
-                name,
-                "zeta-work",
-                vec![agent("asker", name, crate::agents::Status::Waiting)],
-            )
-        };
-        app.watch_waiting();
-        let at_first = app.news().len();
-        // Zeta's first read lands, an agent there already asking.
-        app.away_live.insert(
-            PathBuf::from("/code/zeta"),
-            vec![asking("/code/zeta-trees/1", "1")],
-        );
-        app.watch_waiting();
-        assert_eq!(app.news().len(), at_first, "{:?}", app.news());
-        // Another there starts asking, a tree its pool lists: that is news.
-        let zeta = app
-            .pools
-            .iter_mut()
-            .find(|p| p.away.name == "zeta")
-            .unwrap();
-        zeta.trees
-            .push(tree("/code/zeta-trees/3", "3", "zeta-work", Vec::new()));
-        app.away_live.insert(
-            PathBuf::from("/code/zeta"),
-            vec![
-                asking("/code/zeta-trees/1", "1"),
-                asking("/code/zeta-trees/3", "3"),
-            ],
-        );
-        app.watch_waiting();
-        assert_eq!(app.news().len(), at_first + 1, "{:?}", app.news());
-        assert_eq!(app.news()[0].place, "zeta:3");
-    }
-
-    #[test]
-    fn what_already_waits_in_the_workspace_switched_to_is_not_news() {
-        let mut app = crate::inbox::tests::app();
-        app.is_loaded = true;
-        app.is_agents_read = true;
-        app.checkout = PathBuf::from("/code/main-app");
-        app.watch_waiting();
-        let at_first = app.news().len();
-        // A switch: a new App, the watch kept, its own trees already asking.
-        let mut there = crate::inbox::tests::app();
-        there.is_loaded = true;
-        there.is_agents_read = true;
-        there.checkout = PathBuf::from("/code/api");
-        for tree in &mut there.trees {
-            tree.path = PathBuf::from("/code/api-trees").join(&tree.name);
-        }
-        there.keep_watch(app.take_watch());
-        there.watch_waiting();
-        assert_eq!(there.news().len(), at_first, "{:?}", there.news());
-    }
-
-    #[test]
-    fn what_you_send_is_news_by_the_branch_it_went_to() {
-        let mut app = crate::inbox::tests::app();
-        let seven = app.trees.iter().find(|t| t.name == "7").unwrap();
-        let to = seven
-            .agents
-            .iter()
-            .find_map(|a| Recipient::of(a, &seven.name))
-            .unwrap();
-        let unknown = Recipient {
-            tree: "99".into(),
-            ..to.clone()
-        };
-        app.note_sent(&[to, unknown], "retry the e2e\nwith the log below");
-        let lines: Vec<&str> = app.news().iter().map(|n| n.what.as_str()).collect();
-        assert_eq!(
-            lines,
-            [
-                "you: retry the e2e → tree 99",
-                "you: retry the e2e → me/fix-login"
-            ]
-        );
-    }
-
     fn on_plan() -> App {
         let mut app = crate::inbox::tests::app();
         app.look = crate::config::Look::Panels;
@@ -6994,6 +6918,7 @@ pub(crate) mod tests {
             checkout: Some(PathBuf::from("/code/here")),
             scratch: false,
             issues: Vec::new(),
+            asked: None,
         }]);
         app.checkout = PathBuf::from("/code/here");
         app
@@ -7191,6 +7116,7 @@ pub(crate) mod tests {
                 checkout: None,
                 scratch: false,
                 issues: Vec::new(),
+                asked: None,
             },
         );
         app.reselect(Some(app.trees[0].path.clone()));
@@ -7200,19 +7126,6 @@ pub(crate) mod tests {
             app.plan_chats[app.plan_at].job, "j1",
             "the chat that made ANB-41"
         );
-    }
-
-    #[test]
-    fn the_palette_stays_shut_on_another_workspaces_tab_whose_trees_it_does_not_list() {
-        let mut app = crate::inbox::tests::with_workspaces();
-        let palette = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
-        press(&mut app, KeyCode::Char(']'));
-        assert!(app.viewing.is_some());
-        app.handle_key(palette);
-        assert!(app.palette.is_none());
-        press(&mut app, KeyCode::Esc);
-        app.handle_key(palette);
-        assert!(app.palette.is_some(), "back here it opens");
     }
 
     #[test]
@@ -7292,32 +7205,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn an_ask_waits_to_open_until_another_workspaces_tab_is_left() {
-        let mut app = crate::inbox::tests::with_workspaces();
-        app.is_agents_read = true;
-        app.viewing = Some("/code/api".into());
-        assert_eq!(app.next_ask(), None, "only looking at api");
-        app.viewing = None;
-        assert!(app.next_ask().is_some(), "back here, it opens");
-    }
-
-    #[test]
-    fn space_on_waiting_marks_and_unmarks_its_tree_and_keeps_the_other_marks() {
-        let mut app = crate::inbox::tests::with_workspaces();
-        let one = app.trees[1].path.clone();
-        app.marked.insert(one.clone());
-        press(&mut app, KeyCode::Char('1'));
-        let (items, _) = app.notes_list();
-        app.waiting_at = items.iter().position(|e| e.tree == "7").unwrap();
-        let seven = items[app.waiting_at].path.clone();
-        press(&mut app, KeyCode::Char(' '));
-        assert_eq!(app.marked, BTreeSet::from([one.clone(), seven]));
-        press(&mut app, KeyCode::Char(' '));
-        assert_eq!(app.marked, BTreeSet::from([one]));
-        assert_eq!(app.panel, Panel::Waiting);
-    }
-
-    #[test]
     fn a_planning_chats_ask_is_no_news_and_rings_no_bell_and_a_scratch_chats_still_does() {
         let mut app = app();
         app.scratch_root = Some(PathBuf::from("/state/scratch"));
@@ -7365,9 +7252,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_tree_key_on_an_empty_ship_or_on_news_acts_on_no_tree() {
-        for panel in [Panel::Ship, Panel::News] {
-            for key in ['r', 'x', 'z', 'n', 'm', 't', 'F', 'M', 'S', ' '] {
+    fn a_tree_key_on_an_empty_ship_or_on_linear_or_keel_acts_on_no_tree() {
+        for panel in [Panel::Ship, Panel::Linear, Panel::Keel] {
+            let keys = ['r', 'x', 'z', 'n', 'm', 't', 'D', 'P', 'F', 'M', 'S', ' '];
+            // I is on the tree's issue, so [3] and [4] take it.
+            let on_ship = (panel == Panel::Ship).then_some('I');
+            for key in keys.into_iter().chain(on_ship) {
                 let mut app = crate::inbox::tests::with_workspaces();
                 app.trees[2].ship = None;
                 app.reselect(Some(app.trees[0].path.clone()));
@@ -7382,6 +7272,9 @@ pub(crate) mod tests {
                     app.pending.is_none() && app.prompt.is_none(),
                     "{panel:?} {key}"
                 );
+                assert!(!app.is_window_focused && !app.is_issues, "{panel:?} {key}");
+                // What a key on a tree could not do there is said.
+                assert_eq!(app.message, None, "{panel:?} {key}");
                 assert_eq!(app.marked.len(), 1, "{panel:?} {key}");
             }
         }
@@ -7393,41 +7286,6 @@ pub(crate) mod tests {
             panic!("x shelves the row's tree");
         };
         assert_eq!(path, app.trees[2].path);
-    }
-
-    #[test]
-    fn enter_on_news_goes_to_what_it_is_about() {
-        let mut app = crate::inbox::tests::with_workspaces();
-        app.reports.clear();
-        app.watch_waiting();
-        app.apply_reports(vec![crate::inbox::tests::report(
-            "j4",
-            "/pool/4/app",
-            State::Blocked,
-            "Which?",
-            1,
-        )]);
-        app.watch_waiting();
-        app.reselect(Some(app.trees[1].path.clone()));
-        app.panel = Panel::News;
-        assert!(matches!(
-            press(&mut app, KeyCode::Enter),
-            Outcome::Chat { ref tree, .. } if tree == "4"
-        ));
-        // What you sent is about nothing to go to.
-        app.add_news(None, "you: hi → x".into(), None);
-        app.panel = Panel::News;
-        app.is_window_focused = false;
-        press(&mut app, KeyCode::Char('g'));
-        assert_eq!(press(&mut app, KeyCode::Enter), Outcome::Continue);
-    }
-
-    #[test]
-    fn what_you_send_a_planning_chat_is_news_by_its_name() {
-        let mut app = on_plan();
-        let to = Recipient::of_job("plan 1", SCRATCH.into(), "j1", true);
-        app.note_sent(&[to], "Draft it");
-        assert_eq!(app.news()[0].what, "you: Draft it → plan 1");
     }
 
     #[test]
@@ -7471,8 +7329,7 @@ pub(crate) mod tests {
     fn the_cursor_put_on_a_tree_follows_it_into_parked_as_records_are_read() {
         let mut app = crate::inbox::tests::with_workspaces();
         let path = app.trees[0].path.clone();
-        app.arriving = Some((path.clone(), None));
-        app.arrival();
+        app.reveal(path.clone());
         let parked = Sidecar {
             parked: true,
             ..Sidecar::leased_now()
@@ -7482,20 +7339,38 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn w_opens_the_next_waiting_from_the_window_too() {
-        let mut app = crate::inbox::tests::with_workspaces();
-        app.reselect(Some(app.trees[1].path.clone()));
-        app.is_window_focused = true;
-        assert!(matches!(
-            press(&mut app, KeyCode::Char('w')),
-            Outcome::Chat { .. } | Outcome::SwitchTo { .. } | Outcome::Continue
-        ));
-        assert!(app.picker.is_none());
-        assert_ne!(
-            app.window_tree().map(|t| t.name.clone()),
-            Some("2".into()),
-            "on to one that waits"
-        );
+    fn shift_w_opens_the_next_that_needs_you_from_the_window_and_from_plan() {
+        for is_plan in [false, true] {
+            let mut app = crate::inbox::tests::with_workspaces();
+            app.pools.clear();
+            app.reselect(Some(app.trees[1].path.clone()));
+            let first = app.notes_list().0[0].tree.clone();
+            app.is_plan = is_plan;
+            app.is_window_focused = true;
+            press(&mut app, KeyCode::Char('W'));
+            assert!(!app.is_plan && app.picker.is_none());
+            assert_eq!(
+                app.window_tree().map(|t| t.name.as_str()),
+                Some(first.as_str()),
+                "on to the oldest that waits"
+            );
+        }
+    }
+
+    #[test]
+    fn e_lists_what_needs_you_on_plan_and_gives_its_keys_back() {
+        for is_window_focused in [false, true] {
+            let mut app = on_plan();
+            app.is_window_focused = is_window_focused;
+            press(&mut app, KeyCode::Char('e'));
+            assert!(app.is_notes_shown());
+            press(&mut app, KeyCode::Char('j'));
+            assert_eq!(app.notes, Some(1), "its keys are the list's");
+            press(&mut app, KeyCode::Esc);
+            assert!(!app.is_notes_shown() && app.is_plan);
+            press(&mut app, KeyCode::Char('2'));
+            assert_eq!(app.plan_focus, 2, "and Plan's again");
+        }
     }
 
     #[test]
@@ -7559,8 +7434,6 @@ pub(crate) mod tests {
                 let mut app = crate::inbox::tests::with_workspaces();
                 app.reselect(Some(app.trees[1].path.clone()));
                 app.panel = panel;
-                let (items, _) = app.notes_list();
-                app.waiting_at = items.iter().position(|e| e.tree == "7").unwrap();
                 app
             };
             let mut app = with();
@@ -7586,6 +7459,11 @@ pub(crate) mod tests {
             assert!(app.is_issues && !app.is_plan, "{panel:?}");
             let mut app = with();
             assert_eq!(run_command(&mut app, "planning"), Outcome::Plan);
+            // Gone to, its tree has the keys, so none acts on Ship's row.
+            let mut app = with();
+            app.pools.clear();
+            run_command(&mut app, "next thing that needs you");
+            assert_eq!(app.panel, Panel::Trees, "{panel:?}");
         }
         // Neither the double nor zoom is offered where there is neither.
         let mut app = crate::inbox::tests::with_workspaces();
@@ -7599,24 +7477,18 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn g_and_shift_g_move_waitings_and_ships_own_cursors() {
+    fn g_and_shift_g_move_ships_own_cursor() {
         let mut app = crate::inbox::tests::with_workspaces();
         let mut ship = app.trees[2].ship.clone().unwrap();
         ship.stage = Stage::Approved;
         app.trees[1].ship = Some(ship);
-        press(&mut app, KeyCode::Char('3'));
+        press(&mut app, KeyCode::Char('1'));
         press(&mut app, KeyCode::Char('G'));
         assert_eq!(app.ship_at, 1);
         let rows: Vec<PathBuf> = app.ship_rows().iter().map(|t| t.path.clone()).collect();
         assert_eq!(app.window_tree().map(|t| &t.path), Some(&rows[1]));
         press(&mut app, KeyCode::Char('g'));
         assert_eq!(app.ship_at, 0);
-        press(&mut app, KeyCode::Char('1'));
-        let at = app.selected;
-        press(&mut app, KeyCode::Char('G'));
-        assert_eq!(app.waiting_at, app.notes_list().0.len() - 1);
-        press(&mut app, KeyCode::Char('g'));
-        assert_eq!((app.waiting_at, app.selected), (0, at));
     }
 
     #[test]
@@ -7646,12 +7518,6 @@ pub(crate) mod tests {
         press(&mut app, KeyCode::Char('1'));
         app.watch_waiting();
         assert!(!asks(&app), "answered");
-        // As news too, by what was picked.
-        assert!(
-            app.news()
-                .iter()
-                .any(|n| n.what.starts_with("you: 1 Left → "))
-        );
         let long_ago = Instant::now().checked_sub(ANSWER_TAKES).unwrap();
         for at in app.watch.answered.values_mut() {
             *at = long_ago;
@@ -7681,7 +7547,7 @@ pub(crate) mod tests {
             ship.label = format!("#{at}");
             ship
         };
-        press(&mut app, KeyCode::Char('3'));
+        press(&mut app, KeyCode::Char('1'));
         assert_eq!(app.ship_rows()[0].name, "7");
         // Two more, listed above it.
         for at in [0, 1] {
@@ -7711,23 +7577,51 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn waitings_cursor_stays_on_its_item_as_others_resolve() {
+    fn the_notifications_cursor_stays_on_its_item_as_others_resolve() {
         let mut app = crate::inbox::tests::with_workspaces();
-        press(&mut app, KeyCode::Char('1'));
+        press(&mut app, KeyCode::Char('e'));
         press(&mut app, KeyCode::Char('j'));
         press(&mut app, KeyCode::Char('j'));
-        let on = app.notes_list().0[app.waiting_at].about();
+        let on = app.notes_list().0[app.notes.unwrap()].about();
         // The first resolves.
         let first = app.notes_list().0[0].clone();
         app.reports
             .retain(|r| r.dir.as_ref().is_none_or(|d| !d.starts_with(&first.path)));
         assert_ne!(app.notes_list().0[0].about(), first.about());
         app.hold_cursors();
-        assert_eq!(app.notes_list().0[app.waiting_at].about(), on);
+        assert_eq!(app.notes_list().0[app.notes.unwrap()].about(), on);
     }
 
     #[test]
-    fn plans_and_newss_cursors_stay_on_theirs_as_others_join_above() {
+    fn the_notifications_open_at_the_top_though_what_was_there_has_moved_down() {
+        let mut app = crate::inbox::tests::with_workspaces();
+        let first = app.notes_list().0[0].about();
+        // Tree 4's, which is listed below it, seen first this time.
+        let four = app.trees[0].path.clone();
+        let next = app.notes_list().0.into_iter().find(|e| e.path == four);
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Esc);
+        app.watch
+            .since
+            .insert(next.unwrap().about(), std::time::UNIX_EPOCH);
+        assert_ne!(app.notes_list().0[0].about(), first);
+        press(&mut app, KeyCode::Char('e'));
+        assert_eq!(app.notes, Some(0));
+    }
+
+    #[test]
+    fn shift_w_from_a_chat_opened_over_the_notifications_leaves_them_closed() {
+        let mut app = crate::inbox::tests::with_workspaces();
+        app.pools.clear();
+        press(&mut app, KeyCode::Char('e'));
+        // A started agent's chat opens, with the keys.
+        app.is_window_focused = true;
+        press(&mut app, KeyCode::Char('W'));
+        assert!(!app.is_notes_shown());
+    }
+
+    #[test]
+    fn plans_cursors_stay_on_theirs_as_others_join_above() {
         let mut app = with_made();
         press(&mut app, KeyCode::Char('3'));
         let mut newer = app.plan_chats[0].clone();
@@ -7762,74 +7656,19 @@ pub(crate) mod tests {
         app.plan_made.get_mut("j1").unwrap().reverse();
         app.hold_cursors();
         assert_eq!(app.made()[app.made_at].id, "ANB-90");
-        // [4] News.
-        let mut app = crate::inbox::tests::with_workspaces();
-        app.add_news(None, "first".into(), None);
-        app.add_news(None, "second".into(), None);
-        press(&mut app, KeyCode::Char('4'));
-        press(&mut app, KeyCode::Char('G'));
-        app.add_news(None, "third".into(), None);
-        app.hold_cursors();
-        assert_eq!(app.news()[app.news_at].what, "first");
-        // The same twice over, the cursor still goes down past it.
-        for _ in 0..3 {
-            app.add_news(None, "same".into(), None);
-        }
-        app.news_at = 0;
-        for at in 1..4 {
-            press(&mut app, KeyCode::Char('j'));
-            assert_eq!(app.news_at, at);
-        }
-    }
-
-    #[test]
-    fn the_cursor_on_another_workspaces_tab_stays_on_its_tree_as_the_pool_changes() {
-        use crate::inbox::tests::tree;
-        let mut app = crate::inbox::tests::with_workspaces();
-        let held = |n: &str| Tree {
-            leased_at: Some("2026-01-01T09:00:00-05:00".into()),
-            ..tree(
-                &format!("/code/zeta-trees/{n}"),
-                n,
-                &format!("work-{n}"),
-                Vec::new(),
-            )
-        };
-        let zeta = PathBuf::from("/code/zeta");
-        app.away_live
-            .insert(zeta.clone(), vec![held("1"), held("2"), held("3")]);
-        app.viewing = Some(zeta.clone());
-        let at = |app: &App| {
-            app.viewed_trees()
-                .and_then(|t| t.get(app.viewed).map(|t| t.name.clone()))
-        };
-        press(&mut app, KeyCode::Char('j'));
-        let on = at(&app);
-        assert!(on.is_some());
-        // The one above it is returned.
-        let first = app.viewed_trees().unwrap()[0].name.clone();
-        let rest = ["1", "2", "3"]
-            .iter()
-            .filter(|n| **n != first)
-            .map(|n| held(n));
-        app.away_live.insert(zeta, rest.collect());
-        app.hold_cursors();
-        assert_eq!(at(&app), on);
     }
 
     #[test]
     fn an_ask_waits_until_a_key_once_you_have_been_taken_to_another_tree() {
-        for kind in [None, Some(crate::inbox::Kind::Failed)] {
-            let mut app = crate::inbox::tests::with_workspaces();
-            app.is_agents_read = true;
-            app.arriving = Some((app.trees[1].path.clone(), kind));
-            assert_eq!(app.next_ask(), None, "still on the way");
-            app.arrival();
-            assert_eq!(app.next_ask(), None, "landed on what was picked");
-            assert_eq!(app.current().map(|t| t.name.as_str()), Some("2"));
-            press(&mut app, KeyCode::Char('j'));
-            assert!(app.next_ask().is_some(), "moved on, it opens");
-        }
+        let mut app = crate::inbox::tests::with_workspaces();
+        app.is_agents_read = true;
+        app.arriving = Some((app.trees[1].path.clone(), crate::inbox::Kind::Failed));
+        assert_eq!(app.next_ask(), None, "still on the way");
+        app.arrival();
+        assert_eq!(app.next_ask(), None, "landed on what was picked");
+        assert_eq!(app.current().map(|t| t.name.as_str()), Some("2"));
+        press(&mut app, KeyCode::Char('j'));
+        assert!(app.next_ask().is_some(), "moved on, it opens");
     }
 
     #[test]
@@ -7895,11 +7734,26 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn going_to_another_workspace_from_waiting_waits_for_what_runs_here() {
+    fn r_after_going_to_an_item_returns_its_tree_though_another_is_marked() {
         let mut app = crate::inbox::tests::with_workspaces();
-        press(&mut app, KeyCode::Char('1'));
+        app.pools.clear();
+        app.marked.insert(app.trees[1].path.clone());
+        press(&mut app, KeyCode::Char('W'));
+        app.is_window_focused = false;
+        let shown = app.window_tree().unwrap().name.clone();
+        assert_ne!(shown, "2");
+        press(&mut app, KeyCode::Char('r'));
+        let pending = app.pending.as_ref().unwrap();
+        let names: Vec<&str> = pending.trees.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, [shown.as_str()]);
+    }
+
+    #[test]
+    fn going_to_another_workspace_from_the_notifications_waits_for_what_runs_here() {
+        let mut app = crate::inbox::tests::with_workspaces();
         let (items, _) = app.notes_list();
-        app.waiting_at = items.iter().position(|e| e.away.is_some()).unwrap();
+        let away = items.iter().position(|e| e.away.is_some());
+        app.notes = away;
         let path = app.trees[0].path.clone();
         app.jobs.insert(path.clone(), JobState::Queued(Kind::Fix));
         assert_eq!(press(&mut app, KeyCode::Enter), Outcome::Continue);
@@ -7910,6 +7764,7 @@ pub(crate) mod tests {
                 .contains("still running here")
         );
         app.jobs.remove(&path);
+        app.notes = away;
         assert!(matches!(
             press(&mut app, KeyCode::Enter),
             Outcome::SwitchTo { .. }
@@ -7934,7 +7789,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn w_goes_round_everything_waiting_though_one_tree_has_two() {
+    fn shift_w_goes_round_everything_that_needs_you_though_one_tree_has_two() {
         let mut app = crate::inbox::tests::with_workspaces();
         app.pools.clear();
         // Tree 4 asks and its PR failed too.
@@ -7946,15 +7801,15 @@ pub(crate) mod tests {
         let mut seen = HashSet::new();
         for _ in 0..all.len() {
             app.is_window_focused = false;
-            press(&mut app, KeyCode::Char('w'));
-            seen.insert(app.notes_list().0[app.waiting_at].about());
+            press(&mut app, KeyCode::Char('W'));
+            seen.insert(app.watch.gone_to.clone().unwrap());
         }
         assert_eq!(seen.len(), all.len(), "{seen:?}");
     }
 
     #[test]
-    fn w_from_ship_or_news_leaves_the_keys_on_the_tree_it_shows() {
-        for panel in [Panel::Ship, Panel::News] {
+    fn shift_w_from_another_panel_leaves_the_keys_on_the_tree_it_shows() {
+        for panel in [Panel::Ship, Panel::Linear, Panel::Keel] {
             let mut app = crate::inbox::tests::with_workspaces();
             app.pools.clear();
             app.reports.clear();
@@ -7964,7 +7819,7 @@ pub(crate) mod tests {
             app.trees[1].ship = Some(ship);
             app.panel = panel;
             app.hold_cursors();
-            press(&mut app, KeyCode::Char('w'));
+            press(&mut app, KeyCode::Char('W'));
             assert_eq!(app.window_tree().map(|t| t.name.as_str()), Some("7"));
             let Outcome::Queue(jobs) = press(&mut app, KeyCode::Char('F')) else {
                 panic!("F sends it: {panel:?} {:?}", app.message);
@@ -8051,32 +7906,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_key_that_acts_on_a_tree_acts_on_the_one_under_waitings_cursor() {
-        let mut app = crate::inbox::tests::with_workspaces();
-        app.reselect(Some(app.trees[0].path.clone()));
-        app.marked.insert(app.trees[0].path.clone());
-        press(&mut app, KeyCode::Char('1'));
-        let (items, _) = app.notes_list();
-        let failed = |e: &crate::inbox::Entry| e.kind == crate::inbox::Kind::Failed;
-        app.waiting_at = items.iter().position(failed).unwrap();
-        let Outcome::Queue(jobs) = press(&mut app, KeyCode::Char('F')) else {
-            panic!("F sends the item's failure: {:?}", app.message);
-        };
-        assert_eq!(jobs[0].tree.name, "7");
-        assert_eq!(app.panel, Panel::Waiting);
-        // Another workspace's is gone to, so nothing here is acted on.
-        app.jobs.clear();
-        let (items, _) = app.notes_list();
-        app.waiting_at = items.iter().position(|e| e.away.is_some()).unwrap();
-        assert!(matches!(
-            press(&mut app, KeyCode::Char('r')),
-            Outcome::SwitchTo { ref tree, .. } if *tree == items[app.waiting_at].path
-        ));
-        assert!(app.pending.is_none(), "{:?}", app.pending);
-        assert_eq!(app.marked.len(), 1, "the marks stay");
-    }
-
-    #[test]
     fn the_tree_arrived_at_keeps_the_cursor_as_agents_and_prs_are_first_read() {
         use crate::inbox::tests::{agent, tree};
         let trees: Vec<Tree> = ["1", "2", "3"]
@@ -8097,9 +7926,17 @@ pub(crate) mod tests {
         app.trees = trees;
         app.is_loaded = true;
         let unread = order(&app);
-        app.arriving = Some((format!("/pool/{}/app", unread[0]).into(), None));
-        assert_eq!(app.arrival(), None, "only looked at, so nothing opens");
-        assert_eq!(on(&app), Some(unread[0].clone()), "before any read");
+        let waits = crate::inbox::Kind::NeedsYou;
+        app.arriving = Some((format!("/pool/{}/app", unread[1]).into(), waits));
+        assert_eq!(app.arrival(), None, "no agent is read, so nothing opens");
+        assert_eq!(on(&app), Some(unread[1].clone()), "before any read");
+        app.reselect(Some(format!("/pool/{}/app", unread[2]).into()));
+        app.arrival();
+        assert_eq!(on(&app), Some(unread[2].clone()), "moved since, left there");
+        app.is_cursor_held = false;
+        app.arriving = Some((format!("/pool/{}/app", unread[0]).into(), waits));
+        assert_eq!(app.arrival(), None);
+        assert_eq!(on(&app), Some(unread[0].clone()));
         // The last one's agent waits on you, so it sorts first.
         let last = PathBuf::from(format!("/pool/{}/app", unread[2]));
         app.apply_agents(&HashMap::from([(
@@ -8123,7 +7960,8 @@ pub(crate) mod tests {
             .collect();
         app.is_loaded = true;
         app.is_agents_read = true;
-        app.arriving = Some((format!("/pool/{}/app", unread[0]).into(), None));
+        let merged = crate::inbox::Kind::Merged;
+        app.arriving = Some((format!("/pool/{}/app", unread[0]).into(), merged));
         app.arrival();
         let mut ship = crate::inbox::tests::app().trees[2].ship.clone().unwrap();
         ship.branch = format!("work-{}", unread[2]);
@@ -8188,23 +8026,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn an_answered_ask_leaves_its_workspaces_tab_count_with_its_row() {
-        let mut app = crate::inbox::tests::with_workspaces();
-        let count = |app: &App| {
-            app.workspace_tabs()
-                .iter()
-                .find(|t| t.checkout == app.checkout)
-                .map(|t| t.waiting)
-        };
-        let before = count(&app).unwrap();
-        app.reselect(Some(app.trees[0].path.clone()));
-        app.is_window_focused = true;
-        app.dialog = Some(vec!["Left".into(), "Right".into()]);
-        assert_eq!(press(&mut app, KeyCode::Char('1')), Outcome::Answer('1'));
-        assert_eq!(count(&app), Some(before - 1));
-    }
-
-    #[test]
     fn a_message_typed_to_an_asking_agent_takes_its_ask_off_what_waits() {
         let asks = |app: &App| {
             app.notes_list()
@@ -8239,95 +8060,17 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn another_workspaces_pr_failed_before_its_prs_were_first_read_is_not_news() {
-        let mut app = crate::inbox::tests::with_workspaces();
-        let mut ship = app.trees[2].ship.clone().unwrap();
-        ship.branch = "zeta-work".into();
-        let zeta = PathBuf::from("/code/zeta");
-        let mut tree = app
-            .pools
-            .iter()
-            .find(|p| p.away.checkout == zeta)
-            .unwrap()
-            .trees[0]
-            .clone();
-        // Its agents are read first, and its PRs a while later.
-        app.away_live.insert(zeta.clone(), vec![tree.clone()]);
-        app.watch_waiting();
-        app.watch_waiting();
-        let before = app.news().len();
-        tree.ship = Some(ship.clone());
-        app.away_live.insert(zeta.clone(), vec![tree.clone()]);
-        app.away_ships.insert(zeta.clone());
-        app.watch_waiting();
-        assert_eq!(app.news().len(), before, "{:?}", app.news());
-        // It passes, then fails again: that is news.
-        tree.ship = None;
-        app.away_live.insert(zeta.clone(), vec![tree.clone()]);
-        app.watch_waiting();
-        tree.ship = Some(ship);
-        app.away_live.insert(zeta, vec![tree]);
-        app.watch_waiting();
-        assert_eq!(app.news().len(), before + 1, "{:?}", app.news());
-    }
-
-    #[test]
-    fn a_pr_failed_before_treetop_opened_is_not_news_and_one_failing_after_is() {
-        // The first look comes before the PRs are read.
-        let mut app = crate::inbox::tests::with_workspaces();
-        let ship = app.trees[2].ship.take().unwrap();
-        app.watch_waiting();
-        let answer = |ship: &crate::ship::Ship| {
-            Ok(Answer {
-                ships: [("/pool/7/app".into(), ship.clone())].into(),
-                ..Answer::default()
-            })
-        };
-        let failed = |app: &App| {
-            app.news()
-                .iter()
-                .filter(|n| n.kind == Some(crate::inbox::Kind::Failed))
-                .count()
-        };
-        app.apply_ship(answer(&ship));
-        app.watch_waiting();
-        assert_eq!(failed(&app), 0, "{:?}", app.news());
-        // It passes, then fails again: that is news.
-        let passing = crate::ship::Ship {
-            stage: Stage::Checks,
-            ..(*ship).clone()
-        };
-        app.apply_ship(answer(&passing));
-        app.watch_waiting();
-        app.apply_ship(answer(&ship));
-        app.watch_waiting();
-        assert_eq!(failed(&app), 1, "{:?}", app.news());
-    }
-
-    #[test]
     fn the_window_follows_the_pr_under_ships_cursor() {
         let mut app = crate::inbox::tests::with_workspaces();
         let mut ship = app.trees[2].ship.clone().unwrap();
         ship.stage = Stage::Approved;
         app.trees[1].ship = Some(ship);
         app.reselect(Some(app.trees[0].path.clone()));
-        press(&mut app, KeyCode::Char('3'));
+        press(&mut app, KeyCode::Char('1'));
         let rows: Vec<PathBuf> = app.ship_rows().iter().map(|t| t.path.clone()).collect();
         assert_eq!(app.window_tree().map(|t| &t.path), Some(&rows[0]));
         press(&mut app, KeyCode::Char('j'));
         assert_eq!(app.window_tree().map(|t| &t.path), Some(&rows[1]));
-    }
-
-    #[test]
-    fn j_on_news_scrolls_it_and_leaves_the_trees_cursor() {
-        let mut app = crate::inbox::tests::with_workspaces();
-        app.reselect(Some(app.trees[0].path.clone()));
-        let at = app.selected;
-        press(&mut app, KeyCode::Char('4'));
-        for key in ['j', 'j', 'G', 'k', 'g'] {
-            press(&mut app, KeyCode::Char(key));
-            assert_eq!(app.selected, at, "{key}");
-        }
     }
 
     #[test]
@@ -8338,12 +8081,63 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_plan_screen_takes_no_mouse_for_the_trees() {
+    fn the_plan_screen_takes_the_mouse_for_the_count_alone() {
         let mut app = on_plan();
-        app.is_plan = false;
-        assert!(app.wants_mouse(), "the Trees screen's count takes a click");
-        app.is_plan = true;
+        assert!(app.wants_mouse(), "the count takes a click");
+        // What is done is listed too, but not counted.
+        app.trees.retain(|t| t.name == "2");
+        app.pools.clear();
+        app.reports.retain(|r| r.job == "j2");
+        let (needs, done) = app.notes_list();
+        assert!(needs.is_empty() && !done.is_empty());
         assert!(!app.wants_mouse());
+    }
+
+    #[test]
+    fn a_planning_chats_step_follows_what_reached_it_then_what_it_made() {
+        use crate::scratch::PlanAsk;
+        let mut app = with_made();
+        app.plan_made.clear();
+        app.trees.clear();
+        app.plan_chats[0].issues.clear();
+        let step = |app: &App| app.plan_step(&app.plan_chats[0]);
+        assert_eq!(step(&app), 1);
+        press(&mut app, KeyCode::Char('1'));
+        // Asked, and never delivered.
+        press(&mut app, KeyCode::Char('D'));
+        assert_eq!(step(&app), 1, "not typed to it yet");
+        let name = app.plan_chats[0].name.clone();
+        app.plan_undelivered(&name);
+        assert_eq!(app.plan_delivered(&name), None, "nothing left to deliver");
+        // Delivered, in the order they were asked.
+        press(&mut app, KeyCode::Char('D'));
+        press(&mut app, KeyCode::Char('S'));
+        let mut newer = app.plan_chats[0].clone();
+        (newer.job, newer.name) = ("j2".into(), "plan 2".into());
+        newer.record = "/state/2.json".into();
+        app.plan_chats.push(newer);
+        let record = app.plan_chats[0].record.clone();
+        assert_eq!(app.plan_delivered("plan 2"), None);
+        assert_eq!(app.plan_delivered(&name), Some((record, PlanAsk::Draft)));
+        assert_eq!(step(&app), 2);
+        app.plan_at = 1;
+        press(&mut app, KeyCode::Char('D'));
+        assert!(app.plan_delivered("plan 2").is_some());
+        assert_eq!(app.plan_step(&app.plan_chats[1]), 2, "each has its own");
+        assert_eq!(app.plan_asks.len(), 1, "the first's is still to come");
+        assert!(app.plan_delivered(&name).is_some());
+        assert_eq!(step(&app), 3);
+        // Its issues made, whatever it was asked; then one picked up.
+        app.plan_chats[0].asked = None;
+        app.plan_chats[0].issues = vec!["ANB-90".into()];
+        assert_eq!(step(&app), 4);
+        let job = app.plan_chats[0].job.clone();
+        let made = planned("ANB-90", crate::planned::Stage::Going, &[]);
+        app.plan_made.insert(job, vec![made]);
+        assert_eq!(step(&app), 5);
+        let mut app = with_made();
+        app.plan_made.clear();
+        assert_eq!(app.plan_step(&app.plan_chats[0]), 5, "ANB-41 is in tree 4");
     }
 
     #[test]
@@ -8434,27 +8228,6 @@ pub(crate) mod tests {
             to.iter().map(|r| r.tree.as_str()).collect::<Vec<_>>(),
             ["7"]
         );
-    }
-
-    #[test]
-    fn news_keeps_what_happened_newest_first_capped_and_across_a_switch() {
-        let mut app = crate::inbox::tests::app();
-        app.add_news(None, "first".into(), None);
-        app.add_news(Some("api:2".into()), "second".into(), None);
-        assert_eq!(app.news()[0].what, "second");
-        assert_eq!(app.news()[0].place, "api:2");
-        for n in 0..NEWS_KEPT {
-            app.add_news(None, format!("{n}"), None);
-        }
-        assert_eq!(app.news().len(), NEWS_KEPT);
-        assert!(
-            app.news().iter().all(|n| n.what != "first"),
-            "the oldest go"
-        );
-        // A switch builds a new App; the log rides along with what waits.
-        let mut next = App::new(None);
-        next.keep_watch(app.take_watch());
-        assert_eq!(next.news().len(), NEWS_KEPT);
     }
 
     #[test]
@@ -9456,6 +9229,7 @@ pub(crate) mod tests {
             checkout: None,
             scratch: true,
             issues: Vec::new(),
+            asked: None,
         }
     }
 
@@ -10411,7 +10185,7 @@ pub(crate) mod tests {
         Choice {
             checkout: PathBuf::from(path),
             name: crate::workspaces::name(std::path::Path::new(path)),
-            held,
+            trees: held.map(|held| (held, 1)),
         }
     }
 
@@ -10462,6 +10236,438 @@ pub(crate) mod tests {
             Outcome::Switch(PathBuf::from("/home/me/lander"))
         );
         assert!(app.picker.is_none());
+    }
+
+    #[test]
+    fn slash_narrows_the_picker_by_name_and_enter_switches_to_the_one_left() {
+        let mut app = app_with_main();
+        app.checkout = PathBuf::from("/repo");
+        let names = |app: &App| -> Vec<String> {
+            let picker = app.picker.as_ref().unwrap();
+            picker.shown().iter().map(|c| c.name.clone()).collect()
+        };
+        app.open_picker(vec![
+            choice("/repo", None),
+            choice("/home/me/harness", None),
+            choice("/home/me/Lander", None),
+        ]);
+        press(&mut app, KeyCode::Char('/'));
+        // Its keys are typed now, `j`, `q` and `w` among them.
+        for c in "jqw".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(names(&app), [""; 0]);
+        // Nor with Ctrl, which a terminal may send for Backspace or Enter.
+        for c in "whlj".chars() {
+            let ctrl = KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+            assert_eq!(app.handle_key(ctrl), Outcome::Continue);
+            assert_eq!(app.picker.as_ref().unwrap().query.as_deref(), Some("jqw"));
+        }
+        assert_eq!(press(&mut app, KeyCode::Enter), Outcome::Continue);
+        assert!(app.picker.is_some(), "nothing to switch to");
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        press(&mut app, KeyCode::Char('l'));
+        assert_eq!(names(&app), ["Lander"], "whatever its case");
+        // Esc widens it, the cursor never on the one you are in.
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(names(&app).len(), 3);
+        let at = |app: &App| app.picker.as_ref().unwrap().selected;
+        assert_eq!(at(&app), 1);
+        press(&mut app, KeyCode::Char('/'));
+        assert_eq!(at(&app), 1);
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(names(&app), ["harness", "Lander"]);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Outcome::Switch(PathBuf::from("/home/me/Lander"))
+        );
+    }
+
+    #[test]
+    fn w_lists_the_workspaces_from_every_panel_and_from_plan_which_takes_the_keys() {
+        let mut app = crate::inbox::tests::with_workspaces();
+        app.checkout = PathBuf::from("/repo");
+        for panel in Panel::ALL {
+            app.panel = panel;
+            assert_eq!(press(&mut app, KeyCode::Char('w')), Outcome::Workspaces);
+        }
+        app.is_plan = true;
+        for is_window_focused in [false, true] {
+            app.is_window_focused = is_window_focused;
+            assert_eq!(press(&mut app, KeyCode::Char('w')), Outcome::Workspaces);
+        }
+        app.open_picker(vec![choice("/repo", None), choice("/home/me/lander", None)]);
+        press(&mut app, KeyCode::Char('k'));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Outcome::Switch(PathBuf::from("/home/me/lander"))
+        );
+    }
+
+    /// A run of eleven steps in the tree at `path`, on its `current`.
+    fn run_at(path: &std::path::Path, current: Option<usize>) -> crate::keel::Run {
+        let step = |n: usize| crate::keel::Step {
+            title: format!("Step {n}"),
+            state: "pending".into(),
+        };
+        crate::keel::Run {
+            tree: path.into(),
+            playbook: "issue".into(),
+            goal: String::new(),
+            state: "active".into(),
+            steps: (1..12).map(step).collect(),
+            current,
+            attention: 0,
+            stale: false,
+        }
+    }
+
+    #[test]
+    fn keels_cursor_moves_among_the_steps_and_starts_again_on_another_trees_run() {
+        let mut app = crate::inbox::tests::with_workspaces();
+        let (four, two) = (app.trees[0].path.clone(), app.trees[1].path.clone());
+        for (path, at) in [(&four, Some(5)), (&two, Some(2))] {
+            app.runs.insert(path.clone(), run_at(path, at));
+        }
+        app.reselect(Some(four.clone()));
+        let at = |app: &App| app.keel_step(&app.runs[&app.window_tree().unwrap().path]);
+        assert_eq!(at(&app), 4, "the current one");
+        press(&mut app, KeyCode::Char('4'));
+        let cursor = app.selected;
+        for (key, want) in [
+            ('j', 5),
+            ('k', 4),
+            ('k', 3),
+            ('G', 10),
+            ('j', 10),
+            ('g', 0),
+            ('k', 0),
+        ] {
+            press(&mut app, KeyCode::Char(key));
+            assert_eq!((at(&app), app.selected), (want, cursor), "{key}");
+        }
+        // Once another panel has had the keys, it is on the current one again.
+        for key in ['2', '3'] {
+            press(&mut app, KeyCode::Char(key));
+            assert_eq!(at(&app), 4, "{key}");
+        }
+        press(&mut app, KeyCode::Char('G'));
+        app.reselect(Some(two.clone()));
+        assert_eq!(at(&app), 1);
+        // All done, it is on the last.
+        app.runs.insert(two.clone(), run_at(&two, None));
+        assert_eq!(at(&app), 10);
+        // A run of no steps, and none at all.
+        app.runs.get_mut(&two).unwrap().steps.clear();
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(at(&app), 0);
+        app.runs.clear();
+        press(&mut app, KeyCode::Char('j'));
+    }
+
+    #[test]
+    fn enter_on_keel_shows_the_run_in_the_window_and_says_so_where_none_holds_it() {
+        let mut app = crate::inbox::tests::with_workspaces();
+        let path = app.trees[0].path.clone();
+        app.reselect(Some(path.clone()));
+        app.panel = Panel::Keel;
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.is_window_focused);
+        assert!(app.message.as_deref().unwrap().contains("no keel run"));
+        app.runs.insert(path.clone(), run_at(&path, Some(5)));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.is_window_focused && app.shown_tab() == WindowTab::Run);
+    }
+
+    /// Tree 4 of the fixture on ANB-41, In Progress and read, with tree 2 on
+    /// none, and [3] Linear with the keys.
+    fn on_linear() -> App {
+        let mut app = crate::inbox::tests::with_workspaces();
+        app.tree_issues = crate::tree_issues::tests::one_read();
+        let record = app.trees[0].sidecar.as_mut().unwrap();
+        record.ticket = Some("ANB-41".into());
+        record.source = None;
+        app.trees[1].sidecar = None;
+        app.trees[1].branch = Some("me/no-issue".into());
+        app.reselect(Some(app.trees[0].path.clone()));
+        press(&mut app, KeyCode::Char('3'));
+        app
+    }
+
+    /// The state of ANB-41 as it stands here.
+    fn state_of_41(app: &App) -> String {
+        let key = crate::tree_issues::tests::key("ANB-41");
+        app.tree_issues.issue(&key).unwrap().state.clone()
+    }
+
+    #[test]
+    fn s_on_linear_changes_the_status_of_the_issue_shown_though_the_cursor_moves_on() {
+        let mut app = on_linear();
+        press(&mut app, KeyCode::Char('s'));
+        assert!(app.statuses.is_some());
+        // The list moves under it: a read puts the cursor on another tree,
+        // with an issue of its own.
+        app.trees[1].branch = Some("me/anb-42-next".into());
+        app.reselect(Some(app.trees[1].path.clone()));
+        for c in "review".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let Outcome::Edit(asked) = press(&mut app, KeyCode::Enter) else {
+            panic!("it goes to Linear");
+        };
+        assert!(app.statuses.is_none());
+        assert_eq!(asked.key.id, "ANB-41");
+        assert_eq!(asked.issue.uuid, "u-ANB-41");
+        let crate::tree_issues::Edit::Change(change) = &asked.what else {
+            panic!("{:?}", asked.what);
+        };
+        let status = linear::Change {
+            state_id: Some("s-In Review".into()),
+            ..linear::Change::default()
+        };
+        assert_eq!(**change, status, "its status and nothing else");
+        assert_eq!(state_of_41(&app), "In Review", "at once");
+        // Refused, it is back, and says why.
+        app.edit_answered(asked, Said::Changed(Err("not allowed".into())));
+        assert_eq!(state_of_41(&app), "In Progress");
+        assert_eq!(
+            app.message.as_deref(),
+            Some("status of ANB-41 not changed: not allowed")
+        );
+    }
+
+    #[test]
+    fn a_start_in_a_popup_over_linear_keeps_the_keys() {
+        let mut app = on_linear();
+        app.opening = Some(Opening {
+            agent: "assistant".into(),
+            tree: String::new(),
+            key: None,
+            failed: None,
+            leases: false,
+            side: None,
+        });
+        for key in ['s', 'c'] {
+            press(&mut app, KeyCode::Char(key));
+            assert!(app.statuses.is_none() && app.prompt.is_none(), "{key}");
+        }
+    }
+
+    #[test]
+    fn the_status_list_takes_every_key_and_the_one_it_has_already_changes_nothing() {
+        let mut app = on_linear();
+        press(&mut app, KeyCode::Char('s'));
+        for key in ['1', 'q', 'W', 'r'] {
+            press(&mut app, KeyCode::Char(key));
+        }
+        assert!(app.statuses.is_some() && app.panel == Panel::Linear);
+        assert!(app.pending.is_none());
+        press(&mut app, KeyCode::Esc);
+        assert!(app.statuses.is_none());
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(press(&mut app, KeyCode::Enter), Outcome::Continue);
+        assert_eq!(state_of_41(&app), "In Progress");
+    }
+
+    #[test]
+    fn an_issue_that_cannot_be_changed_says_why() {
+        let says = |app: &mut App, key: char| {
+            press(app, KeyCode::Char(key));
+            assert!(app.statuses.is_none() && app.prompt.is_none());
+            app.message.clone().unwrap_or_default()
+        };
+        // Another team's, whose statuses are its own.
+        let mut app = on_linear();
+        let key = crate::tree_issues::tests::key("ANB-41");
+        let mut other = app.tree_issues.issue(&key).unwrap().clone();
+        other.team_id = Some("another".into());
+        app.tree_issues.change(&key, other);
+        assert!(says(&mut app, 's').contains("not in ANB"));
+        // Not read yet.
+        let mut app = on_linear();
+        app.tree_issues = TreeIssues::default();
+        for key in ['s', 'c', 'O'] {
+            assert!(says(&mut app, key).contains("not read yet"), "{key}");
+        }
+        // A tree on none.
+        let mut app = on_linear();
+        app.reselect(Some(app.trees[1].path.clone()));
+        for key in ['s', 'c', 'O'] {
+            assert!(says(&mut app, key).contains("I picks one"), "{key}");
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.is_window_focused);
+        // Its statuses could not be read.
+        let mut app = on_linear();
+        app.tree_issues = TreeIssues::default();
+        let mut read = crate::tree_issues::tests::found(
+            &["ANB-41"],
+            vec![crate::tree_issues::tests::issue("ANB-41", "Todo")],
+            Instant::now(),
+        );
+        read.sources[0].team = Err("anb names no team".into());
+        app.tree_issues.apply(read);
+        assert!(says(&mut app, 's').contains("anb names no team"));
+        // A source on a plugin.
+        let mut app = on_linear();
+        app.tree_issues.apply(crate::tree_issues::Read {
+            asked: Instant::now(),
+            sources: vec![crate::tree_issues::SourceRead {
+                source: None,
+                ids: Vec::new(),
+                issues: Ok(Vec::new()),
+                team: Ok(None),
+                projects: HashMap::new(),
+            }],
+        });
+        for key in ['s', 'c'] {
+            assert_eq!(says(&mut app, key), issues::READ_ONLY);
+        }
+    }
+
+    #[test]
+    fn enter_on_linear_reads_the_issue_l_its_project_and_esc_gives_the_keys_back() {
+        let mut app = on_linear();
+        app.issue_rows.set(9);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.is_window_focused && app.shown_tab() == WindowTab::Issue);
+        let key = crate::tree_issues::tests::key("ANB-41");
+        let view = |app: &App| {
+            let view = app.issue_view(&key);
+            (view.is_project, view.scroll)
+        };
+        for (pressed, want) in [
+            ('j', (false, 1)),
+            ('G', (false, 9)),
+            ('j', (false, 9)),
+            ('k', (false, 8)),
+            ('l', (true, 0)),
+            ('j', (true, 1)),
+            ('h', (false, 0)),
+        ] {
+            press(&mut app, KeyCode::Char(pressed));
+            assert_eq!(view(&app), want, "{pressed}");
+        }
+        press(&mut app, KeyCode::Char('s'));
+        assert!(app.statuses.is_some(), "its status from here too");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.is_window_focused);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!((app.is_window_focused, app.panel), (false, Panel::Linear));
+        // A tree with none has no such tab, nor does the table layout.
+        app.reselect(Some(app.trees[1].path.clone()));
+        assert!(!app.window_tabs().contains(&WindowTab::Issue));
+        app.reselect(Some(app.trees[0].path.clone()));
+        assert!(app.window_tabs().contains(&WindowTab::Issue));
+        app.show_panels(false);
+        assert!(!app.window_tabs().contains(&WindowTab::Issue));
+    }
+
+    #[test]
+    fn the_issue_a_branch_names_is_read_and_i_opens_it_on_issues() {
+        let mut app = on_linear();
+        app.trees[1].branch = Some("me/anb-77-login".into());
+        app.reselect(Some(app.trees[1].path.clone()));
+        assert_eq!(app.shown_issue().unwrap().id, "ANB-77");
+        let mut wanted = app.wanted_issues().unwrap().remove(0).1;
+        wanted.sort();
+        assert!(wanted.contains(&"ANB-77".to_string()), "{wanted:?}");
+        for panel in ['3', '4'] {
+            app.is_issues = false;
+            app.open_issue = None;
+            press(&mut app, KeyCode::Char(panel));
+            press(&mut app, KeyCode::Char('I'));
+            assert!(app.is_issues, "{panel}");
+            assert_eq!(app.open_issue.as_deref(), Some("ANB-77"));
+        }
+        // Nor a free tree's, nor the main checkout's.
+        app.trees[1].status = "available".into();
+        assert!(app.issue_on(&app.trees[1]).is_none());
+    }
+
+    #[test]
+    fn c_on_linear_comments_and_one_refused_is_in_its_box_again() {
+        let mut app = on_linear();
+        press(&mut app, KeyCode::Char('c'));
+        for c in "ok".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let Outcome::Edit(asked) = press(&mut app, KeyCode::Enter) else {
+            panic!("it goes to Linear");
+        };
+        assert_eq!(asked.key.id, "ANB-41");
+        assert_eq!(asked.what, crate::tree_issues::Edit::Comment("ok".into()));
+        app.edit_answered(asked.clone(), Said::Commented(Err("no".into())));
+        assert!(
+            app.message
+                .as_deref()
+                .unwrap()
+                .contains("not commented on ANB-41: no")
+        );
+        // It waits for what is under way, and not for the issue tab.
+        app.is_help = true;
+        assert!(!app.can_reopen_comment());
+        app.is_help = false;
+        assert!(app.can_reopen_comment());
+        press(&mut app, KeyCode::Enter);
+        assert!(app.is_window_focused && app.can_reopen_comment());
+        press(&mut app, KeyCode::Char('s'));
+        assert!(!app.can_reopen_comment());
+        press(&mut app, KeyCode::Esc);
+        app.reopen_comment(asked.clone());
+        assert!(!app.can_reopen_comment());
+        // An Enter already on its way is for something else.
+        assert_eq!(press(&mut app, KeyCode::Enter), Outcome::Continue);
+        assert!(app.prompt.is_some(), "still in its box");
+        app.comment_reopened = Instant::now().checked_sub(ASK_SETTLES);
+        assert_eq!(press(&mut app, KeyCode::Enter), Outcome::Edit(asked));
+    }
+
+    #[test]
+    fn a_chat_that_starts_waits_for_the_status_list_and_a_comment() {
+        let chat = || Outcome::Chat {
+            command: vec!["attach".into()],
+            agent: "claude".into(),
+            tree: "4".into(),
+        };
+        for key in ['s', 'c'] {
+            let mut app = on_linear();
+            press(&mut app, KeyCode::Char(key));
+            app.started_chat = Some(chat());
+            assert_eq!(app.ready_chat(), None, "{key}");
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(app.ready_chat(), Some(chat()), "{key}");
+        }
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_issue_tab() {
+        let mut app = on_linear();
+        app.issue_rows.set(9);
+        press(&mut app, KeyCode::Enter);
+        let key = crate::tree_issues::tests::key("ANB-41");
+        app.wheel_window(true);
+        assert_eq!(app.issue_view(&key).scroll, 3);
+        app.wheel_window(false);
+        assert_eq!(app.issue_view(&key).scroll, 0);
+    }
+
+    #[test]
+    fn brackets_step_the_windows_tabs_from_every_panel() {
+        for panel in Panel::ALL {
+            let mut app = crate::inbox::tests::with_workspaces();
+            app.reselect(Some(app.trees[0].path.clone()));
+            app.panel = panel;
+            let before = app.shown_tab();
+            press(&mut app, KeyCode::Char(']'));
+            assert_ne!(app.shown_tab(), before, "{panel:?}");
+            press(&mut app, KeyCode::Char('['));
+            assert_eq!(app.shown_tab(), before, "{panel:?}");
+        }
     }
 
     #[test]

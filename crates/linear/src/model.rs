@@ -93,6 +93,19 @@ pub struct Standing {
     pub blocked_by: Vec<Link>,
 }
 
+/// A project, with its text and where each of its issues stands.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Project {
+    pub id: String,
+    pub name: String,
+    /// Its summary, one line.
+    pub summary: Option<String>,
+    /// Its Markdown text.
+    pub content: Option<String>,
+    /// By number.
+    pub issues: Vec<Standing>,
+}
+
 /// A workflow state. `kind` is Linear's type: `triage`, `backlog`,
 /// `unstarted`, `started`, `completed` or `canceled`.
 #[derive(Debug, Clone, PartialEq)]
@@ -197,6 +210,45 @@ pub(crate) struct RawIssue {
     children: Option<Nodes<RawLinked>>,
     relations: Option<Nodes<RawRelation>>,
     inverse_relations: Option<Nodes<RawRelation>>,
+}
+
+/// What a project asks for: the most issues Linear gives in a request, each
+/// with no more than its row shows.
+pub const PROJECT_FIELDS: &str = "id name description content \
+    issues(first: 250) { nodes { identifier title state { name type } } }";
+
+#[derive(Deserialize)]
+pub struct RawProject {
+    id: String,
+    #[serde(default)]
+    name: String,
+    description: Option<String>,
+    content: Option<String>,
+    issues: Option<Nodes<RawStanding>>,
+}
+
+impl From<RawProject> for Project {
+    fn from(raw: RawProject) -> Self {
+        let text = |text: Option<String>| text.filter(|t| !t.trim().is_empty());
+        let mut issues: Vec<Standing> = raw
+            .issues
+            .map(|i| i.nodes)
+            .unwrap_or_default()
+            .into_iter()
+            .map(Standing::from)
+            .collect();
+        issues.sort_by_key(|issue| {
+            let (team, number) = issue.id.split_once('-').unwrap_or((&issue.id, ""));
+            (team.to_string(), number.parse::<u64>().ok())
+        });
+        Project {
+            id: raw.id,
+            name: raw.name,
+            summary: text(raw.description),
+            content: text(raw.content),
+            issues,
+        }
+    }
 }
 
 /// What a standing asks of each issue.

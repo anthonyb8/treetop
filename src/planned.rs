@@ -206,7 +206,7 @@ pub fn read(backend: &dyn Backend, ids: &[String]) -> Result<Vec<Planned>, Strin
 /// The stage of a status: by its type, or, from a source that gives none,
 /// a ticket plugin's, by its name, so one done or under way there is not
 /// offered to pick up.
-fn stage(kind: Option<&str>, name: &str) -> Stage {
+pub fn stage(kind: Option<&str>, name: &str) -> Stage {
     match kind {
         Some("started") => Stage::Going,
         Some("completed") => Stage::Done,

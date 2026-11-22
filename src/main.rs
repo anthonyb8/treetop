@@ -51,6 +51,7 @@ mod syntax;
 mod theme;
 mod tickets;
 mod tmux;
+mod tree_issues;
 mod ui;
 mod update;
 mod watch;
@@ -193,8 +194,6 @@ fn open_chat(
 ) -> Result<()> {
     let is_popup = ui::is_popup(app, &agent, &tree);
     if !is_popup && !app.is_plan {
-        // Its tree is this workspace's, whatever [2] was looking at.
-        app.viewing = None;
         app.select_tree(&tree);
         app.tab = app::WindowTab::Chat;
         if app.window_tree().map(|t| t.name.as_str()) != Some(tree.as_str()) {
@@ -340,6 +339,7 @@ fn send(
             continue;
         }
         let agent = recipient.agent.clone();
+        let is_planning = recipient.tree == app::SCRATCH;
         let hints = recipient.plugin.as_deref().and_then(plugin::screen_of);
         if let Err(err) = chats.deliver(
             &recipient.command,
@@ -349,6 +349,9 @@ fn send(
             hints,
         ) {
             app.message = Some(format!("could not reach {agent}: {err:#}"));
+            if is_planning {
+                app.plan_undelivered(&agent);
+            }
         }
     }
     Ok(())
@@ -359,7 +362,7 @@ enum Exit {
     Quit,
     /// Show the pool of the repository checked out here instead, and open
     /// what waits in the tree at the second path, once it is read.
-    Switch(PathBuf, Option<(PathBuf, Option<inbox::Kind>)>),
+    Switch(PathBuf, Option<(PathBuf, inbox::Kind)>),
     /// Start the treetop installed over this one, on this workspace.
     Restart,
 }
@@ -369,12 +372,23 @@ fn choices() -> Vec<Choice> {
     workspaces::list()
         .into_iter()
         .map(|workspace| Choice {
-            held: cache::read(&workspace.checkout)
-                .map(|trees| trees.iter().filter(|t| t.is_held()).count()),
+            trees: cache::read(&workspace.checkout).map(|trees| {
+                let held = trees.iter().filter(|t| t.is_held()).count();
+                (held, trees.len() - held)
+            }),
             name: workspace.name(),
             checkout: workspace.checkout,
         })
         .collect()
+}
+
+/// A read of the trees' issues: all of them, or one's text and comments.
+enum IssueRead {
+    All(tree_issues::Read),
+    One(
+        tree_issues::Key,
+        std::result::Result<Box<linear::Detail>, String>,
+    ),
 }
 
 fn run(
@@ -383,6 +397,7 @@ fn run(
     checkout: &Path,
     desktop: &mut notify::Desktop,
     chats: &mut Chats,
+    editor: &mut tree_issues::Editor,
 ) -> Result<Exit> {
     let refresher = Refresher::spawn(checkout.to_path_buf(), app.trees.clone());
     let worker = Worker::spawn();
@@ -397,6 +412,8 @@ fn run(
     // read is a few `gh` calls and the popup stays live meanwhile.
     let (prs_done, prs) = std::sync::mpsc::channel();
     // The Issues screen, made the first time it is shown.
+    app.tree_issues.own = tickets::own_team(checkout);
+    let (issue_reads_done, issue_reads) = std::sync::mpsc::channel();
     let mut issues: Option<issues::Screen> = None;
     let mut was_issues = false;
     // Drawn only when something changed, or every REDRAW: drawing the whole
@@ -468,9 +485,6 @@ fn run(
                     if !news.is_empty() {
                         announce(&news)?;
                     }
-                    for line in news {
-                        app.add_news(None, line, None);
-                    }
                 }
                 Update::Sidecars(sidecars) => app.apply_sidecars(sidecars),
                 Update::Ship(answer) => {
@@ -511,12 +525,7 @@ fn run(
                     if job.kind == Kind::Ship {
                         refresher.refresh_ship();
                     }
-                    let before = app.message.clone();
                     app.job_finished(job, is_ok, output);
-                    // What it came to, kept in [4] News past the next key.
-                    if let Some(said) = app.message.clone().filter(|m| Some(m) != before.as_ref()) {
-                        app.add_news(None, said, None);
-                    }
                     if !is_preview {
                         refresher.refresh();
                     }
@@ -541,7 +550,6 @@ fn run(
             snapshot::write(checkout, &status);
         }
         if let Some(Outcome::Send { to, text }) = app.ready_failure() {
-            app.note_sent(&to, &text);
             send(term, app, chats, &worker, to, &text)?;
             refresher.refresh_ship();
         }
@@ -573,6 +581,51 @@ fn run(
                 let _ = done.send((path, pr));
             });
             is_stale = true;
+        }
+        // The issues the trees work on, and the edits made to them here.
+        if was_issues && !app.is_issues {
+            app.tree_issues.read_again();
+        }
+        while let Ok(read) = issue_reads.try_recv() {
+            is_stale = true;
+            match read {
+                IssueRead::All(read) => app.tree_issues.apply(read),
+                IssueRead::One(key, read) => app.tree_issues.apply_detail(key, read),
+            }
+        }
+        while let Some(answered) = editor.answered() {
+            is_stale = true;
+            if answered.checkout == checkout {
+                app.edit_answered(answered.asked, answered.said);
+            } else if let Some(why) = answered.failed() {
+                app.message = Some(why);
+            }
+        }
+        if !chat_has_keys(chats, app)
+            && app.can_reopen_comment()
+            && let Some(refused) = editor.take_unposted(checkout)
+        {
+            app.reopen_comment(refused);
+            is_stale = true;
+        }
+        if let Some(wanted) = app.wanted_issues() {
+            let done = issue_reads_done.clone();
+            let here = checkout.to_path_buf();
+            std::thread::spawn(move || {
+                let at = Instant::now();
+                let read = tree_issues::read(wanted, at, |name| tickets::named(name, &here));
+                let _ = done.send(IssueRead::All(read));
+            });
+        }
+        if let Some(key) = app.wanted_detail() {
+            let done = issue_reads_done.clone();
+            let here = checkout.to_path_buf();
+            std::thread::spawn(move || {
+                let read = tickets::named(key.source.as_deref(), &here)
+                    .and_then(|backend| backend.detail(&key.id))
+                    .map(Box::new);
+                let _ = done.send(IssueRead::One(key, read));
+            });
         }
         if app.is_issues {
             match issues.as_mut() {
@@ -823,10 +876,9 @@ fn run(
                         .collect();
                     if !fresh.is_empty() {
                         chat.issues.extend(fresh);
-                        // Not for a chat deleted while this read ran.
-                        if chat.record.exists() {
-                            let _ = scratch::save(chat);
-                        }
+                        let _ = scratch::edit(&chat.record, |kept| {
+                            kept.issues.clone_from(&chat.issues);
+                        });
                     }
                 }
                 let made = tickets::own(&here).map(|backend| {
@@ -957,11 +1009,21 @@ fn run(
             });
             is_stale = true;
         }
+        for (agent, tree) in &pumped.delivered {
+            if tree == app::SCRATCH
+                && let Some((record, asked)) = app.plan_delivered(agent)
+            {
+                let _ = scratch::edit(&record, |kept| kept.asked = Some(asked));
+            }
+        }
         if let Some((agent, tree, why)) = pumped.failed.first() {
             app.message = Some(format!("not sent to {agent} in {tree}: {why}"));
             is_stale = true;
         }
         for (agent, tree, _) in &pumped.failed {
+            if tree == app::SCRATCH {
+                app.plan_undelivered(agent);
+            }
             app.unsent(tree);
             app.handoff_unsent(agent, tree);
         }
@@ -1335,6 +1397,7 @@ fn run(
                 tree,
                 kind,
             } => return Ok(Exit::Switch(checkout, Some((tree, kind)))),
+            Outcome::Edit(asked) => editor.send(checkout, asked),
             Outcome::Restart => return Ok(Exit::Restart),
             Outcome::Update => {
                 app.is_updating = true;
@@ -1433,7 +1496,6 @@ fn run(
                 refresher.refresh();
             }
             Outcome::Send { to, text } => {
-                app.note_sent(&to, &text);
                 // Plan's `S` makes issues: read for them at the next look.
                 if app.is_plan {
                     plan_read_at = None;
@@ -1488,19 +1550,20 @@ fn show(
     start: PathBuf,
     mut checkout: PathBuf,
     is_issues: bool,
+    editor: &mut tree_issues::Editor,
 ) -> Result<Option<PathBuf>> {
     let mut here = Some(start);
     // What waits, as the last workspace looked, so `e` keeps its place.
     let mut watch = app::Watch::default();
     // The other workspaces as last read, kept across a switch.
     let mut away = inbox::AwayRound::default();
-    // The panel with the keys in the panels layout, kept across a switch.
-    let mut panel = app::Panel::default();
     // What the desktop has been told of, kept across a switch too, so a
     // reminder still comes.
     let mut desktop = notify::Desktop::default();
     let mut is_issues = is_issues;
     let mut arriving = None;
+    // What was still to be sent in the workspace left, for the bar of the next.
+    let mut unsent = None;
     let mut chats = Chats::default();
     loop {
         std::env::set_current_dir(&checkout)?;
@@ -1511,7 +1574,6 @@ fn show(
         away.ships_read.remove(&checkout);
         app.away_live = std::mem::take(&mut away.trees);
         app.away_ships = std::mem::take(&mut away.ships_read);
-        app.panel = panel;
         app.is_in_tmux = tmux::is_inside();
         app.checkout = checkout.clone();
         app.user = branch::user();
@@ -1540,6 +1602,7 @@ fn show(
             app.put_away_file = Some(file);
         }
         app.arriving = arriving.take();
+        app.message = unsent.take();
         app.pools = inbox::other_pools(&checkout);
         app.ship_plugins = ship::plugins(&checkout).0;
         app.is_issues = std::mem::take(&mut is_issues);
@@ -1547,20 +1610,23 @@ fn show(
             cached.insert(0, pool::main_tree(&checkout));
             app.set_cached(cached);
         }
-        let exit = run(term, &mut app, &checkout, &mut desktop, &mut chats);
+        let exit = run(term, &mut app, &checkout, &mut desktop, &mut chats, editor);
         desktop.switched();
         if matches!(exit, Ok(Exit::Switch(..))) {
+            let left = workspaces::name(&checkout);
+            let mut to = Vec::new();
             for (agent, tree) in chats.unsent() {
                 app.unsent(&tree);
-                app.add_news(
-                    None,
-                    format!("not sent to {agent} in {tree}: you switched workspace first"),
-                    None,
-                );
+                to.push(format!("{agent} in {left}:{tree}"));
             }
+            unsent = (!to.is_empty()).then(|| {
+                format!(
+                    "not sent to {}, you switched workspace first",
+                    to.join(" or ")
+                )
+            });
         }
         watch = app.take_watch();
-        panel = app.panel;
         // The workspace left is another from the next one, as last read.
         away.trees = std::mem::take(&mut app.away_live);
         away.ships_read = std::mem::take(&mut app.away_ships);
@@ -1639,8 +1705,19 @@ fn main() -> Result<()> {
     }));
 
     let mut term = enter_screen()?;
-    let result = show(&mut term, start, checkout, is_issues);
+    // Kept across a switch, so a change made just before one still goes, and
+    // waited for before quitting.
+    let mut editor = tree_issues::Editor::spawn(tickets::named);
+    let result = show(&mut term, start, checkout, is_issues, &mut editor);
     leave_screen()?;
+    for answered in editor.finish() {
+        if let Some(why) = answered.failed() {
+            eprintln!("treetop: {why}");
+        }
+        if let Some(text) = answered.unposted() {
+            eprintln!("{text}");
+        }
+    }
     match result? {
         Some(workspace) => restart(&workspace),
         None => Ok(()),

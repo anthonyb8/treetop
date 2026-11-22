@@ -259,6 +259,21 @@ pub fn own(checkout: &Path) -> Result<Arc<dyn Backend>, String> {
     backend(name, source)
 }
 
+/// The repository's own issue source, by name, and the team its issues are
+/// in; None without one.
+pub fn own_team(checkout: &Path) -> Option<crate::tree_issues::Own> {
+    let config = config::load().ok()?;
+    let (name, source) = config.source_for(checkout).ok()?;
+    Some(crate::tree_issues::Own {
+        name: name.to_string(),
+        team: source
+            .settings
+            .get("team")
+            .and_then(|t| t.as_str())
+            .map(str::to_string),
+    })
+}
+
 /// The issue source called `name`, or the repository's own for None, which is
 /// what a tree picked up before sources were recorded works from.
 pub fn named(name: Option<&str>, checkout: &Path) -> Result<Arc<dyn Backend>, String> {
