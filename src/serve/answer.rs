@@ -212,10 +212,6 @@ fn asked(text: &str) -> Option<Value> {
             }
             break;
         }
-        // A blank line can set the options apart from the question.
-        if line.trim().is_empty() && question.is_empty() {
-            continue;
-        }
         if line.trim().is_empty() || is_rule(line) {
             break;
         }
@@ -254,11 +250,6 @@ fn asked(text: &str) -> Option<Value> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_blank_line_before_the_options_leaves_the_question_readable() {
-        let text = "some output\n────────\n Which one?\n\n❯ 1. Left\n  2. Right\n────────\n";
-        assert_eq!(choices(text), Some(vec!["Left".into(), "Right".into()]));
-    }
     use std::path::Path;
 
     /// What Claude Code's plugin says its screen looks like.

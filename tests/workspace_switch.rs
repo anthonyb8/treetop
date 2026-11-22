@@ -1159,6 +1159,49 @@ fn a_planning_chat_left_starting_joins_the_list_on_plan() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// ANB-103: it lands there though another agent in that pool is asking.
+#[test]
+fn enter_on_another_workspaces_tree_lands_on_it_while_another_there_asks() {
+    let Workspaces {
+        root, mut screen, ..
+    } = two_workspaces("land-ask", "");
+    add_tree(&root, "there", "2", Some("there-second"));
+    // Tree 1's agent asks, with a chat that would open.
+    let plugins = root.join("config/treetop/plugins");
+    fs::create_dir_all(&plugins).unwrap();
+    write_script(
+        &plugins.join("ag"),
+        &format!(
+            r#"read -r request
+case "$request" in
+*'"describe"'*) echo '{{"ok":true,"result":{{"protocol":1,"name":"ag","kind":"agent","ops":["find"]}}}}' ;;
+*) echo '{{"ok":true,"result":{{"agents":[{{"id":"a1","name":"asker","dir":"{}","live":true,"status":"waiting","background":true,"attach":["sh","-c","echo asks; sleep 600"]}}]}}}}' ;;
+esac
+"#,
+            root.join("there-trees/1").display()
+        ),
+    );
+    screen.wait_for("the ask", |text| {
+        text.contains("[2] Trees") && text.contains("1 needs action")
+    });
+    screen.press("]");
+    screen.wait_for("there's trees", |text| text.contains("there-second"));
+    screen.press("j");
+    screen.press("\r");
+    screen.wait_on("there");
+    screen.wait_for("tree 2 in the window", |text| {
+        text.contains("[0] Tree 2 · there-second")
+    });
+    std::thread::sleep(Duration::from_secs(5));
+    assert!(
+        screen.text().contains("[0] Tree 2 · there-second"),
+        "{}",
+        screen.text()
+    );
+    drop(screen);
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// ANB-103: Enter on another workspace's parked tree lands on it too.
 #[test]
 fn enter_on_another_workspaces_parked_tree_lands_on_it() {

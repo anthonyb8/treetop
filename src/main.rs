@@ -864,6 +864,7 @@ fn run(
                     tree,
                 }) = app.next_ask()
                 {
+                    app.ask_opened = Some(Instant::now());
                     open_chat(term, app, chats, &command, agent, tree)?;
                     is_stale = true;
                 }

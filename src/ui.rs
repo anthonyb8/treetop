@@ -1101,7 +1101,7 @@ fn panel_row(
     const BRANCH: usize = 4;
     let mut cells = row(app, tree);
     if let Some(branch) = &tree.branch {
-        cells[BRANCH] = Cell::from(fit(branch, room));
+        cells[BRANCH] = Cell::from(fit(short_branch(app, branch), room));
     }
     if let Some(state) = state_cell(app, tree, why) {
         cells[STATUS] = state;
@@ -1300,7 +1300,10 @@ fn draw_ship(frame: &mut Frame, app: &App, area: Rect, has_keys: bool) {
             };
             Some(Row::new(vec![
                 Cell::from(tree.name.clone()).style(fg(t.muted)),
-                Cell::from(fit(tree.branch.as_deref().unwrap_or_default(), branch)),
+                Cell::from(fit(
+                    short_branch(app, tree.branch.as_deref().unwrap_or_default()),
+                    branch,
+                )),
                 Cell::from(fit(&ship.label, label)).style(stage_style(ship.stage)),
                 Cell::from(key),
             ]))
@@ -1357,6 +1360,42 @@ fn draw_news(frame: &mut Frame, app: &App, area: Rect, has_keys: bool) {
         .collect();
     let selected = has_keys.then_some(app.news_at.min(news.len() - 1));
     draw_list(frame, area, lines, selected);
+}
+
+/// A question's choices on their number keys, for the bottom border of a
+/// window `width` columns wide.
+fn answer_row(choices: &[String], width: u16) -> Line<'static> {
+    const HEAD: &str = " ▲ answer ";
+    const TAIL: &str = "i types instead ";
+    let t = theme();
+    // The borders, the key and the space round each choice, and the words.
+    let around = 2 + Line::raw(HEAD).width() + choices.len() * 6 + TAIL.len();
+    let room = usize::from(width).saturating_sub(around);
+    let mut row = vec![Span::styled(
+        HEAD,
+        fg(t.warning).add_modifier(Modifier::BOLD),
+    )];
+    for (n, choice) in fit_each(choices, room).iter().enumerate() {
+        row.push(Span::styled(
+            format!(" {} ", n + 1),
+            Style::new()
+                .fg(t.badge.fg.unwrap_or(t.text))
+                .bg(t.warning)
+                .add_modifier(Modifier::BOLD),
+        ));
+        row.push(Span::raw(format!(" {choice}  ")));
+    }
+    row.push(Span::styled(TAIL, fg(t.muted)));
+    Line::from(row)
+}
+
+/// `branch` without your own prefix, which every one of yours has, so a
+/// narrow column tells them apart.
+fn short_branch<'a>(app: &App, branch: &'a str) -> &'a str {
+    match branch.split_once('/') {
+        Some((user, rest)) if !app.user.is_empty() && user == app.user => rest,
+        _ => branch,
+    }
 }
 
 /// `texts` in `room` columns between them, the longest shortened first.
@@ -2180,6 +2219,27 @@ fn panel_keys(app: &App) -> &'static [(&'static str, &'static str)] {
             ("Tab", "Issues"),
         ];
     }
+    if app.is_window_focused && app.shown_tab() == WindowTab::Diff {
+        return &[
+            ("j/k", "scroll"),
+            ("n/p", "files"),
+            ("[ ]", "tabs"),
+            ("w", "next waiting"),
+            ("Esc", "back"),
+            ("1-4", "panels"),
+        ];
+    }
+    if app.is_window_focused && app.shown_tab() == WindowTab::Pr {
+        return &[
+            ("h/l", "sections"),
+            ("j/k", "move"),
+            ("f", "send it"),
+            ("O", "browser"),
+            ("w", "next waiting"),
+            ("Esc", "back"),
+            ("1-4", "panels"),
+        ];
+    }
     if app.is_window_focused && !matches!(app.shown_tab(), WindowTab::Chat | WindowTab::Shell) {
         return &[
             ("w", "next waiting"),
@@ -2796,6 +2856,12 @@ fn draw_plan(frame: &mut Frame, app: &App, main: Rect, chat: Option<&Chat>) {
         &format!(" [0] {name}"),
         usize::from(window.width).saturating_sub(2),
     ));
+    let block = match &app.dialog {
+        Some(choices) if app.is_window_focused => {
+            block.title_bottom(answer_row(choices, window.width))
+        }
+        _ => block,
+    };
     // The chat itself once open; until then what it last said.
     if let Some(chat) = open {
         let body = block.inner(window);
@@ -3510,29 +3576,7 @@ fn draw_window(frame: &mut Frame, app: &App, area: Rect, pane: &Pane, chat: Opti
         .as_ref()
         .filter(|_| pane.is_cursor && !number.is_empty())
     {
-        let mut answer = vec![Span::styled(
-            " ▲ answer ",
-            fg(theme().warning).add_modifier(Modifier::BOLD),
-        )];
-        const TAIL: &str = "i types instead ";
-        let around = usize::from(area.width).saturating_sub(2)
-            - Line::from(answer.clone())
-                .width()
-                .min(usize::from(area.width).saturating_sub(2));
-        // The key and the space round each choice, and the words after.
-        let room = around.saturating_sub(choices.len() * 6 + TAIL.len());
-        for (n, choice) in fit_each(choices, room).iter().enumerate() {
-            answer.push(Span::styled(
-                format!(" {} ", n + 1),
-                Style::new()
-                    .fg(theme().badge.fg.unwrap_or(theme().text))
-                    .bg(theme().warning)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            answer.push(Span::raw(format!(" {choice}  ")));
-        }
-        answer.push(Span::styled(TAIL, fg(theme().muted)));
-        block = block.title_bottom(Line::from(answer));
+        block = block.title_bottom(answer_row(choices, area.width));
     }
     frame.render_widget(block, area);
     let [bar, body] = window_areas(area);
@@ -10051,6 +10095,50 @@ mod panels_tests {
         let rows = panel_rows(&screen(&app, 160, 46), "[2] Trees");
         let row = rows.iter().find(|l| l.contains("me/anb-41")).unwrap();
         assert!(row.contains("● working"), "{row}");
+    }
+
+    #[test]
+    fn a_planning_chats_question_shows_its_choices_too() {
+        let mut app = panels();
+        app.open_plan(vec![plan_chat("j1", "plan 1")]);
+        app.is_window_focused = true;
+        app.dialog = Some(vec!["Left".into(), "Right".into()]);
+        let shown = screen(&app, 160, 46).join("\n");
+        assert!(shown.contains("▲ answer  1  Left   2  Right"), "{shown}");
+    }
+
+    #[test]
+    fn branches_are_told_apart_by_what_they_do_not_share() {
+        let mut app = panels();
+        app.user = "anthonyb8".into();
+        for (at, branch) in ["anthonyb8/anb-101-read", "anthonyb8/anb-102-panels"]
+            .into_iter()
+            .enumerate()
+        {
+            app.trees[at].branch = Some(branch.into());
+            app.trees[at].ship = app.trees[2].ship.clone();
+        }
+        let shown = screen(&app, 150, 45);
+        for title in ["[2] Trees", "[3] Ship"] {
+            let rows = panel_rows(&shown, title).join("\n");
+            assert!(
+                rows.contains("anb-101-read") && rows.contains("anb-102-panels"),
+                "{rows}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_bar_lists_the_keys_of_the_diff_and_the_pr_while_they_have_them() {
+        let mut app = panels();
+        app.select_tree("7");
+        app.is_window_focused = true;
+        app.tab = WindowTab::Pr;
+        let bar = screen(&app, 200, 46).pop().unwrap();
+        assert!(bar.contains("h/l sections"), "{bar}");
+        app.tab = WindowTab::Diff;
+        let bar = screen(&app, 200, 46).pop().unwrap();
+        assert!(bar.contains("n/p files"), "{bar}");
     }
 
     #[test]

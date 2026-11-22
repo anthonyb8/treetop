@@ -643,6 +643,10 @@ pub struct News {
 /// still there was not answered, or is the next one.
 const ANSWER_TAKES: Duration = Duration::from_secs(10);
 
+/// How long a question that opened by itself takes no number: one pressed as
+/// it opened was for something else.
+const ASK_SETTLES: Duration = Duration::from_millis(1500);
+
 /// The most lines [4] News keeps, the oldest going first.
 const NEWS_KEPT: usize = 300;
 
@@ -802,6 +806,8 @@ pub struct App {
     landings: Vec<Job>,
     /// The Parked group is open, showing the trees set aside.
     pub is_parked_open: bool,
+    /// When an ask's chat last opened by itself.
+    pub ask_opened: Option<Instant>,
     /// What was answered in the window, and when, until its agent moves on.
     pub answered: HashMap<crate::inbox::About, Instant>,
     /// The same in the panels, where it starts open.
@@ -935,6 +941,8 @@ pub struct App {
     /// The cursor was put on its tree, so it stays on it as the list is
     /// first sorted by what its reads find.
     pub is_cursor_held: bool,
+    /// Gone to a tree picked, with no key pressed there yet.
+    pub has_landed: bool,
     /// The issue `p` on Plan picked up, whose tree the cursor goes to once
     /// it is listed, and the tree the cursor was on.
     pub picked: Option<(String, Option<PathBuf>)>,
@@ -1953,6 +1961,11 @@ impl App {
         let n = usize::from(c as u8 - b'0');
         if !self.shows_panels() || !self.is_window_focused || !is_plain(key) || self.is_typing() {
             return None;
+        }
+        // One pressed as the question opened was for something else.
+        if self.ask_opened.is_some_and(|at| at.elapsed() < ASK_SETTLES) {
+            self.message = Some("this question just opened: press it again to answer".into());
+            return Some(Outcome::Continue);
         }
         // No such choice: the keys stay on the question.
         if n > choices.len() {
@@ -4242,6 +4255,10 @@ impl App {
     /// you in turn as you finish with the last. The cursor moves to its
     /// tree, so leaving the chat lands on it.
     pub fn next_ask(&mut self) -> Option<Outcome> {
+        // Taken to another tree, you see it first: the next key frees it.
+        if self.arriving.is_some() || self.has_landed {
+            return None;
+        }
         let asks: Vec<(PathBuf, String, String, Vec<String>)> = self
             .asks()
             .into_iter()
@@ -4559,6 +4576,7 @@ impl App {
             }
             let path = path.clone();
             self.arriving = None;
+            self.has_landed = true;
             self.reveal(path);
             return None;
         }
@@ -4567,6 +4585,7 @@ impl App {
         }
         let (path, kind) = self.arriving.take()?;
         let kind = kind?;
+        self.has_landed = true;
         if !self.trees.iter().any(|t| t.path == path) {
             self.message = Some(format!("{} is no longer in this pool", path.display()));
             return None;
@@ -6108,6 +6127,7 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Outcome {
+        self.has_landed = false;
         self.hold_cursors();
         let outcome = self.take_key(key);
         self.hold_cursors();
@@ -7701,6 +7721,39 @@ pub(crate) mod tests {
         app.away_live.insert(zeta, rest.collect());
         app.hold_cursors();
         assert_eq!(at(&app), on);
+    }
+
+    #[test]
+    fn an_ask_waits_until_a_key_once_you_have_been_taken_to_another_tree() {
+        for kind in [None, Some(crate::inbox::Kind::Failed)] {
+            let mut app = crate::inbox::tests::with_workspaces();
+            app.is_agents_read = true;
+            app.arriving = Some((app.trees[1].path.clone(), kind));
+            assert_eq!(app.next_ask(), None, "still on the way");
+            app.arrival();
+            assert_eq!(app.next_ask(), None, "landed on what was picked");
+            assert_eq!(app.current().map(|t| t.name.as_str()), Some("2"));
+            press(&mut app, KeyCode::Char('j'));
+            assert!(app.next_ask().is_some(), "moved on, it opens");
+        }
+    }
+
+    #[test]
+    fn a_question_that_opened_by_itself_takes_no_number_for_a_moment() {
+        let mut app = crate::inbox::tests::with_workspaces();
+        app.reselect(Some(app.trees[0].path.clone()));
+        app.is_window_focused = true;
+        app.dialog = Some(vec!["Yes".into(), "No".into()]);
+        app.ask_opened = Some(Instant::now());
+        assert_eq!(press(&mut app, KeyCode::Char('1')), Outcome::Continue);
+        assert!(app.is_window_focused, "and it goes nowhere else");
+        assert!(
+            app.message
+                .as_deref()
+                .is_some_and(|m| m.contains("press it again"))
+        );
+        app.ask_opened = Instant::now().checked_sub(ASK_SETTLES);
+        assert_eq!(press(&mut app, KeyCode::Char('1')), Outcome::Answer('1'));
     }
 
     #[test]
