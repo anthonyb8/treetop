@@ -184,7 +184,10 @@ impl Pool {
     fn read_away(&self, app: &mut App) -> bool {
         let mut away = self.away.lock().unwrap_or_else(PoisonError::into_inner);
         let away = away.get_or_insert_with(|| Away {
-            reader: crate::inbox::spawn_reader(self.checkout.clone()),
+            reader: crate::inbox::spawn_reader(
+                self.checkout.clone(),
+                crate::inbox::AwayRound::default(),
+            ),
             is_read: false,
         });
         while let Ok(live) = away.reader.rounds.try_recv() {

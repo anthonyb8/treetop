@@ -881,6 +881,8 @@ pub struct App {
     /// one has its keys and treetop can read it: one question, one choice.
     /// main reads it off the chat's screen each pass.
     pub dialog: Option<Vec<String>>,
+    /// What each panel's cursor was on.
+    held: HeldCursors,
     /// In [1] Waiting, the item under its cursor.
     pub waiting_at: usize,
     /// In [3] Ship, the PR under its cursor.
@@ -1036,6 +1038,45 @@ impl issues::Host for App {
 /// Shift, so Shift is no modifier here.
 fn is_plain(key: KeyEvent) -> bool {
     (key.modifiers - KeyModifiers::SHIFT).is_empty()
+}
+
+/// Where a panel's cursor was, and on what.
+#[derive(Debug, Clone, Default)]
+struct Held {
+    at: usize,
+    on: Option<String>,
+}
+
+/// Every panel's cursor, as last held.
+#[derive(Debug, Clone, Default)]
+struct HeldCursors {
+    waiting: Held,
+    ship: Held,
+    news: Held,
+    viewed: Held,
+    made: Held,
+    ready: Held,
+}
+
+/// Puts the cursor `at` of a list of `items`, by what tells each apart, back
+/// on the one it was `held` on, unless it has been moved since; says whether
+/// that one is gone.
+fn hold(at: &mut usize, held: &mut Held, items: Vec<String>) -> bool {
+    let mut is_gone = false;
+    if let Some(on) = held.on.as_ref().filter(|_| *at == held.at)
+        && items.get(*at) != Some(on)
+    {
+        match items.iter().position(|item| item == on) {
+            Some(now) => *at = now,
+            None => is_gone = true,
+        }
+    }
+    *at = (*at).min(items.len().saturating_sub(1));
+    *held = Held {
+        at: *at,
+        on: items.into_iter().nth(*at),
+    };
+    is_gone
 }
 
 /// `code` is a key that does something to the tree under the table's cursor,
@@ -4456,6 +4497,11 @@ impl App {
         !has(&self.trees) || !kind.is_pr() || self.is_ships_read
     }
 
+    /// This workspace's PRs have been read.
+    pub fn has_read_ships(&self) -> bool {
+        self.is_ships_read
+    }
+
     /// Since when `about` has waited, as the last look saw it.
     pub fn waiting_since(&self, about: &crate::inbox::About) -> Option<std::time::SystemTime> {
         self.watch.since.get(about).copied()
@@ -6017,7 +6063,58 @@ impl App {
         }
     }
 
+    /// Each panel's cursor back on the item it was on, wherever a read has
+    /// moved it, so what a key acts on is what was picked. An item gone, its
+    /// cursor stays in place, and Ship's window goes on with it.
+    pub fn hold_cursors(&mut self) {
+        let waiting: Vec<String> = self
+            .notes_list()
+            .0
+            .iter()
+            .map(|e| format!("{:?} {}", e.kind, e.path.display()))
+            .collect();
+        hold(&mut self.waiting_at, &mut self.held.waiting, waiting);
+        let ships: Vec<String> = self
+            .ship_rows()
+            .iter()
+            .map(|t| t.path.display().to_string())
+            .collect();
+        let is_gone = hold(&mut self.ship_at, &mut self.held.ship, ships);
+        if is_gone && self.panel == Panel::Ship && self.shows_panels() && !self.is_window_focused {
+            self.follow_ship();
+        }
+        // Not looked at, News stays at its newest.
+        if self.panel == Panel::News || self.news_at > 0 {
+            let news: Vec<String> = self
+                .news()
+                .iter()
+                .map(|n| format!("{:?} {} {}", n.at, n.place, n.what))
+                .collect();
+            hold(&mut self.news_at, &mut self.held.news, news);
+        }
+        // Another workspace's tab, whose paths are its own, so one tab's
+        // cursor is never put by another's.
+        let viewed: Vec<String> = self
+            .viewed_trees()
+            .unwrap_or_default()
+            .iter()
+            .map(|t| t.path.display().to_string())
+            .collect();
+        hold(&mut self.viewed, &mut self.held.viewed, viewed);
+        let made: Vec<String> = self.made().iter().map(|i| i.id.clone()).collect();
+        hold(&mut self.made_at, &mut self.held.made, made);
+        let ready: Vec<String> = self.ready_issues().iter().map(|i| i.id.clone()).collect();
+        hold(&mut self.ready_at, &mut self.held.ready, ready);
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> Outcome {
+        self.hold_cursors();
+        let outcome = self.take_key(key);
+        self.hold_cursors();
+        outcome
+    }
+
+    fn take_key(&mut self, key: KeyEvent) -> Outcome {
         // The palette opens over everything, a diff or a PR with the keys too.
         if self.palette.is_some() {
             return self.handle_palette_key(key);
@@ -7205,9 +7302,9 @@ pub(crate) mod tests {
         ));
         // What you sent is about nothing to go to.
         app.add_news(None, "you: hi → x".into(), None);
-        app.news_at = 0;
         app.panel = Panel::News;
         app.is_window_focused = false;
+        press(&mut app, KeyCode::Char('g'));
         assert_eq!(press(&mut app, KeyCode::Enter), Outcome::Continue);
     }
 
@@ -7459,6 +7556,151 @@ pub(crate) mod tests {
         press(&mut app, KeyCode::Char('x'));
         app.watch_waiting();
         assert!(!asks(&app));
+    }
+
+    #[test]
+    fn ships_cursor_stays_on_its_pr_as_others_join_and_leave() {
+        let mut app = crate::inbox::tests::with_workspaces();
+        let approved = |app: &App, at: usize| {
+            let mut ship = app.trees[2].ship.clone().unwrap();
+            ship.stage = Stage::Approved;
+            ship.label = format!("#{at}");
+            ship
+        };
+        press(&mut app, KeyCode::Char('3'));
+        assert_eq!(app.ship_rows()[0].name, "7");
+        // Two more, listed above it.
+        for at in [0, 1] {
+            app.trees[at].ship = Some(approved(&app, at));
+        }
+        app.hold_cursors();
+        assert_eq!(app.ship_rows()[app.ship_at].name, "7");
+        // The key acts on it, though no draw came between.
+        app.ship_at = 2;
+        app.hold_cursors();
+        app.trees[0].ship = None;
+        press(&mut app, KeyCode::Char('M'));
+        assert!(
+            app.message
+                .as_deref()
+                .is_some_and(|m| m.contains("tree 7's PR is not approved")),
+            "{:?}",
+            app.message
+        );
+        // Gone itself, the window goes on with the cursor.
+        app.hold_cursors();
+        app.trees[2].ship = None;
+        app.reselect(Some(app.trees[3].path.clone()));
+        app.hold_cursors();
+        let on = app.ship_rows()[app.ship_at].path.clone();
+        assert_eq!(app.window_tree().map(|t| t.path.clone()), Some(on));
+    }
+
+    #[test]
+    fn waitings_cursor_stays_on_its_item_as_others_resolve() {
+        let mut app = crate::inbox::tests::with_workspaces();
+        press(&mut app, KeyCode::Char('1'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        let on = app.notes_list().0[app.waiting_at].about();
+        // The first resolves.
+        let first = app.notes_list().0[0].clone();
+        app.reports
+            .retain(|r| r.dir.as_ref().is_none_or(|d| !d.starts_with(&first.path)));
+        assert_ne!(app.notes_list().0[0].about(), first.about());
+        app.hold_cursors();
+        assert_eq!(app.notes_list().0[app.waiting_at].about(), on);
+    }
+
+    #[test]
+    fn plans_and_newss_cursors_stay_on_theirs_as_others_join_above() {
+        let mut app = with_made();
+        press(&mut app, KeyCode::Char('3'));
+        let mut newer = app.plan_chats[0].clone();
+        newer.job = "j0".into();
+        newer.issues = vec!["ANB-94".into()];
+        app.plan_chats.insert(0, newer);
+        app.plan_at = 1;
+        app.plan_made.insert(
+            "j0".into(),
+            vec![planned("ANB-94", crate::planned::Stage::NotStarted, &[])],
+        );
+        let Outcome::Queue(jobs) = press(&mut app, KeyCode::Char('p')) else {
+            panic!("p picks it up");
+        };
+        let launch = jobs[0].launch.as_ref().unwrap();
+        assert_eq!(launch.ticket.as_ref().unwrap().id, "ANB-90");
+        // The same issue from two chats: j still goes on past it.
+        let mut app = with_made();
+        let mut other = app.plan_chats[0].clone();
+        other.job = "j2".into();
+        app.plan_chats.push(other);
+        let issue = planned("ANB-90", crate::planned::Stage::NotStarted, &[]);
+        app.plan_made.insert("j2".into(), vec![issue]);
+        press(&mut app, KeyCode::Char('3'));
+        press(&mut app, KeyCode::Char('j'));
+        app.hold_cursors();
+        assert_eq!(app.ready_at, 1);
+        // [2], as its issues are read in another order.
+        let mut app = with_made();
+        press(&mut app, KeyCode::Char('2'));
+        press(&mut app, KeyCode::Char('j'));
+        app.plan_made.get_mut("j1").unwrap().reverse();
+        app.hold_cursors();
+        assert_eq!(app.made()[app.made_at].id, "ANB-90");
+        // [4] News.
+        let mut app = crate::inbox::tests::with_workspaces();
+        app.add_news(None, "first".into(), None);
+        app.add_news(None, "second".into(), None);
+        press(&mut app, KeyCode::Char('4'));
+        press(&mut app, KeyCode::Char('G'));
+        app.add_news(None, "third".into(), None);
+        app.hold_cursors();
+        assert_eq!(app.news()[app.news_at].what, "first");
+        // The same twice over, the cursor still goes down past it.
+        for _ in 0..3 {
+            app.add_news(None, "same".into(), None);
+        }
+        app.news_at = 0;
+        for at in 1..4 {
+            press(&mut app, KeyCode::Char('j'));
+            assert_eq!(app.news_at, at);
+        }
+    }
+
+    #[test]
+    fn the_cursor_on_another_workspaces_tab_stays_on_its_tree_as_the_pool_changes() {
+        use crate::inbox::tests::tree;
+        let mut app = crate::inbox::tests::with_workspaces();
+        let held = |n: &str| Tree {
+            leased_at: Some("2026-01-01T09:00:00-05:00".into()),
+            ..tree(
+                &format!("/code/zeta-trees/{n}"),
+                n,
+                &format!("work-{n}"),
+                Vec::new(),
+            )
+        };
+        let zeta = PathBuf::from("/code/zeta");
+        app.away_live
+            .insert(zeta.clone(), vec![held("1"), held("2"), held("3")]);
+        app.viewing = Some(zeta.clone());
+        let at = |app: &App| {
+            app.viewed_trees()
+                .and_then(|t| t.get(app.viewed).map(|t| t.name.clone()))
+        };
+        press(&mut app, KeyCode::Char('j'));
+        let on = at(&app);
+        assert!(on.is_some());
+        // The one above it is returned.
+        let first = app.viewed_trees().unwrap()[0].name.clone();
+        let rest = ["1", "2", "3"]
+            .iter()
+            .filter(|n| **n != first)
+            .map(|n| held(n));
+        app.away_live.insert(zeta, rest.collect());
+        app.hold_cursors();
+        assert_eq!(at(&app), on);
     }
 
     #[test]

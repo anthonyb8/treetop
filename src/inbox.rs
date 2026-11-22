@@ -270,10 +270,11 @@ pub struct AwayRound {
 /// Reads each other workspace opened within STALE: its trees with their
 /// agents as often as the open workspace's own, and, on a thread of its
 /// own so a slow one holds up no agents' read, their PRs every SHIP_EVERY.
-/// With no other workspace due it reads nothing. A switch drops it, which
+/// Until then they stand as `before`, the last round before a switch, had
+/// them. With no other workspace due it reads nothing. A switch drops it, which
 /// stops it.
-pub fn spawn_reader(here: PathBuf) -> Reader<AwayRound> {
-    let ships = Arc::new(Mutex::new(AwayShips::default()));
+pub fn spawn_reader(here: PathBuf, before: AwayRound) -> Reader<AwayRound> {
+    let ships = Arc::new(Mutex::new(AwayShips::from(before)));
     let pools = move || -> Vec<(PathBuf, Vec<Tree>)> {
         due(crate::workspaces::list(), &here, secs(SystemTime::now()))
             .into_iter()
@@ -307,6 +308,22 @@ pub fn spawn_reader(here: PathBuf) -> Reader<AwayRound> {
 struct AwayShips {
     by_tree: HashMap<PathBuf, Box<crate::ship::Ship>>,
     read: HashSet<PathBuf>,
+}
+
+impl From<AwayRound> for AwayShips {
+    fn from(round: AwayRound) -> Self {
+        let read = round.ships_read;
+        AwayShips {
+            by_tree: round
+                .trees
+                .into_iter()
+                .filter(|(checkout, _)| read.contains(checkout))
+                .flat_map(|(_, trees)| trees)
+                .filter_map(|t| Some((t.path, t.ship?)))
+                .collect(),
+            read,
+        }
+    }
 }
 
 impl AwayShips {
@@ -1185,6 +1202,22 @@ pub mod tests {
         // A PR the next read no longer finds is not kept.
         ships.apply(checkout, &api().1);
         assert_eq!(stage(&ships), (None, 1));
+    }
+
+    #[test]
+    fn a_reader_starts_from_the_prs_already_read_before_a_switch() {
+        let (checkout, mut trees) = away_pool("/code/api", &["me/fix-login"]);
+        trees[0].ship = Some(failing_pr("me/fix-login"));
+        let ships = AwayShips::from(AwayRound {
+            trees: [(checkout.clone(), trees)].into(),
+            ships_read: [checkout.clone()].into(),
+        });
+        let read = ships.read(vec![away_pool("/code/api", &["me/fix-login"])], |_| {});
+        assert_eq!(
+            read.trees[&checkout][0].ship.as_ref().map(|s| s.stage),
+            Some(Stage::CiFailed)
+        );
+        assert!(read.ships_read.contains(&checkout));
     }
 
     #[test]

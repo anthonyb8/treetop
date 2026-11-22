@@ -1236,3 +1236,82 @@ fn the_palettes_rename_is_of_the_tree_it_names_from_any_panel() {
     drop(screen);
     let _ = fs::remove_dir_all(&root);
 }
+
+/// An agent in the tree at `tree` starts asking, until the file returned is
+/// removed.
+fn asking_in(tree: &Path, asker: &Asker) -> PathBuf {
+    let git_dir = Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--git-dir"])
+        .current_dir(tree)
+        .output()
+        .unwrap();
+    let file = PathBuf::from(String::from_utf8(git_dir.stdout).unwrap().trim()).join("agent.json");
+    fs::write(
+        &file,
+        serde_json::json!({ "name": "asker", "pid": asker.0.id(), "status": "waiting" })
+            .to_string(),
+    )
+    .unwrap();
+    file
+}
+
+/// ANB-104: [1] Waiting's cursor stays on its item as one above it resolves,
+/// so Enter goes to what was picked.
+#[test]
+fn waitings_cursor_stays_on_what_it_was_on_as_another_resolves() {
+    let Workspaces {
+        root, mut screen, ..
+    } = two_workspaces("hold", "");
+    add_tree(&root, "there", "2", Some("there-second"));
+    add_tree(&root, "there", "3", Some("there-third"));
+    screen.wait_for("the panels", |text| text.contains("[2] Trees"));
+    // Away and back, so there's trees are known.
+    screen.press("]");
+    screen.wait_for("there's trees", |text| text.contains("there-work"));
+    screen.press("\r");
+    screen.wait_on("there");
+    screen.wait_for("all three", |text| text.contains("there-third"));
+    screen.press("]");
+    screen.wait_for("here's trees", |text| text.contains("here-work"));
+    screen.press("\r");
+    screen.wait_on("here");
+    // One process each: one is one agent, wherever it is said to be.
+    let askers = [(); 3].map(|()| Asker(Command::new("sleep").arg("600").spawn().unwrap()));
+    let files = [1, 2, 3].map(|n| {
+        let file = asking_in(&root.join(format!("there-trees/{n}")), &askers[n - 1]);
+        screen.wait_for("the ask", |text| {
+            text.contains(&format!("{n} needs action"))
+        });
+        file
+    });
+    // Onto the second of them, whichever it is in the list.
+    let on = |text: &str, n: usize| {
+        text.lines()
+            .filter(|l| l.contains("● there:"))
+            .nth(n)
+            .unwrap_or("")
+            .to_string()
+    };
+    screen.press("1");
+    screen.press("j");
+    let picked = ["there:1", "there:2", "there:3"]
+        .into_iter()
+        .find(|place| on(&screen.text(), 1).contains(place))
+        .unwrap();
+    let above = ["there:1", "there:2", "there:3"]
+        .into_iter()
+        .find(|place| on(&screen.text(), 0).contains(place))
+        .unwrap();
+    // The one above it resolves.
+    let number: usize = above.trim_start_matches("there:").parse().unwrap();
+    fs::remove_file(&files[number - 1]).unwrap();
+    screen.wait_for("it gone", |text| text.contains("2 needs action"));
+    screen.press("\r");
+    screen.wait_on("there");
+    let number = picked.trim_start_matches("there:");
+    let title = format!("[0] Tree {number} ·");
+    screen.wait_for("the tree picked", |text| text.contains(&title));
+    drop(askers);
+    drop(screen);
+    let _ = fs::remove_dir_all(&root);
+}

@@ -1137,8 +1137,14 @@ fn state_cell(app: &App, tree: &Tree, why: &HashMap<PathBuf, Kind>) -> Option<Ce
             .is_agents_read
             .then(|| Cell::from("no agent").style(fg(t.muted)));
     };
-    let (mark, style) = agent_style(agent.status);
-    let said = match agent.status {
+    // Just answered, it is on its way, whatever the last read had.
+    let asked = (Kind::NeedsYou, tree.path.clone());
+    let status = match agent.status {
+        Some(Status::Waiting) if app.answered.contains_key(&asked) => Some(Status::Busy),
+        status => status,
+    };
+    let (mark, style) = agent_style(status);
+    let said = match status {
         Some(Status::Waiting) => "asks you",
         Some(Status::Busy) => "working",
         Some(Status::Idle) => "idle",
@@ -1351,6 +1357,16 @@ fn draw_news(frame: &mut Frame, app: &App, area: Rect, has_keys: bool) {
         .collect();
     let selected = has_keys.then_some(app.news_at.min(news.len() - 1));
     draw_list(frame, area, lines, selected);
+}
+
+/// `texts` in `room` columns between them, the longest shortened first.
+fn fit_each(texts: &[String], room: usize) -> Vec<String> {
+    let width = |text: &String| Line::raw(text.as_str()).width();
+    let mut widest = texts.iter().map(width).max().unwrap_or(0);
+    while widest > 1 && texts.iter().map(|t| width(t).min(widest)).sum::<usize>() > room {
+        widest -= 1;
+    }
+    texts.iter().map(|text| fit(text, widest)).collect()
 }
 
 /// What a News line says cut to `room` columns, keeping whom it went to, the
@@ -3498,7 +3514,14 @@ fn draw_window(frame: &mut Frame, app: &App, area: Rect, pane: &Pane, chat: Opti
             " ▲ answer ",
             fg(theme().warning).add_modifier(Modifier::BOLD),
         )];
-        for (n, choice) in choices.iter().enumerate() {
+        const TAIL: &str = "i types instead ";
+        let around = usize::from(area.width).saturating_sub(2)
+            - Line::from(answer.clone())
+                .width()
+                .min(usize::from(area.width).saturating_sub(2));
+        // The key and the space round each choice, and the words after.
+        let room = around.saturating_sub(choices.len() * 6 + TAIL.len());
+        for (n, choice) in fit_each(choices, room).iter().enumerate() {
             answer.push(Span::styled(
                 format!(" {} ", n + 1),
                 Style::new()
@@ -3508,7 +3531,7 @@ fn draw_window(frame: &mut Frame, app: &App, area: Rect, pane: &Pane, chat: Opti
             ));
             answer.push(Span::raw(format!(" {choice}  ")));
         }
-        answer.push(Span::styled("i types instead ", fg(theme().muted)));
+        answer.push(Span::styled(TAIL, fg(theme().muted)));
         block = block.title_bottom(Line::from(answer));
     }
     frame.render_widget(block, area);
@@ -9983,6 +10006,51 @@ mod panels_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn every_choice_of_a_question_shows_however_long_they_are() {
+        let mut app = panels();
+        app.selected = 1;
+        app.tab = WindowTab::Chat;
+        app.is_window_focused = true;
+        app.dialog = Some(vec![
+            "Yes".into(),
+            "Yes, and don't ask again for npm test commands in /home/me/web".into(),
+            "No, and tell Claude what to do differently (esc)".into(),
+        ]);
+        for width in [120, 150, 200] {
+            let shown = screen(&app, width, 45);
+            let row = shown.iter().find(|l| l.contains("▲ answer")).unwrap();
+            for choice in [" 1  Yes ", " 2  Yes, and", " 3  No, "] {
+                assert!(row.contains(choice), "{width} {choice}: {row}");
+            }
+            assert!(row.contains("i types instead"), "{width}: {row}");
+        }
+        let row = |app: &App| {
+            let shown = screen(app, 120, 45);
+            shown
+                .iter()
+                .find(|l| l.contains("▲ answer"))
+                .unwrap()
+                .clone()
+        };
+        assert!(row(&app).contains('…'), "{}", row(&app));
+        app.dialog = Some(vec!["Left".into(), "Right".into()]);
+        assert!(!row(&app).contains('…'), "{}", row(&app));
+    }
+
+    #[test]
+    fn a_tree_just_answered_reads_working() {
+        let mut app = panels();
+        app.trees[0].agents[0].status = Some(Status::Waiting);
+        app.select_tree("4");
+        app.is_window_focused = true;
+        app.dialog = Some(vec!["Left".into(), "Right".into()]);
+        crate::app::tests::press(&mut app, ratatui::crossterm::event::KeyCode::Char('1'));
+        let rows = panel_rows(&screen(&app, 160, 46), "[2] Trees");
+        let row = rows.iter().find(|l| l.contains("me/anb-41")).unwrap();
+        assert!(row.contains("● working"), "{row}");
     }
 
     #[test]

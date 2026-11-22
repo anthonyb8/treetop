@@ -386,7 +386,11 @@ fn run(
 ) -> Result<Exit> {
     let refresher = Refresher::spawn(checkout.to_path_buf(), app.trees.clone());
     let worker = Worker::spawn();
-    let away = inbox::spawn_reader(checkout.to_path_buf());
+    let before = inbox::AwayRound {
+        trees: app.away_live.clone(),
+        ships_read: app.away_ships.clone(),
+    };
+    let away = inbox::spawn_reader(checkout.to_path_buf(), before);
     app.base = diff::base(checkout);
     let diffs = diff::Loader::spawn(app.base.clone());
     // Each PR the popup asks for is read on a thread of its own, since a
@@ -1024,6 +1028,7 @@ fn run(
                 app,
                 Rect::new(0, 0, size.width, size.height),
             ));
+            app.hold_cursors();
             // The window's chat asking a question, for number keys to answer.
             app.dialog = chats
                 .open()
@@ -1486,6 +1491,8 @@ fn show(
     let mut here = Some(start);
     // What waits, as the last workspace looked, so `e` keeps its place.
     let mut watch = app::Watch::default();
+    // The other workspaces as last read, kept across a switch.
+    let mut away = inbox::AwayRound::default();
     // The panel with the keys in the panels layout, kept across a switch.
     let mut panel = app::Panel::default();
     // What the desktop has been told of, kept across a switch too, so a
@@ -1499,6 +1506,10 @@ fn show(
         workspaces::record(&checkout);
         let mut app = App::new(here.take());
         app.keep_watch(std::mem::take(&mut watch));
+        away.trees.remove(&checkout);
+        away.ships_read.remove(&checkout);
+        app.away_live = std::mem::take(&mut away.trees);
+        app.away_ships = std::mem::take(&mut away.ships_read);
         app.panel = panel;
         app.is_in_tmux = tmux::is_inside();
         app.checkout = checkout.clone();
@@ -1539,6 +1550,14 @@ fn show(
         desktop.switched();
         watch = app.take_watch();
         panel = app.panel;
+        // The workspace left is another from the next one, as last read.
+        away.trees = std::mem::take(&mut app.away_live);
+        away.ships_read = std::mem::take(&mut app.away_ships);
+        if app.has_read_ships() {
+            away.ships_read.insert(checkout.clone());
+        }
+        away.trees
+            .insert(checkout.clone(), std::mem::take(&mut app.trees));
         // Leaving treetop takes what waits off tmux's status line; a switch
         // shows the next workspace's at once.
         if app.is_in_tmux && !matches!(exit, Ok(Exit::Switch(..))) {
