@@ -2145,7 +2145,7 @@ impl App {
 
     /// Something takes typed text or keys of its own, so the panels' keys
     /// leave them alone.
-    fn is_typing(&self) -> bool {
+    pub fn is_typing(&self) -> bool {
         self.prompt.is_some()
             || self.picker.is_some()
             || self.port_menu.is_some()

@@ -1718,7 +1718,9 @@ fn footer_left(app: &App, is_panels: bool) -> Line<'static> {
             format!(" filter: {}", app.filter),
             fg(t.accent),
         ));
-    } else if is_panels {
+    } else if is_panels && !app.is_typing() {
+        // A dialog's keys are its own: what has them under it would only
+        // type into it.
         for (key, does) in panel_keys(app) {
             spans.push(Span::styled(
                 format!("  {key}"),

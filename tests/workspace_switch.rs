@@ -721,3 +721,26 @@ esac
     drop(screen);
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn a_dialog_open_over_the_panels_has_a_bar_of_its_mode_alone() {
+    let Workspaces {
+        root, mut screen, ..
+    } = two_workspaces("dialog", "");
+    screen.wait_for("the panels", |text| text.contains("[2] Trees"));
+    screen.press("G");
+    screen.press("n");
+    screen.wait_for("the new agent dialog", |text| {
+        text.lines()
+            .last()
+            .is_some_and(|bar| bar.starts_with(" INSERT "))
+    });
+    // What the bar would offer, [2] Trees' keys, would only type into it.
+    let bar = screen.text().lines().last().unwrap_or("").to_string();
+    assert!(
+        !bar.contains("j/k move") && !bar.contains("1-4 panels"),
+        "{bar}"
+    );
+    drop(screen);
+    let _ = fs::remove_dir_all(&root);
+}
