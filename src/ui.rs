@@ -1082,9 +1082,18 @@ fn why_each(app: &App) -> HashMap<PathBuf, Kind> {
 /// A tree's cells in [2] Trees of the panels layout: the full table's, with
 /// why it waits, or what its agent is doing, where that has the pool's
 /// status.
-fn panel_row(app: &App, tree: &Tree, why: &HashMap<PathBuf, Kind>) -> Vec<Cell<'static>> {
+fn panel_row(
+    app: &App,
+    tree: &Tree,
+    why: &HashMap<PathBuf, Kind>,
+    room: usize,
+) -> Vec<Cell<'static>> {
     const STATUS: usize = 2;
+    const BRANCH: usize = 4;
     let mut cells = row(app, tree);
+    if let Some(branch) = &tree.branch {
+        cells[BRANCH] = Cell::from(fit(branch, room));
+    }
     if let Some(state) = state_cell(app, tree, why) {
         cells[STATUS] = state;
     }
@@ -1183,6 +1192,14 @@ fn draw_waiting(frame: &mut Frame, app: &App, area: Rect, has_keys: bool) {
         );
         return;
     }
+    // Where each is, whole: another workspace's carries its name.
+    let place = items
+        .iter()
+        .map(|e| inbox::place_of(e).chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(20);
+    let what_room = usize::from(area.width).saturating_sub(1 + place + 13 + 4 + 4);
     let rows: Vec<Row> = items
         .iter()
         .map(|entry| {
@@ -1192,19 +1209,12 @@ fn draw_waiting(frame: &mut Frame, app: &App, area: Rect, has_keys: bool) {
             Row::new(vec![
                 Cell::from(mark).style(fg(color).add_modifier(Modifier::BOLD)),
                 Cell::from(place).style(fg(t.muted)),
-                Cell::from(what),
+                Cell::from(fit(&what, what_room)),
                 Cell::from(asks_for(entry.kind)).style(fg(color)),
                 Cell::from(entry.at.map(reports::age).unwrap_or_default()).style(fg(t.muted)),
             ])
         })
         .collect();
-    // Where each is, whole: another workspace's carries its name.
-    let place = items
-        .iter()
-        .map(|e| inbox::place_of(e).chars().count())
-        .max()
-        .unwrap_or(0)
-        .min(20);
     let widths = [
         Constraint::Length(1),
         Constraint::Length(u16::try_from(place).unwrap_or(20)),
@@ -1252,6 +1262,7 @@ fn draw_ship(frame: &mut Frame, app: &App, area: Rect, has_keys: bool) {
             .filter_map(|t| Some(t.ship.as_ref()?.label.as_str())),
     )
     .clamp(8, usize::from(area.width / 2).saturating_sub(9).max(8));
+    let branch = usize::from(area.width).saturating_sub(3 + label + 9 + 3);
     let lines: Vec<Row> = rows
         .iter()
         .filter_map(|tree| {
@@ -1265,7 +1276,7 @@ fn draw_ship(frame: &mut Frame, app: &App, area: Rect, has_keys: bool) {
             };
             Some(Row::new(vec![
                 Cell::from(tree.name.clone()).style(fg(t.muted)),
-                Cell::from(tree.branch.clone().unwrap_or_default()),
+                Cell::from(fit(tree.branch.as_deref().unwrap_or_default(), branch)),
                 Cell::from(fit(&ship.label, label)).style(stage_style(ship.stage)),
                 Cell::from(key),
             ]))
@@ -1315,12 +1326,64 @@ fn draw_news(frame: &mut Frame, app: &App, area: Rect, has_keys: bool) {
             if !said.is_empty() {
                 spans.push(Span::styled(format!("{said} "), fg(color)));
             }
-            spans.push(Span::raw(line.what.clone()));
+            let room = usize::from(area.width).saturating_sub(Line::from(spans.clone()).width());
+            spans.push(Span::raw(fit_news(&line.what, room)));
             ListItem::new(Line::from(spans))
         })
         .collect();
     let selected = has_keys.then_some(app.news_at.min(news.len() - 1));
     draw_list(frame, area, lines, selected);
+}
+
+/// What a News line says cut to `room` columns, keeping whom it went to, the
+/// end of what you sent: `you: ship it… → fix-login`.
+fn fit_news(what: &str, room: usize) -> String {
+    match what.rsplit_once(" → ") {
+        Some((said, to)) if what.starts_with("you: ") => {
+            let to = fit(&format!(" → {to}"), room / 2);
+            let said = fit(said, room.saturating_sub(Line::raw(to.as_str()).width()));
+            format!("{said}{to}")
+        }
+        _ => fit(what, room),
+    }
+}
+
+/// The branch column's width in [2] Trees on `area`: what its fixed columns
+/// and the space between leave.
+fn branch_room(app: &App, area: Rect) -> usize {
+    let columns = columns(app, true);
+    let fixed: u16 = columns
+        .iter()
+        .map(|(_, width, _)| match width {
+            Constraint::Length(width) => *width,
+            _ => 0,
+        })
+        .sum();
+    let spaces = u16::try_from(columns.len().saturating_sub(1)).unwrap_or(0);
+    usize::from(area.width.saturating_sub(fixed + spaces))
+}
+
+/// The free trees' row in [2] Trees: how many, and their numbers, as many as
+/// fit.
+fn free_row(free: &[&Tree], room: usize) -> Vec<Cell<'static>> {
+    let t = theme();
+    let mut numbers = String::new();
+    for (at, tree) in free.iter().enumerate() {
+        let next = format!("{}○ {}", if at == 0 { "" } else { "  " }, tree.name);
+        let more = if at + 1 == free.len() { 0 } else { 2 };
+        if Line::raw(numbers.as_str()).width() + Line::raw(next.as_str()).width() + more > room {
+            numbers.push_str(" …");
+            break;
+        }
+        numbers.push_str(&next);
+    }
+    vec![
+        Cell::from("▸").style(fg(t.accent)),
+        Cell::from(""),
+        Cell::from(format!("free · {}", free.len())).style(fg(t.muted)),
+        Cell::from(""),
+        Cell::from(numbers).style(fg(t.muted)),
+    ]
 }
 
 /// When `at` was, as `HH:MM` in local time.
@@ -1418,6 +1481,7 @@ fn draw_viewed(frame: &mut Frame, app: &App, area: Rect, trees: &[&Tree]) {
     let t = theme();
     let columns = columns(app, true);
     let why = why_each(app);
+    let room = branch_room(app, area);
     let header = Row::new(columns.iter().map(|(title, ..)| *title)).style(t.header);
     let heading = |glyph: &'static str, label: &'static str| {
         Row::new(pick_cells(
@@ -1451,25 +1515,15 @@ fn draw_viewed(frame: &mut Frame, app: &App, area: Rect, trees: &[&Tree]) {
         if at == app.viewed {
             selected = Some(rows.len());
         }
-        rows.push(Row::new(pick_cells(&columns, panel_row(app, tree, &why))));
+        rows.push(Row::new(pick_cells(
+            &columns,
+            panel_row(app, tree, &why, room),
+        )));
     }
     let free = app.viewed_free();
     if !free.is_empty() {
         rows.push(Row::new(Vec::<Cell>::new()));
-        let numbers: Vec<Span> = free
-            .iter()
-            .map(|tree| Span::styled(format!("○ {}  ", tree.name), fg(t.muted)))
-            .collect();
-        rows.push(Row::new(pick_cells(
-            &columns,
-            vec![
-                Cell::from("▸").style(fg(t.accent)),
-                Cell::from(""),
-                Cell::from("free").style(fg(t.muted)),
-                Cell::from(""),
-                Cell::from(Line::from(numbers)),
-            ],
-        )));
+        rows.push(Row::new(pick_cells(&columns, free_row(&free, room))));
     }
     if trees.is_empty() && free.is_empty() {
         rows.push(heading("", "not read yet"));
@@ -1490,6 +1544,7 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect, fold: bool, compact: boo
     } else {
         HashMap::new()
     };
+    let room = branch_room(app, area);
     let header = Row::new(columns.iter().map(|(title, ..)| *title)).style(t.header);
     let pick = |cells| pick_cells(&columns, cells);
     // A blank line sets each heading apart from the trees above it. The
@@ -1510,7 +1565,7 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect, fold: bool, compact: boo
         }
         rows.push(match list_row {
             ListRow::Tree(tree) => Row::new(pick(if compact {
-                panel_row(app, tree, &why)
+                panel_row(app, tree, &why, room)
             } else {
                 row(app, tree)
             }))
@@ -1519,6 +1574,10 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect, fold: bool, compact: boo
             } else {
                 Style::new()
             }),
+            // The panels layout keeps the free trees on one row, by number.
+            ListRow::Heading {
+                group: Group::Free, ..
+            } if compact => Row::new(pick(free_row(&app.free_trees(), room))),
             ListRow::Heading {
                 group,
                 count,
@@ -1577,7 +1636,12 @@ fn heading_row(
         .filter(|tree| matches!(group, Group::Base(b) if tree.branch.as_ref() == Some(b)));
     let (label, mut name) = match group {
         Group::Base(base) => (
-            "base",
+            // The panels' column has no room for the words after the name.
+            if main.is_some() && app.shows_panels() {
+                "checkout"
+            } else {
+                "base"
+            },
             vec![
                 Span::styled(
                     if base.is_empty() {
@@ -1594,14 +1658,6 @@ fn heading_row(
             "backburner",
             vec![Span::styled(format!("{count} not now"), fg(t.muted))],
         ),
-        // The panels layout keeps the free trees on one row, by number.
-        Group::Free if app.shows_panels() => (
-            "free",
-            app.free_trees()
-                .iter()
-                .map(|tree| Span::styled(format!("○ {}  ", tree.name), fg(t.muted)))
-                .collect(),
-        ),
         Group::Free => (
             "free",
             vec![Span::styled(format!("{count} not leased"), fg(t.muted))],
@@ -1612,7 +1668,9 @@ fn heading_row(
         ),
     };
     if let Some(main) = main {
-        name.push(Span::styled("  · main checkout", fg(t.muted)));
+        if !app.shows_panels() {
+            name.push(Span::styled("  · main checkout", fg(t.muted)));
+        }
         name.push(Span::raw(" "));
         name.push(window_marks(app, main));
     }
@@ -1896,7 +1954,7 @@ impl Mode {
 /// What the left of the bottom bar says: the mode, then the filter being
 /// typed, the error or message there is, or the filter narrowing the list.
 /// The keys are on `?`.
-fn footer_left(app: &App, is_panels: bool) -> Line<'static> {
+fn footer_left(app: &App, is_panels: bool, room: usize) -> Line<'static> {
     let t = theme();
     let mode = Mode::of(app);
     let mut spans = vec![Span::styled(
@@ -1920,7 +1978,16 @@ fn footer_left(app: &App, is_panels: bool) -> Line<'static> {
     } else if is_panels && !app.is_typing() {
         // A dialog's keys are its own: what has them under it would only
         // type into it.
-        for (key, does) in panel_keys(app) {
+        // Each hint whole, as many as fit, `?` listing the rest.
+        let mut used = Line::from(spans.clone()).width();
+        for (at, (key, does)) in panel_keys(app).iter().enumerate() {
+            let width = Line::raw(format!("  {key} {does}")).width();
+            let is_last = at + 1 == panel_keys(app).len();
+            if used + width + if is_last { 0 } else { 2 } > room {
+                spans.push(Span::styled(" …", fg(t.muted)));
+                break;
+            }
+            used += width;
             spans.push(Span::styled(
                 format!("  {key}"),
                 fg(t.info).add_modifier(Modifier::BOLD),
@@ -2077,7 +2144,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect, is_panels: bool) {
     let [left_area, right_area] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(right_width)]).areas(area);
     frame.render_widget(
-        Paragraph::new(footer_left(app, is_panels)).style(t.bar),
+        Paragraph::new(footer_left(app, is_panels, usize::from(left_area.width))).style(t.bar),
         left_area,
     );
     frame.render_widget(Paragraph::new(right).style(t.bar), right_area);
@@ -3348,7 +3415,12 @@ fn draw_window(frame: &mut Frame, app: &App, area: Rect, pane: &Pane, chat: Opti
             None => "",
         };
         let body = Block::new().padding(Padding::horizontal(1)).inner(body);
-        frame.render_widget(Paragraph::new(text).style(fg(t.muted)), body);
+        frame.render_widget(
+            Paragraph::new(text)
+                .style(fg(t.muted))
+                .wrap(Wrap { trim: true }),
+            body,
+        );
         return;
     };
     let agent = App::chat_agent(tree);
@@ -9611,6 +9683,104 @@ mod panels_tests {
             "{}",
             shown.join("\n")
         );
+    }
+
+    #[test]
+    fn the_free_row_says_how_many_and_that_it_leaves_some_out() {
+        let free = |app: &mut App, n: usize| {
+            for at in 0..n {
+                let mut tree = crate::inbox::tests::tree(
+                    &format!("/pool/f{at}"),
+                    &format!("{}", 20 + at),
+                    "",
+                    Vec::new(),
+                );
+                tree.status = "available".into();
+                app.trees.push(tree);
+            }
+        };
+        let row = |app: &App, width: u16| {
+            panel_rows(&screen(app, width, 46), "[2] Trees")
+                .into_iter()
+                .find(|l| l.contains("free"))
+                .unwrap()
+        };
+        let mut app = panels();
+        free(&mut app, 2);
+        let all = row(&app, 160);
+        assert!(
+            all.contains("free · 2") && all.contains("○ 20  ○ 21"),
+            "{all}"
+        );
+        assert!(!all.contains('…'), "{all}");
+        free(&mut app, 28);
+        for width in [120, 160, 220] {
+            let cut = row(&app, width);
+            assert!(
+                cut.contains("free · 30") && cut.contains('…'),
+                "{width}: {cut}"
+            );
+        }
+        // The same on another workspace's tab.
+        let mut app = with_workspaces();
+        app.viewing = Some("/code/zeta".into());
+        assert!(row(&app, 160).contains("free · 1"), "{}", row(&app, 160));
+    }
+
+    #[test]
+    fn nothing_the_panels_say_is_cut_mid_word() {
+        let mut app = with_workspaces();
+        for width in [120, 135, 150, 160, 200] {
+            let bar = screen(&app, width, 31).pop().unwrap();
+            let shown: Vec<&str> = panel_keys(&app)
+                .iter()
+                .map(|(_, does)| *does)
+                .filter(|does| bar.contains(does))
+                .collect();
+            let hints: String = panel_keys(&app)
+                .iter()
+                .take(shown.len())
+                .map(|(key, does)| format!("  {key} {does}"))
+                .collect();
+            assert!(bar.contains(&hints), "{width}: {bar}");
+            let rest = &bar[bar.find(&hints).unwrap() + hints.len()..];
+            assert!(
+                rest.trim_start_matches(" …").starts_with("  ") || rest.trim().is_empty(),
+                "{width}: {bar}"
+            );
+        }
+        app.viewing = Some("/code/api".into());
+        let shown = screen(&app, 120, 31).join("\n");
+        assert!(shown.contains("Esc comes back"), "{shown}");
+        app.viewing = None;
+        app.add_news(
+            None,
+            "you: If you have shown me a draft, yes: create those issues → me/fix-login".into(),
+            None,
+        );
+        app.add_news(
+            None,
+            "a line far too long for any of the panels to show whole".into(),
+            None,
+        );
+        let news = panel_rows(&screen(&app, 150, 45), "[4] News");
+        assert!(news[0].contains('…'), "{news:?}");
+        assert!(news[1].contains("… → me/fix-login"), "{news:?}");
+        // The main checkout's heading says so whole.
+        let mut main = crate::inbox::tests::tree("/code/main", "main", "main", Vec::new());
+        main.is_main = true;
+        app.trees.push(main);
+        let trees = panel_rows(&screen(&app, 120, 45), "[2] Trees").join("\n");
+        assert!(
+            trees.contains("checkout     main") && !trees.contains("· m"),
+            "{trees}"
+        );
+        // A tree's branch and what waits on it.
+        app.trees[0].branch = Some("me/a-branch-far-too-long-for-the-column-it-is-in".into());
+        let trees = panel_rows(&screen(&app, 120, 45), "[2] Trees").join("\n");
+        assert!(trees.contains("me/a") && trees.contains('…'), "{trees}");
+        let waiting = panel_rows(&screen(&app, 120, 45), "[1] Waiting").join("\n");
+        assert!(waiting.contains('…'), "{waiting}");
     }
 
     #[test]

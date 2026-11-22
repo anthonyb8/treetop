@@ -193,6 +193,8 @@ fn open_chat(
 ) -> Result<()> {
     let is_popup = ui::is_popup(app, &agent, &tree);
     if !is_popup && !app.is_plan {
+        // Its tree is this workspace's, whatever [2] was looking at.
+        app.viewing = None;
         app.select_tree(&tree);
         app.tab = app::WindowTab::Chat;
         if app.window_tree().map(|t| t.name.as_str()) != Some(tree.as_str()) {
@@ -1018,6 +1020,12 @@ fn run(
                         .then(|| serve::answer::choices(&text))
                         .flatten()
                 });
+            // Or a draft in its box, which Enter sends.
+            app.is_draft_shown = chats
+                .open()
+                .filter(|c| app.is_window_focused && is_window_chat(c, app))
+                .and_then(|c| Some(chat::input(&c.screen().contents(), c.hints()?)))
+                .is_some_and(|input| matches!(input, chat::Input::Holding(_)));
             let other = app
                 .other_chat()
                 .and_then(|(command, ..)| chats.running(&command));
@@ -1119,7 +1127,9 @@ fn run(
                     }
                 }
                 Event::Paste(text) => {
-                    app.has_typed |= is_window_chat(open, app);
+                    if is_window_chat(open, app) {
+                        app.pasted_in_window(text);
+                    }
                     open.paste(text);
                 }
                 &Event::Mouse(mouse) => {

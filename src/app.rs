@@ -855,8 +855,11 @@ pub struct App {
     pub waiting_at: usize,
     /// In [3] Ship, the PR under its cursor.
     pub ship_at: usize,
-    /// Something is typed into the window's chat since its last Enter.
-    pub has_typed: bool,
+    /// The tree whose chat was last typed into, and how many characters of
+    /// that are in its box still, since its last Enter.
+    pub typed: (PathBuf, usize),
+    /// The window's chat shows a draft in its input box, as last drawn.
+    pub is_draft_shown: bool,
     /// In [4] News, the line under its cursor.
     pub news_at: usize,
     /// The Plan screen is shown, in the panels layout: Tab goes Trees,
@@ -1818,25 +1821,48 @@ impl App {
         if self.shows_panels() {
             self.message = None;
         }
+        let is_agent = self.shown_tab() == WindowTab::Chat && !self.is_plan;
+        let Some(path) = self
+            .window_tree()
+            .filter(|_| is_agent)
+            .map(|t| t.path.clone())
+        else {
+            return;
+        };
+        if self.typed.0 != path {
+            self.typed = (path.clone(), 0);
+        }
+        let is_control = key.modifiers.contains(KeyModifiers::CONTROL);
         let answers = match key.code {
             KeyCode::Enter if key.modifiers.is_empty() => {
-                std::mem::take(&mut self.has_typed) || self.dialog.is_some()
+                let typed = std::mem::take(&mut self.typed.1);
+                typed > 0 || self.is_draft_shown || self.dialog.is_some()
+            }
+            KeyCode::Esc => {
+                self.typed.1 = 0;
+                false
+            }
+            KeyCode::Char('u' | 'c') if is_control => {
+                self.typed.1 = 0;
+                false
+            }
+            KeyCode::Backspace => {
+                self.typed.1 = self.typed.1.saturating_sub(1);
+                false
             }
             KeyCode::Char(c @ '1'..='9') if self.dialog.is_some() => self
                 .dialog
                 .as_ref()
                 .is_some_and(|choices| usize::from(c as u8 - b'0') <= choices.len()),
             KeyCode::Char(_) if is_plain(key) => {
-                self.has_typed = true;
+                self.typed.1 += 1;
                 false
             }
             _ => false,
         };
-        if answers && self.shown_tab() == WindowTab::Chat && !self.is_plan {
-            self.has_typed = false;
-            if let Some(path) = self.window_tree().map(|t| t.path.clone()) {
-                self.put_away_kind(&path, crate::inbox::Kind::NeedsYou);
-            }
+        if answers {
+            self.typed.1 = 0;
+            self.put_away_kind(&path, crate::inbox::Kind::NeedsYou);
         }
     }
 
@@ -1863,6 +1889,14 @@ impl App {
             .map(|t| t.path.clone());
         if let Some(path) = path {
             self.put_back(&path, crate::inbox::Kind::Failed);
+        }
+    }
+
+    /// `text` pasted into the window's chat in Insert, as `typed_in_window`
+    /// has a key.
+    pub fn pasted_in_window(&mut self, text: &str) {
+        for c in text.chars().filter(|c| !c.is_control()) {
+            self.typed_in_window(KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT));
         }
     }
 
@@ -1931,10 +1965,21 @@ impl App {
                     None => Outcome::Continue,
                 });
             }
+            // Space marks the item's tree, the other marks as they are.
+            KeyCode::Char(' ') => {
+                if let Some(entry) = items.into_iter().nth(self.waiting_at.min(last)) {
+                    if entry.away.is_some() {
+                        return Some(self.go_to(entry));
+                    }
+                    if !self.marked.remove(&entry.path) {
+                        self.marked.insert(entry.path);
+                    }
+                }
+            }
             // Everything the table does to the tree under its cursor.
             KeyCode::Char(
                 'i' | 't' | 'n' | 'm' | 'D' | 'r' | 'x' | 'z' | 'o' | 'p' | 'P' | 'Q' | 'v' | 'O'
-                | 'F' | 'R' | 'H' | 'S' | 'b' | 'I' | ':' | ' ',
+                | 'F' | 'R' | 'H' | 'S' | 'b' | 'I' | ':',
             ) => {
                 return Some(match items.into_iter().nth(self.waiting_at.min(last)) {
                     Some(entry) if entry.away.is_some() => self.go_to(entry),
@@ -3366,7 +3411,6 @@ impl App {
     pub fn insert_in_window(&mut self) {
         self.is_window_focused = true;
         self.is_inserting = true;
-        self.has_typed = false;
     }
 
     /// Steps the window to its next tab, or its last, in Normal.
@@ -3908,6 +3952,7 @@ impl App {
             && !self.is_filtering
             && !self.is_issues
             && !self.is_plan
+            && self.viewing.is_none()
             && !self.is_quitting
     }
 
@@ -6703,6 +6748,78 @@ pub(crate) mod tests {
         app.message = Some("stale".into());
         app.typed_in_window(KeyEvent::from(KeyCode::Char('a')));
         assert_eq!(app.message, None);
+    }
+
+    #[test]
+    fn only_what_is_typed_to_the_asking_agent_answers_it() {
+        let asks = |app: &App| {
+            app.notes_list()
+                .0
+                .iter()
+                .any(|e| e.path == app.trees[0].path && e.kind == crate::inbox::Kind::NeedsYou)
+        };
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let type_at = |app: &mut App, at: usize, codes: &[KeyCode]| {
+            app.is_inserting = false;
+            app.reselect(Some(app.trees[at].path.clone()));
+            app.is_window_focused = true;
+            app.is_inserting = true;
+            for code in codes {
+                app.typed_in_window(key(*code));
+            }
+        };
+        // Typed in another tree's chat and left there.
+        let mut app = crate::inbox::tests::with_workspaces();
+        type_at(&mut app, 1, &[KeyCode::Char('x')]);
+        type_at(&mut app, 0, &[KeyCode::Enter]);
+        assert!(asks(&app), "nothing was said to this one");
+        // Typed and rubbed out, or cleared.
+        for gone in [
+            key(KeyCode::Backspace),
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            key(KeyCode::Esc),
+        ] {
+            let mut app = crate::inbox::tests::with_workspaces();
+            type_at(&mut app, 0, &[KeyCode::Char('x')]);
+            app.typed_in_window(gone);
+            app.typed_in_window(key(KeyCode::Enter));
+            assert!(asks(&app), "{gone:?}");
+        }
+        type_at(&mut app, 0, &[KeyCode::Char('x'), KeyCode::Enter]);
+        assert!(!asks(&app));
+        // A draft from before, which its input box shows.
+        let mut app = crate::inbox::tests::with_workspaces();
+        type_at(&mut app, 0, &[]);
+        app.is_draft_shown = true;
+        app.typed_in_window(key(KeyCode::Enter));
+        assert!(!asks(&app));
+    }
+
+    #[test]
+    fn an_ask_waits_to_open_until_another_workspaces_tab_is_left() {
+        let mut app = crate::inbox::tests::with_workspaces();
+        app.is_agents_read = true;
+        app.viewing = Some("/code/api".into());
+        assert_eq!(app.next_ask(), None, "only looking at api");
+        app.viewing = None;
+        assert!(app.next_ask().is_some(), "back here, it opens");
+    }
+
+    #[test]
+    fn space_on_waiting_marks_and_unmarks_its_tree_and_keeps_the_other_marks() {
+        let mut app = crate::inbox::tests::with_workspaces();
+        let one = app.trees[1].path.clone();
+        app.marked.insert(one.clone());
+        press(&mut app, KeyCode::Char('1'));
+        let (items, _) = app.notes_list();
+        app.waiting_at = items.iter().position(|e| e.tree == "7").unwrap();
+        let seven = items[app.waiting_at].path.clone();
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.marked, BTreeSet::from([one.clone(), seven]));
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.marked, BTreeSet::from([one]));
+        assert_eq!(app.panel, Panel::Waiting);
     }
 
     #[test]
