@@ -339,6 +339,7 @@ fn send(
             continue;
         }
         let agent = recipient.agent.clone();
+        let is_planning = recipient.tree == app::SCRATCH;
         let hints = recipient.plugin.as_deref().and_then(plugin::screen_of);
         if let Err(err) = chats.deliver(
             &recipient.command,
@@ -348,6 +349,9 @@ fn send(
             hints,
         ) {
             app.message = Some(format!("could not reach {agent}: {err:#}"));
+            if is_planning {
+                app.plan_undelivered(&agent);
+            }
         }
     }
     Ok(())
@@ -872,10 +876,9 @@ fn run(
                         .collect();
                     if !fresh.is_empty() {
                         chat.issues.extend(fresh);
-                        // Not for a chat deleted while this read ran.
-                        if chat.record.exists() {
-                            let _ = scratch::save(chat);
-                        }
+                        let _ = scratch::edit(&chat.record, |kept| {
+                            kept.issues.clone_from(&chat.issues);
+                        });
                     }
                 }
                 let made = tickets::own(&here).map(|backend| {
@@ -1006,11 +1009,21 @@ fn run(
             });
             is_stale = true;
         }
+        for (agent, tree) in &pumped.delivered {
+            if tree == app::SCRATCH
+                && let Some((record, asked)) = app.plan_delivered(agent)
+            {
+                let _ = scratch::edit(&record, |kept| kept.asked = Some(asked));
+            }
+        }
         if let Some((agent, tree, why)) = pumped.failed.first() {
             app.message = Some(format!("not sent to {agent} in {tree}: {why}"));
             is_stale = true;
         }
         for (agent, tree, _) in &pumped.failed {
+            if tree == app::SCRATCH {
+                app.plan_undelivered(agent);
+            }
             app.unsent(tree);
             app.handoff_unsent(agent, tree);
         }

@@ -10,8 +10,10 @@
 //! ```
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -38,9 +40,23 @@ pub struct Scratch {
     /// shows `keel linear create` saying, in the order it made them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub issues: Vec<String>,
+    /// What a planning chat was last asked for; None in a record written
+    /// before it was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asked: Option<PlanAsk>,
     /// Its record's file; not written, since it is where the record is.
     #[serde(skip)]
     pub record: PathBuf,
+}
+
+/// What Plan's `D` and `S` ask a planning chat for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PlanAsk {
+    /// A draft of its issues.
+    Draft,
+    /// Its issues, in Linear.
+    Create,
 }
 
 impl Scratch {
@@ -172,13 +188,33 @@ pub fn start(checkout: Option<&Path>) -> Result<Scratch, String> {
         checkout: checkout.map(Path::to_path_buf),
         scratch: checkout.is_none(),
         issues: Vec::new(),
+        asked: None,
     };
     save(&chat)?;
     Ok(chat)
 }
 
-/// Writes the chat's record again, as it now stands.
-pub fn save(chat: &Scratch) -> Result<(), String> {
+/// Makes `change` to the record in the file `record` as it stands there, so
+/// what changes one part of it never undoes another; not for one deleted.
+pub fn edit(record: &Path, change: impl FnOnce(&mut Scratch)) -> Result<(), String> {
+    static EDITING: Mutex<()> = Mutex::new(());
+    let _editing = EDITING.lock().unwrap_or_else(PoisonError::into_inner);
+    let text = fs::read_to_string(record).map_err(|err| format!("{}: {err}", record.display()))?;
+    let mut chat: Scratch =
+        serde_json::from_str(&text).map_err(|err| format!("{}: {err}", record.display()))?;
+    change(&mut chat);
+    let text = serde_json::to_string(&chat).map_err(|err| err.to_string())?;
+    // Never creates it: one deleted since it was read stays deleted.
+    fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(record)
+        .and_then(|mut file| file.write_all(text.as_bytes()))
+        .map_err(|err| format!("{}: {err}", record.display()))
+}
+
+/// Writes a new chat's record.
+fn save(chat: &Scratch) -> Result<(), String> {
     let text = serde_json::to_string(chat).map_err(|err| err.to_string())?;
     fs::write(&chat.record, text).map_err(|err| format!("{}: {err}", chat.record.display()))
 }
@@ -228,6 +264,27 @@ mod tests {
             ["j3", "j1"],
             "here's, and the old one that names none"
         );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn an_edit_keeps_what_another_wrote_reads_old_records_and_leaves_a_deleted_one() {
+        let root = std::env::temp_dir().join(format!("treetop-edit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let record = root.join("1.json");
+        // Written before `asked` was kept.
+        fs::write(&record, r#"{"job":"j1","name":"plan 1","created":1}"#).unwrap();
+        let old = list_in(&root).remove(0);
+        assert_eq!(old.asked, None);
+        edit(&record, |chat| chat.asked = Some(PlanAsk::Draft)).unwrap();
+        edit(&record, |chat| chat.issues = vec!["ANB-1".into()]).unwrap();
+        let kept = list_in(&root).remove(0);
+        assert_eq!(kept.asked, Some(PlanAsk::Draft));
+        assert_eq!(kept.issues, ["ANB-1"]);
+        let deleted_meanwhile = edit(&record, |_| fs::remove_file(&record).unwrap());
+        assert!(deleted_meanwhile.is_err());
+        assert!(!record.exists(), "a deleted chat stays so");
         fs::remove_dir_all(&root).unwrap();
     }
 

@@ -2936,6 +2936,93 @@ fn plan_areas(main: Rect) -> (Rect, Rect) {
     (left, window)
 }
 
+/// Inside the Plan screen's window: its steps, then its chat.
+fn plan_window(window: Rect) -> [Rect; 2] {
+    let inner = Block::bordered().inner(window);
+    Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(inner)
+}
+
+/// Plan's steps: what each is called, whole and in short, and the key that
+/// goes on to the next.
+const PLAN_STEPS: [(&str, &str, &str); 4] = [
+    ("Talk it through", "Talk", "D drafts them"),
+    ("Draft the issues", "Draft", "S creates them"),
+    ("Create them in Linear", "Create", ""),
+    ("Pick one up", "Pick up", "p picks one up"),
+];
+
+/// Plan's steps on one row of `width`, those before `at` ticked and it picked
+/// out, then the key for what comes next where there is room.
+fn plan_steps(at: usize, width: usize) -> Line<'static> {
+    let t = theme();
+    let row = |is_short: bool| {
+        let mut spans = vec![Span::raw(" ")];
+        for (n, (whole, short, _)) in PLAN_STEPS.iter().enumerate() {
+            if n > 0 {
+                spans.push(Span::styled(" ─ ", fg(t.border)));
+            }
+            let name = format!("{} {}", n + 1, if is_short { short } else { whole });
+            spans.push(match (n + 1).cmp(&at) {
+                std::cmp::Ordering::Less => Span::styled(format!("✓ {name}"), fg(t.success)),
+                std::cmp::Ordering::Equal => Span::styled(
+                    format!("▸ {name}"),
+                    fg(t.warning).add_modifier(Modifier::BOLD),
+                ),
+                std::cmp::Ordering::Greater => Span::styled(name, fg(t.muted)),
+            });
+        }
+        Line::from(spans)
+    };
+    let mut line = row(false);
+    if line.width() > width {
+        line = row(true);
+    }
+    let next = at
+        .checked_sub(1)
+        .and_then(|n| PLAN_STEPS.get(n))
+        .map_or("", |(_, _, next)| next);
+    if let Some((key, does)) = next.split_once(' ')
+        && line.width() + 3 + next.len() <= width
+    {
+        line.push_span(Span::styled(
+            format!("   {key}"),
+            fg(t.info).add_modifier(Modifier::BOLD),
+        ));
+        line.push_span(Span::styled(format!(" {does}"), fg(t.muted)));
+    }
+    line
+}
+
+/// How Plan works, a line a step, for a workspace with no planning chats.
+fn plan_explained(workspace: &str) -> Vec<Line<'static>> {
+    const DOES: [(&str, &str); 4] = [
+        ("n", "starts a chat; say what you want built"),
+        ("D", "asks it for a draft, and creates nothing"),
+        ("S", "creates them as drafted"),
+        ("p", "gives one a fresh tree and an agent"),
+    ];
+    let t = theme();
+    let mut lines = vec![
+        Line::styled(
+            format!("No planning chats for {workspace} yet."),
+            fg(t.muted),
+        ),
+        Line::raw(""),
+    ];
+    for (n, ((name, ..), (key, does))) in PLAN_STEPS.iter().zip(DOES).enumerate() {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{} ", n + 1), fg(t.muted)),
+            Span::styled(
+                format!("{name:<23}"),
+                Style::new().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("{key} "), fg(t.info).add_modifier(Modifier::BOLD)),
+            Span::styled(does, fg(t.muted)),
+        ]));
+    }
+    lines
+}
+
 /// A planned issue's mark and colour by where it stands.
 fn planned_mark(app: &App, issue: &crate::planned::Planned) -> (&'static str, Color) {
     use crate::planned::Stage;
@@ -3183,10 +3270,15 @@ fn draw_plan(frame: &mut Frame, app: &App, main: Rect, chat: Option<&Chat>) {
         }
         _ => block,
     };
+    let [steps, body] = plan_window(window);
+    frame.render_widget(block, window);
+    if let Some(chat) = shown {
+        let width = usize::from(steps.width);
+        let row = plan_steps(app.plan_step(chat), width);
+        frame.render_widget(Paragraph::new(row), steps);
+    }
     // The chat itself once open; until then what it last said.
     if let Some(chat) = open {
-        let body = block.inner(window);
-        frame.render_widget(block, window);
         if !chat.is_ready() {
             draw_note(frame, body, &opening_note(&chat.agent));
             return;
@@ -3197,10 +3289,7 @@ fn draw_plan(frame: &mut Frame, app: &App, main: Rect, chat: Option<&Chat>) {
         }
         return;
     }
-    let body = Block::new()
-        .padding(Padding::horizontal(1))
-        .inner(block.inner(window));
-    frame.render_widget(block, window);
+    let body = Block::new().padding(Padding::horizontal(1)).inner(body);
     let workspace = crate::workspaces::name(&app.checkout);
     let lines = match shown {
         Some(chat) => vec![
@@ -3219,10 +3308,7 @@ fn draw_plan(frame: &mut Frame, app: &App, main: Rect, chat: Option<&Chat>) {
                 fg(t.muted),
             ),
         ],
-        None => vec![Line::styled(
-            format!("No planning chats for {workspace} yet: n starts one, in no tree."),
-            fg(t.muted),
-        )],
+        None => plan_explained(&workspace),
     };
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
 }
@@ -3492,7 +3578,7 @@ fn window_areas(area: Rect) -> [Rect; 2] {
 pub fn window_chat_area(app: &App, screen: Rect) -> Option<Rect> {
     let main = screen_rows(app, screen).main;
     if app.is_plan {
-        return Some(Block::bordered().inner(plan_areas(main).1));
+        return Some(plan_window(plan_areas(main).1)[1]);
     }
     let window = windows(app, main).window?;
     Some(window_areas(pane_areas(app, window).0)[1])
@@ -10044,6 +10130,7 @@ mod panels_tests {
             checkout: None,
             scratch: false,
             issues: Vec::new(),
+            asked: None,
         }
     }
 
@@ -10196,6 +10283,90 @@ mod panels_tests {
         app.trees[2].ship = Some(ship.clone());
         let rows = panel_rows(&screen(&app, 160, 46), "[1] Ship").join("\n");
         assert!(rows.contains("#66 a label") && rows.contains('…'), "{rows}");
+    }
+
+    #[test]
+    fn plan_shows_its_four_steps_over_the_chat_and_the_key_for_the_next() {
+        use crate::scratch::PlanAsk;
+        let mut app = panels();
+        app.open_plan(vec![plan_chat("j1", "plan 1")]);
+        // The row under the window's title, past the panels.
+        let row = |app: &App, width: u16| -> String {
+            let shown = screen(app, width, 46);
+            let at = shown[1].find("[0]").unwrap();
+            let before = shown[1][..at].chars().count();
+            shown[2].chars().skip(before - 1).collect()
+        };
+        for (asked, steps) in [
+            (
+                None,
+                "▸ 1 Talk it through ─ 2 Draft the issues ─ 3 Create them in Linear \
+                 ─ 4 Pick one up   D drafts them ",
+            ),
+            (
+                Some(PlanAsk::Draft),
+                "✓ 1 Talk it through ─ ▸ 2 Draft the issues ─ 3 Create them in Linear \
+                 ─ 4 Pick one up   S creates them ",
+            ),
+            (
+                Some(PlanAsk::Create),
+                "✓ 1 Talk it through ─ ✓ 2 Draft the issues ─ ▸ 3 Create them in Linear \
+                 ─ 4 Pick one up ",
+            ),
+        ] {
+            app.plan_chats[0].asked = asked;
+            let shown = row(&app, 190);
+            assert!(shown.contains(steps), "{shown}");
+        }
+        app.plan_chats[0].issues = vec!["ANB-90".into()];
+        let shown = row(&app, 190);
+        assert!(
+            shown.contains("✓ 3 Create them in Linear ─ ▸ 4 Pick one up   p picks one up"),
+            "{shown}"
+        );
+        // One picked up: all four done, and no key after the last.
+        app.trees[0].sidecar.as_mut().unwrap().ticket = Some("ANB-90".into());
+        let shown = row(&app, 190);
+        assert!(shown.contains("─ ✓ 4 Pick one up      "), "{shown}");
+        // Short where there is less room, and whole on the smallest screen.
+        app.plan_chats[0].issues.clear();
+        app.plan_chats[0].asked = Some(PlanAsk::Draft);
+        let shown = row(&app, 120);
+        assert!(
+            shown.contains("✓ 1 Talk ─ ▸ 2 Draft ─ 3 Create ─ 4 Pick up   S creates them"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn with_no_planning_chats_plan_explains_its_four_steps() {
+        let mut app = panels();
+        app.checkout = "/code/app".into();
+        app.open_plan(Vec::new());
+        for width in [120, 190] {
+            let shown = screen(&app, width, 31).join("\n");
+            for line in [
+                "No planning chats for app yet.",
+                "1 Talk it through        n starts a chat; say what you want built ",
+                "2 Draft the issues       D asks it for a draft, and creates nothing ",
+                "3 Create them in Linear  S creates them as drafted ",
+                "4 Pick one up            p gives one a fresh tree and an agent ",
+            ] {
+                assert!(shown.contains(line), "{width} {line}:\n{shown}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_planning_chat_runs_under_the_steps() {
+        let mut app = panels();
+        app.open_plan(vec![plan_chat("j1", "plan 1")]);
+        let screen = Rect::new(0, 0, 160, 46);
+        let chat = window_chat_area(&app, screen).unwrap();
+        let window = plan_areas(screen_rows(&app, screen).main).1;
+        assert_eq!(chat.y, window.y + 2, "under the border and the steps");
+        assert_eq!(chat.bottom(), window.bottom() - 1);
+        assert_eq!((chat.x, chat.right()), (window.x + 1, window.right() - 1));
     }
 
     /// Tree 4 under the cursor, on ANB-41, In Progress and read.

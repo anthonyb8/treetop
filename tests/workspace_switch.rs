@@ -474,6 +474,66 @@ fn with_no_layout_set_treetop_opens_on_numbered_panels_and_number_keys_move_the_
     let _ = fs::remove_dir_all(&root);
 }
 
+/// ANB-113: Plan's steps follow what was typed to the chat, its record keeps
+/// where it is, and with no chats the window explains them.
+#[test]
+fn plans_steps_follow_the_chat_and_are_kept_with_it() {
+    let Workspaces {
+        root, mut screen, ..
+    } = two_workspaces("plan-steps", "");
+    screen.wait_for("the panels", |text| text.contains("[2] Trees"));
+    screen.press("\t");
+    screen.wait_for("the steps explained", |text| {
+        text.contains("No planning chats for here yet.")
+            && text.contains("4 Pick one up            p gives one a fresh tree and an agent")
+    });
+    screen.press("\t\t");
+    screen.wait_for("Trees", |text| text.contains("[2] Trees"));
+    let here = root.join("here").canonicalize().unwrap();
+    let records = root.join("state/treetop/scratch");
+    fs::create_dir_all(&records).unwrap();
+    let record = records.join("1.json");
+    fs::write(
+        &record,
+        serde_json::json!({"job": "j1", "name": "plan 1", "created": 1, "checkout": here})
+            .to_string(),
+    )
+    .unwrap();
+    // A chat with an input box, emptied as each message is sent.
+    write_script(
+        &root.join("bin/claude"),
+        "[ \"$1\" = attach ] || exit 1\n\
+         box() { printf '\\033[2J\\033[H%s\\n❯ \\n\\n\\n\\n\\n%s\\n\\033[2;3H' ────── ──────; }\n\
+         box\nwhile IFS= read -r line; do box; done\n",
+    );
+    screen.press("\t");
+    screen.wait_for("the first step", |text| {
+        text.contains("▸ 1 Talk it through ─ 2 Draft the issues")
+    });
+    for (key, step, kept) in [
+        ("D", "✓ 1 Talk it through ─ ▸ 2 Draft the issues", "draft"),
+        (
+            "S",
+            "✓ 2 Draft the issues ─ ▸ 3 Create them in Linear",
+            "create",
+        ),
+    ] {
+        screen.press(key);
+        screen.wait_for(step, |text| text.contains(step));
+        let record = fs::read_to_string(&record).unwrap();
+        assert!(record.contains(&format!(r#""asked":"{kept}""#)), "{record}");
+    }
+    // Away and back reads its record again.
+    screen.press("\t\t");
+    screen.wait_for("Trees", |text| text.contains("[2] Trees"));
+    screen.press("\t");
+    screen.wait_for("the same step", |text| {
+        text.contains("▸ 3 Create them in Linear")
+    });
+    drop(screen);
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// ANB-112: the Linear panel shows the issue of the tree under the cursor, and
 /// the next tree's as the cursor moves, with no Enter; Enter reads it in the
 /// window and Esc gives the keys back.

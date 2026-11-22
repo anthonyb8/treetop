@@ -898,8 +898,8 @@ impl Chats {
             )
         };
         self.background.retain(|c| {
-            if c.is_ended() && !c.outbox.is_empty() {
-                failed.push(ended(c));
+            if c.is_ended() {
+                failed.extend(c.outbox.iter().map(|_| ended(c)));
             }
             !c.is_ended()
         });
@@ -939,8 +939,8 @@ impl Chats {
             };
         };
         open.flush_into(&mut delivered, &mut failed);
-        if open.is_ended() && !open.outbox.is_empty() {
-            failed.push(ended(open));
+        if open.is_ended() {
+            failed.extend(open.outbox.iter().map(|_| ended(open)));
         }
         let ended = open
             .is_ended()
@@ -1529,6 +1529,26 @@ mod tests {
             let pumped = outcome(&mut chats);
             assert_eq!(pumped.failed, Vec::new(), "sending {text}");
             assert_eq!(pumped.delivered.len(), 1, "sending {text}");
+        }
+    }
+
+    #[test]
+    fn a_chat_that_ends_fails_every_message_it_held() {
+        let command = ["sh", "-c", "sleep 0.3"].map(String::from);
+        for is_open in [false, true] {
+            let mut chats = Chats::default();
+            let who = ("agent".to_string(), "tree".to_string());
+            for text in ["draft", "create"] {
+                chats
+                    .deliver(&command, text, (24, 80), who.clone(), Some(claude()))
+                    .unwrap();
+            }
+            if is_open {
+                chats
+                    .show(&command, (24, 80), who.0, who.1, Some(claude()))
+                    .unwrap();
+            }
+            assert_eq!(outcome(&mut chats).failed.len(), 2, "open: {is_open}");
         }
     }
 

@@ -910,6 +910,9 @@ pub struct App {
     /// The open workspace's planning chats, as the Plan screen last read
     /// them, and the one under its cursor.
     pub plan_chats: Vec<crate::scratch::Scratch>,
+    /// What `D` and `S` asked planning chats for, by name, and not yet
+    /// delivered.
+    plan_asks: Vec<(String, crate::scratch::PlanAsk)>,
     pub plan_at: usize,
     /// What each planning chat made, by its job, as Linear last said, and
     /// the issue source that said it, for picking up; or why it could not.
@@ -2548,6 +2551,49 @@ impl App {
         }
     }
 
+    /// What `D` or `S` asked the planning chat `name` for has been typed to
+    /// it: its record's file, and what to keep there.
+    pub fn plan_delivered(&mut self, name: &str) -> Option<(PathBuf, crate::scratch::PlanAsk)> {
+        let asked = self.take_plan_ask(name)?;
+        let chat = self.plan_chats.iter_mut().find(|c| c.name == name)?;
+        chat.asked = Some(asked);
+        Some((chat.record.clone(), asked))
+    }
+
+    /// What was asked of the planning chat `name` never reached it.
+    pub fn plan_undelivered(&mut self, name: &str) {
+        self.take_plan_ask(name);
+    }
+
+    fn take_plan_ask(&mut self, name: &str) -> Option<crate::scratch::PlanAsk> {
+        let at = self.plan_asks.iter().position(|(n, _)| n == name)?;
+        Some(self.plan_asks.remove(at).1)
+    }
+
+    /// Which of Plan's four steps `chat` is on, from 1: talking, its issues
+    /// drafted, being created, or made, to pick up; past the last once one
+    /// has been picked up.
+    pub fn plan_step(&self, chat: &crate::scratch::Scratch) -> usize {
+        use crate::planned::Stage;
+        use crate::scratch::PlanAsk;
+        if chat.issues.is_empty() {
+            return match chat.asked {
+                None => 1,
+                Some(PlanAsk::Draft) => 2,
+                Some(PlanAsk::Create) => 3,
+            };
+        }
+        let is_started =
+            |i: &crate::planned::Planned| matches!(i.stage, Stage::Going | Stage::Done);
+        let read = self.plan_made.get(&chat.job);
+        let is_picked = chat
+            .issues
+            .iter()
+            .any(|id| self.tree_of_ticket(id).is_some())
+            || read.is_some_and(|made| made.iter().any(is_started));
+        if is_picked { 5 } else { 4 }
+    }
+
     /// The planning chats asking you, for the Plan screen's count.
     pub fn plan_asking(&self) -> usize {
         self.plan_chats
@@ -2662,6 +2708,12 @@ impl App {
                 };
                 let to =
                     crate::dispatch::Recipient::of_job(&chat.name, SCRATCH.into(), &chat.job, true);
+                let asked = if c == 'D' {
+                    crate::scratch::PlanAsk::Draft
+                } else {
+                    crate::scratch::PlanAsk::Create
+                };
+                self.plan_asks.push((chat.name, asked));
                 return Outcome::Send { to: vec![to], text };
             }
             KeyCode::Char('q') => return self.quit(),
@@ -6866,6 +6918,7 @@ pub(crate) mod tests {
             checkout: Some(PathBuf::from("/code/here")),
             scratch: false,
             issues: Vec::new(),
+            asked: None,
         }]);
         app.checkout = PathBuf::from("/code/here");
         app
@@ -7063,6 +7116,7 @@ pub(crate) mod tests {
                 checkout: None,
                 scratch: false,
                 issues: Vec::new(),
+                asked: None,
             },
         );
         app.reselect(Some(app.trees[0].path.clone()));
@@ -8037,6 +8091,53 @@ pub(crate) mod tests {
         let (needs, done) = app.notes_list();
         assert!(needs.is_empty() && !done.is_empty());
         assert!(!app.wants_mouse());
+    }
+
+    #[test]
+    fn a_planning_chats_step_follows_what_reached_it_then_what_it_made() {
+        use crate::scratch::PlanAsk;
+        let mut app = with_made();
+        app.plan_made.clear();
+        app.trees.clear();
+        app.plan_chats[0].issues.clear();
+        let step = |app: &App| app.plan_step(&app.plan_chats[0]);
+        assert_eq!(step(&app), 1);
+        press(&mut app, KeyCode::Char('1'));
+        // Asked, and never delivered.
+        press(&mut app, KeyCode::Char('D'));
+        assert_eq!(step(&app), 1, "not typed to it yet");
+        let name = app.plan_chats[0].name.clone();
+        app.plan_undelivered(&name);
+        assert_eq!(app.plan_delivered(&name), None, "nothing left to deliver");
+        // Delivered, in the order they were asked.
+        press(&mut app, KeyCode::Char('D'));
+        press(&mut app, KeyCode::Char('S'));
+        let mut newer = app.plan_chats[0].clone();
+        (newer.job, newer.name) = ("j2".into(), "plan 2".into());
+        newer.record = "/state/2.json".into();
+        app.plan_chats.push(newer);
+        let record = app.plan_chats[0].record.clone();
+        assert_eq!(app.plan_delivered("plan 2"), None);
+        assert_eq!(app.plan_delivered(&name), Some((record, PlanAsk::Draft)));
+        assert_eq!(step(&app), 2);
+        app.plan_at = 1;
+        press(&mut app, KeyCode::Char('D'));
+        assert!(app.plan_delivered("plan 2").is_some());
+        assert_eq!(app.plan_step(&app.plan_chats[1]), 2, "each has its own");
+        assert_eq!(app.plan_asks.len(), 1, "the first's is still to come");
+        assert!(app.plan_delivered(&name).is_some());
+        assert_eq!(step(&app), 3);
+        // Its issues made, whatever it was asked; then one picked up.
+        app.plan_chats[0].asked = None;
+        app.plan_chats[0].issues = vec!["ANB-90".into()];
+        assert_eq!(step(&app), 4);
+        let job = app.plan_chats[0].job.clone();
+        let made = planned("ANB-90", crate::planned::Stage::Going, &[]);
+        app.plan_made.insert(job, vec![made]);
+        assert_eq!(step(&app), 5);
+        let mut app = with_made();
+        app.plan_made.clear();
+        assert_eq!(app.plan_step(&app.plan_chats[0]), 5, "ANB-41 is in tree 4");
     }
 
     #[test]
@@ -9128,6 +9229,7 @@ pub(crate) mod tests {
             checkout: None,
             scratch: true,
             issues: Vec::new(),
+            asked: None,
         }
     }
 
