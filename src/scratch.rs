@@ -25,6 +25,19 @@ pub struct Scratch {
     pub name: String,
     /// When it was started, in seconds since the epoch.
     pub created: u64,
+    /// A planning chat's workspace: the checkout it plans for, which it can
+    /// read and runs `keel` from. None for a scratch chat, and for a record
+    /// written before planning chats, which shows in every workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout: Option<PathBuf>,
+    /// A scratch chat `C` started, for no workspace: never on Plan. A
+    /// record without it, written before planning chats, can be either.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub scratch: bool,
+    /// The Linear issues a planning chat has created, as its transcript
+    /// shows `keel linear create` saying, in the order it made them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issues: Vec<String>,
     /// Its record's file; not written, since it is where the record is.
     #[serde(skip)]
     pub record: PathBuf,
@@ -80,15 +93,50 @@ fn next_number(root: &Path) -> u32 {
         + 1
 }
 
-/// Starts a new scratch chat, idle, and waits until Claude Code lists it.
+/// The planning chats of the workspace at `checkout`, the newest first:
+/// those started for it, and those whose record names no workspace.
+pub fn planning(checkout: &Path) -> Vec<Scratch> {
+    root()
+        .map(|root| planning_in(&root, checkout))
+        .unwrap_or_default()
+}
+
+/// The jobs of every planning chat, in any workspace.
+pub fn planning_jobs() -> std::collections::HashSet<String> {
+    list()
+        .into_iter()
+        .filter(|chat| chat.checkout.is_some())
+        .map(|chat| chat.job)
+        .collect()
+}
+
+fn planning_in(root: &Path, checkout: &Path) -> Vec<Scratch> {
+    list_in(root)
+        .into_iter()
+        .filter(|chat| match &chat.checkout {
+            Some(c) => c == checkout,
+            None => !chat.scratch,
+        })
+        .collect()
+}
+
+/// Starts a new scratch chat, idle, and waits until Claude Code lists it,
+/// or with `checkout` a planning chat for that workspace, which can read it.
 /// Slow: it runs off the screen's thread.
-pub fn start() -> Result<Scratch, String> {
+pub fn start(checkout: Option<&Path>) -> Result<Scratch, String> {
     let root = root().ok_or("no home directory for scratch chats")?;
     fs::create_dir_all(&root).map_err(|err| format!("{}: {err}", root.display()))?;
     let number = next_number(&root);
-    let name = format!("scratch {number}");
-    let out = Command::new("claude")
-        .args(["--bg", "--name", &name])
+    let name = match checkout {
+        Some(_) => format!("plan {number}"),
+        None => format!("scratch {number}"),
+    };
+    let mut command = Command::new("claude");
+    command.args(["--bg", "--name", &name]);
+    if let Some(checkout) = checkout {
+        command.arg("--add-dir").arg(checkout);
+    }
+    let out = command
         .current_dir(&root)
         .output()
         .map_err(|err| format!("claude: {err}"))?;
@@ -121,10 +169,18 @@ pub fn start() -> Result<Scratch, String> {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |since| since.as_secs()),
         record: root.join(format!("{number}.json")),
+        checkout: checkout.map(Path::to_path_buf),
+        scratch: checkout.is_none(),
+        issues: Vec::new(),
     };
-    let text = serde_json::to_string(&chat).map_err(|err| err.to_string())?;
-    fs::write(&chat.record, text).map_err(|err| format!("{}: {err}", chat.record.display()))?;
+    save(&chat)?;
     Ok(chat)
+}
+
+/// Writes the chat's record again, as it now stands.
+pub fn save(chat: &Scratch) -> Result<(), String> {
+    let text = serde_json::to_string(chat).map_err(|err| err.to_string())?;
+    fs::write(&chat.record, text).map_err(|err| format!("{}: {err}", chat.record.display()))
 }
 
 /// Deletes a scratch chat: its session, with `claude rm`, then its record.
@@ -146,6 +202,34 @@ pub fn remove(chat: &Scratch) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plan_lists_its_workspaces_chats_and_old_ones_but_not_scratch_chats() {
+        let root = std::env::temp_dir().join(format!("treetop-planning-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let records = [
+            ("1", r#""checkout":"/code/here""#),
+            ("2", r#""checkout":"/code/there""#),
+            ("3", ""),
+            ("4", r#""scratch":true"#),
+        ];
+        for (n, extra) in records {
+            let sep = if extra.is_empty() { "" } else { "," };
+            let text = format!(r#"{{"job":"j{n}","name":"chat {n}","created":{n}{sep}{extra}}}"#);
+            fs::write(root.join(format!("{n}.json")), text).unwrap();
+        }
+        let jobs: Vec<String> = planning_in(&root, Path::new("/code/here"))
+            .into_iter()
+            .map(|c| c.job)
+            .collect();
+        assert_eq!(
+            jobs,
+            ["j3", "j1"],
+            "here's, and the old one that names none"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn lists_the_readable_chats_newest_first_and_numbers_the_next() {

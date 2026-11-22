@@ -79,6 +79,20 @@ pub struct Detail {
     pub links: Vec<Link>,
 }
 
+/// Where an issue stands: its status, and what it is blocked by.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Standing {
+    /// The id people use, such as `END-123`.
+    pub id: String,
+    pub title: String,
+    pub project: Option<String>,
+    pub state: String,
+    /// Its status's type, as `State::kind`; None where the source has none.
+    pub kind: Option<String>,
+    /// The issues blocking it, done or not.
+    pub blocked_by: Vec<Link>,
+}
+
 /// A workflow state. `kind` is Linear's type: `triage`, `backlog`,
 /// `unstarted`, `started`, `completed` or `canceled`.
 #[derive(Debug, Clone, PartialEq)]
@@ -185,6 +199,43 @@ pub(crate) struct RawIssue {
     inverse_relations: Option<Nodes<RawRelation>>,
 }
 
+/// What a standing asks of each issue.
+pub const STANDING_FIELDS: &str = "identifier title state { name type } project { name } \
+    inverseRelations(first: 20) { nodes { type issue { identifier title state { name type } } } }";
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawStanding {
+    identifier: String,
+    #[serde(default)]
+    title: String,
+    state: Option<RawName>,
+    project: Option<RawName>,
+    inverse_relations: Option<Nodes<RawRelation>>,
+}
+
+impl From<RawStanding> for Standing {
+    fn from(raw: RawStanding) -> Self {
+        let state = raw.state.unwrap_or_default();
+        Standing {
+            id: raw.identifier,
+            title: raw.title,
+            project: raw.project.map(|p| p.name),
+            state: state.name,
+            kind: Some(state.kind).filter(|k| !k.is_empty()),
+            blocked_by: raw
+                .inverse_relations
+                .map(|r| r.nodes)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|r| r.kind == "blocks")
+                .filter_map(|r| r.issue)
+                .map(|i| i.into_link("blocked by"))
+                .collect(),
+        }
+    }
+}
+
 /// Another issue, as a detail names it.
 #[derive(Deserialize)]
 struct RawLinked {
@@ -197,7 +248,7 @@ struct RawLinked {
 
 /// A name with no id, as a linked issue's status is asked for, with the
 /// status's type.
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct RawName {
     #[serde(default)]
     name: String,

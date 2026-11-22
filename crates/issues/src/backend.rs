@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use linear::{Change, Client, Comment, Detail, Issue, NewIssue, Team};
+use linear::{Change, Client, Comment, Detail, Issue, NewIssue, Standing, Team};
 
 use crate::Filters;
 
@@ -20,6 +20,35 @@ pub trait Backend: Send + Sync {
 
     /// One issue with its description, comments and links.
     fn detail(&self, id: &str) -> Result<Detail, String>;
+
+    /// Where each of the issues `ids` stands, those it has; by reading each
+    /// in turn unless the source can read them at once. An error only where
+    /// none could be read.
+    fn standings(&self, ids: &[String]) -> Result<Vec<Standing>, String> {
+        let mut found = Vec::new();
+        let mut failed = None;
+        for id in ids {
+            match self.detail(id) {
+                Ok(detail) => found.push(Standing {
+                    id: detail.issue.id,
+                    title: detail.issue.title,
+                    project: detail.issue.project,
+                    state: detail.issue.state,
+                    kind: None,
+                    blocked_by: detail
+                        .links
+                        .into_iter()
+                        .filter(|l| l.kind == "blocked by")
+                        .collect(),
+                }),
+                Err(why) => failed = failed.or(Some(why)),
+            }
+        }
+        match failed {
+            Some(why) if found.is_empty() => Err(why),
+            _ => Ok(found),
+        }
+    }
 
     /// What its issues can be set to; None for a source that cannot change
     /// them.
@@ -179,6 +208,10 @@ impl Backend for Linear {
 
     fn detail(&self, id: &str) -> Result<Detail, String> {
         self.client()?.detail(id).map_err(|err| err.message)
+    }
+
+    fn standings(&self, ids: &[String]) -> Result<Vec<Standing>, String> {
+        self.client()?.standings(ids).map_err(|err| err.message)
     }
 
     fn team(&self) -> Result<Option<Arc<Team>>, String> {

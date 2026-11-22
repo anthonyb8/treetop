@@ -623,6 +623,13 @@ fn transcript(projects: &[PathBuf], session_id: &str) -> Option<PathBuf> {
         .map(|(_, path)| path)
 }
 
+/// Background job `job`'s transcript, where Claude Code keeps one.
+pub fn job_transcript(job: &str) -> Option<PathBuf> {
+    let home = home_of(job)?;
+    let projects = dirs(&home.join("projects"));
+    transcript(&projects, &resume_id(&home, job)?)
+}
+
 fn dirs(dir: &Path) -> Vec<PathBuf> {
     fs::read_dir(dir)
         .map(|entries| entries.flatten().map(|e| e.path()).collect())

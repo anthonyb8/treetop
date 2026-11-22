@@ -34,6 +34,7 @@ mod naming;
 mod nomistakes_plugin;
 mod notify;
 mod phone;
+mod planned;
 mod plugin;
 mod pool;
 mod popup;
@@ -91,6 +92,17 @@ const WINDOW_REST: Duration = Duration::from_millis(300);
 /// How long before the second window of a double tries again to start a
 /// chat that would not start.
 const OTHER_RETRY: Duration = Duration::from_secs(5);
+/// How often the Plan screen reads again what its planning chats made,
+/// their transcripts and the issues in Linear, while it is shown.
+const PLAN_READ: Duration = Duration::from_secs(30);
+
+/// What a read of the planning chats found: the chats with the issues their
+/// transcripts showed made, and each one's issues as the workspace's issue
+/// source has them, with its name, or why there is none.
+type PlanRead = (
+    Vec<scratch::Scratch>,
+    Result<(String, std::collections::HashMap<String, app::MadeRead>), String>,
+);
 /// How often the screen is drawn when nothing has changed, for the listing's
 /// age in the summary.
 const REDRAW: Duration = Duration::from_secs(1);
@@ -129,6 +141,9 @@ fn chat_size(term: &Term, app: &App) -> Result<(u16, u16)> {
     })
 }
 
+/// The agent plugin planning chats run as.
+const CLAUDE: &str = "claude";
+
 /// The size of the terminal a popup chat runs in, the assistant's or a
 /// scratch one: its popup, less its sidebar.
 fn popup_size(term: &Term) -> Result<(u16, u16)> {
@@ -143,12 +158,18 @@ fn chat_has_keys(chats: &Chats, app: &App) -> bool {
     app.palette.is_none()
         && chats
             .open()
-            .is_some_and(|chat| ui::is_popup_chat(chat) || app.is_inserting())
+            .is_some_and(|chat| ui::is_popup_chat(app, chat) || app.is_inserting())
 }
 
 /// The chat open is the one the window's tab shows for its tree: its
 /// agent's on the chat tab, whichever agent, and its shell on the shell tab.
 fn is_window_chat(chat: &Chat, app: &App) -> bool {
+    // On the Plan screen, the planning chat under its cursor.
+    if app.is_plan {
+        return app
+            .plan_chat()
+            .is_some_and(|shown| shown.attach() == chat.command());
+    }
     let is_here = app.window_tree().map(|t| t.name.as_str()) == Some(chat.tree.as_str());
     let is_shell = chat.agent == app::SHELL;
     is_here
@@ -170,8 +191,10 @@ fn open_chat(
     agent: String,
     tree: String,
 ) -> Result<()> {
-    let is_popup = ui::is_popup(&agent, &tree);
-    if !is_popup {
+    let is_popup = ui::is_popup(app, &agent, &tree);
+    if !is_popup && !app.is_plan {
+        // Its tree is this workspace's, whatever [2] was looking at.
+        app.viewing = None;
         app.select_tree(&tree);
         app.tab = app::WindowTab::Chat;
         if app.window_tree().map(|t| t.name.as_str()) != Some(tree.as_str()) {
@@ -192,6 +215,7 @@ fn open_chat(
         .flat_map(|t| &t.agents)
         .find(|a| a.attach.as_deref() == Some(command))
         .and_then(|a| a.plugin.as_deref())
+        .or(app.is_plan.then_some(CLAUDE))
         .and_then(plugin::screen_of);
     if chats.open().is_some_and(|open| open.command() != command) {
         chats.hide();
@@ -220,7 +244,12 @@ fn show_in_window(
     (command, agent, tree): (Vec<String>, String, String),
 ) -> Result<()> {
     let size = chat_size(term, app)?;
-    let hints = app.window_plugin().and_then(plugin::screen_of);
+    let plugin = if app.is_plan {
+        Some(CLAUDE)
+    } else {
+        app.window_plugin()
+    };
+    let hints = plugin.and_then(plugin::screen_of);
     // A chat that cannot open says so in the window, as an opening note
     // that stays; the next cursor move tries another.
     let _ = chats.show(&command, size, agent, tree, hints);
@@ -330,7 +359,7 @@ enum Exit {
     Quit,
     /// Show the pool of the repository checked out here instead, and open
     /// what waits in the tree at the second path, once it is read.
-    Switch(PathBuf, Option<(PathBuf, inbox::Kind)>),
+    Switch(PathBuf, Option<(PathBuf, Option<inbox::Kind>)>),
     /// Start the treetop installed over this one, on this workspace.
     Restart,
 }
@@ -357,7 +386,11 @@ fn run(
 ) -> Result<Exit> {
     let refresher = Refresher::spawn(checkout.to_path_buf(), app.trees.clone());
     let worker = Worker::spawn();
-    let away = inbox::spawn_reader(checkout.to_path_buf());
+    let before = inbox::AwayRound {
+        trees: app.away_live.clone(),
+        ships_read: app.away_ships.clone(),
+    };
+    let away = inbox::spawn_reader(checkout.to_path_buf(), before);
     app.base = diff::base(checkout);
     let diffs = diff::Loader::spawn(app.base.clone());
     // Each PR the popup asks for is read on a thread of its own, since a
@@ -385,6 +418,16 @@ fn run(
     let mut other_tried: (Option<Vec<String>>, Instant) = (None, Instant::now());
     // A scratch chat starting, and those being deleted, off this thread.
     let mut starting_scratch: Option<mpsc::Receiver<Result<scratch::Scratch, String>>> = None;
+    // The chat starting is a planning chat, for where its outcome is said.
+    let mut is_planning = false;
+    // The Plan screen's read of what its chats made, off this thread, and
+    // when the last began; each transcript read on from where it stopped.
+    // The planning chat last looked at, when, and whether its session runs.
+    let mut plan_running = (String::new(), Instant::now(), false);
+    let mut was_plan = false;
+    let mut plan_reading: Option<mpsc::Receiver<PlanRead>> = None;
+    let mut plan_read_at: Option<Instant> = None;
+    let transcripts = std::sync::Arc::new(std::sync::Mutex::new(planned::Reader::default()));
     let mut removing_scratch: Vec<mpsc::Receiver<Result<String, String>>> = Vec::new();
     // URLs a configured browser is opening, off this thread, each with
     // whether the Issues screen asked, so its outcome is said there.
@@ -420,9 +463,13 @@ fn run(
                     // Another workspace leases trees as its agents start, so
                     // its cache is read again to place their reports.
                     app.pools = inbox::other_pools(checkout);
+                    app.planning = scratch::planning_jobs();
                     let news = app.apply_reports(reports);
                     if !news.is_empty() {
                         announce(&news)?;
+                    }
+                    for line in news {
+                        app.add_news(None, line, None);
                     }
                 }
                 Update::Sidecars(sidecars) => app.apply_sidecars(sidecars),
@@ -464,7 +511,12 @@ fn run(
                     if job.kind == Kind::Ship {
                         refresher.refresh_ship();
                     }
+                    let before = app.message.clone();
                     app.job_finished(job, is_ok, output);
+                    // What it came to, kept in [4] News past the next key.
+                    if let Some(said) = app.message.clone().filter(|m| Some(m) != before.as_ref()) {
+                        app.add_news(None, said, None);
+                    }
                     if !is_preview {
                         refresher.refresh();
                     }
@@ -489,6 +541,7 @@ fn run(
             snapshot::write(checkout, &status);
         }
         if let Some(Outcome::Send { to, text }) = app.ready_failure() {
+            app.note_sent(&to, &text);
             send(term, app, chats, &worker, to, &text)?;
             refresher.refresh_ship();
         }
@@ -594,11 +647,29 @@ fn run(
             is_stale = true;
             match result {
                 // Esc while it started leaves it for C to open.
-                Ok(chat) if app.opening.is_none() => {
+                Ok(chat) if app.opening.is_none() && !is_planning => {
                     app.message = Some(format!("{} is ready; C opens it", chat.name));
+                }
+                // A planning chat's joins Plan's list, to open from there.
+                Ok(chat) if app.opening.is_none() => {
+                    let chats = scratch::planning(checkout);
+                    let said = if app.is_plan {
+                        app.open_plan(chats);
+                        "Enter on it opens it"
+                    } else {
+                        app.plan_chats = chats;
+                        "it is on Plan"
+                    };
+                    app.message = Some(format!("{} is ready; {said}", chat.name));
                 }
                 Ok(chat) => {
                     app.opening = None;
+                    // A planning chat joins the Plan screen's list, and goes
+                    // under its cursor.
+                    if app.is_plan {
+                        app.plan_wanted = Some(chat.job.clone());
+                        app.open_plan(scratch::planning(checkout));
+                    }
                     open_chat(
                         term,
                         app,
@@ -607,9 +678,18 @@ fn run(
                         chat.name,
                         app::SCRATCH.into(),
                     )?;
+                    // A planning chat is ready to type to.
+                    if app.is_plan {
+                        app.insert_in_window();
+                    }
                 }
                 // Said in the list it was asked from, whole, since the bar
                 // would cut it short.
+                // A planning chat's on the bar, wherever you are by now.
+                Err(err) if is_planning => {
+                    app.opening = None;
+                    app.message = Some(format!("could not start a planning chat: {err}"));
+                }
                 Err(err) => {
                     app.opening = None;
                     app.open_scratch_menu(scratch::list());
@@ -684,6 +764,7 @@ fn run(
             open_chat(term, app, chats, &command, agent, tree)?;
             is_stale = true;
         }
+        app.land_pick();
         // What waits in another workspace, gone to from here, opens its
         // agent once the pool is read, before any ask takes the screen.
         if !chat_has_keys(chats, app) {
@@ -705,10 +786,65 @@ fn run(
                 _ => {}
             }
         }
-        // The other workspaces' agents and PRs, as their slower read last
+        // Leaving the Plan screen leaves its chat running, off the screen.
+        if was_plan && !app.is_plan && chats.open().is_some_and(|c| c.tree == app::SCRATCH) {
+            chats.hide();
+            leave_window(app)?;
+            is_stale = true;
+        }
+        was_plan = app.is_plan;
+        // What the planning chats made, while the Plan screen shows.
+        if let Some((chats, made)) = plan_reading.as_ref().and_then(|r| r.try_recv().ok()) {
+            plan_reading = None;
+            is_stale = true;
+            app.apply_plan_read(chats, made);
+        }
+        if app.is_plan
+            && plan_reading.is_none()
+            && plan_read_at.is_none_or(|at| at.elapsed() >= PLAN_READ)
+        {
+            plan_read_at = Some(Instant::now());
+            let (done, result) = mpsc::channel();
+            let mut chats = app.plan_chats.clone();
+            let here = checkout.to_path_buf();
+            let transcripts = std::sync::Arc::clone(&transcripts);
+            std::thread::spawn(move || {
+                for chat in &mut chats {
+                    let Some(path) = agents::claude::job_transcript(&chat.job) else {
+                        continue;
+                    };
+                    let found = transcripts
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .new_ids(&path);
+                    let fresh: Vec<String> = found
+                        .into_iter()
+                        .filter(|id| !chat.issues.contains(id))
+                        .collect();
+                    if !fresh.is_empty() {
+                        chat.issues.extend(fresh);
+                        // Not for a chat deleted while this read ran.
+                        if chat.record.exists() {
+                            let _ = scratch::save(chat);
+                        }
+                    }
+                }
+                let made = tickets::own(&here).map(|backend| {
+                    let made = chats
+                        .iter()
+                        .map(|chat| (chat.job.clone(), planned::read(&*backend, &chat.issues)))
+                        .collect();
+                    (backend.name().to_string(), made)
+                });
+                let _ = done.send((chats, made));
+            });
+            plan_reading = Some(result);
+        }
+        // The other workspaces' agents and PRs, as their own reader last
         // found them.
         while let Ok(live) = away.rounds.try_recv() {
-            app.away_live = live;
+            app.away_live = live.trees;
+            app.away_ships = live.ships_read;
             is_stale = true;
         }
         // An agent asking you something gets its chat opened once nothing
@@ -728,6 +864,7 @@ fn run(
                     tree,
                 }) = app.next_ask()
                 {
+                    app.ask_opened = Some(Instant::now());
                     open_chat(term, app, chats, &command, agent, tree)?;
                     is_stale = true;
                 }
@@ -739,8 +876,13 @@ fn run(
         // opens it at once. A chat already open on the window's tree stays,
         // whichever of its agents it is and however the listing has it, so
         // one Enter just started is not closed while it comes up.
-        if !chats.open().is_some_and(ui::is_popup_chat) {
-            let here = app.window_tree().map(|t| (t.path.clone(), app.shown_tab()));
+        if !chats.open().is_some_and(|c| ui::is_popup_chat(app, c)) {
+            let here = if app.is_plan {
+                app.plan_chat()
+                    .map(|c| (c.record.clone(), app::WindowTab::Chat))
+            } else {
+                app.window_tree().map(|t| (t.path.clone(), app.shown_tab()))
+            };
             if here != window_wants.0 {
                 window_wants = (here, Instant::now());
                 // A double is kept as the cursor leaves it, for a restart.
@@ -749,12 +891,28 @@ fn run(
                 }
             }
             let is_rested = app.is_window_focused || window_wants.1.elapsed() >= WINDOW_REST;
-            let wanted = app.window_chat();
+            // A planning chat shows once it is rested on and while its
+            // session runs: one that stopped starts again only when asked.
+            let wanted = match app.plan_chat() {
+                Some(_) if app.is_plan && !is_rested => None,
+                Some(shown) if app.is_plan => {
+                    if plan_running.0 != shown.job || plan_running.1.elapsed() >= OTHER_RETRY {
+                        let is_running = agents::claude::running_jobs().contains(&shown.job);
+                        plan_running = (shown.job.clone(), Instant::now(), is_running);
+                    }
+                    plan_running
+                        .2
+                        .then(|| (shown.attach(), shown.name.clone(), app::SCRATCH.into()))
+                }
+                None if app.is_plan => None,
+                _ => app.window_chat(),
+            };
             let is_shown_here = chats.open().is_some_and(|c| is_window_chat(c, app));
-            let is_terminal_tab = matches!(
-                app.shown_tab(),
-                app::WindowTab::Chat | app::WindowTab::Shell
-            );
+            let is_terminal_tab = app.is_plan
+                || matches!(
+                    app.shown_tab(),
+                    app::WindowTab::Chat | app::WindowTab::Shell
+                );
             if app.is_window_focused && is_terminal_tab && wanted.is_none() && !is_shown_here {
                 leave_window(app)?;
             }
@@ -804,13 +962,14 @@ fn run(
             is_stale = true;
         }
         for (agent, tree, _) in &pumped.failed {
+            app.unsent(tree);
             app.handoff_unsent(agent, tree);
         }
         if let Some((agent, _)) = &pumped.kept {
             app.message = Some(format!("kept in {agent}'s chat; Ctrl+Q leaves it"));
         }
         if let Some((agent, tree)) = pumped.ended {
-            if app.is_window_focused || ui::is_popup(&agent, &tree) {
+            if app.is_window_focused || ui::is_popup(app, &agent, &tree) {
                 chat_closed(app, &agent, &tree)?;
             }
             is_stale = true;
@@ -825,7 +984,7 @@ fn run(
             let screen = Rect::new(0, 0, size.width, size.height);
             if let Some(open) = chats
                 .open_mut()
-                .filter(|c| ui::floats(app, ui::is_popup_chat(c), screen))
+                .filter(|c| ui::floats(app, ui::is_popup_chat(app, c), screen))
             {
                 open.resize(popup_rows, popup_cols);
             }
@@ -841,7 +1000,8 @@ fn run(
             }
             let now = SystemTime::now();
             let read: Vec<PathBuf> = app.away_live.keys().cloned().collect();
-            let due = desktop.due(&inbox::needs_action(app), &read, now);
+            let ships: Vec<PathBuf> = app.away_ships.iter().cloned().collect();
+            let due = desktop.due(&inbox::needs_action(app), &read, &ships, now);
             if !due.is_empty() {
                 let passthrough = app.is_in_tmux.then(tmux::allow_passthrough);
                 let (bytes, said) = desktop.tell(&due, passthrough.as_deref(), now);
@@ -865,6 +1025,27 @@ fn run(
                 app,
                 Rect::new(0, 0, size.width, size.height),
             ));
+            app.show_panels(ui::has_panels(
+                app,
+                Rect::new(0, 0, size.width, size.height),
+            ));
+            app.hold_cursors();
+            // The window's chat asking a question, for number keys to answer.
+            app.dialog = chats
+                .open()
+                .filter(|c| app.is_window_focused && is_window_chat(c, app))
+                .and_then(|c| {
+                    let text = c.screen().contents();
+                    (chat::input(&text, c.hints()?) == chat::Input::Dialog)
+                        .then(|| serve::answer::choices(&text))
+                        .flatten()
+                });
+            // Or a draft in its box, which Enter sends.
+            app.is_draft_shown = chats
+                .open()
+                .filter(|c| app.is_window_focused && is_window_chat(c, app))
+                .and_then(|c| Some(chat::input(&c.screen().contents(), c.hints()?)))
+                .is_some_and(|input| matches!(input, chat::Input::Holding(_)));
             let other = app
                 .other_chat()
                 .and_then(|(command, ..)| chats.running(&command));
@@ -911,7 +1092,7 @@ fn run(
             let size = term.size()?;
             let is_popup = ui::floats(
                 app,
-                ui::is_popup_chat(open),
+                ui::is_popup_chat(app, open),
                 Rect::new(0, 0, size.width, size.height),
             );
             let mut is_list_click = false;
@@ -922,10 +1103,13 @@ fn run(
                     // From a tree's chat only: the assistant's and a scratch
                     // chat's popups belong to no tree, and would cover a
                     // command's dialog.
-                    if chat::is_palette(key) && !is_popup && open.agent != app::SHELL {
+                    // The Plan screen's has no tree either.
+                    let is_trees = !is_popup && !app.is_plan;
+                    if chat::is_palette(key) && is_trees && open.agent != app::SHELL {
                         app.open_palette();
                     } else if chat::is_zoom(key)
-                        && !ui::is_popup_chat(open)
+                        && !app.is_plan
+                        && !ui::is_popup_chat(app, open)
                         && open.agent != app::SHELL
                     {
                         app.toggle_zoom(app::Zoom::Windows);
@@ -933,7 +1117,7 @@ fn run(
                         // Ctrl+Q drops Insert to Normal, the window keeping
                         // the keys and the mouse, for the wheel and a click.
                         app.is_inserting = false;
-                    } else if chat::is_exit(key) && !ui::is_popup_chat(open) {
+                    } else if chat::is_exit(key) && !ui::is_popup_chat(app, open) {
                         // A tree's chat floating over the Issues screen or a
                         // short terminal has no Normal to drop to on screen.
                         app.cycle_keys();
@@ -944,7 +1128,7 @@ fn run(
                         let (agent, tree) = (open.agent.clone(), open.tree.clone());
                         chats.hide();
                         chat_closed(app, &agent, &tree)?;
-                    } else if chat::is_next(key) {
+                    } else if chat::is_next(key) && !app.is_plan {
                         let from = open.tree.clone();
                         if let Some(Outcome::Chat {
                             command,
@@ -956,10 +1140,18 @@ fn run(
                             open_chat(term, app, chats, &command, agent, tree)?;
                         }
                     } else {
+                        if is_window_chat(open, app) {
+                            app.typed_in_window(key);
+                        }
                         open.send_key(key);
                     }
                 }
-                Event::Paste(text) => open.paste(text),
+                Event::Paste(text) => {
+                    if is_window_chat(open, app) {
+                        app.pasted_in_window(text);
+                    }
+                    open.paste(text);
+                }
                 &Event::Mouse(mouse) => {
                     let size = term.size()?;
                     let screen = Rect::new(0, 0, size.width, size.height);
@@ -1092,6 +1284,28 @@ fn run(
             Outcome::Quit => return Ok(Exit::Quit),
             Outcome::Workspaces => app.open_picker(choices()),
             Outcome::Scratches => app.open_scratch_menu(scratch::list()),
+            Outcome::Plan => {
+                app.open_plan(scratch::planning(checkout));
+                // Read at once on coming to Plan.
+                plan_read_at = None;
+            }
+            Outcome::NewPlan => {
+                app.opening = Some(Opening {
+                    agent: "a planning chat".into(),
+                    tree: app::SCRATCH.into(),
+                    key: None,
+                    failed: None,
+                    leases: false,
+                    side: None,
+                });
+                let (done, result) = mpsc::channel();
+                let here = checkout.to_path_buf();
+                std::thread::spawn(move || {
+                    let _ = done.send(scratch::start(Some(&here)));
+                });
+                starting_scratch = Some(result);
+                is_planning = true;
+            }
             Outcome::NewScratch => {
                 app.opening = Some(Opening {
                     agent: "a scratch chat".into(),
@@ -1103,9 +1317,10 @@ fn run(
                 });
                 let (done, result) = mpsc::channel();
                 std::thread::spawn(move || {
-                    let _ = done.send(scratch::start());
+                    let _ = done.send(scratch::start(None));
                 });
                 starting_scratch = Some(result);
+                is_planning = false;
             }
             Outcome::RemoveScratch(chat) => {
                 let (done, result) = mpsc::channel();
@@ -1162,6 +1377,24 @@ fn run(
                     app.message = Some(format!("could not record it: {err}"));
                 }
             }
+            // Only while the dialog is still there: one gone since the
+            // screen was drawn would take the number as typing.
+            Outcome::Answer(key) => {
+                if let Some(open) = chats.open_mut().filter(|c| {
+                    c.hints().is_some_and(|hints| {
+                        chat::input(&c.screen().contents(), hints) == chat::Input::Dialog
+                    })
+                }) {
+                    open.send_key(event::KeyEvent::from(event::KeyCode::Char(key)));
+                }
+            }
+            Outcome::Records(records) => {
+                for (path, record) in records {
+                    if let Err(err) = sidecar::write(&path, &record) {
+                        app.message = Some(format!("could not record it: {err}"));
+                    }
+                }
+            }
             Outcome::OpenUrl(url) => {
                 let opening = actions::open_url(&url);
                 app.message = Some(opening.said_now());
@@ -1199,7 +1432,14 @@ fn run(
                 *term = enter_screen()?;
                 refresher.refresh();
             }
-            Outcome::Send { to, text } => send(term, app, chats, &worker, to, &text)?,
+            Outcome::Send { to, text } => {
+                app.note_sent(&to, &text);
+                // Plan's `S` makes issues: read for them at the next look.
+                if app.is_plan {
+                    plan_read_at = None;
+                }
+                send(term, app, chats, &worker, to, &text)?;
+            }
             Outcome::Editor => {
                 let text = app
                     .prompt
@@ -1252,6 +1492,10 @@ fn show(
     let mut here = Some(start);
     // What waits, as the last workspace looked, so `e` keeps its place.
     let mut watch = app::Watch::default();
+    // The other workspaces as last read, kept across a switch.
+    let mut away = inbox::AwayRound::default();
+    // The panel with the keys in the panels layout, kept across a switch.
+    let mut panel = app::Panel::default();
     // What the desktop has been told of, kept across a switch too, so a
     // reminder still comes.
     let mut desktop = notify::Desktop::default();
@@ -1263,6 +1507,11 @@ fn show(
         workspaces::record(&checkout);
         let mut app = App::new(here.take());
         app.keep_watch(std::mem::take(&mut watch));
+        away.trees.remove(&checkout);
+        away.ships_read.remove(&checkout);
+        app.away_live = std::mem::take(&mut away.trees);
+        app.away_ships = std::mem::take(&mut away.ships_read);
+        app.panel = panel;
         app.is_in_tmux = tmux::is_inside();
         app.checkout = checkout.clone();
         app.user = branch::user();
@@ -1270,7 +1519,20 @@ fn show(
         if let Some(file) = state::asked_file(&checkout) {
             app.keep_asked_in(file);
         }
-        if let Some(file) = state::layout_file(&checkout) {
+        app.look = config::load().map(|c| c.layout).unwrap_or_default();
+        // As the first draw will have it, so the cursor is placed by it.
+        let size = term.size()?;
+        app.show_panels(ui::has_panels(
+            &app,
+            Rect::new(0, 0, size.width, size.height),
+        ));
+        // For the planning chats' count on every screen.
+        app.plan_chats = scratch::planning(&checkout);
+        // The panels layout shows one tree, so a double kept from the table
+        // waits in its file for it.
+        if app.look == config::Look::Table
+            && let Some(file) = state::layout_file(&checkout)
+        {
             app.keep_layout_in(file);
         }
         if let Some(file) = state::put_away_file() {
@@ -1287,7 +1549,26 @@ fn show(
         }
         let exit = run(term, &mut app, &checkout, &mut desktop, &mut chats);
         desktop.switched();
+        if matches!(exit, Ok(Exit::Switch(..))) {
+            for (agent, tree) in chats.unsent() {
+                app.unsent(&tree);
+                app.add_news(
+                    None,
+                    format!("not sent to {agent} in {tree}: you switched workspace first"),
+                    None,
+                );
+            }
+        }
         watch = app.take_watch();
+        panel = app.panel;
+        // The workspace left is another from the next one, as last read.
+        away.trees = std::mem::take(&mut app.away_live);
+        away.ships_read = std::mem::take(&mut app.away_ships);
+        if app.has_read_ships() {
+            away.ships_read.insert(checkout.clone());
+        }
+        away.trees
+            .insert(checkout.clone(), std::mem::take(&mut app.trees));
         // Leaving treetop takes what waits off tmux's status line; a switch
         // shows the next workspace's at once.
         if app.is_in_tmux && !matches!(exit, Ok(Exit::Switch(..))) {

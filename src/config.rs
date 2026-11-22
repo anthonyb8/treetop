@@ -306,6 +306,20 @@ pub struct Config {
     /// The Claude Code config dirs sessions are found in.
     #[serde(default)]
     pub claude: Claude,
+    /// How the Trees screen is laid out.
+    #[serde(default)]
+    pub layout: Look,
+}
+
+/// How the Trees screen is laid out: the table with the window under it, or
+/// numbered panels on the left with the tree under the cursor on the right.
+/// Named apart from the double's kept layout and the diff's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Look {
+    Table,
+    #[default]
+    Panels,
 }
 
 /// `path` with a leading `~` as the home directory.
@@ -400,6 +414,16 @@ mod tests {
         assert!(config.hooks.on_dispatch.is_empty());
         let config = parse("[guard]\nin_tree = [\"docker compose down\"]\n").unwrap();
         assert_eq!(config.guard.in_tree, ["docker compose down"]);
+    }
+
+    #[test]
+    fn the_layout_is_the_panels_unless_it_says_table() {
+        assert_eq!(parse("").unwrap().layout, Look::Panels);
+        assert_eq!(parse("layout = \"table\"").unwrap().layout, Look::Table);
+        assert!(
+            parse("layout = \"panel\"").is_err(),
+            "a misspelt layout says so"
+        );
     }
 
     #[test]

@@ -10,9 +10,10 @@
 //! and the tmux status line show until it stops being true. What counts is decided here for the
 //! phone's pushes too, so the desktop and the phone never disagree.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::agents::Status;
@@ -160,6 +161,13 @@ pub enum Kind {
     Merged,
 }
 
+impl Kind {
+    /// It comes from a read of PRs, not of agents.
+    pub fn is_pr(self) -> bool {
+        matches!(self, Self::Failed | Self::Merged)
+    }
+}
+
 /// Another workspace's entry: where it lives, so opening it switches there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Away {
@@ -195,10 +203,9 @@ pub struct Pool {
     pub sidecars: std::collections::HashMap<PathBuf, crate::sidecar::Sidecar>,
 }
 
-/// How long another workspace goes between reads of its agents and PRs,
-/// slower than the open workspace's own, since each read runs its ship
-/// plugins.
-const READ_EVERY: Duration = Duration::from_secs(180);
+/// How long another workspace goes between reads of its PRs, slower than
+/// its agents, since each read runs its ship plugins.
+const SHIP_EVERY: Duration = Duration::from_secs(180);
 
 /// A workspace not opened for this long is not read.
 const STALE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -252,21 +259,122 @@ fn due(
         .collect()
 }
 
-/// Reads each other workspace opened within STALE, every READ_EVERY: its
-/// trees with their agents and PRs, by checkout. With no other workspace
-/// due it reads nothing. A switch drops it, which stops it.
-pub fn spawn_reader(here: PathBuf) -> Reader<HashMap<PathBuf, Vec<Tree>>> {
-    spawn_every(READ_EVERY, move || {
+/// The other workspaces as last read, by checkout.
+#[derive(Debug, Clone, Default)]
+pub struct AwayRound {
+    pub trees: HashMap<PathBuf, Vec<Tree>>,
+    /// Those whose PRs have been read at least once.
+    pub ships_read: HashSet<PathBuf>,
+}
+
+/// Reads each other workspace opened within STALE: its trees with their
+/// agents as often as the open workspace's own, and, on a thread of its
+/// own so a slow one holds up no agents' read, their PRs every SHIP_EVERY.
+/// Until then they stand as `before`, the last round before a switch, had
+/// them. With no other workspace due it reads nothing. A switch drops it, which
+/// stops it.
+pub fn spawn_reader(here: PathBuf, before: AwayRound) -> Reader<AwayRound> {
+    let ships = Arc::new(Mutex::new(AwayShips::from(before)));
+    let pools = move || -> Vec<(PathBuf, Vec<Tree>)> {
         due(crate::workspaces::list(), &here, secs(SystemTime::now()))
             .into_iter()
             .filter_map(|w| {
-                let mut trees = with_main(&w.checkout, crate::cache::read(&w.checkout)?);
-                crate::cli::read_agents(&mut trees);
-                crate::cli::read_ship(&w.checkout, &mut trees);
+                let trees = with_main(&w.checkout, crate::cache::read(&w.checkout)?);
                 Some((w.checkout, trees))
             })
             .collect()
+    };
+    let for_ships = (pools.clone(), Arc::clone(&ships));
+    let ship_reader = spawn_every(SHIP_EVERY, move || {
+        let (pools, ships) = &for_ships;
+        for (checkout, mut trees) in pools() {
+            crate::cli::read_ship(&checkout, &mut trees);
+            ships
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .apply(checkout, &trees);
+        }
+    });
+    spawn_every(crate::refresh::AGENTS_EVERY, move || {
+        // Kept as long as this reader, and dropped with it.
+        let _ = &ship_reader;
+        let ships = ships.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        ships.read(pools(), crate::cli::read_agents)
     })
+}
+
+/// The other workspaces' PRs as last read, and whose have been.
+#[derive(Debug, Clone, Default)]
+struct AwayShips {
+    by_tree: HashMap<PathBuf, Box<crate::ship::Ship>>,
+    read: HashSet<PathBuf>,
+}
+
+impl From<AwayRound> for AwayShips {
+    fn from(round: AwayRound) -> Self {
+        let read = round.ships_read;
+        AwayShips {
+            by_tree: round
+                .trees
+                .into_iter()
+                .filter(|(checkout, _)| read.contains(checkout))
+                .flat_map(|(_, trees)| trees)
+                .filter_map(|t| Some((t.path, t.ship?)))
+                .collect(),
+            read,
+        }
+    }
+}
+
+impl AwayShips {
+    /// Takes up what a read of the PRs of `checkout`'s `trees` found, in
+    /// place of what its last did, so a PR gone since is not kept.
+    fn apply(&mut self, checkout: PathBuf, trees: &[Tree]) {
+        for tree in trees {
+            match &tree.ship {
+                Some(ship) => {
+                    self.by_tree.insert(tree.path.clone(), ship.clone());
+                }
+                None => {
+                    self.by_tree.remove(&tree.path);
+                }
+            }
+        }
+        self.read.insert(checkout);
+    }
+
+    /// Fills in `pools`, each workspace's trees by checkout: every
+    /// workspace's agents with one call to `agents`, so the running
+    /// processes are walked once a round however many are due, and the PR
+    /// stage each tree was last read at.
+    fn read(
+        &self,
+        pools: Vec<(PathBuf, Vec<Tree>)>,
+        agents: impl FnOnce(&mut [Tree]),
+    ) -> AwayRound {
+        let sizes: Vec<(PathBuf, usize)> =
+            pools.iter().map(|(c, t)| (c.clone(), t.len())).collect();
+        let mut all: Vec<Tree> = pools.into_iter().flat_map(|(_, trees)| trees).collect();
+        agents(&mut all);
+        // Only while the tree is still on that PR's branch: one returned
+        // and leased again since has another's stage.
+        for tree in &mut all {
+            tree.ship = self
+                .by_tree
+                .get(&tree.path)
+                .filter(|ship| tree.branch.as_deref() == Some(ship.branch.as_str()))
+                .cloned();
+        }
+        let mut rest = all.into_iter();
+        let trees = sizes
+            .into_iter()
+            .map(|(checkout, size)| (checkout, rest.by_ref().take(size).collect()))
+            .collect();
+        AwayRound {
+            trees,
+            ships_read: self.read.clone(),
+        }
+    }
 }
 
 /// A workspace's trees as its cache lists them, with its main checkout at
@@ -400,7 +508,35 @@ pub fn answered_keys(app: &App) -> Vec<String> {
     read.filter(|t| !t.agents.iter().any(|a| a.status == Some(Status::Waiting)))
         .map(|t| key(Kind::NeedsYou, &t.path, AT_A_PROMPT))
         .filter(|k| app.put_away.contains(k))
+        .chain(recovered_keys(app))
         .collect()
+}
+
+/// The keys put away of failed PRs, whose PR, as last read, is past that
+/// failure: failing again, with the same line, is a new one. A PR not read
+/// says nothing either way.
+fn recovered_keys(app: &App) -> Vec<String> {
+    app.trees
+        .iter()
+        .chain(app.away_live.values().flatten())
+        .filter(|t| {
+            t.ship
+                .as_ref()
+                .is_some_and(|s| pr_kind(s.stage) != Some(Kind::Failed))
+        })
+        .flat_map(|t| {
+            app.put_away
+                .iter()
+                .filter(|k| is_key_of(k, Kind::Failed, &t.path))
+                .cloned()
+        })
+        .collect()
+}
+
+/// `key` is one put away of `kind` in the tree at `path`.
+pub fn is_key_of(key: &str, kind: Kind, path: &Path) -> bool {
+    key.strip_prefix(&format!("{kind:?} {} ", path.display()))
+        .is_some()
 }
 
 /// The entries put away as they stand, which leave the notifications.
@@ -434,7 +570,20 @@ pub fn needs_action(app: &App) -> Vec<Entry> {
         a.at.is_none()
             .cmp(&b.at.is_none())
             .then(a.at.cmp(&b.at))
-            .then(a.away.is_some().cmp(&b.away.is_some()))
+            // Together, the panels have them in one order from every
+            // workspace, so `w` goes round them all; the table this one's
+            // first.
+            .then_with(|| {
+                if app.look == crate::config::Look::Panels {
+                    let checkout = |e: &Entry| match &e.away {
+                        Some(away) => away.checkout.clone(),
+                        None => app.checkout.clone(),
+                    };
+                    checkout(a).cmp(&checkout(b))
+                } else {
+                    a.away.is_some().cmp(&b.away.is_some())
+                }
+            })
             .then(a.tree.cmp(&b.tree))
     });
     waiting
@@ -551,10 +700,10 @@ pub mod tests {
     use crate::app::Outcome;
     use crate::ship::Ship;
     use crate::sidecar::Sidecar;
-    use ratatui::crossterm::event::{KeyCode, KeyEvent};
+    use ratatui::crossterm::event::KeyCode;
     use std::time::Duration;
 
-    fn agent(name: &str, job: &str, status: Status) -> Agent {
+    pub fn agent(name: &str, job: &str, status: Status) -> Agent {
         Agent {
             name: name.into(),
             pid: Some(1),
@@ -605,6 +754,8 @@ pub mod tests {
     /// agent waits on you in its tree 12.
     pub fn app() -> App {
         let mut app = App::new(None);
+        // The table layout, which these trees were drawn in first.
+        app.look = crate::config::Look::Table;
         let mut asking = tree(
             "/pool/4/app",
             "4",
@@ -686,6 +837,48 @@ pub mod tests {
         app
     }
 
+    /// `app` in the panels layout, on screen, in `/code/main-app`, with two
+    /// other workspaces, `zeta` and `api`, in place of its one: each with a
+    /// held tree 1 and a free tree 2, and api's agent waiting on you.
+    pub fn with_workspaces() -> App {
+        let mut app = app();
+        app.checkout = PathBuf::from("/code/main-app");
+        app.look = crate::config::Look::Panels;
+        app.show_panels(true);
+        app.pools = ["zeta", "api"]
+            .into_iter()
+            .map(|name| {
+                let mut free = tree(&format!("/code/{name}-trees/2"), "2", "", Vec::new());
+                free.status = "available".into();
+                let held = Tree {
+                    leased_at: Some("2026-01-01T09:00:00-05:00".into()),
+                    ..tree(
+                        &format!("/code/{name}-trees/1"),
+                        "1",
+                        &format!("{name}-work"),
+                        Vec::new(),
+                    )
+                };
+                Pool {
+                    away: Away {
+                        name: name.into(),
+                        checkout: PathBuf::from(format!("/code/{name}")),
+                    },
+                    trees: vec![held, free],
+                    sidecars: Default::default(),
+                }
+            })
+            .collect();
+        app.reports.push(report(
+            "japi",
+            "/code/api-trees/1",
+            State::Blocked,
+            "Which endpoint?",
+            60,
+        ));
+        app
+    }
+
     /// Settles everything in `app` that waits on you: the asks and the
     /// dead agent reported, tree 7's failed PR and the other workspace.
     pub fn nothing_waits(app: &mut App) {
@@ -702,9 +895,7 @@ pub mod tests {
             .collect()
     }
 
-    fn press(app: &mut App, code: KeyCode) -> Outcome {
-        app.handle_key(KeyEvent::from(code))
-    }
+    use crate::app::tests::press;
 
     #[test]
     fn what_waits_is_oldest_first_and_what_is_done_never_waits() {
@@ -788,13 +979,13 @@ pub mod tests {
             Outcome::SwitchTo {
                 checkout: "/code/endodeals-web".into(),
                 tree: "/other/12/web".into(),
-                kind: Kind::NeedsYou,
+                kind: Some(Kind::NeedsYou),
             }
         );
 
         // The pool of endodeals-web, as the switch opens it.
         let mut there = App::new(None);
-        there.arriving = Some(("/other/12/web".into(), Kind::NeedsYou));
+        there.arriving = Some(("/other/12/web".into(), Some(Kind::NeedsYou)));
         there.trees = vec![tree(
             "/other/12/web",
             "12",
@@ -910,7 +1101,7 @@ pub mod tests {
                 matches!(
                     o,
                     Outcome::SwitchTo {
-                        kind: Kind::Failed,
+                        kind: Some(Kind::Failed),
                         ..
                     }
                 )
@@ -918,7 +1109,7 @@ pub mod tests {
             Outcome::SwitchTo {
                 checkout: "/code/endodeals-web".into(),
                 tree: "/other/7/web".into(),
-                kind: Kind::Failed,
+                kind: Some(Kind::Failed),
             }
         );
 
@@ -926,7 +1117,7 @@ pub mod tests {
         let mut there = App::new(None);
         there.trees = vec![tree("/other/7/web", "7", "me/END-91-fix-login", Vec::new())];
         there.is_agents_read = true;
-        there.arriving = Some(("/other/7/web".into(), Kind::Failed));
+        there.arriving = Some(("/other/7/web".into(), Some(Kind::Failed)));
         assert_eq!(there.arrival(), None, "no chat opens for a PR");
         assert_eq!(there.current().map(|t| t.name.as_str()), Some("7"));
         assert!(
@@ -968,13 +1159,166 @@ pub mod tests {
             there.is_in_tmux = is_in_tmux;
             there.trees = vec![tree("/other/5/web", "5", "me/seo-meta", vec![pane.clone()])];
             there.is_agents_read = true;
-            there.arriving = Some(("/other/5/web".into(), Kind::NeedsYou));
+            there.arriving = Some(("/other/5/web".into(), Some(Kind::NeedsYou)));
             (there.arrival(), there.message)
         };
         assert!(matches!(arrive(true).0, Some(Outcome::Enter(t)) if t.name == "5"));
         let (outcome, message) = arrive(false);
         assert_eq!(outcome, None, "no shell opens by itself");
         assert!(message.unwrap().contains("t goes to it"));
+    }
+
+    /// Another workspace's pool as its cache lists it, fresh each round.
+    fn away_pool(checkout: &str, branches: &[&str]) -> (PathBuf, Vec<Tree>) {
+        let trees = branches
+            .iter()
+            .enumerate()
+            .map(|(n, branch)| {
+                tree(
+                    &format!("{checkout}/{n}"),
+                    &n.to_string(),
+                    branch,
+                    Vec::new(),
+                )
+            })
+            .collect();
+        (PathBuf::from(checkout), trees)
+    }
+
+    fn failing_pr(branch: &str) -> Box<Ship> {
+        Box::new(Ship {
+            branch: branch.into(),
+            stage: Stage::CiFailed,
+            label: "#212 ✗ e2e".into(),
+            url: None,
+            head: None,
+            detail: Vec::new(),
+            plugin: "github".into(),
+        })
+    }
+
+    #[test]
+    fn another_workspace_keeps_its_pr_stage_between_its_slower_pr_reads() {
+        let mut ships = AwayShips::default();
+        let api = || away_pool("/code/api", &["me/fix-login"]);
+        let stage = |ships: &AwayShips| {
+            let read = ships.read(vec![api()], |_| {});
+            let ship = read.trees[Path::new("/code/api")][0].ship.clone();
+            (ship.map(|s| s.stage), read.ships_read.len())
+        };
+        assert_eq!(stage(&ships), (None, 0), "its PRs are not read yet");
+        let (checkout, mut trees) = api();
+        trees[0].ship = Some(failing_pr("me/fix-login"));
+        ships.apply(checkout.clone(), &trees);
+        assert_eq!(stage(&ships), (Some(Stage::CiFailed), 1));
+        assert_eq!(stage(&ships), (Some(Stage::CiFailed), 1), "a round later");
+        // A PR the next read no longer finds is not kept.
+        ships.apply(checkout, &api().1);
+        assert_eq!(stage(&ships), (None, 1));
+    }
+
+    #[test]
+    fn a_reader_starts_from_the_prs_already_read_before_a_switch() {
+        let (checkout, mut trees) = away_pool("/code/api", &["me/fix-login"]);
+        trees[0].ship = Some(failing_pr("me/fix-login"));
+        let ships = AwayShips::from(AwayRound {
+            trees: [(checkout.clone(), trees)].into(),
+            ships_read: [checkout.clone()].into(),
+        });
+        let read = ships.read(vec![away_pool("/code/api", &["me/fix-login"])], |_| {});
+        assert_eq!(
+            read.trees[&checkout][0].ship.as_ref().map(|s| s.stage),
+            Some(Stage::CiFailed)
+        );
+        assert!(read.ships_read.contains(&checkout));
+    }
+
+    #[test]
+    fn what_started_waiting_together_is_in_one_order_from_every_workspace() {
+        // The same four, seen from each of the two they are in.
+        let order_from = |here: &str, there: &str| {
+            let mut app = App::new(None);
+            app.look = crate::config::Look::Panels;
+            app.checkout = PathBuf::from(format!("/code/{here}"));
+            app.is_loaded = true;
+            app.is_agents_read = true;
+            let asking = |ws: &str| -> Vec<Tree> {
+                ["1", "2"]
+                    .iter()
+                    .map(|n| Tree {
+                        leased_at: Some("2026-01-01T09:00:00-05:00".into()),
+                        ..tree(
+                            &format!("/code/{ws}-trees/{n}"),
+                            n,
+                            "b",
+                            vec![agent("a", &format!("{ws}{n}"), Status::Waiting)],
+                        )
+                    })
+                    .collect()
+            };
+            app.trees = asking(here);
+            let checkout = PathBuf::from(format!("/code/{there}"));
+            app.pools = vec![Pool {
+                away: Away {
+                    name: there.into(),
+                    checkout: checkout.clone(),
+                },
+                trees: asking(there),
+                sidecars: Default::default(),
+            }];
+            app.away_live.insert(checkout, asking(there));
+            app.apply_reports(Vec::new());
+            app.watch_waiting();
+            let order: Vec<PathBuf> = needs_action(&app).into_iter().map(|e| e.path).collect();
+            assert_eq!(order.len(), 4);
+            order
+        };
+        assert_eq!(order_from("api", "web"), order_from("web", "api"));
+    }
+
+    #[test]
+    fn a_tree_leased_again_between_pr_reads_drops_the_old_branchs_pr() {
+        let mut ships = AwayShips::default();
+        let (checkout, mut trees) = away_pool("/code/api", &["me/fix-login"]);
+        trees[0].ship = Some(failing_pr("me/fix-login"));
+        ships.apply(checkout, &trees);
+        // Returned and leased again on another branch before the next PR read.
+        let read = ships.read(vec![away_pool("/code/api", &["me/new-work"])], |_| {});
+        assert_eq!(read.trees[Path::new("/code/api")][0].ship, None);
+    }
+
+    #[test]
+    fn one_agents_read_covers_every_workspace_and_each_gets_its_own_trees_back() {
+        let away = AwayShips::default();
+        let mut agent_reads = 0;
+        let read = away.read(
+            vec![
+                away_pool("/code/api", &["me/a", "me/b"]),
+                away_pool("/code/web", &["me/c"]),
+            ],
+            |trees: &mut [Tree]| {
+                agent_reads += 1;
+                for tree in trees {
+                    tree.agents = vec![agent("x", "j", Status::Waiting)];
+                }
+            },
+        );
+        assert_eq!(
+            agent_reads, 1,
+            "the processes were walked once per workspace"
+        );
+        let branches = |checkout: &str| -> Vec<Option<String>> {
+            read.trees[Path::new(checkout)]
+                .iter()
+                .map(|t| t.branch.clone())
+                .collect()
+        };
+        assert_eq!(
+            branches("/code/api"),
+            [Some("me/a".into()), Some("me/b".into())]
+        );
+        assert_eq!(branches("/code/web"), [Some("me/c".into())]);
+        assert!(read.trees.values().flatten().all(|t| t.agents.len() == 1));
     }
 
     #[test]
@@ -1039,8 +1383,8 @@ pub mod tests {
         assert!(!is_new);
         assert_eq!(
             line.as_deref(),
-            Some("● 4 needs action  ✓ 1 done"),
-            "the counts alone, as the count in the table's corner has them"
+            Some("● 4 needs action"),
+            "what waits alone, as the count has it: what is done is no news to act on"
         );
         assert_eq!(app.watch_waiting(), Some((false, line)), "nor again");
         // Tree 4's agent, still asking, writes its report again: the same

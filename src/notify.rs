@@ -40,6 +40,8 @@ pub struct Desktop {
     /// The other workspaces read so far: what waits in one at its first
     /// read was already waiting, and is not announced either.
     read: HashSet<PathBuf>,
+    /// The same, of their PRs, which are read apart from their agents.
+    ships: HashSet<PathBuf>,
     /// When it last looked, so something not seen since before then has
     /// been out of what waits.
     looked: Option<SystemTime>,
@@ -52,7 +54,7 @@ pub struct Desktop {
 
 impl Desktop {
     /// What to tell the desktop of as of `now`, from what is `waiting`, with
-    /// the other workspaces `read` so far: each thing that has started
+    /// the other workspaces `read` so far, and whose `ships` have been: each thing that has started
     /// waiting since the last look, and, once, each that has waited AGAIN,
     /// no sooner than GAP after it was first told. The flag is set on a
     /// reminder.
@@ -60,6 +62,7 @@ impl Desktop {
         &mut self,
         waiting: &[Entry],
         read: &[PathBuf],
+        ships: &[PathBuf],
         now: SystemTime,
     ) -> Vec<(Entry, bool)> {
         let known = |now| Told {
@@ -70,6 +73,9 @@ impl Desktop {
         let first_read: HashSet<&PathBuf> =
             read.iter().filter(|r| !self.read.contains(*r)).collect();
         self.read.extend(read.iter().cloned());
+        let first_ships: HashSet<&PathBuf> =
+            ships.iter().filter(|r| !self.ships.contains(*r)).collect();
+        self.ships.extend(ships.iter().cloned());
         let looked = self.looked.replace(now);
         let Some(told) = self.told.as_mut() else {
             self.told = Some(waiting.iter().map(|e| (e.about(), known(now))).collect());
@@ -86,7 +92,10 @@ impl Desktop {
             let is_first_read = entry
                 .away
                 .as_ref()
-                .is_some_and(|a| first_read.contains(&a.checkout));
+                .is_some_and(|a| match entry.kind.is_pr() {
+                    true => first_ships.contains(&a.checkout),
+                    false => first_read.contains(&a.checkout),
+                });
             match told.get_mut(&entry.about()) {
                 None if is_first_read || is_switched => {
                     told.insert(entry.about(), known(now));
@@ -230,27 +239,30 @@ mod tests {
         let already = entry("9", Kind::Died, Some(start));
         assert!(
             desktop
-                .due(std::slice::from_ref(&already), &[], at(0))
+                .due(std::slice::from_ref(&already), &[], &[], at(0))
                 .is_empty(),
             "not at the first look"
         );
         let asks = entry("22", Kind::NeedsYou, Some(at(1)));
         let both = [already.clone(), asks.clone()];
-        let told = desktop.due(&both, &[], at(1));
+        let told = desktop.due(&both, &[], &[], at(1));
         assert_eq!(told.len(), 1);
         assert_eq!((told[0].0.tree.as_str(), told[0].1), ("22", false));
-        assert!(desktop.due(&both, &[], at(2)).is_empty(), "once");
+        assert!(desktop.due(&both, &[], &[], at(2)).is_empty(), "once");
         assert!(
-            desktop.due(&both, &[], at(30)).is_empty(),
+            desktop.due(&both, &[], &[], at(30)).is_empty(),
             "29 minutes is not 30"
         );
-        let again = desktop.due(&both, &[], at(31));
+        let again = desktop.due(&both, &[], &[], at(31));
         assert_eq!(again.len(), 1);
         assert_eq!((again[0].0.tree.as_str(), again[0].1), ("22", true));
-        assert!(desktop.due(&both, &[], at(120)).is_empty(), "then never");
+        assert!(
+            desktop.due(&both, &[], &[], at(120)).is_empty(),
+            "then never"
+        );
         // Answered, then asking again later, it is new.
-        desktop.due(std::slice::from_ref(&already), &[], at(121));
-        assert_eq!(desktop.due(&both, &[], at(124)).len(), 1);
+        desktop.due(std::slice::from_ref(&already), &[], &[], at(121));
+        assert_eq!(desktop.due(&both, &[], &[], at(124)).len(), 1);
     }
 
     #[test]
@@ -258,12 +270,12 @@ mod tests {
         let start = SystemTime::now();
         let at = |m: u32| start + MIN * m;
         let mut desktop = Desktop::default();
-        desktop.due(&[], &[], at(0));
+        desktop.due(&[], &[], &[], at(0));
         // Seen first at minute 40, though it has waited since minute 0.
         let old = [entry("7", Kind::Failed, Some(start))];
-        assert_eq!(desktop.due(&old, &[], at(40)).len(), 1);
-        assert!(desktop.due(&old, &[], at(41)).is_empty());
-        assert_eq!(desktop.due(&old, &[], at(65)).len(), 1);
+        assert_eq!(desktop.due(&old, &[], &[], at(40)).len(), 1);
+        assert!(desktop.due(&old, &[], &[], at(41)).is_empty());
+        assert_eq!(desktop.due(&old, &[], &[], at(65)).len(), 1);
     }
 
     #[test]
@@ -271,18 +283,21 @@ mod tests {
         let start = SystemTime::now();
         let at = |m: u32| start + MIN * m;
         let mut desktop = Desktop::default();
-        desktop.due(&[], &[], at(0));
+        desktop.due(&[], &[], &[], at(0));
         let asks = [entry("22", Kind::NeedsYou, Some(at(1)))];
-        assert_eq!(desktop.due(&asks, &[], at(1)).len(), 1);
+        assert_eq!(desktop.due(&asks, &[], &[], at(1)).len(), 1);
         let moment = at(1) + Duration::from_secs(30);
         assert!(
-            desktop.due(&[], &[], moment).is_empty(),
+            desktop.due(&[], &[], &[], moment).is_empty(),
             "busy for a moment"
         );
-        assert!(desktop.due(&asks, &[], at(2)).is_empty(), "the same ask");
+        assert!(
+            desktop.due(&asks, &[], &[], at(2)).is_empty(),
+            "the same ask"
+        );
         // Gone for longer than that, it is a new one.
-        desktop.due(&[], &[], at(4));
-        assert_eq!(desktop.due(&asks, &[], at(10)).len(), 1);
+        desktop.due(&[], &[], &[], at(4));
+        assert_eq!(desktop.due(&asks, &[], &[], at(10)).len(), 1);
     }
 
     #[test]
@@ -298,16 +313,28 @@ mod tests {
             ..entry(tree, Kind::Failed, None)
         };
         let mut desktop = Desktop::default();
-        desktop.due(&[], &[], at(0));
-        // Its first read, a few seconds on, finds a PR failing already.
+        desktop.due(&[], &[], &[], at(0));
+        // Its agents are read before its PRs, which take longer; their
+        // first read, a few seconds on, finds one failing already.
+        desktop.due(&[], std::slice::from_ref(&there), &[], at(0));
         assert!(
             desktop
-                .due(&[away("7")], std::slice::from_ref(&there), at(1))
+                .due(
+                    &[away("7")],
+                    std::slice::from_ref(&there),
+                    std::slice::from_ref(&there),
+                    at(1)
+                )
                 .is_empty()
         );
         // Another failing at its next read is news.
         let both = [away("7"), away("5")];
-        let told = desktop.due(&both, std::slice::from_ref(&there), at(4));
+        let told = desktop.due(
+            &both,
+            std::slice::from_ref(&there),
+            std::slice::from_ref(&there),
+            at(4),
+        );
         assert_eq!(told.len(), 1);
         assert_eq!(told[0].0.tree, "5");
     }
@@ -386,17 +413,22 @@ mod tests {
         let start = SystemTime::now();
         let at = |m: u32| start + MIN * m;
         let mut desktop = Desktop::default();
-        desktop.due(&[], &[], at(0));
+        desktop.due(&[], &[], &[], at(0));
         let asks = entry("22", Kind::NeedsYou, Some(at(1)));
         assert_eq!(
-            desktop.due(std::slice::from_ref(&asks), &[], at(1)).len(),
+            desktop
+                .due(std::slice::from_ref(&asks), &[], &[], at(1))
+                .len(),
             1
         );
         // The next workspace, where tree 30's checks were failing already.
         desktop.switched();
         let there = [asks.clone(), entry("30", Kind::Failed, None)];
-        assert!(desktop.due(&there, &[], at(2)).is_empty(), "nothing new");
-        let again = desktop.due(&there, &[], at(31));
+        assert!(
+            desktop.due(&there, &[], &[], at(2)).is_empty(),
+            "nothing new"
+        );
+        let again = desktop.due(&there, &[], &[], at(31));
         assert_eq!(again.len(), 1);
         assert_eq!((again[0].0.tree.as_str(), again[0].1), ("22", true));
     }
