@@ -125,15 +125,16 @@ fn chat_size(term: &Term, app: &App) -> Result<(u16, u16)> {
     let screen = Rect::new(0, 0, size.width, size.height);
     Ok(match ui::window_chat_area(app, screen) {
         Some(area) => (area.height.max(1), area.width.max(1)),
-        None => popup_size(term)?,
+        None => popup_size(term, app)?,
     })
 }
 
 /// The size of the terminal a popup chat runs in, the assistant's or a
 /// scratch one: its popup, less its sidebar.
-fn popup_size(term: &Term) -> Result<(u16, u16)> {
+fn popup_size(term: &Term, app: &App) -> Result<(u16, u16)> {
     let size = term.size()?;
-    Ok(popup::terminal_size(size.height, size.width))
+    let area = ui::popup_screen(app, Rect::new(0, 0, size.width, size.height));
+    Ok(popup::terminal_size(area.height, area.width))
 }
 
 /// A chat takes the keys: one in a popup, or the window's while it has
@@ -182,7 +183,7 @@ fn open_chat(
         }
     }
     let size = if is_popup {
-        popup_size(term)?
+        popup_size(term, app)?
     } else {
         chat_size(term, app)?
     };
@@ -385,6 +386,8 @@ fn run(
     let mut other_tried: (Option<Vec<String>>, Instant) = (None, Instant::now());
     // A scratch chat starting, and those being deleted, off this thread.
     let mut starting_scratch: Option<mpsc::Receiver<Result<scratch::Scratch, String>>> = None;
+    // The chat starting is a planning chat, for where its outcome is said.
+    let mut is_planning = false;
     let mut removing_scratch: Vec<mpsc::Receiver<Result<String, String>>> = Vec::new();
     // URLs a configured browser is opening, off this thread, each with
     // whether the Issues screen asked, so its outcome is said there.
@@ -607,6 +610,10 @@ fn run(
                 }
                 Ok(chat) => {
                     app.opening = None;
+                    // A planning chat joins the Plan screen's list.
+                    if app.is_plan {
+                        app.open_plan(scratch::planning(checkout));
+                    }
                     open_chat(
                         term,
                         app,
@@ -618,6 +625,11 @@ fn run(
                 }
                 // Said in the list it was asked from, whole, since the bar
                 // would cut it short.
+                // A planning chat's on the bar, wherever you are by now.
+                Err(err) if is_planning => {
+                    app.opening = None;
+                    app.message = Some(format!("could not start a planning chat: {err}"));
+                }
                 Err(err) => {
                     app.opening = None;
                     app.open_scratch_menu(scratch::list());
@@ -825,7 +837,7 @@ fn run(
         }
         // A resize, or the windows split or joined, changes the room a chat
         // has, before it is drawn there.
-        let sizes = (chat_size(term, app)?, popup_size(term)?);
+        let sizes = (chat_size(term, app)?, popup_size(term, app)?);
         if chat_sized != Some(sizes) {
             let ((rows, cols), (popup_rows, popup_cols)) = sizes;
             chats.resize(rows, cols);
@@ -989,7 +1001,7 @@ fn run(
                     // for the notifications, which the list's own click
                     // below opens.
                     let area = if is_popup {
-                        Some(popup::chat(screen))
+                        Some(popup::chat(ui::popup_screen(app, screen)))
                     } else {
                         ui::window_chat_area(app, screen)
                     };
@@ -1114,6 +1126,24 @@ fn run(
             Outcome::Quit => return Ok(Exit::Quit),
             Outcome::Workspaces => app.open_picker(choices()),
             Outcome::Scratches => app.open_scratch_menu(scratch::list()),
+            Outcome::Plan => app.open_plan(scratch::planning(checkout)),
+            Outcome::NewPlan => {
+                app.opening = Some(Opening {
+                    agent: "a planning chat".into(),
+                    tree: app::SCRATCH.into(),
+                    key: None,
+                    failed: None,
+                    leases: false,
+                    side: None,
+                });
+                let (done, result) = mpsc::channel();
+                let here = checkout.to_path_buf();
+                std::thread::spawn(move || {
+                    let _ = done.send(scratch::start(Some(&here)));
+                });
+                starting_scratch = Some(result);
+                is_planning = true;
+            }
             Outcome::NewScratch => {
                 app.opening = Some(Opening {
                     agent: "a scratch chat".into(),
@@ -1125,9 +1155,10 @@ fn run(
                 });
                 let (done, result) = mpsc::channel();
                 std::thread::spawn(move || {
-                    let _ = done.send(scratch::start());
+                    let _ = done.send(scratch::start(None));
                 });
                 starting_scratch = Some(result);
+                is_planning = false;
             }
             Outcome::RemoveScratch(chat) => {
                 let (done, result) = mpsc::channel();
@@ -1317,6 +1348,8 @@ fn show(
             app.keep_asked_in(file);
         }
         app.look = config::load().map(|c| c.layout).unwrap_or_default();
+        // For the planning chats' count on every screen.
+        app.plan_chats = scratch::planning(&checkout);
         // The panels layout shows one tree, so a double kept from the table
         // waits in its file for it.
         if app.look == config::Look::Table

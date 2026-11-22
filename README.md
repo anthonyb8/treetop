@@ -207,6 +207,7 @@ The number keys give a panel the keys, from the table or the window in Normal, a
 Its trees come first, then those parked or on the Backburner, then the free ones as one row of numbers, where `n` starts an agent in the lowest.
 With trees marked, `z` and `x` park them or put them on the Backburner together, or bring them all back when all are there already, and the bar shows what the marked trees can be given.
 In it the PR tab's sections step with `h` and `l` only, and the double and zoom are off.
+Tab goes from Trees to a Plan screen, then to Issues: Plan lists the workspace's planning chats, Claude sessions in no tree that can read the repository, for planning a project before any tree is leased, with ▲ by one asking you. `n` starts one, Enter opens it in the window on the right, where `Ctrl+Q` leaves it running, `D` asks it to draft what was planned as Linear issues with `/spec` and show the draft, and `S` tells it to create them once you have seen the draft; `▲2 planning` on the bar counts those asking you from any screen. A chat started before planning chats existed shows on every workspace's Plan; the scratch chats `C` starts never do.
 On a screen under 120 columns or 30 rows the table layout shows instead, and `layout = "table"`, the default, keeps it.
 
 A repository can add hooks of its own under `[repos]`.

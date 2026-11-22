@@ -536,6 +536,10 @@ pub enum Outcome {
     },
     /// Write each tree's record, as `Record` does for one.
     Records(Vec<(PathBuf, Sidecar)>),
+    /// Show the Plan screen, its planning chats read again.
+    Plan,
+    /// Start a planning chat for the open workspace.
+    NewPlan,
     /// Press this key in the window's chat, its dialog's choice.
     Answer(char),
     /// Open `command`, agent `agent`'s chat in tree `tree`, in a popup over
@@ -578,6 +582,14 @@ pub struct Watch {
     /// read for the first time since, or a switch, is no news either, as
     /// what it holds was already there, as the desktop is not told of it.
     news_read: (PathBuf, HashSet<PathBuf>),
+}
+
+/// Where a planning chat stands, for the Plan screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanState {
+    Asks,
+    Talking,
+    Idle,
 }
 
 /// A line of [4] News: when, where, and what happened; `kind` for the
@@ -826,6 +838,13 @@ pub struct App {
     pub waiting_at: usize,
     /// In [3] Ship, the PR under its cursor.
     pub ship_at: usize,
+    /// The Plan screen is shown, in the panels layout: Tab goes Trees,
+    /// Plan, Issues. Never with `is_issues`.
+    pub is_plan: bool,
+    /// The open workspace's planning chats, as the Plan screen last read
+    /// them, and the one under its cursor.
+    pub plan_chats: Vec<crate::scratch::Scratch>,
+    pub plan_at: usize,
     /// The command palette, while Ctrl+P has it open.
     pub palette: Option<Palette>,
     /// In a double, the side of the window the cursor drives, the one that
@@ -1333,7 +1352,8 @@ impl App {
     /// cursor, or the main checkout on its heading.
     pub fn window_tree(&self) -> Option<&Tree> {
         // Another workspace's tab is only looked at: its trees open nothing.
-        if self.viewing.is_some() {
+        // Nor does the Plan screen, whose window is its planning chat's.
+        if self.viewing.is_some() || self.is_plan {
             return None;
         }
         self.current().or(self.main_under_cursor())
@@ -1767,6 +1787,98 @@ impl App {
             kind,
         });
         self.watch.news.truncate(NEWS_KEPT);
+    }
+
+    /// Shows the Plan screen with `chats`, the open workspace's planning
+    /// chats.
+    pub fn open_plan(&mut self, chats: Vec<crate::scratch::Scratch>) {
+        self.is_plan = true;
+        self.is_issues = false;
+        self.plan_chats = chats;
+        self.plan_at = self.plan_at.min(self.plan_chats.len().saturating_sub(1));
+    }
+
+    /// A planning chat's state, by its report: asking you, talking, or idle.
+    pub fn plan_state(&self, chat: &crate::scratch::Scratch) -> PlanState {
+        let report = self.reports.iter().find(|r| r.job == chat.job);
+        match report.map(|r| report_state(r, &self.trees)) {
+            Some(State::Blocked) => PlanState::Asks,
+            Some(State::Working) => PlanState::Talking,
+            _ => PlanState::Idle,
+        }
+    }
+
+    /// The planning chats asking you, for the Plan screen's count.
+    pub fn plan_asking(&self) -> usize {
+        self.plan_chats
+            .iter()
+            .filter(|c| self.plan_state(c) == PlanState::Asks)
+            .count()
+    }
+
+    /// The Plan screen's keys: j and k move among its planning chats, `n`
+    /// starts one for this workspace, Enter or `i` opens the one under the
+    /// cursor in the window, `D` asks it to draft its plan as issues and
+    /// `S` to create them in Linear, as `/spec` does, and Tab goes on to
+    /// Issues. Every other key, the Trees screen's and Ctrl's among them,
+    /// does nothing here, so none acts on a tree.
+    fn handle_plan_key(&mut self, key: KeyEvent) -> Outcome {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            return self.quit();
+        }
+        if !key.modifiers.is_empty() && key.modifiers != KeyModifiers::SHIFT {
+            return Outcome::Continue;
+        }
+        // A planning chat on its way holds the keys until it opens; Esc
+        // leaves it starting, to open from the list.
+        if self.opening.is_some() {
+            if key.code == KeyCode::Esc {
+                self.opening = None;
+            }
+            return Outcome::Continue;
+        }
+        let last = self.plan_chats.len().saturating_sub(1);
+        let chat = self.plan_chats.get(self.plan_at.min(last)).cloned();
+        match key.code {
+            KeyCode::Tab => {
+                self.is_plan = false;
+                self.is_issues = true;
+            }
+            KeyCode::Char('j') | KeyCode::Down => self.plan_at = (self.plan_at + 1).min(last),
+            KeyCode::Char('k') | KeyCode::Up => self.plan_at = self.plan_at.saturating_sub(1),
+            KeyCode::Char('n') => return Outcome::NewPlan,
+            KeyCode::Enter | KeyCode::Char('i' | 'l') => {
+                if let Some(chat) = chat {
+                    return Outcome::Chat {
+                        command: chat.attach(),
+                        agent: chat.name,
+                        tree: SCRATCH.into(),
+                    };
+                }
+            }
+            KeyCode::Char(c @ ('D' | 'S')) => {
+                let Some(chat) = chat else {
+                    self.message = Some("no planning chat yet: n starts one".into());
+                    return Outcome::Continue;
+                };
+                let at = self.checkout.display().to_string();
+                let text = if c == 'D' {
+                    format!(
+                        "Draft what we planned as Linear issues with /spec, from keel's templates, for the repository at {at}; run keel from there. Show me the draft and create nothing yet."
+                    )
+                } else {
+                    format!(
+                        "If you have shown me a draft, yes: create those issues in Linear as drafted, running keel from {at}. If you have not, show me the draft first and create nothing."
+                    )
+                };
+                let to =
+                    crate::dispatch::Recipient::of_job(&chat.name, SCRATCH.into(), &chat.job, true);
+                return Outcome::Send { to: vec![to], text };
+            }
+            KeyCode::Char('q') => return self.quit(),
+            _ => {}
+        }
+        Outcome::Continue
     }
 
     /// What you sent each of `to`, into [4] News: its first line, and the
@@ -3451,6 +3563,7 @@ impl App {
         let (needs, done) = self.notes_list();
         (is_reading || !needs.is_empty() || !done.is_empty() || self.usage_overflow > 0)
             && !self.is_issues
+            && !self.is_plan
             && !self.has_keys_on(WindowTab::Diff)
             && !self.has_keys_on(WindowTab::Pr)
             && self.prompt.is_none()
@@ -5143,6 +5256,9 @@ impl App {
         if let Some(outcome) = self.answer_by_number(key) {
             return outcome;
         }
+        if self.is_plan {
+            return self.handle_plan_key(key);
+        }
         if self.focus_by_number(key) {
             return Outcome::Continue;
         }
@@ -5398,6 +5514,8 @@ impl App {
                     return Outcome::Enter(tree.clone());
                 }
             }
+            // The panels layout has Plan between Trees and Issues.
+            KeyCode::Tab if self.shows_panels() => return Outcome::Plan,
             KeyCode::Tab => self.is_issues = true,
             KeyCode::Char(':') => {
                 let context = self.cursor_context();
@@ -5865,6 +5983,122 @@ mod tests {
                 "you: retry the e2e → tree 99",
                 "you: retry the e2e → me/fix-login"
             ]
+        );
+    }
+
+    fn on_plan() -> App {
+        let mut app = crate::inbox::tests::app();
+        app.look = crate::config::Look::Panels;
+        app.show_panels(true);
+        app.open_plan(vec![crate::scratch::Scratch {
+            job: "j1".into(),
+            name: "plan 1".into(),
+            created: 0,
+            record: PathBuf::from("/state/scratch/1.json"),
+            checkout: Some(PathBuf::from("/code/here")),
+            scratch: false,
+        }]);
+        app.checkout = PathBuf::from("/code/here");
+        app
+    }
+
+    #[test]
+    fn tab_goes_trees_plan_issues_in_the_panels() {
+        // The table layout's Tab, straight to Issues, is
+        // tab_shows_the_issues_screen's.
+        let mut app = on_plan();
+        app.is_plan = false;
+        assert_eq!(press(&mut app, KeyCode::Tab), Outcome::Plan);
+        app.open_plan(Vec::new());
+        assert!(app.is_plan && !app.is_issues);
+        press(&mut app, KeyCode::Tab);
+        assert!(app.is_issues && !app.is_plan, "Plan goes on to Issues");
+    }
+
+    #[test]
+    fn a_planning_chats_report_says_when_it_asks_you() {
+        let mut app = on_plan();
+        assert_eq!(app.plan_state(&app.plan_chats[0]), PlanState::Idle);
+        assert_eq!(app.plan_asking(), 0);
+        for (state, shown, asking) in [
+            (State::Working, PlanState::Talking, 0),
+            (State::Blocked, PlanState::Asks, 1),
+            (State::Done, PlanState::Idle, 0),
+        ] {
+            app.reports = vec![crate::inbox::tests::report(
+                "j1",
+                "/state/scratch",
+                state,
+                "Split it in two?",
+                1,
+            )];
+            assert_eq!(app.plan_state(&app.plan_chats[0]), shown, "{state:?}");
+            assert_eq!(app.plan_asking(), asking, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn enter_opens_the_planning_chat_and_d_asks_only_for_a_draft() {
+        let mut app = on_plan();
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Outcome::Chat {
+                command: vec!["claude".into(), "attach".into(), "j1".into()],
+                agent: "plan 1".into(),
+                tree: SCRATCH.into(),
+            }
+        );
+        let Outcome::Send { text, .. } = press(&mut app, KeyCode::Char('D')) else {
+            panic!("D sends");
+        };
+        assert!(
+            text.contains("/spec") && text.contains("/code/here"),
+            "{text}"
+        );
+        assert!(text.contains("create nothing yet"), "{text}");
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_the_plan_screen_as_from_any() {
+        let mut app = on_plan();
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(app.handle_key(ctrl_c), Outcome::Quit);
+    }
+
+    #[test]
+    fn the_plan_screen_takes_no_mouse_for_the_trees() {
+        let mut app = on_plan();
+        app.is_plan = false;
+        assert!(app.wants_mouse(), "the Trees screen's count takes a click");
+        app.is_plan = true;
+        assert!(!app.wants_mouse());
+    }
+
+    #[test]
+    fn n_while_a_planning_chat_starts_starts_no_second_one() {
+        let mut app = on_plan();
+        assert_eq!(press(&mut app, KeyCode::Char('n')), Outcome::NewPlan);
+        app.opening = Some(Opening {
+            agent: "a planning chat".into(),
+            tree: SCRATCH.into(),
+            key: None,
+            failed: None,
+            leases: false,
+            side: None,
+        });
+        assert_ne!(press(&mut app, KeyCode::Char('n')), Outcome::NewPlan);
+    }
+
+    #[test]
+    fn s_creates_only_a_draft_already_shown() {
+        let mut app = on_plan();
+        let Outcome::Send { text, to } = press(&mut app, KeyCode::Char('S')) else {
+            panic!("S sends");
+        };
+        assert_eq!(to[0].job.as_deref(), Some("j1"));
+        assert!(
+            text.contains("show me the draft") && text.contains("/code/here"),
+            "{text}"
         );
     }
 
@@ -6947,6 +7181,8 @@ mod tests {
             name: name.into(),
             created: 0,
             record: PathBuf::from(format!("/state/scratch/{name}.json")),
+            checkout: None,
+            scratch: true,
         }
     }
 

@@ -575,3 +575,48 @@ fn an_ask_in_another_workspace_is_news_that_stays() {
     drop(screen);
     let _ = fs::remove_dir_all(&root);
 }
+
+/// ANB-106: in the panels layout Tab goes to the Plan screen, where `n`
+/// starts a planning chat for this workspace in no tree, able to read the
+/// repository; one Claude Code will not start says so on the bar, on Plan.
+#[test]
+fn n_on_the_plan_screen_starts_a_planning_chat_that_can_read_the_repository() {
+    let Workspaces {
+        root, mut screen, ..
+    } = two_workspaces("plan", "layout = \"panels\"\n");
+    screen.wait_on("here");
+    // Claude Code as a stand-in that writes down what it was asked, then
+    // will not start.
+    let asked = root.join("claude-asked");
+    write_script(
+        &root.join("bin/claude"),
+        &format!(
+            "echo \"$@\" >> {}\necho 'no session' >&2\nexit 1\n",
+            asked.display()
+        ),
+    );
+    screen.press("\t");
+    screen.wait_for("the Plan screen", |text| {
+        text.contains("[1] Planning chats")
+            && text.lines().last().unwrap_or("").starts_with(" PLAN ")
+    });
+    screen.press("n");
+    screen.wait_for("the start's failure on the bar", |text| {
+        text.lines()
+            .last()
+            .is_some_and(|bar| bar.contains("could not start a planning chat"))
+    });
+    let said = fs::read_to_string(&asked).unwrap();
+    let here = root.join("here").canonicalize().unwrap();
+    assert!(
+        said.contains("--bg --name plan ")
+            && said.contains(&format!("--add-dir {}", here.display())),
+        "{said}"
+    );
+    assert!(
+        screen.text().contains("[1] Planning chats"),
+        "still on Plan"
+    );
+    drop(screen);
+    let _ = fs::remove_dir_all(&root);
+}
