@@ -418,6 +418,40 @@ pub enum Zoom {
     Windows,
 }
 
+/// A numbered panel on the left of the panels layout, on its number key;
+/// the window on the right is 0.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Panel {
+    Waiting,
+    #[default]
+    Trees,
+    Ship,
+    News,
+}
+
+impl Panel {
+    pub const ALL: [Panel; 4] = [Panel::Waiting, Panel::Trees, Panel::Ship, Panel::News];
+
+    /// Its number key and title.
+    pub fn number(self) -> u8 {
+        match self {
+            Panel::Waiting => 1,
+            Panel::Trees => 2,
+            Panel::Ship => 3,
+            Panel::News => 4,
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Panel::Waiting => "Waiting",
+            Panel::Trees => "Trees",
+            Panel::Ship => "Ship",
+            Panel::News => "News",
+        }
+    }
+}
+
 /// What a shell in the window under the table names as its agent.
 pub const SHELL: &str = "shell";
 
@@ -734,6 +768,11 @@ pub struct App {
     pub other: Option<OtherWindow>,
     /// What Ctrl+F zoomed, while it is zoomed.
     pub zoom: Option<Zoom>,
+    /// How the Trees screen is laid out, as the config says.
+    pub look: crate::config::Look,
+    /// In the panels layout, the panel on the left that has the keys while
+    /// the window, [0], does not.
+    pub panel: Panel,
     /// The command palette, while Ctrl+P has it open.
     pub palette: Option<Palette>,
     /// In a double, the side of the window the cursor drives, the one that
@@ -1363,9 +1402,52 @@ impl App {
         Outcome::Continue
     }
 
+    /// In the panels layout, a number key from the table or a window in
+    /// Normal: 1 to 4 give the keys to that panel, 0 to the window, as
+    /// lazygit numbers its panels, so they win over the PR tab's own 1 to 4,
+    /// which h and l still step. False for any other key, for the table
+    /// layout, and while something takes typed text or a key of its own.
+    fn focus_by_number(&mut self, key: KeyEvent) -> bool {
+        let KeyCode::Char(c @ '0'..='4') = key.code else {
+            return false;
+        };
+        let is_taken = self.prompt.is_some()
+            || self.picker.is_some()
+            || self.port_menu.is_some()
+            || self.phone.is_some()
+            || self.scratch_menu.is_some()
+            || self.is_notes_shown()
+            || self.is_filtering
+            || self.is_help
+            || !self.reviews.is_empty()
+            || self.pending.is_some()
+            || self.shipping.is_some();
+        if self.look != crate::config::Look::Panels || !key.modifiers.is_empty() || is_taken {
+            return false;
+        }
+        match Panel::ALL
+            .into_iter()
+            .find(|p| p.number() == c as u8 - b'0')
+        {
+            Some(panel) => {
+                self.is_window_focused = false;
+                self.is_inserting = false;
+                self.is_usage_focused = false;
+                self.panel = panel;
+            }
+            None if !self.is_window_focused => self.cycle_keys(),
+            None => {}
+        }
+        true
+    }
+
     /// Ctrl+F: zooms `what`, the table from the table and the windows from
     /// a window with the keys, or zooms back out.
     pub fn toggle_zoom(&mut self, what: Zoom) {
+        // The panels layout has no zoom yet: its panels and window stay put.
+        if self.look == crate::config::Look::Panels {
+            return;
+        }
         self.zoom = match self.zoom {
             Some(_) => None,
             None => Some(what),
@@ -1376,6 +1458,10 @@ impl App {
     /// tree it was on kept on the left, with the cursor moved to the next
     /// tree down; or back to one, keeping the window that had the keys.
     pub fn toggle_double(&mut self) {
+        // The panels layout shows one tree in its window, for now.
+        if self.look == crate::config::Look::Panels {
+            return;
+        }
         // A double whose other tree has left the pool counts as none, so
         // this opens a new one rather than only forgetting it.
         let was_double = self.other_window().is_some();
@@ -4523,6 +4609,9 @@ impl App {
         if self.palette.is_some() {
             return self.handle_palette_key(key);
         }
+        if self.focus_by_number(key) {
+            return Outcome::Continue;
+        }
         if self.view.is_some() && self.has_keys_on(WindowTab::Diff) {
             return self.handle_view_key(key);
         }
@@ -4918,6 +5007,49 @@ mod tests {
 
     fn press(app: &mut App, code: KeyCode) -> Outcome {
         app.handle_key(KeyEvent::from(code))
+    }
+
+    #[test]
+    fn number_keys_give_the_keys_to_a_panel_or_the_window_only_in_the_panels_layout() {
+        let mut app = crate::inbox::tests::app();
+        app.reselect(Some(app.trees[0].path.clone()));
+        app.tab = WindowTab::Diff;
+        press(&mut app, KeyCode::Char('3'));
+        assert_eq!(app.panel, Panel::Trees, "the table layout has no panels");
+        app.look = crate::config::Look::Panels;
+        press(&mut app, KeyCode::Char('3'));
+        assert_eq!((app.panel, app.is_window_focused), (Panel::Ship, false));
+        press(&mut app, KeyCode::Char('0'));
+        assert!(app.is_window_focused, "0 gives the window the keys");
+        // From the window in Normal a panel number takes them back.
+        press(&mut app, KeyCode::Char('4'));
+        assert_eq!((app.panel, app.is_window_focused), (Panel::News, false));
+        // Typing a filter keeps its digits.
+        press(&mut app, KeyCode::Char('2'));
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Char('1'));
+        assert_eq!((app.panel, app.filter.as_str()), (Panel::Trees, "1"));
+    }
+
+    #[test]
+    fn the_panels_layout_has_no_zoom_or_double_yet() {
+        // On a tree, so the table layout opens both and only the layout
+        // keeps the panels' from opening.
+        for (look, opens) in [
+            (crate::config::Look::Table, true),
+            (crate::config::Look::Panels, false),
+        ] {
+            let mut app = crate::inbox::tests::app();
+            app.reselect(Some(app.trees[0].path.clone()));
+            app.look = look;
+            app.toggle_zoom(Zoom::Table);
+            app.toggle_double();
+            assert_eq!(
+                (app.zoom.is_some(), app.other.is_some()),
+                (opens, opens),
+                "{look:?}"
+            );
+        }
     }
 
     fn names(jobs: &[Job]) -> Vec<(Kind, &str)> {

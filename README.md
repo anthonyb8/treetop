@@ -198,6 +198,11 @@ on_return = ["harness", "stack", "down"]
 
 A hook is a command and its arguments, run in the tree with `TREETOP_TREE`, `TREETOP_BRANCH` and `TREETOP_TICKET` set, and given two minutes.
 
+`layout = "panels"` lays the Trees screen out in numbered panels down the left, with the tree under the cursor in a window on the right, [0]: [1] Waiting, [2] Trees, which holds the table, [3] Ship and [4] News, the last three still being built.
+The number keys give a panel the keys, from the table or the window in Normal, and 0 gives them to the window; the bar names the panel with the keys and shows its keys.
+In it the PR tab's sections step with `h` and `l` only, and the double and zoom are off.
+On a screen under 120 columns or 30 rows the table layout shows instead, and `layout = "table"`, the default, keeps it.
+
 A repository can add hooks of its own under `[repos]`.
 Its `on_return` runs in each of its trees after the global one, for what only it needs, such as clearing a Rust tree's build leftovers so a returned tree does not keep tens of gigabytes of old test binaries.
 Its `on_catch_up` runs in its main checkout each time treetop fast-forwards it (see [Use](#use)), given ten minutes, so what new trees are seeded from, such as installed packages, keeps up with the base; a failure shows on the status line.

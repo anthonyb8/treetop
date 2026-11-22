@@ -17,12 +17,13 @@ use ratatui::widgets::{
 
 use crate::agents::{Agent, Status};
 use crate::app::{
-    App, DiffView, Group, Item, JobState, ListRow, LogEntry, Opening, Outcome, Pending, Phone,
-    Picker, PortMenu, Reach, Review, SCRATCH, ScratchMenu, Shipping, WindowTab, Zoom,
+    App, DiffView, Group, Item, JobState, ListRow, LogEntry, Opening, Outcome, Panel, Pending,
+    Phone, Picker, PortMenu, Reach, Review, SCRATCH, ScratchMenu, Shipping, WindowTab, Zoom,
 };
 use crate::assistant;
 use crate::chat::Chat;
 use crate::coderabbit;
+use crate::config::Look;
 use crate::diff::{Change, FileDiff, Layout as DiffLayout, Row as DiffRow, Side, ViewRow};
 use crate::dispatch::{Prompt, Purpose, Target};
 use crate::guard;
@@ -181,7 +182,36 @@ pub fn draw(
         None => {
             let rows = screen_rows(frame.area());
             let windows = windows(app, rows.main);
-            if is_classic(app) {
+            // Marked only while nothing else takes the keys: a window,
+            // a compose box or the palette. In Normal's green, as a
+            // window and the Usage column are with the keys.
+            let has_keys = !app.is_window_focused
+                && !app.has_usage_keys()
+                && app.prompt.is_none()
+                && app.palette.is_none();
+            if let Some(panels) = windows.panels {
+                // Numbered as their keys are; [2] holds the table, the
+                // others wait for what fills them.
+                let boxes = [
+                    (Panel::Waiting, panels.waiting),
+                    (Panel::Trees, windows.top),
+                    (Panel::Ship, panels.ship),
+                    (Panel::News, panels.news),
+                ];
+                for (panel, area) in boxes {
+                    let focused = has_keys && app.panel == panel;
+                    let block = window_block(focused.then_some(Mode::Normal)).title(format!(
+                        " [{}] {} ",
+                        panel.number(),
+                        panel.title()
+                    ));
+                    let body = block.inner(area);
+                    frame.render_widget(block, area);
+                    if panel == Panel::Trees {
+                        draw_table(frame, app, body, false, true);
+                    }
+                }
+            } else if is_classic(app) {
                 // Zoomed, the table is the screen treetop had before its
                 // windows: unboxed, the detail pane under it.
                 let [body, detail] =
@@ -191,7 +221,7 @@ pub fn draw(
                 let count = u16::from(count_area(app, rows.main).is_some());
                 let [_, body] =
                     Layout::vertical([Constraint::Length(count), Constraint::Fill(1)]).areas(body);
-                draw_table(frame, app, body, false);
+                draw_table(frame, app, body, false, false);
                 draw_detail(frame, app, detail);
             } else {
                 let fold = folds(app, rows.main);
@@ -201,17 +231,10 @@ pub fn draw(
                 } else {
                     " Trees "
                 };
-                // Marked only while nothing else takes the keys: a window,
-                // a compose box or the palette. In Normal's green, as a
-                // window and the Usage column are with the keys.
-                let has_keys = !app.is_window_focused
-                    && !app.has_usage_keys()
-                    && app.prompt.is_none()
-                    && app.palette.is_none();
                 let block = window_block(has_keys.then_some(Mode::Normal)).title(title);
                 let body = block.inner(windows.top);
                 frame.render_widget(block, windows.top);
-                draw_table(frame, app, body, fold);
+                draw_table(frame, app, body, fold, false);
             }
             if let Some(area) = windows.window {
                 let screen = frame.area();
@@ -229,7 +252,7 @@ pub fn draw(
             if let Some(area) = windows.usage {
                 draw_usage_column(frame, app, area);
             }
-            draw_footer(frame, app, rows.footer);
+            draw_footer(frame, app, rows.footer, windows.panels.is_some());
         }
     }
     let popup_chat = chat.filter(|c| floats(app, is_popup_chat(c), frame.area()));
@@ -872,7 +895,8 @@ fn port_spans(app: &App, tree: &Tree) -> Vec<Span<'static>> {
     spans
 }
 
-fn row(app: &App, tree: &Tree) -> Row<'static> {
+/// A tree's cells, in the full table's column order.
+fn row(app: &App, tree: &Tree) -> Vec<Cell<'static>> {
     let t = theme();
     let mark = if app.marked.contains(&tree.path) {
         Span::styled("*", fg(t.accent).add_modifier(Modifier::BOLD))
@@ -907,24 +931,60 @@ fn row(app: &App, tree: &Tree) -> Row<'static> {
     if app.is_shipping() {
         cells.push(pr_cell(tree));
     }
-    Row::new(cells).style(if app.is_cached {
-        Style::new().add_modifier(Modifier::ITALIC)
-    } else {
-        Style::new()
-    })
+    cells
 }
 
-fn draw_table(frame: &mut Frame, app: &App, area: Rect, fold: bool) {
-    let t = theme();
-    let mut titles = vec!["", "#", "STATUS", "TICKET", "BRANCH", "AGENT"];
+/// The columns the table draws, each its title, width and place in a
+/// row's cells: all of them, or in [2] Trees of the panels layout the few
+/// that fit beside the window, which shows the rest.
+fn columns(app: &App, compact: bool) -> Vec<(&'static str, Constraint, usize)> {
+    let mut all = vec![
+        ("", Constraint::Length(1)),
+        ("#", Constraint::Length(4)),
+        ("STATUS", Constraint::Length(13)),
+        ("TICKET", Constraint::Length(9)),
+        ("BRANCH", Constraint::Fill(3)),
+        ("AGENT", Constraint::Fill(2)),
+    ];
     if !app.runs.is_empty() {
-        titles.push("RUN");
+        all.push(("RUN", Constraint::Length(18)));
     }
-    titles.extend(["PORTS", "GIT"]);
+    all.extend([
+        ("PORTS", Constraint::Length(17)),
+        ("GIT", Constraint::Length(14)),
+    ]);
     if app.is_shipping() {
-        titles.push("PR");
+        all.push(("PR", Constraint::Length(14)));
     }
-    let header = Row::new(titles).style(t.header);
+    let numbered = all
+        .into_iter()
+        .enumerate()
+        .map(|(at, (title, width))| (title, width, at));
+    if !compact {
+        return numbered.collect();
+    }
+    numbered
+        .filter_map(|(title, width, at)| match title {
+            "" | "#" | "BRANCH" => Some((title, width, at)),
+            "STATUS" => Some((title, Constraint::Length(10), at)),
+            "PORTS" => Some((title, Constraint::Length(8), at)),
+            "GIT" => Some((title, Constraint::Length(6), at)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn draw_table(frame: &mut Frame, app: &App, area: Rect, fold: bool, compact: bool) {
+    let t = theme();
+    let columns = columns(app, compact);
+    let header = Row::new(columns.iter().map(|(title, ..)| *title)).style(t.header);
+    // Only the columns drawn, a heading's missing ones left blank.
+    let pick = |mut cells: Vec<Cell<'static>>| -> Vec<Cell<'static>> {
+        columns
+            .iter()
+            .map(|(.., at)| cells.get_mut(*at).map(std::mem::take).unwrap_or_default())
+            .collect()
+    };
     // A blank line sets each heading apart from the trees above it. The
     // cursor never lands on one, so each pushes the rows below it one
     // further down the table.
@@ -942,30 +1002,20 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect, fold: bool) {
             selected = rows.len();
         }
         rows.push(match list_row {
-            ListRow::Tree(tree) => row(app, tree),
+            ListRow::Tree(tree) => Row::new(pick(row(app, tree))).style(if app.is_cached {
+                Style::new().add_modifier(Modifier::ITALIC)
+            } else {
+                Style::new()
+            }),
             ListRow::Heading {
                 group,
                 count,
                 waiting,
                 is_folded,
-            } => heading_row(app, &group, count, waiting, is_folded),
+            } => Row::new(pick(heading_row(app, &group, count, waiting, is_folded))),
         });
     }
-    let mut widths = vec![
-        Constraint::Length(1),
-        Constraint::Length(4),
-        Constraint::Length(13),
-        Constraint::Length(9),
-        Constraint::Fill(3),
-        Constraint::Fill(2),
-    ];
-    if !app.runs.is_empty() {
-        widths.push(Constraint::Length(18));
-    }
-    widths.extend([Constraint::Length(17), Constraint::Length(14)]);
-    if app.is_shipping() {
-        widths.push(Constraint::Length(14));
-    }
+    let widths: Vec<Constraint> = columns.iter().map(|(_, width, _)| *width).collect();
     let table = Table::new(rows, widths)
         .header(header)
         .row_highlight_style(t.cursor);
@@ -1005,7 +1055,7 @@ fn heading_row(
     count: usize,
     waiting: usize,
     is_folded: bool,
-) -> Row<'static> {
+) -> Vec<Cell<'static>> {
     let t = theme();
     let glyph = if is_folded { "▸" } else { "▾" };
     let main = app
@@ -1066,7 +1116,7 @@ fn heading_row(
         cells.push(ports_cell(app, main));
         cells.push(git_cell(main, app.behind));
     }
-    Row::new(cells)
+    cells
 }
 
 /// Where the tree is, who holds it, its agents, ports and processes.
@@ -1326,10 +1376,13 @@ impl Mode {
 /// What the left of the bottom bar says: the mode, then the filter being
 /// typed, the error or message there is, or the filter narrowing the list.
 /// The keys are on `?`.
-fn footer_left(app: &App) -> Line<'static> {
+fn footer_left(app: &App, is_panels: bool) -> Line<'static> {
     let t = theme();
     let mode = Mode::of(app);
-    let mut spans = vec![Span::styled(mode.label(), t.badge.bg(mode.color()))];
+    let mut spans = vec![Span::styled(
+        badge(app, is_panels),
+        t.badge.bg(mode.color()),
+    )];
     if app.is_filtering {
         spans.push(Span::raw(format!(
             " Filter: {}_   Enter keeps it, Esc clears it",
@@ -1344,13 +1397,57 @@ fn footer_left(app: &App) -> Line<'static> {
             format!(" filter: {}", app.filter),
             fg(t.accent),
         ));
+    } else if is_panels {
+        for (key, does) in panel_keys(app) {
+            spans.push(Span::styled(
+                format!("  {key}"),
+                fg(t.info).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(format!(" {does}"), fg(t.muted)));
+        }
     }
     Line::from(spans)
 }
 
+/// The bar's badge: the mode, and in the panels layout the panel that has
+/// the keys where the table's would say TABLE.
+fn badge(app: &App, is_panels: bool) -> String {
+    match Mode::of(app) {
+        Mode::Table if is_panels => format!(" PANEL {} ", app.panel.number()),
+        mode => mode.label().to_string(),
+    }
+}
+
+/// The keys of what has them in the panels layout, for the bar: the
+/// window's, [2] Trees', and only the panel keys for the panels still
+/// empty.
+fn panel_keys(app: &App) -> &'static [(&'static str, &'static str)] {
+    if app.is_window_focused {
+        return &[
+            ("i", "insert"),
+            ("[ ]", "tabs"),
+            ("Esc", "back"),
+            ("1-4", "panels"),
+        ];
+    }
+    match app.panel {
+        Panel::Trees => &[
+            ("j/k", "move"),
+            ("Enter", "chat"),
+            ("n", "new agent"),
+            ("r", "return"),
+            ("Space", "mark"),
+            ("/", "filter"),
+            ("0", "window"),
+            ("1-4", "panels"),
+        ],
+        _ => &[("0", "window"), ("1-4", "panels")],
+    }
+}
+
 /// The bottom bar: the mode and a message on the left, the summary on the
 /// right.
-fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_footer(frame: &mut Frame, app: &App, area: Rect, is_panels: bool) {
     let t = theme();
     // The message keeps at least MESSAGE_ROOM columns; a full summary that
     // would squeeze it gives way to the compact one.
@@ -1362,13 +1459,16 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         full
     };
     // The mode stays whole however narrow the bar: the summary is cut first.
-    let mode = u16::try_from(Mode::of(app).label().len()).unwrap_or(u16::MAX);
+    let mode = u16::try_from(badge(app, is_panels).len()).unwrap_or(u16::MAX);
     let right_width = u16::try_from(right.width())
         .unwrap_or(u16::MAX)
         .min(area.width.saturating_sub(mode));
     let [left_area, right_area] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(right_width)]).areas(area);
-    frame.render_widget(Paragraph::new(footer_left(app)).style(t.bar), left_area);
+    frame.render_widget(
+        Paragraph::new(footer_left(app, is_panels)).style(t.bar),
+        left_area,
+    );
     frame.render_widget(Paragraph::new(right).style(t.bar), right_area);
 }
 
@@ -1428,11 +1528,66 @@ struct Windows {
     usage: Option<Rect>,
     /// The window under them, showing the tree under the cursor.
     window: Option<Rect>,
+    /// In the panels layout, the panels beside [2] Trees, which is `top`;
+    /// `window` is then [0] on the right.
+    panels: Option<PanelAreas>,
+}
+
+/// The panels layout's other panels down the left, around [2] Trees.
+#[derive(Debug, Clone, Copy)]
+struct PanelAreas {
+    waiting: Rect,
+    ship: Rect,
+    news: Rect,
+}
+
+/// The smallest screen above the bar the panels layout is drawn on; below
+/// it the table layout is, until the panels have a small-terminal form.
+const PANELS_MIN_WIDTH: u16 = 120;
+const PANELS_MIN_HEIGHT: u16 = 30;
+
+/// The share of the width the panels down the left take, between their
+/// fewest and most columns, the window on the right taking the rest.
+const PANELS_SHARE: u16 = 36;
+const PANELS_MIN_COLUMNS: u16 = 48;
+const PANELS_MAX_COLUMNS: u16 = 72;
+
+/// The panels layout on `main`, when the config asks for it and the screen
+/// has room: [1] to [4] down the left, [2] Trees the tallest, and the
+/// window on the right.
+fn panels(app: &App, main: Rect) -> Option<Windows> {
+    if app.look != Look::Panels || main.width < PANELS_MIN_WIDTH || main.height < PANELS_MIN_HEIGHT
+    {
+        return None;
+    }
+    let columns = (main.width * PANELS_SHARE / 100).clamp(PANELS_MIN_COLUMNS, PANELS_MAX_COLUMNS);
+    let [left, window] =
+        Layout::horizontal([Constraint::Length(columns), Constraint::Fill(1)]).areas(main);
+    let [waiting, trees, ship, news] = Layout::vertical([
+        Constraint::Fill(2),
+        Constraint::Fill(4),
+        Constraint::Fill(2),
+        Constraint::Fill(3),
+    ])
+    .areas(left);
+    Some(Windows {
+        top: trees,
+        usage: None,
+        window: Some(window),
+        panels: Some(PanelAreas {
+            waiting,
+            ship,
+            news,
+        }),
+    })
 }
 
 /// The table's window, the column beside it and the window under both,
-/// on `main`.
+/// on `main`, or the panels layout's panels and window.
 fn windows(app: &App, main: Rect) -> Windows {
+    if let Some(panels) = panels(app, main) {
+        return panels;
+    }
     let laid = lay_out(app, main);
     // From USAGE_FROM the column sits beside the table, its height, but
     // not beside the table folded to the windows' rows.
@@ -1462,6 +1617,7 @@ fn lay_out(app: &App, main: Rect) -> Windows {
                 top: main,
                 usage: None,
                 window: None,
+                panels: None,
             };
         }
         // The windows, under the rows of their trees and the header.
@@ -1475,6 +1631,7 @@ fn lay_out(app: &App, main: Rect) -> Windows {
                 top,
                 usage: None,
                 window: Some(window),
+                panels: None,
             };
         }
         _ => {}
@@ -1501,6 +1658,7 @@ fn lay_out(app: &App, main: Rect) -> Windows {
             top: main,
             usage: None,
             window: None,
+            panels: None,
         };
     }
     let [top, window] =
@@ -1509,6 +1667,7 @@ fn lay_out(app: &App, main: Rect) -> Windows {
         top,
         usage: None,
         window: Some(window),
+        panels: None,
     }
 }
 
@@ -2085,12 +2244,21 @@ fn draw_window(frame: &mut Frame, app: &App, area: Rect, pane: &Pane, chat: Opti
     } else {
         String::new()
     };
+    // In the panels layout the window is [0], as its number key is.
+    let number = if windows(app, screen_rows(frame.area()).main)
+        .panels
+        .is_some()
+    {
+        "[0] "
+    } else {
+        ""
+    };
     let title = tree.map(|tree| {
         let branch = tree.branch.as_deref().unwrap_or("(detached)");
         if tree.is_main {
-            format!(" {mark}{alone}main checkout · {branch} ")
+            format!(" {number}{mark}{alone}main checkout · {branch} ")
         } else {
-            format!(" {mark}{alone}Tree {} · {branch} ", tree.name)
+            format!(" {number}{mark}{alone}Tree {} · {branch} ", tree.name)
         }
     });
     let mode = if pane.is_inserting {
@@ -2098,7 +2266,15 @@ fn draw_window(frame: &mut Frame, app: &App, area: Rect, pane: &Pane, chat: Opti
     } else {
         Mode::Normal
     };
-    let block = window_block(pane.has_keys.then_some(mode)).title(title.unwrap_or_default());
+    // With no tree, on a heading, the panels layout's window keeps its number.
+    let title = title.unwrap_or_else(|| {
+        if number.is_empty() {
+            String::new()
+        } else {
+            format!(" {number}")
+        }
+    });
+    let block = window_block(pane.has_keys.then_some(mode)).title(title);
     frame.render_widget(block, area);
     let [bar, body] = window_areas(area);
     let Some(tree) = tree else {
@@ -7925,5 +8101,126 @@ mod window_tests {
         app.prompt = None;
         app.open_palette();
         assert_eq!(table(&app), theme().border, "the palette has them");
+    }
+}
+
+/// The panels layout (ANB-102): what `layout = "panels"` draws, and that a
+/// screen too small for it keeps the table layout.
+#[cfg(test)]
+mod panels_tests {
+    use super::*;
+    use crate::inbox::tests::app;
+
+    fn screen(app: &App, width: u16, height: u16) -> Vec<String> {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, app, None, None, None))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    fn panels() -> App {
+        let mut app = app();
+        app.look = Look::Panels;
+        app
+    }
+
+    #[test]
+    fn the_panels_are_numbered_down_the_left_with_the_trees_in_two() {
+        let shown = screen(&panels(), 160, 46);
+        let row = |text: &str| {
+            shown
+                .iter()
+                .position(|l| l.contains(text))
+                .unwrap_or_else(|| panic!("{text} is not on screen:\n{}", shown.join("\n")))
+        };
+        // Down the left in order, the window on the right.
+        let (waiting, trees, ship, news) = (
+            row("[1] Waiting"),
+            row("[2] Trees"),
+            row("[3] Ship"),
+            row("[4] News"),
+        );
+        assert!(waiting < trees && trees < ship && ship < news);
+        // On a heading the window has no tree, and is still [0].
+        assert!(shown[waiting].contains("┌ [0] ─"), "{}", shown[waiting]);
+        assert!(shown[waiting].find("[0]").unwrap() > shown[trees].find("[2]").unwrap());
+        // [2] holds the table, its trees between it and [3].
+        let branch = row("me/help-columns");
+        assert!(trees < branch && branch < ship, "{}", shown.join("\n"));
+        assert!(shown[trees + 1].contains("BRANCH"));
+        assert!(shown.last().unwrap().starts_with(" PANEL 2 "));
+    }
+
+    #[test]
+    fn a_screen_too_small_for_the_panels_shows_the_table_layout() {
+        for (width, height) in [(119, 46), (160, 29)] {
+            let shown = screen(&panels(), width, height);
+            let all = shown.join("\n");
+            assert!(!all.contains("[2] Trees"), "{width}x{height}:\n{all}");
+            assert!(shown[0].starts_with("┌ Trees "), "{width}x{height}:\n{all}");
+            assert!(shown.last().unwrap().starts_with(" TABLE "));
+        }
+    }
+
+    /// The numbered boxes whose border is Normal's green, the colour of
+    /// what has the keys: "[2]" for [2] Trees.
+    fn green(app: &App) -> Vec<String> {
+        let (width, height) = (160, 46);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, app, None, None, None))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut boxes = Vec::new();
+        for y in 0..height {
+            for x in 0..width.saturating_sub(4) {
+                let at = |dx: u16| buffer[(x + dx, y)].symbol().to_string();
+                if at(0) == "┌" && at(2) == "[" && at(4) == "]" {
+                    let number = format!("[{}]", at(3));
+                    if buffer[(x, y)].fg == Mode::Normal.color() {
+                        boxes.push(number);
+                    }
+                }
+            }
+        }
+        boxes
+    }
+
+    #[test]
+    fn the_green_border_follows_the_keys_from_panel_to_panel_and_to_the_window() {
+        let mut app = panels();
+        app.selected = 1;
+        assert_eq!(green(&app), ["[2]"]);
+        app.panel = Panel::News;
+        assert_eq!(green(&app), ["[4]"]);
+        // The window with the keys is green instead, and the bar shows its
+        // keys; its height is what the main loop gives it each frame.
+        app.window_rows = 40;
+        app.is_window_focused = true;
+        assert_eq!(green(&app), ["[0]"]);
+        let bar = screen(&app, 160, 46).pop().unwrap();
+        assert!(
+            bar.starts_with(" NORMAL ") && bar.contains("i insert"),
+            "{bar}"
+        );
+    }
+
+    #[test]
+    fn the_bar_names_the_panel_with_the_keys_and_shows_only_its_keys() {
+        let mut app = panels();
+        app.panel = Panel::Ship;
+        let bar = screen(&app, 160, 46).pop().unwrap();
+        assert!(bar.starts_with(" PANEL 3 "), "{bar}");
+        assert!(
+            bar.contains("0 window") && bar.contains("1-4 panels"),
+            "{bar}"
+        );
+        assert!(!bar.contains("j/k move"), "{bar}");
     }
 }

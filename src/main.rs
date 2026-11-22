@@ -1270,7 +1270,12 @@ fn show(
         if let Some(file) = state::asked_file(&checkout) {
             app.keep_asked_in(file);
         }
-        if let Some(file) = state::layout_file(&checkout) {
+        app.look = config::load().map(|c| c.layout).unwrap_or_default();
+        // The panels layout shows one tree, so a double kept from the table
+        // waits in its file for it.
+        if app.look == config::Look::Table
+            && let Some(file) = state::layout_file(&checkout)
+        {
             app.keep_layout_in(file);
         }
         if let Some(file) = state::put_away_file() {

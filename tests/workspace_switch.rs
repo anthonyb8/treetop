@@ -189,7 +189,8 @@ fn shells(file: &Path) -> Vec<i32> {
 
 /// Two pooled repositories, `here` and `there`, each with tree 1 leased,
 /// both workspaces with `here` opened last, and treetop started on `here`
-/// in a terminal of its own, against stand-ins for everything it reads.
+/// in a terminal of its own, against stand-ins for everything it reads,
+/// with `config` as its config file.
 struct Workspaces {
     root: PathBuf,
     /// Where the stand-in shell writes down each one it starts.
@@ -197,7 +198,7 @@ struct Workspaces {
     screen: Screen,
 }
 
-fn two_workspaces(name: &str) -> Workspaces {
+fn two_workspaces(name: &str, config: &str) -> Workspaces {
     let root = std::env::temp_dir().join(format!("treetop-{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     let bin = root.join("bin");
@@ -242,6 +243,8 @@ fn two_workspaces(name: &str) -> Workspaces {
     .unwrap();
 
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    fs::create_dir_all(root.join("config/treetop")).unwrap();
+    fs::write(root.join("config/treetop/config.toml"), config).unwrap();
     let screen = Screen::start(
         Command::new(env!("CARGO_BIN_EXE_treetop"))
             .current_dir(root.join("here-trees/1"))
@@ -268,7 +271,7 @@ fn a_shell_left_for_another_workspace_is_the_same_shell_on_coming_back() {
         started,
         mut screen,
         ..
-    } = two_workspaces("switch");
+    } = two_workspaces("switch", "");
     screen.wait_on("here");
     screen.wait_for("tree 1's window", |text| {
         text.contains("Tree 1 · here-work")
@@ -344,7 +347,7 @@ impl Drop for Asker {
 fn an_agent_asking_in_another_workspace_shows_within_seconds() {
     let Workspaces {
         root, mut screen, ..
-    } = two_workspaces("asking");
+    } = two_workspaces("asking", "");
     screen.wait_on("here");
     screen.wait_for("tree 1's window", |text| {
         text.contains("Tree 1 · here-work")
@@ -390,6 +393,43 @@ fn an_agent_asking_in_another_workspace_shows_within_seconds() {
         std::thread::sleep(Duration::from_millis(50));
     }
     drop(asker);
+    drop(screen);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// ANB-102: with `layout = "panels"`, treetop opens on its numbered panels
+/// with the tree under the cursor in the window, and the number keys move
+/// the keys between them, the bar saying which has them.
+#[test]
+fn the_panels_layout_opens_on_numbered_panels_and_number_keys_move_the_keys() {
+    let Workspaces {
+        root, mut screen, ..
+    } = two_workspaces("panels", "layout = \"panels\"\n");
+    screen.wait_for("the numbered panels and the window", |text| {
+        [
+            "[1] Waiting",
+            "[2] Trees",
+            "[3] Ship",
+            "[4] News",
+            "[0] Tree 1 · here-work",
+        ]
+        .iter()
+        .all(|title| text.contains(title))
+    });
+    let bar = |text: &str| text.lines().last().unwrap_or_default().to_string();
+    assert!(
+        bar(&screen.text()).starts_with(" PANEL 2 "),
+        "{}",
+        screen.text()
+    );
+    screen.press("3");
+    screen.wait_for("panel 3 with the keys", |text| {
+        bar(text).starts_with(" PANEL 3 ")
+    });
+    screen.press("2");
+    screen.wait_for("panel 2 with the keys", |text| {
+        bar(text).starts_with(" PANEL 2 ") && bar(text).contains("j/k move")
+    });
     drop(screen);
     let _ = fs::remove_dir_all(&root);
 }
