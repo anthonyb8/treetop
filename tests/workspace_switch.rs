@@ -293,7 +293,7 @@ fn a_shell_left_for_another_workspace_is_the_same_shell_on_coming_back() {
         started,
         mut screen,
         ..
-    } = two_workspaces("switch", "");
+    } = two_workspaces("switch", "layout = \"table\"\n");
     screen.wait_on("here");
     screen.wait_for("tree 1's window", |text| {
         text.contains("Tree 1 · here-work")
@@ -369,7 +369,7 @@ impl Drop for Asker {
 fn an_agent_asking_in_another_workspace_shows_within_seconds() {
     let Workspaces {
         root, mut screen, ..
-    } = two_workspaces("asking", "");
+    } = two_workspaces("asking", "layout = \"table\"\n");
     screen.wait_on("here");
     screen.wait_for("tree 1's window", |text| {
         text.contains("Tree 1 · here-work")
@@ -419,14 +419,14 @@ fn an_agent_asking_in_another_workspace_shows_within_seconds() {
     let _ = fs::remove_dir_all(&root);
 }
 
-/// ANB-102: with `layout = "panels"`, treetop opens on its numbered panels
-/// with the tree under the cursor in the window, and the number keys move
-/// the keys between them, the bar saying which has them.
+/// ANB-102, ANB-108: with no `layout` in the config, treetop opens on its
+/// numbered panels with the tree under the cursor in the window, and the
+/// number keys move the keys between them, the bar saying which has them.
 #[test]
-fn the_panels_layout_opens_on_numbered_panels_and_number_keys_move_the_keys() {
+fn with_no_layout_set_treetop_opens_on_numbered_panels_and_number_keys_move_the_keys() {
     let Workspaces {
         root, mut screen, ..
-    } = two_workspaces("panels", "layout = \"panels\"\n");
+    } = two_workspaces("panels", "");
     screen.wait_for("the numbered panels and the window", |text| {
         [
             "[1] Waiting",

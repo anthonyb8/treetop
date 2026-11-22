@@ -666,6 +666,8 @@ pub mod tests {
     /// agent waits on you in its tree 12.
     pub fn app() -> App {
         let mut app = App::new(None);
+        // The table layout, which these trees were drawn in first.
+        app.look = crate::config::Look::Table;
         let mut asking = tree(
             "/pool/4/app",
             "4",

@@ -317,8 +317,8 @@ pub struct Config {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Look {
-    #[default]
     Table,
+    #[default]
     Panels,
 }
 
@@ -417,9 +417,9 @@ mod tests {
     }
 
     #[test]
-    fn the_layout_is_the_table_unless_it_says_panels() {
-        assert_eq!(parse("").unwrap().layout, Look::Table);
-        assert_eq!(parse("layout = \"panels\"").unwrap().layout, Look::Panels);
+    fn the_layout_is_the_panels_unless_it_says_table() {
+        assert_eq!(parse("").unwrap().layout, Look::Panels);
+        assert_eq!(parse("layout = \"table\"").unwrap().layout, Look::Table);
         assert!(
             parse("layout = \"panel\"").is_err(),
             "a misspelt layout says so"

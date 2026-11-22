@@ -6663,6 +6663,7 @@ mod sidebar_tests {
     /// A tree with a keel session working in it under a keel run.
     fn keel_app() -> App {
         let mut app = App::new(None);
+        app.look = crate::config::Look::Table;
         let mut agent = agent();
         agent.name = "fix-retry".into();
         agent.label = Some("keel".into());
