@@ -586,6 +586,33 @@ impl Screen {
             .to_vec(),
         ))
         .style(p.header);
+        // The compact list gives the title what it can: an id of eight,
+        // `urg`, and `12 · waiting` are as wide as its columns go.
+        let id_width = match (is_compact, self.marked.is_empty()) {
+            (true, true) => 9,
+            (true, false) => 11,
+            (false, true) => 10,
+            (false, false) => 12,
+        };
+        // The compact list cuts a long title with an ellipsis, as [1]'s
+        // title is, rather than mid-word at WORK: its room is what the box
+        // leaves after a column of air each side, ID, PRI, WORK and the
+        // spaces between them.
+        let title_room =
+            usize::from(area.width).saturating_sub(2 + usize::from(id_width) + 4 + 12 + 3);
+        let title_cell = |title: &str| -> Cell<'static> {
+            if !is_compact || Span::raw(title).width() <= title_room {
+                return Cell::from(title.to_string());
+            }
+            let mut cut = String::new();
+            for c in title.chars() {
+                if Span::raw(format!("{cut}{c}")).width() + 1 > title_room {
+                    break;
+                }
+                cut.push(c);
+            }
+            Cell::from(format!("{}…", cut.trim_end()))
+        };
         // A grouped list puts a heading row above each group, so the cursor's
         // row on screen counts the headings above it.
         let mut rows: Vec<Row> = Vec::new();
@@ -633,20 +660,12 @@ impl Screen {
                 id,
                 Cell::from(issue.state.clone()).style(fg(p.info)),
                 priority(issue, p, is_compact),
-                Cell::from(issue.title.clone()),
+                title_cell(&issue.title),
                 Cell::from(issue.labels.join(", ")).style(fg(p.special)),
                 Cell::from(issue.assignee.clone().unwrap_or_default()).style(fg(p.muted)),
                 work_cell(host, &issue.id, p),
             ])));
         }
-        // The compact list gives the title what it can: an id of eight,
-        // `urg`, and `12 · waiting` are as wide as its columns go.
-        let id_width = match (is_compact, self.marked.is_empty()) {
-            (true, true) => 9,
-            (true, false) => 11,
-            (false, true) => 10,
-            (false, false) => 12,
-        };
         let widths: Vec<Constraint> = [
             Constraint::Length(id_width),
             Constraint::Length(14),

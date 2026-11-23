@@ -2838,6 +2838,16 @@ mod tests {
     }
 
     #[test]
+    fn on_the_panels_a_long_title_is_cut_with_an_ellipsis_before_work() {
+        let (mut screen, _) = on_panels(2);
+        screen.issues[0].title = "A very long title that goes on past the edge of the list".into();
+        let (list, _) = drawn_on_panels(&screen, &TreeThree);
+        let row = row_of(&list, "END-1");
+        assert!(row.contains("A very long title"), "{row}");
+        assert!(row.contains("… 3 · no agent "), "{row}");
+    }
+
+    #[test]
     fn on_the_panels_the_list_keeps_a_column_of_air_each_side_as_its_filter_line_does() {
         let (screen, _) = on_panels(2);
         let (list, _) = drawn_on_panels(&screen, &TreeThree);

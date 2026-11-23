@@ -3599,8 +3599,9 @@ fn draw_project(
         "  {done} done · {going} going · {} to start",
         all - done - going
     );
-    // The bar gives way before its words do, in a narrow column.
-    let room = usize::from(body.width).saturating_sub(1 + Span::raw(said.as_str()).width());
+    // The bar gives way before its words do, in a narrow column, with a
+    // space kept each side as on every other line.
+    let room = usize::from(body.width).saturating_sub(2 + Span::raw(said.as_str()).width());
     let mut bar = vec![Span::raw(" ")];
     bar.extend(bar_cells(done, going, all, room.min(16)));
     bar.push(Span::styled(said, fg(t.muted)));
@@ -10991,6 +10992,11 @@ mod panels_tests {
             rows[1].contains("███▓▓▓░░░░░░░░░░  1 done · 1 going · 3 to start"),
             "{all}"
         );
+        // In the narrowest column the bar gives way, and its words keep a
+        // space before the border as every other line does.
+        let narrow = drawn_issues(&app, &issues, 120, 31);
+        let line = narrow.lines().find(|l| l.contains("done · ")).unwrap();
+        assert!(line.contains("3 to start │"), "{line}");
         let row = |id: &str| rows.iter().position(|l| l.contains(id));
         let said = |id: &str| {
             row(id).map_or(String::new(), |at| {
