@@ -21,7 +21,7 @@ use ratatui::style::{Color, Modifier, Style};
 use serde::{Deserialize, Serialize};
 
 pub use backend::{Backend, Linear, READ_ONLY};
-pub use draw::draw_picker;
+pub use draw::{Bar, draw_picker};
 pub use host::{Host, NoTrees, Work};
 pub use markdown::{Piece, pieces, render};
 pub use picker::{Kind as PickerKind, Picked, Picker};

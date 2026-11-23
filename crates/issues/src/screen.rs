@@ -51,7 +51,8 @@ pub enum Action {
 }
 
 /// What fills the screen: the list, with the issue under the cursor
-/// below it, or one issue, whole, to read.
+/// below it, or one issue, whole, to read. On the panels both show, and it
+/// says which has the keys: [2] the list, or [1] the issue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     List,
@@ -102,6 +103,12 @@ pub struct Screen {
     pub(crate) preview_height: Cell<u16>,
     /// Where the preview was last drawn, so the wheel over it scrolls it.
     pub(crate) preview_area: Cell<Rect>,
+    /// The screen is drawn on the panels: the list in [2], the issue under
+    /// the cursor whole in [1], the digits moving the keys between them.
+    pub(crate) is_panels: bool,
+    /// Where [1]'s text was last drawn on the panels, so the wheel over it
+    /// scrolls it from the list.
+    pub(crate) issue_area: Cell<Rect>,
     /// The issues opened from the open one's links, by id, the one on
     /// screen last; Esc goes back along them.
     pub(crate) trail: Vec<String>,
@@ -210,6 +217,8 @@ impl Screen {
             preview_max: Cell::new(0),
             preview_height: Cell::new(0),
             preview_area: Cell::new(Rect::default()),
+            is_panels: false,
+            issue_area: Cell::new(Rect::default()),
             view_height: Cell::new(0),
             trail: Vec::new(),
             target: None,
@@ -258,11 +267,28 @@ impl Screen {
         self.message = Some(message);
     }
 
+    /// Draws the screen on the panels, or on its own, from the next key on:
+    /// the program says which, since it lays the panels out.
+    pub fn set_panels(&mut self, is_panels: bool) {
+        self.is_panels = is_panels;
+    }
+
+    /// [1] has the keys on the panels, or the open issue fills the screen.
+    pub fn is_reading(&self) -> bool {
+        self.focus == Focus::Issue
+    }
+
+    /// The issue on screen is drawn whole, with its images: opened, or in
+    /// [1] beside the list.
+    fn shows_issue_whole(&self) -> bool {
+        self.focus == Focus::Issue || self.is_panels
+    }
+
     /// Whether the screen needs to know how the terminal draws images: an
     /// open issue has some, and it has not asked yet.
     pub fn wants_terminal_asked(&self) -> bool {
         !self.has_asked_terminal
-            && self.focus == Focus::Issue
+            && self.shows_issue_whole()
             && self
                 .targets()
                 .iter()
@@ -406,7 +432,7 @@ impl Screen {
                 id: viewed.0,
             });
         }
-        if self.focus == Focus::Issue && self.has_asked_terminal {
+        if self.shows_issue_whole() && self.has_asked_terminal {
             for target in self.targets() {
                 if let Target::Image { url, .. } = target
                     && !self.pictures.contains_key(&url)
@@ -1116,7 +1142,7 @@ impl Screen {
     /// Folds the group under the cursor to its heading, or unfolds it.
     fn toggle_fold(&mut self) {
         let Some(group) = self.group_of(self.selected) else {
-            self.message = Some("z folds a group: 4 groups the list by status".into());
+            self.message = Some(format!("z folds a group: {}", self.how_to_group()));
             return;
         };
         if self.folded.remove(&group) {
@@ -1131,6 +1157,16 @@ impl Screen {
         self.scroll = 0;
     }
 
+    /// How the list is grouped: by view 4 on its own, and by the filters on
+    /// the panels, where the digits move between them.
+    fn how_to_group(&self) -> &'static str {
+        if self.is_panels {
+            "f groups the list by status"
+        } else {
+            "4 groups the list by status"
+        }
+    }
+
     /// The rows the preview of the issue under the cursor is scrolled down.
     pub(crate) fn preview_scroll(&self, id: &str) -> u16 {
         if self.preview.0 == id {
@@ -1141,8 +1177,14 @@ impl Screen {
     }
 
     /// Scrolls the preview below the list `delta` rows, within what it
-    /// holds, so an issue is read without opening it.
+    /// holds, so an issue is read without opening it; on the panels, [1].
     fn scroll_preview(&mut self, delta: i32) {
+        if self.is_panels {
+            let max = i32::from(self.max_scroll.get());
+            let to = (i32::from(self.scroll) + delta).clamp(0, max);
+            self.scroll = u16::try_from(to).unwrap_or(0);
+            return;
+        }
         let Some(id) = self.current().map(|i| i.id.clone()) else {
             return;
         };
@@ -1158,7 +1200,7 @@ impl Screen {
             .filter_map(|at| self.group_of(at))
             .collect();
         if groups.is_empty() {
-            self.message = Some("Z folds the groups: 4 groups the list by status".into());
+            self.message = Some(format!("Z folds the groups: {}", self.how_to_group()));
             return;
         }
         if groups.is_subset(&self.folded) {
@@ -1367,6 +1409,10 @@ impl Screen {
                     }
                     return Action::None;
                 }
+                KeyCode::Char('2') if self.is_panels => {
+                    self.give_list_keys();
+                    return Action::None;
+                }
                 _ => {}
             }
             let max = self.max_scroll.get();
@@ -1431,16 +1477,15 @@ impl Screen {
             }
             KeyCode::Char('z') => self.toggle_fold(),
             KeyCode::Char('Z') => self.toggle_all_folds(),
-            KeyCode::Enter | KeyCode::Right if self.current().is_some() => {
-                self.focus = Focus::Issue;
-                self.is_from_outside = false;
-                self.scroll = 0;
-                self.target = None;
-            }
+            KeyCode::Enter | KeyCode::Right if self.current().is_some() => self.read(),
             KeyCode::Char('/') => {
                 self.search = Some(self.filters.query.clone().unwrap_or_default());
             }
             KeyCode::Char('f') => self.panel = Some(0),
+            // On the panels the digits move the keys between them, as on the
+            // program's other screens, and the filters do what views did.
+            KeyCode::Char('1') if self.is_panels && self.current().is_some() => self.read(),
+            KeyCode::Char('1'..='9') if self.is_panels => {}
             KeyCode::Char(c @ '1'..='9') => {
                 self.show_view(usize::from(c as u8 - b'1'));
             }
@@ -1456,6 +1501,29 @@ impl Screen {
             _ => return self.on_issue(key),
         }
         Action::None
+    }
+
+    /// Opens the issue under the cursor to read: on the whole screen, or on
+    /// the panels by giving [1] the keys, where it stays as scrolled.
+    fn read(&mut self) {
+        self.focus = Focus::Issue;
+        self.is_from_outside = false;
+        self.target = None;
+        if !self.is_panels {
+            self.scroll = 0;
+        }
+    }
+
+    /// Gives [2] the keys back on the panels: [1] shows the issue under the
+    /// cursor again, not one opened from a link or from the program.
+    fn give_list_keys(&mut self) {
+        if !self.trail.is_empty() {
+            self.trail.clear();
+            self.scroll = 0;
+        }
+        self.focus = Focus::List;
+        self.is_from_outside = false;
+        self.target = None;
     }
 
     /// Moves Tab's mark to the next target, `delta` away, round from the
@@ -1533,7 +1601,11 @@ impl Screen {
     /// list, or the program's own screen when it was opened from there.
     fn back(&mut self) -> Action {
         let from = self.trail.pop();
-        self.scroll = 0;
+        // On the panels [1] goes on showing the issue the list is on, as
+        // it was scrolled.
+        if from.is_some() || !self.is_panels {
+            self.scroll = 0;
+        }
         self.target = None;
         if self.is_from_outside && self.trail.is_empty() {
             self.is_from_outside = false;
@@ -1586,13 +1658,15 @@ impl Screen {
         if !self.wants_mouse() {
             return Action::None;
         }
-        // On the list the wheel scrolls the preview when over it, and moves
-        // through the issues anywhere else.
+        // On the list the wheel scrolls the preview when over it, [1] on the
+        // panels, and moves through the issues anywhere else.
         if self.focus == Focus::List {
-            let is_preview = self
-                .preview_area
-                .get()
-                .contains(Position::new(mouse.column, mouse.row));
+            let preview = if self.is_panels {
+                self.issue_area.get()
+            } else {
+                self.preview_area.get()
+            };
+            let is_preview = preview.contains(Position::new(mouse.column, mouse.row));
             match (mouse.kind, is_preview) {
                 (MouseEventKind::ScrollDown, true) => self.scroll_preview(3),
                 (MouseEventKind::ScrollUp, true) => self.scroll_preview(-3),
@@ -2468,6 +2542,242 @@ mod tests {
             row("END-2")
         );
         assert!(!row("END-1").contains('·'), "{}", row("END-1"));
+        // A tree with no agent yet says so, in the full list's own words.
+        let rows = drawn_with(&screen, &TreeThree, 140);
+        assert!(
+            row_of(&rows, "END-1").trim_end().ends_with("3 · no agent"),
+            "{}",
+            row_of(&rows, "END-1")
+        );
+    }
+
+    /// Tree 3 works on END-1, no agent started in it yet.
+    struct TreeThree;
+
+    impl crate::Host for TreeThree {
+        fn work_on(&self, id: &str) -> Option<crate::Work> {
+            (id == "END-1").then(|| crate::Work {
+                tree: "3".into(),
+                agent: None,
+                needs_you: false,
+                is_ready: false,
+            })
+        }
+    }
+
+    fn row_of(rows: &[String], id: &str) -> String {
+        rows.iter()
+            .find(|r| r.starts_with(id))
+            .unwrap_or_else(|| panic!("{id} is not drawn:\n{}", rows.join("\n")))
+            .clone()
+    }
+
+    /// What `screen` draws on the panels, as the program lays them out on
+    /// 120 by 30: [2]'s body in the left 50 columns, [1]'s in the rest.
+    fn drawn_on_panels(screen: &Screen, host: &dyn crate::Host) -> (Vec<String>, Vec<String>) {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let (list, issue) = (Rect::new(0, 0, 50, 30), Rect::new(50, 0, 70, 30));
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let p = crate::Palette::default();
+        terminal
+            .draw(|frame| {
+                screen.draw_list_panel(frame, list, &p, host);
+                screen.draw_issue(frame, issue, &p, host);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows = |area: Rect| -> Vec<String> {
+            (area.y..area.bottom())
+                .map(|y| {
+                    (area.x..area.right())
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect()
+                })
+                .collect()
+        };
+        (rows(list), rows(issue))
+    }
+
+    /// The screen on the panels over END-1, urgent and assigned, and END-2,
+    /// medium; END-1's description runs to `lines` lines.
+    fn on_panels(lines: usize) -> (Screen, Arc<Fake>) {
+        let fake = Arc::new(Fake {
+            name: "work".into(),
+            issues: vec![
+                Issue {
+                    state: "Todo".into(),
+                    priority: 1,
+                    assignee: Some("Anthony".into()),
+                    labels: vec!["Bug".into()],
+                    project: Some("Panels".into()),
+                    updated_at: "2026-10-17T10:30:00Z".into(),
+                    ..issue("END-1")
+                },
+                Issue {
+                    state: "Todo".into(),
+                    priority: 3,
+                    ..issue("END-2")
+                },
+            ],
+            descriptions: HashMap::from([(
+                "END-1".to_string(),
+                (1..=lines)
+                    .map(|n| format!("line {n}"))
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+            )]),
+            ..Fake::default()
+        });
+        let mut screen = Screen::new(vec![fake.clone()], 0, Vec::new());
+        screen.set_panels(true);
+        settle(&mut screen);
+        (screen, fake)
+    }
+
+    #[test]
+    fn a_narrow_list_drops_whole_filters_rather_than_cut_one_into_the_hints() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let (screen, _) = on_panels(2);
+        let pieces = ["my issues", "open", "by status"];
+        let mut kept_counts = HashSet::new();
+        // From too narrow for the last filter to wide enough for them all.
+        for width in 34..=60 {
+            let mut terminal = Terminal::new(TestBackend::new(width, 3)).unwrap();
+            terminal
+                .draw(|frame| {
+                    let area = Rect::new(0, 0, width, 3);
+                    screen.draw_list_panel(frame, area, &crate::Palette::default(), &TreeFour);
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let line: String = (0..width).map(|x| buffer[(x, 0)].symbol()).collect();
+            let line = line.trim_end();
+            let (said, hints) = line.split_once("f filters").expect(line);
+            assert_eq!(hints, "  / search", "{width}: {line}");
+            assert!(
+                said.ends_with("  "),
+                "{width}: two spaces before the hints: {line}"
+            );
+            // Whole filters from the first, an ellipsis saying some are gone.
+            let words: Vec<&str> = said.split_whitespace().collect();
+            let kept = (1..=pieces.len()).find(|&kept| {
+                let mut shown = pieces[..kept].join(" · ");
+                if kept < pieces.len() {
+                    shown.push_str(" …");
+                }
+                shown.split_whitespace().eq(words.iter().copied())
+            });
+            let kept = kept.unwrap_or_else(|| panic!("{width}: {line}"));
+            kept_counts.insert(kept);
+        }
+        assert_eq!(kept_counts.len(), pieces.len(), "{kept_counts:?}");
+    }
+
+    #[test]
+    fn on_the_panels_the_list_keeps_four_columns_and_1_shows_the_issue_whole() {
+        let (mut screen, _) = on_panels(2);
+        let (list, issue) = drawn_on_panels(&screen, &TreeFour);
+        let header = list.iter().find(|r| r.starts_with("ID")).unwrap();
+        let words: Vec<&str> = header.split_whitespace().collect();
+        assert_eq!(words, ["ID", "PRI", "TITLE", "WORK"], "{}", list.join("\n"));
+        let first = row_of(&list, "END-1");
+        assert!(
+            first.contains(" urg ") && first.contains("END-1 title"),
+            "{first}"
+        );
+        let second = row_of(&list, "END-2");
+        assert!(second.contains(" med "), "{second}");
+        assert!(second.trim_end().ends_with("4 · waiting"), "{second}");
+        let all = issue.join("\n");
+        for shown in [
+            "status    Todo  ·  urgent  ·  Anthony",
+            "labels    Bug",
+            "project   Panels",
+            "work      nobody yet: p picks it up",
+            "line 1",
+            "line 2",
+        ] {
+            assert!(all.contains(shown), "{shown}:\n{all}");
+        }
+        // [1] follows the cursor, with no key but the list's.
+        screen.handle_key(key(KeyCode::Char('j')));
+        settle(&mut screen);
+        let all = drawn_on_panels(&screen, &TreeFour).1.join("\n");
+        assert!(all.contains("work      tree 4, agent waiting"), "{all}");
+        assert!(all.contains("END-2 text"), "{all}");
+    }
+
+    #[test]
+    fn on_the_panels_enter_and_1_give_1_the_keys_and_2_and_esc_give_them_back() {
+        let (mut screen, fake) = on_panels(2);
+        for (give, back) in [
+            (KeyCode::Enter, KeyCode::Char('2')),
+            (KeyCode::Char('1'), KeyCode::Esc),
+        ] {
+            assert_eq!(screen.handle_key(key(give)), Action::None, "{give:?}");
+            assert!(screen.is_reading(), "{give:?} gives [1] the keys");
+            assert!(
+                matches!(screen.handle_key(key(KeyCode::Char('p'))), Action::Pick(i) if i.id == "END-1"),
+                "p picks the issue up from [1]"
+            );
+            assert_eq!(screen.handle_key(key(back)), Action::None, "{back:?}");
+            assert!(!screen.is_reading(), "{back:?} gives [2] the keys back");
+        }
+        // The other digits are off the list: no view, no new listing.
+        let asked = fake.asked.lock().unwrap().len();
+        for digit in '3'..='9' {
+            assert_eq!(screen.handle_key(key(KeyCode::Char(digit))), Action::None);
+            settle(&mut screen);
+        }
+        assert_eq!(screen.view_name(), "mine");
+        assert_eq!(fake.asked.lock().unwrap().len(), asked);
+        assert_eq!(screen.current().unwrap().id, "END-1");
+        assert!(!screen.is_reading());
+        assert!(
+            matches!(screen.handle_key(key(KeyCode::Char('p'))), Action::Pick(i) if i.id == "END-1"),
+            "p picks the issue up from [2]"
+        );
+    }
+
+    #[test]
+    fn on_the_panels_j_k_and_the_wheel_over_1_scroll_it_while_2_keeps_the_keys() {
+        let (mut screen, _) = on_panels(40);
+        // The row of [1] "line 10" is on: the issue scrolled up that many.
+        let at = |screen: &Screen| {
+            let (_, issue) = drawn_on_panels(screen, &TreeFour);
+            issue
+                .iter()
+                .position(|r| r.trim() == "line 10")
+                .unwrap_or_else(|| panic!("line 10 is not in [1]:\n{}", issue.join("\n")))
+        };
+        let start = at(&screen);
+        screen.handle_key(key(KeyCode::Char('J')));
+        screen.handle_key(key(KeyCode::Char('J')));
+        assert_eq!(at(&screen), start - 2, "J scrolls [1] a row");
+        screen.handle_key(key(KeyCode::Char('K')));
+        assert_eq!(at(&screen), start - 1, "K back up a row");
+        screen.handle_key(key(KeyCode::PageUp));
+        assert_eq!(at(&screen), start, "no further up than its top");
+        let area = screen.issue_area.get();
+        let wheel = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        screen.handle_mouse(wheel(MouseEventKind::ScrollDown, area.x + 2, area.y + 2));
+        screen.handle_mouse(wheel(MouseEventKind::ScrollDown, area.x + 2, area.y + 2));
+        assert_eq!(at(&screen), start - 6, "the wheel over [1] scrolls it");
+        assert!(!screen.is_reading(), "[2] keeps the keys");
+        assert_eq!(screen.current().unwrap().id, "END-1", "the cursor stays");
+        screen.handle_mouse(wheel(MouseEventKind::ScrollDown, 3, 3));
+        assert_eq!(
+            screen.current().unwrap().id,
+            "END-2",
+            "over the list it moves"
+        );
     }
 
     #[test]

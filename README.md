@@ -793,19 +793,24 @@ CodeRabbit's comments are read from the markers it leaves in them; one it writes
 treetop has three screens, Trees, Plan and Issues; Tab goes through them in that order and from Issues back to Trees, and `treetop issues` opens straight onto Issues.
 Plan is described under [Use](#use); the table layout has none, so there Tab goes between Trees and Issues alone.
 The Issues screen shows the repository's issues from its issue source in the config (see [Config](#config)): the list on top, your own open issues first, the most recently updated at the top, and below it the issue under the cursor with its fields, its description rendered from Markdown, and its comments.
+In the panels layout, from 120 by 31, it is drawn as Trees and Plan are: the list is [2] down the left, in the columns ID, PRI, TITLE and WORK under the filter line, and the issue under the cursor is [1] on the right, whole, a row each for its status, labels, project and work above its description and comments.
+[2]'s title names the source and how many issues it lists, and treetop's bar shows the keys of the panel that has them.
 Everything loads in the background, and an issue's description and comments are kept once read, so moving the cursor never waits on the network.
 Each issue picked up in a tree shows it in the WORK column, with its agent's state, `4 · waiting` in the warning colour when the agent waits on you.
 Enter or `→` opens the issue under the cursor on the whole screen, to scroll with j/k, Space and PgUp, g and G, or the mouse wheel; Esc or `←` goes back to the list.
+On the panels Enter or `1` gives [1] the keys instead, its border turning green, and Esc or `2` gives them back to [2].
 The keys that change an issue work the same from the list and from inside it.
 An open issue lists the issues it is linked to: its parent, its sub-issues, the ones it blocks or is blocked by, related ones and duplicates, and the issues of its team its text mentions.
 Tab moves between those links and the issue's images, and Enter or a click opens the one marked: an issue opens in its place, and Esc goes back along the issues opened, then to the list.
 Images show in the text, read with the source's key, in the terminal's own graphics where it has them (Kitty, Ghostty, WezTerm, iTerm2, through tmux with `allow-passthrough on`) and in coloured blocks anywhere else.
 An image opened fills the screen; `←` and `→` go to the issue's other images, and `o` opens it in the browser.
 The preview below the list scrolls with the mouse wheel over it, `J` and `K` a line, and `PgDn` and `PgUp` a page, so an issue can be read without opening it; the wheel over the list moves through the issues.
+On the panels the same keys and the wheel over [1] scroll [1] while [2] keeps the keys.
 On the Issues screen treetop takes the mouse, so selecting text there takes Shift as you drag.
 `w` switches to the next issue source, so a work and a personal workspace are one key apart, and `o` opens the issue in the browser.
 
-Number keys switch between views: `1` your open issues and `2` everyone's, both grouped by status as Linear groups them, `3` grouped by project, `4` grouped by status in the team's workflow order, and `5` the current cycle.
+Number keys switch between views in the table layout and on a screen too small for the panels; on the panels they move between [2] and [1], `3` to `9` do nothing, and the filters on `f` do what the views did.
+The views are: `1` your open issues and `2` everyone's, both grouped by status as Linear groups them, `3` grouped by project, `4` grouped by status in the team's workflow order, and `5` the current cycle.
 Views of your own go on `6` to `9`, in name order, from `[views]` in the config, each a line of filters: `mine`, and `assignee:`, `creator:` (a name, or `me`), `priority:` (`urgent`, `high`, `medium`, `low` or `none`), `label:`, `state:` (a status, or `any`), `project:` and `cycle:` (`current` or a number), a value with spaces in double quotes, other words searched for, and `group:project` or `group:status`:
 
 ```toml

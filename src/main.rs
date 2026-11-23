@@ -647,6 +647,12 @@ fn run(
                 Some(_) => {}
             }
             if let Some(screen) = issues.as_mut() {
+                // Set before the keys that follow, as the screen is drawn.
+                let size = term.size()?;
+                screen.set_panels(ui::issues_on_panels(
+                    app,
+                    Rect::new(0, 0, size.width, size.height),
+                ));
                 if let Some(id) = app.open_issue.take() {
                     screen.show_issue(&id);
                 }
