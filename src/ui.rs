@@ -10263,11 +10263,16 @@ mod panels_tests {
             let x = u16::try_from(at.unwrap_or_else(|| panic!("{text}: {}", row(y)))).unwrap();
             buffer[(x, y)].style()
         };
+        // A terminal without true colour reverses the cursor's row instead.
+        let is_cursors = |style: Style| match theme().cursor.bg {
+            Some(bg) => style.bg == Some(bg),
+            None => style.add_modifier.contains(Modifier::REVERSED),
+        };
         for style in [on(0, "Trees"), on(2, "chat")] {
-            assert_eq!(style.bg, theme().cursor.bg);
+            assert!(is_cursors(style), "{style:?}");
             assert!(style.add_modifier.contains(Modifier::BOLD));
         }
-        assert_ne!(on(0, "Plan").bg, theme().cursor.bg);
+        assert!(!is_cursors(on(0, "Plan")), "{:?}", on(0, "Plan"));
     }
 
     #[test]
