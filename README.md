@@ -719,7 +719,7 @@ Esc, `h` or `e` closes them, and coming back after time away opens nothing by it
 The oldest comes first: each is as old as it has waited, from when it happened, or from when treetop first saw it where that is not known, as for a PR.
 
 When something starts waiting, treetop rings the terminal bell, once, so it is heard from any window; the assistant finishing an answer rings it too, and shows it in the status line for five seconds.
-It shows a desktop notification too, on the machine whose terminal treetop is in, a laptop reaching the server over SSH included: the tree, its ticket and branch, what it waits for and, for an ask, the question.
+It shows a desktop notification too, on the machine whose terminal treetop is in, a laptop reaching the server over SSH included: the tree, its ticket and branch, and what it waits for, never what the agent wrote.
 It goes as the terminal's own notification escape, OSC 777, which foot, WezTerm, Ghostty, kitty and urxvt show, so nothing more runs on the server; something still waiting at thirty minutes is shown once more, saying how long, and what already waits when treetop opens is not.
 Inside tmux it needs `allow-passthrough` set to `all` (`tmux set -g allow-passthrough all`), since `on` passes it only from the window on screen, and until it is, treetop says so once on its status line.
 
