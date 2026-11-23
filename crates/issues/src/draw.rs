@@ -49,7 +49,7 @@ const MARKED_KEYS: [(&str, &str); 6] = [
 ];
 
 /// The bar's keys on the panels, with [2] the list's.
-const PANEL_LIST_KEYS: [(&str, &str); 10] = [
+const PANEL_LIST_KEYS: [(&str, &str); 11] = [
     ("j/k", "move"),
     ("Enter", "read it"),
     ("p", "pick up"),
@@ -58,12 +58,25 @@ const PANEL_LIST_KEYS: [(&str, &str); 10] = [
     ("s", "status"),
     ("x", "mark"),
     ("1", "issue"),
+    ("3", "project"),
+    ("Tab", "Trees"),
+    ("?", "help"),
+];
+
+/// The bar's keys on the panels, with [3] the project's.
+const PANEL_PROJECT_KEYS: [(&str, &str); 8] = [
+    ("j/k", "move"),
+    ("Enter", "show it"),
+    ("p", "pick up"),
+    ("1", "issue"),
+    ("2", "list"),
+    ("Esc", "back"),
     ("Tab", "Trees"),
     ("?", "help"),
 ];
 
 /// The bar's keys on the panels, with [1] the issue's.
-const PANEL_ISSUE_KEYS: [(&str, &str); 9] = [
+const PANEL_ISSUE_KEYS: [(&str, &str); 10] = [
     ("j/k", "scroll"),
     ("Tab", "links"),
     ("p", "pick up"),
@@ -72,6 +85,7 @@ const PANEL_ISSUE_KEYS: [(&str, &str); 9] = [
     ("o", "browser"),
     ("Esc", "back"),
     ("2", "list"),
+    ("3", "project"),
     ("?", "help"),
 ];
 
@@ -186,7 +200,7 @@ const HELP: [(&str, &str); 28] = [
 ];
 
 /// The help's rows that differ on the panels, by key: the digits move
-/// between [2] and [1] there, and the views are off them.
+/// between [2], [1] and [3] there, and the views are off them.
 const PANELS_HELP: [(&str, &str, &str); 5] = [
     ("Enter →", "Enter 1", "read it: [1] takes the keys"),
     (
@@ -200,7 +214,11 @@ const PANELS_HELP: [(&str, &str, &str); 5] = [
         "scroll [1] from the list, a line or a page",
     ),
     ("1 to 5", "2", "back to the list: [2] takes the keys"),
-    ("6 to 9", "", ""),
+    (
+        "6 to 9",
+        "3",
+        "the project: j k move, Enter shows it in [1], p picks it up",
+    ),
 ];
 
 /// What the bar says on the left: the keys for what is on screen, or a
@@ -273,19 +291,24 @@ fn priority_style(issue: &Issue, p: &Palette) -> Style {
     }
 }
 
-/// Which tree is working on the issue, and its agent's state: `4 ·
-/// waiting` loud, a busy one green, the rest muted.
+/// Which tree is working on the issue, and its agent's state, as
+/// `work_span` says it.
 fn work_cell(host: &dyn Host, id: &str, p: &Palette) -> Cell<'static> {
-    let Some(work) = host.work_on(id) else {
-        return Cell::from("");
-    };
+    host.work_on(id)
+        .map_or_else(|| Cell::from(""), |work| Cell::from(work_span(&work, p)))
+}
+
+/// The work on an issue as the WORK column says it, for the program's own
+/// panels to say it the same: `4 · waiting` loud, a busy one green, the
+/// rest muted, or `ready`.
+pub fn work_span(work: &Work, p: &Palette) -> Span<'static> {
     let text = if work.is_ready {
         "ready".to_string()
     } else {
         let agent = work.agent.as_deref().unwrap_or("no agent");
         format!("{} · {agent}", work.tree)
     };
-    Cell::from(text).style(work_style(&work, p))
+    Span::styled(text, work_style(work, p))
 }
 
 /// The work on an issue in words, for [1] on the panels: its tree and
@@ -490,6 +513,7 @@ impl Screen {
             None if self.focus == Focus::Issue && self.viewer.is_some() => &VIEWER_KEYS,
             None if self.focus == Focus::Issue && self.is_panels => &PANEL_ISSUE_KEYS,
             None if self.focus == Focus::Issue => &ISSUE_KEYS,
+            None if self.focus == Focus::Project => &PANEL_PROJECT_KEYS,
             None if !self.marked.is_empty() => &MARKED_KEYS,
             None if self.is_panels => &PANEL_LIST_KEYS,
             None => &KEYS,
@@ -874,7 +898,7 @@ impl Screen {
         let mut trail: Vec<&str> = self
             .issues
             .get(self.selected)
-            .filter(|_| !self.is_from_outside)
+            .filter(|_| !self.is_from_outside && !self.is_from_project)
             .map(|i| i.id.as_str())
             .into_iter()
             .collect();

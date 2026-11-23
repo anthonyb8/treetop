@@ -1118,8 +1118,9 @@ fn a_planning_chat_opens_in_the_window_with_normal_and_insert() {
 /// ANB-122: on the panels Issues is drawn as Trees and Plan are, the list in
 /// [2] and the issue under the cursor whole in [1]; `1` gives [1] the keys
 /// and `2` gives them back, the other digits pick no view,
-/// and p still picks the issue up. On a terminal too small for the panels
-/// it is the screen it was, its digits picking views.
+/// and p still picks the issue up. ANB-123: [3] under [2] names the project
+/// of the issue in [1], and `3` gives it the keys. On a terminal too small
+/// for the panels it is the screen it was, its digits picking views.
 #[test]
 fn issues_on_the_panels_read_the_issue_beside_the_list_and_digits_move_the_keys() {
     let Workspaces {
@@ -1179,12 +1180,35 @@ esac
             && l.contains("WORK")),
         "{list}"
     );
-    screen.press("j");
-    screen.wait_for("[1] on the next issue", |text| {
-        titles(text).contains("[1] ANB-91 Keep the rail") && text.contains("Keep it drawn.")
+    // [3] under [2] names the issue's project; a plugin has no project ids,
+    // so it says it cannot read the project rather than reading forever.
+    let project = |text: &str| -> String {
+        text.lines()
+            .skip_while(|l| !l.contains("[3] Project"))
+            .take(2)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    screen.wait_for("[3] on ANB-90's project", |text| {
+        project(text).contains("┌ [3] Project · Inbox ")
+            && project(text).contains("this source's plugin cannot read projects")
     });
-    // The digits past 2 pick no view on the panels.
+    screen.press("j");
+    screen.wait_for("[1] on the next issue, in no project", |text| {
+        titles(text).contains("[1] ANB-91 Keep the rail")
+            && text.contains("Keep it drawn.")
+            && project(text).contains("┌ [3] Project · none ")
+            && project(text).contains("not in a project")
+    });
+    // `3` gives [3] the keys and its own on the bar; Esc gives them back.
     screen.press("3");
+    screen.wait_for("[3] with the keys", |text| {
+        bar_is(" PANEL 3 ")(text) && text.lines().last().unwrap_or("").contains("show it")
+    });
+    screen.press("\x1b");
+    screen.wait_for("[2] with the keys from [3]", bar_is(" PANEL 2 "));
+    // The digits past 3 pick no view on the panels.
+    screen.press("4");
     let shown = screen.text();
     assert!(
         titles(&shown).contains("[1] ANB-91 Keep the rail")

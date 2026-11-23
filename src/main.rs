@@ -389,6 +389,11 @@ enum IssueRead {
         tree_issues::Key,
         std::result::Result<Box<linear::Detail>, String>,
     ),
+    /// The project [3] on the Issues screen shows.
+    Project(
+        app::ProjectKey,
+        std::result::Result<planned::ProjectRead, String>,
+    ),
 }
 
 fn run(
@@ -589,6 +594,7 @@ fn run(
             match read {
                 IssueRead::All(read) => app.tree_issues.apply(read),
                 IssueRead::One(key, read) => app.tree_issues.apply_detail(key, read),
+                IssueRead::Project(key, read) => app.apply_project_read(key, read),
             }
         }
         while let Some(answered) = editor.answered() {
@@ -649,10 +655,8 @@ fn run(
             if let Some(screen) = issues.as_mut() {
                 // Set before the keys that follow, as the screen is drawn.
                 let size = term.size()?;
-                screen.set_panels(ui::issues_on_panels(
-                    app,
-                    Rect::new(0, 0, size.width, size.height),
-                ));
+                let is_panels = ui::issues_on_panels(app, Rect::new(0, 0, size.width, size.height));
+                screen.set_panels(is_panels);
                 if let Some(id) = app.open_issue.take() {
                     screen.show_issue(&id);
                 }
@@ -660,6 +664,19 @@ fn run(
                     screen.choose_issue(format!("the issue tree {tree} works on"));
                 }
                 is_stale |= screen.poll();
+                // [3] follows the issue in [1], its project read behind
+                // the screen so the cursor never waits on it.
+                app.follow_project(screen.source_name(), screen.current());
+                screen.set_project(app.project_ids());
+                if is_panels && let Some(key) = app.wanted_project() {
+                    let done = issue_reads_done.clone();
+                    let here = checkout.to_path_buf();
+                    std::thread::spawn(move || {
+                        let read = tickets::named(Some(&key.0), &here)
+                            .and_then(|backend| planned::project(&*backend, &key.1));
+                        let _ = done.send(IssueRead::Project(key, read));
+                    });
+                }
                 // Asked only once an image is wanted, since a terminal that
                 // never answers holds the screen up while it is asked.
                 if screen.wants_terminal_asked() {
@@ -1315,6 +1332,15 @@ fn run(
                     issues::Action::Quit => app.quit(),
                     issues::Action::Pick(issue) => {
                         app.pick(issue.id, screen.source_name().to_string())
+                    }
+                    issues::Action::PickFromProject(id) => {
+                        match app.pick_from_project(&id, screen.source_name().to_string()) {
+                            Ok(outcome) => outcome,
+                            Err(why) => {
+                                screen.say(why);
+                                Outcome::Continue
+                            }
+                        }
                     }
                     issues::Action::Ask(context) => {
                         app.open_ask(Some(context));

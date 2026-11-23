@@ -48,15 +48,20 @@ pub enum Action {
     /// Ask the program's assistant something, about what this says is on
     /// screen.
     Ask(String),
+    /// Put an agent on issue `id`, from [3], the program's project panel,
+    /// which knows whether anything holds it up.
+    PickFromProject(String),
 }
 
 /// What fills the screen: the list, with the issue under the cursor
 /// below it, or one issue, whole, to read. On the panels both show, and it
-/// says which has the keys: [2] the list, or [1] the issue.
+/// says which has the keys: [2] the list, [1] the issue, or [3] the
+/// project of the issue in [1], which the program draws.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     List,
     Issue,
+    Project,
 }
 
 pub struct Screen {
@@ -109,6 +114,12 @@ pub struct Screen {
     /// Where [1]'s text was last drawn on the panels, so the wheel over it
     /// scrolls it from the list.
     pub(crate) issue_area: Cell<Rect>,
+    /// [3]'s rows on the panels, by issue id, as the program lists them,
+    /// and the one its cursor is on.
+    project: Vec<String>,
+    project_at: usize,
+    /// The issue in [1] was shown from [3], which Esc goes back to.
+    pub(crate) is_from_project: bool,
     /// The issues opened from the open one's links, by id, the one on
     /// screen last; Esc goes back along them.
     pub(crate) trail: Vec<String>,
@@ -219,6 +230,9 @@ impl Screen {
             preview_area: Cell::new(Rect::default()),
             is_panels: false,
             issue_area: Cell::new(Rect::default()),
+            project: Vec::new(),
+            project_at: 0,
+            is_from_project: false,
             view_height: Cell::new(0),
             trail: Vec::new(),
             target: None,
@@ -271,11 +285,27 @@ impl Screen {
     /// the program says which, since it lays the panels out.
     pub fn set_panels(&mut self, is_panels: bool) {
         self.is_panels = is_panels;
+        // Off the panels there is no [3] to have the keys.
+        if !is_panels && self.focus == Focus::Project {
+            self.give_list_keys();
+        }
     }
 
     /// [1] has the keys on the panels, or the open issue fills the screen.
     pub fn is_reading(&self) -> bool {
         self.focus == Focus::Issue
+    }
+
+    /// [3]'s rows, by issue id, from the next key on: the program reads
+    /// the project and draws [3], and the screen moves its cursor.
+    pub fn set_project(&mut self, ids: Vec<String>) {
+        self.project = ids;
+        self.project_at = self.project_at.min(self.project.len().saturating_sub(1));
+    }
+
+    /// [3] has the keys on the panels, and the row its cursor is on.
+    pub fn project_cursor(&self) -> Option<usize> {
+        (self.focus == Focus::Project).then_some(self.project_at)
     }
 
     /// The issue on screen is drawn whole, with its images: opened, or in
@@ -321,9 +351,9 @@ impl Screen {
                 || (self.panel.is_none() && self.search.is_none() && !self.is_help))
     }
 
-    /// The id of the issue on screen: the last one opened from a link, else
-    /// the one under the cursor.
-    pub(crate) fn viewed_id(&self) -> Option<&str> {
+    /// The id of the issue on screen: the last one opened from a link or
+    /// shown from [3], else the one under the cursor.
+    pub fn viewed_id(&self) -> Option<&str> {
         match self.trail.last() {
             Some(id) => Some(id),
             None => self.issues.get(self.selected).map(|i| i.id.as_str()),
@@ -1399,6 +1429,9 @@ impl Screen {
         if let Some(at) = self.viewer {
             return self.on_viewer(key, at);
         }
+        if self.focus == Focus::Project {
+            return self.on_project(key);
+        }
         if self.focus == Focus::Issue {
             match key.code {
                 KeyCode::Tab => return self.select(1),
@@ -1411,6 +1444,10 @@ impl Screen {
                 }
                 KeyCode::Char('2') if self.is_panels => {
                     self.give_list_keys();
+                    return Action::None;
+                }
+                KeyCode::Char('3') if self.is_panels => {
+                    self.give_project_keys();
                     return Action::None;
                 }
                 _ => {}
@@ -1485,6 +1522,7 @@ impl Screen {
             // On the panels the digits move the keys between them, as on the
             // program's other screens, and the filters do what views did.
             KeyCode::Char('1') if self.is_panels && self.current().is_some() => self.read(),
+            KeyCode::Char('3') if self.is_panels => self.give_project_keys(),
             KeyCode::Char('1'..='9') if self.is_panels => {}
             KeyCode::Char(c @ '1'..='9') => {
                 self.show_view(usize::from(c as u8 - b'1'));
@@ -1523,6 +1561,64 @@ impl Screen {
         }
         self.focus = Focus::List;
         self.is_from_outside = false;
+        self.is_from_project = false;
+        self.target = None;
+    }
+
+    /// Gives [3] the keys on the panels, its cursor on the issue in [1]
+    /// when that is one of its rows.
+    fn give_project_keys(&mut self) {
+        if let Some(at) = self
+            .viewed_id()
+            .and_then(|id| self.project.iter().position(|row| row == id))
+        {
+            self.project_at = at;
+        }
+        self.focus = Focus::Project;
+        self.target = None;
+    }
+
+    /// The keys of [3] on the panels: j and k move its cursor, Enter shows
+    /// the issue it is on in [1], `p` picks that up, and the digits, Tab
+    /// and Esc go where they go from the list.
+    fn on_project(&mut self, key: KeyEvent) -> Action {
+        let last = self.project.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.project_at = (self.project_at + 1).min(last);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.project_at = self.project_at.saturating_sub(1);
+            }
+            KeyCode::Home | KeyCode::Char('g') => self.project_at = 0,
+            KeyCode::End | KeyCode::Char('G') => self.project_at = last,
+            KeyCode::Enter | KeyCode::Right => {
+                if let Some(id) = self.project.get(self.project_at).cloned() {
+                    self.show_from_project(id);
+                }
+            }
+            KeyCode::Char('p') => {
+                if let Some(id) = self.project.get(self.project_at) {
+                    return Action::PickFromProject(id.clone());
+                }
+            }
+            KeyCode::Char('1') if self.current().is_some() => self.read(),
+            KeyCode::Char('2') | KeyCode::Esc => self.give_list_keys(),
+            KeyCode::Tab => return Action::Back,
+            KeyCode::Char('q' | '?' | ':') => return self.on_issue(key),
+            _ => {}
+        }
+        Action::None
+    }
+
+    /// Shows issue `id` of [3] in [1], with the keys, whether or not the
+    /// list has it; Esc gives them back to [3], [1] still showing it.
+    fn show_from_project(&mut self, id: String) {
+        self.trail = vec![id];
+        self.is_from_project = true;
+        self.is_from_outside = false;
+        self.focus = Focus::Issue;
+        self.scroll = 0;
         self.target = None;
     }
 
@@ -1580,6 +1676,7 @@ impl Screen {
         self.choosing = Some(what);
         self.focus = Focus::List;
         self.trail.clear();
+        self.is_from_project = false;
         self.viewer = None;
         self.panel = None;
     }
@@ -1590,6 +1687,7 @@ impl Screen {
         self.focus = Focus::Issue;
         self.trail = vec![id.to_string()];
         self.is_from_outside = true;
+        self.is_from_project = false;
         self.scroll = 0;
         self.target = None;
         self.viewer = None;
@@ -1598,8 +1696,15 @@ impl Screen {
     }
 
     /// Back from the open issue: to the one it was opened from, else the
-    /// list, or the program's own screen when it was opened from there.
+    /// list, [3] when shown from there, or the program's own screen when it
+    /// was opened from there.
     fn back(&mut self) -> Action {
+        // Shown from [3], the issue stays in [1] as [3] takes the keys back.
+        if self.is_from_project && self.trail.len() == 1 {
+            self.focus = Focus::Project;
+            self.target = None;
+            return Action::None;
+        }
         let from = self.trail.pop();
         // On the panels [1] goes on showing the issue the list is on, as
         // it was scrolled.
@@ -1659,8 +1764,9 @@ impl Screen {
             return Action::None;
         }
         // On the list the wheel scrolls the preview when over it, [1] on the
-        // panels, and moves through the issues anywhere else.
-        if self.focus == Focus::List {
+        // panels, and moves through the issues anywhere else; with [3]'s
+        // keys too, [3] taking no mouse of its own.
+        if self.focus != Focus::Issue {
             let preview = if self.is_panels {
                 self.issue_area.get()
             } else {
@@ -2725,9 +2831,9 @@ mod tests {
             assert_eq!(screen.handle_key(key(back)), Action::None, "{back:?}");
             assert!(!screen.is_reading(), "{back:?} gives [2] the keys back");
         }
-        // The other digits are off the list: no view, no new listing.
+        // The digits past [3] are off the list: no view, no new listing.
         let asked = fake.asked.lock().unwrap().len();
-        for digit in '3'..='9' {
+        for digit in '4'..='9' {
             assert_eq!(screen.handle_key(key(KeyCode::Char(digit))), Action::None);
             settle(&mut screen);
         }
@@ -2739,6 +2845,45 @@ mod tests {
             matches!(screen.handle_key(key(KeyCode::Char('p'))), Action::Pick(i) if i.id == "END-1"),
             "p picks the issue up from [2]"
         );
+    }
+
+    /// ANB-123: `3` gives [3] the keys, its cursor on [1]'s issue; Enter
+    /// shows the issue under it in [1] whether or not [2] lists it, Esc
+    /// comes back to [3] with [1] still on it, and `p` picks up the row.
+    #[test]
+    fn on_the_panels_3_moves_through_the_project_and_enter_shows_its_issue_in_1() {
+        let (mut screen, _) = on_panels(2);
+        // END-7 and END-9 are in the project, not on [2]'s list.
+        screen.set_project(vec!["END-7".into(), "END-1".into(), "END-9".into()]);
+        assert_eq!(screen.project_cursor(), None, "[2] has the keys");
+        assert_eq!(screen.handle_key(key(KeyCode::Char('3'))), Action::None);
+        assert_eq!(screen.project_cursor(), Some(1), "on [1]'s issue, END-1");
+        assert!(!screen.is_reading());
+        for (press, at) in [('j', 2), ('j', 2), ('k', 1), ('k', 0), ('k', 0)] {
+            screen.handle_key(key(KeyCode::Char(press)));
+            assert_eq!(screen.project_cursor(), Some(at), "{press}");
+        }
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Char('p'))),
+            Action::PickFromProject("END-7".into())
+        );
+        assert_eq!(screen.handle_key(key(KeyCode::Enter)), Action::None);
+        assert!(screen.is_reading(), "[1] has the keys");
+        assert_eq!(screen.project_cursor(), None);
+        settle(&mut screen);
+        assert_eq!(screen.current().map(|i| i.id.as_str()), Some("END-7"));
+        let (_, issue) = drawn_on_panels(&screen, &TreeFour);
+        assert!(issue.join("\n").contains("END-7 text"), "{issue:?}");
+        // Esc in [1] goes back to [3], [1] still on END-7 and [2] where it was.
+        assert_eq!(screen.handle_key(key(KeyCode::Esc)), Action::None);
+        assert_eq!(screen.project_cursor(), Some(0));
+        assert_eq!(screen.viewed_id(), Some("END-7"));
+        assert_eq!(screen.issues[screen.selected].id, "END-1");
+        // Esc in [3] gives [2] the keys, and [1] its issue again.
+        screen.handle_key(key(KeyCode::Esc));
+        assert_eq!(screen.project_cursor(), None);
+        assert!(!screen.is_reading());
+        assert_eq!(screen.viewed_id(), Some("END-1"));
     }
 
     #[test]

@@ -370,7 +370,12 @@ impl TreeIssues {
     }
 
     pub fn project(&self, issue: &Issue) -> Option<&Project> {
-        self.projects.get(issue.project_id.as_ref()?)
+        self.project_by_id(issue.project_id.as_ref()?)
+    }
+
+    /// The project `id`, where a tree's issue is in it.
+    pub fn project_by_id(&self, id: &str) -> Option<&Project> {
+        self.projects.get(id)
     }
 
     pub fn project_error(&self, issue: &Issue) -> Option<&str> {
