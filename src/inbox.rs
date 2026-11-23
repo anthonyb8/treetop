@@ -6,8 +6,8 @@
 //! of what happened, so an agent already waiting when treetop opens is in it.
 //!
 //! Of those, what is waiting on you, an agent asking, a PR whose checks
-//! failed and an agent that died, is what the count, its notifications
-//! and the tmux status line show until it stops being true. What counts is decided here for the
+//! failed and an agent that died, is what the count and its notifications
+//! show until it stops being true. What counts is decided here for the
 //! phone's pushes too, so the desktop and the phone never disagree.
 
 use std::collections::{HashMap, HashSet};
@@ -1368,7 +1368,7 @@ pub mod tests {
     }
 
     #[test]
-    fn the_bell_rings_once_for_what_starts_waiting_and_tmux_says_what_waits() {
+    fn the_bell_rings_once_for_what_starts_waiting() {
         // Treetop opening: its trees listed, its agents' reports not yet read.
         let read = app();
         let mut app = App::new(None);
@@ -1379,20 +1379,14 @@ pub mod tests {
         assert_eq!(app.watch_waiting(), None, "no look before the reports");
         app.apply_reports(read.reports.clone());
         // What already waits once they are read rings nothing.
-        let (is_new, line) = app.watch_waiting().unwrap();
-        assert!(!is_new);
-        assert_eq!(
-            line.as_deref(),
-            Some("● 4 needs action"),
-            "what waits alone, as the count has it: what is done is no news to act on"
-        );
-        assert_eq!(app.watch_waiting(), Some((false, line)), "nor again");
+        assert_eq!(app.watch_waiting(), Some(false));
+        assert_eq!(app.watch_waiting(), Some(false), "nor again");
         // Tree 4's agent, still asking, writes its report again: the same
         // ask, so no bell.
         let mut reports = app.reports.clone();
         reports[0] = report("j4", "/pool/4/app", State::Blocked, "Still: where?", 1);
         app.apply_reports(reports);
-        assert_eq!(app.watch_waiting().map(|(is_new, _)| is_new), Some(false));
+        assert_eq!(app.watch_waiting(), Some(false));
         // Tree 2's agent comes to ask something, and the other workspace's,
         // back at work a moment, asks again: the bell rings for them here,
         // with no news besides.
@@ -1403,16 +1397,9 @@ pub mod tests {
         reports[1] = report("j2", "/pool/2/app", State::Blocked, "Which column?", 5);
         reports[3].state = State::Blocked;
         assert_eq!(app.apply_reports(reports), Vec::<String>::new());
-        let (is_new, line) = app.watch_waiting().unwrap();
-        assert!(is_new, "a new ask rings");
-        assert_eq!(
-            line.as_deref(),
-            Some("● 5 needs action"),
-            "tree 2 asking now, not done"
-        );
-        // Once nothing waits, the status line clears.
+        assert_eq!(app.watch_waiting(), Some(true), "a new ask rings");
         nothing_waits(&mut app);
-        assert_eq!(app.watch_waiting(), Some((false, None)));
+        assert_eq!(app.watch_waiting(), Some(false));
     }
 
     #[test]

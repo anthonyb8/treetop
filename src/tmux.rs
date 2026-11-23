@@ -130,87 +130,6 @@ pub fn notify(text: &str) {
     let _ = tmux(&["display-message", "-d", "5000", text]);
 }
 
-/// The session options `show_waiting` changes, which it keeps first and
-/// puts back as they were.
-const KEPT: [&str; 2] = ["status-right", "status-right-length"];
-
-/// The tmux user option holding the session's own value of `option` while
-/// treetop's line is up, empty for none; set once kept, so a second treetop
-/// or one started after another died keeps the first's copy.
-fn kept(option: &str) -> String {
-    format!("@treetop-{option}")
-}
-
-/// Reads an option of this session: its own value, or with `-g` the global
-/// one, empty where it has none.
-fn option(scope: &str, name: &str) -> String {
-    tmux(&["show-options", scope, name])
-        .unwrap_or_default()
-        .trim_end()
-        .to_string()
-}
-
-/// `line` before `right`, the status-right it goes in front of: what needs
-/// action as a badge in the warning colours, what is done plain beside it.
-fn status_text(line: &str, right: &str) -> String {
-    let line = line.replace('#', "##");
-    let (needs, done) = match line.split_once("  ") {
-        Some((needs, done)) if needs.starts_with('●') => (needs, done),
-        _ if line.starts_with('●') => (line.as_str(), ""),
-        _ => ("", line.as_str()),
-    };
-    let badge =
-        (!needs.is_empty()).then(|| format!("#[fg=black,bg=yellow,bold] {needs} #[default]"));
-    // One space between each part shown, so it takes no more room than
-    // `show_waiting` keeps for it.
-    [badge.as_deref().unwrap_or(""), done, right]
-        .into_iter()
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// Puts `line`, the counts of what needs action and what is done, at the
-/// left of this session's status-right, what needs action in the warning
-/// colours, where every window shows it until it is cleared; None clears
-/// it, putting back what the session had.
-pub fn show_waiting(line: Option<&str>) {
-    let Some(line) = line else {
-        if option("-qv", "@treetop-kept").is_empty() {
-            return;
-        }
-        for name in KEPT {
-            let own = option("-qv", &kept(name));
-            let _ = if own.is_empty() {
-                tmux(&["set-option", "-u", name])
-            } else {
-                tmux(&["set-option", name, &own])
-            };
-            let _ = tmux(&["set-option", "-u", &kept(name)]);
-        }
-        let _ = tmux(&["set-option", "-u", "@treetop-kept"]);
-        return;
-    };
-    if option("-qv", "@treetop-kept").is_empty() {
-        for name in KEPT {
-            let _ = tmux(&["set-option", &kept(name), &option("-qv", name)]);
-        }
-        let _ = tmux(&["set-option", "@treetop-kept", "1"]);
-    }
-    // What the session showed before: its own, else the global one.
-    let before = |name: &str| {
-        Some(option("-qv", &kept(name)))
-            .filter(|own| !own.is_empty())
-            .unwrap_or_else(|| option("-gv", name))
-    };
-    let shown = status_text(line, &before("status-right"));
-    // Room for the line on top of what was there, so tmux cuts neither.
-    let room: usize = before("status-right-length").parse().unwrap_or(40);
-    let room = (room + line.chars().count() + 3).to_string();
-    let _ = tmux(&["set-option", "status-right-length", &room]);
-    let _ = tmux(&["set-option", "status-right", &shown]);
-}
-
 /// treetop's own pane's `allow-passthrough`, as it takes effect there, from
 /// the pane, its window or the global setting: its pane by `$TMUX_PANE`,
 /// since without a target tmux reads the pane on screen.
@@ -271,29 +190,6 @@ pub fn open(tree: &Tree) -> Result<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_status_shows_the_counts_what_needs_action_as_a_badge() {
-        let right = "%Y-%m-%d";
-        assert_eq!(
-            status_text("● 2 needs action  ✓ 3 done", right),
-            "#[fg=black,bg=yellow,bold] ● 2 needs action #[default] ✓ 3 done %Y-%m-%d"
-        );
-        assert_eq!(
-            status_text("● 2 needs action", right),
-            "#[fg=black,bg=yellow,bold] ● 2 needs action #[default] %Y-%m-%d"
-        );
-        // Only what is done: no badge, nothing loud.
-        assert_eq!(status_text("✓ 3 done", right), "✓ 3 done %Y-%m-%d");
-        // Never wider than the line and the three columns kept for it.
-        let shown = |text: String| {
-            text.replace("#[fg=black,bg=yellow,bold]", "")
-                .replace("#[default]", "")
-        };
-        for line in ["● 2 needs action  ✓ 3 done", "● 2 needs action", "✓ 3 done"] {
-            let width = shown(status_text(line, right)).chars().count();
-            assert!(width <= line.chars().count() + 3 + right.len(), "{line}");
-        }
-    }
     use crate::pool::parse;
 
     fn trees() -> Vec<Tree> {
