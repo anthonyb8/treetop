@@ -3508,7 +3508,12 @@ fn issues_list_title(screen: &issues::Screen, p: &issues::Palette, width: usize)
     for (at, name) in names.iter().enumerate() {
         if Some(at) == shown {
             let name = fit(name, shown_width.saturating_sub(2));
-            spans.push(Span::styled(format!(" {name} "), shown_tab_style()));
+            // In the text's colour: the title's own is the border's, which
+            // is all but lost on the cursor's grey.
+            spans.push(Span::styled(
+                format!(" {name} "),
+                shown_tab_style().fg(t.text),
+            ));
         } else if tab(name) <= room {
             room -= tab(name);
             spans.push(Span::styled(format!(" {name} "), fg(t.muted)));
@@ -10556,6 +10561,22 @@ mod panels_tests {
             }
         };
         assert!(is_shown(&issues, "work") && !is_shown(&issues, "personal"));
+        // The shown tab's words are the text's colour, never the border's
+        // that the rest of the title takes, so they read with or without
+        // the keys on [2].
+        let text_of = |issues: &issues::Screen, name: &str| {
+            let (title, _) = list_title_row(&app, issues);
+            let x = u16::try_from(title[..title.find(name).unwrap()].chars().count()).unwrap();
+            drawn_buffer(&app, issues, 120, 31)[(x, y)].fg
+        };
+        assert_eq!(text_of(&issues, "work"), theme().text, "with the keys");
+        issues.handle_key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Char('1'),
+        ));
+        assert_eq!(text_of(&issues, "work"), theme().text, "without the keys");
+        issues.handle_key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Char('2'),
+        ));
         // Which way each bracket steps is the crate's to prove; here the
         // mark follows the source shown, with its list read into [1].
         issues.handle_key(ratatui::crossterm::event::KeyEvent::from(

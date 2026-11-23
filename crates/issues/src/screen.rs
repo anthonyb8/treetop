@@ -2717,7 +2717,7 @@ mod tests {
 
     fn row_of(rows: &[String], id: &str) -> String {
         rows.iter()
-            .find(|r| r.starts_with(id))
+            .find(|r| r.trim_start().starts_with(id))
             .unwrap_or_else(|| panic!("{id} is not drawn:\n{}", rows.join("\n")))
             .clone()
     }
@@ -2826,10 +2826,21 @@ mod tests {
     }
 
     #[test]
+    fn on_the_panels_the_list_keeps_a_column_of_air_each_side_as_its_filter_line_does() {
+        let (screen, _) = on_panels(2);
+        let (list, _) = drawn_on_panels(&screen, &TreeThree);
+        let header = list.iter().find(|r| r.contains("TITLE")).unwrap();
+        assert!(header.starts_with(" ID "), "{}", list.join("\n"));
+        let row = row_of(&list, "END-1");
+        assert!(row.starts_with(" END-1"), "{row}");
+        assert!(row.ends_with("3 · no agent "), "{row}");
+    }
+
+    #[test]
     fn on_the_panels_the_list_keeps_four_columns_and_1_shows_the_issue_whole() {
         let (mut screen, _) = on_panels(2);
         let (list, issue) = drawn_on_panels(&screen, &TreeFour);
-        let header = list.iter().find(|r| r.starts_with("ID")).unwrap();
+        let header = list.iter().find(|r| r.contains("TITLE")).unwrap();
         let words: Vec<&str> = header.split_whitespace().collect();
         assert_eq!(words, ["ID", "PRI", "TITLE", "WORK"], "{}", list.join("\n"));
         let first = row_of(&list, "END-1");

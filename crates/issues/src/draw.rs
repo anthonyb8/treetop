@@ -665,6 +665,13 @@ impl Screen {
             .header(header)
             .row_highlight_style(p.cursor);
         let mut state = TableState::default().with_selected(Some(cursor_row));
+        // In [2]'s box the table keeps a column of air each side, as the
+        // filter line above it and the other panels' text do.
+        let area = if is_compact {
+            Block::new().padding(Padding::horizontal(1)).inner(area)
+        } else {
+            area
+        };
         frame.render_stateful_widget(table, area, &mut state);
     }
 
