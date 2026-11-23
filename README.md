@@ -711,7 +711,7 @@ While anything needs action, a count sits at the right of the top row, such as `
 It never takes the keys, so what you type keeps going where it was, a chat in Insert included, and it stays bright over a popup.
 `e` from the panels, Plan or the table, or from a chat or shell in Normal, or a click on the count, opens the notifications under it: Needs action, what is stopped until you act, then Done, what finished or merged and is not working, the newest first.
 They keep to the right of the screen, over the Usage column where it shows, so a wider terminal never moves them.
-Each shows its tree, its ticket and branch, how long ago, and what it is about in full, such as the agent's whole question.
+Each is one row: its tree, its ticket and branch, what it needs, such as `asks you`, `checks failed` or `done`, and how long ago; what the agent wrote is in its chat.
 ↑↓ pick one and Enter or `l` opens it: an agent's chat, with its question at the bottom; for a PR, the cursor on its tree with its checks in the info tab, where `F` sends a failure to its agent; for a dead agent, the cursor on its tree, where `R` resumes it.
 Needs action leaves once it is dealt with, and Done once you open it.
 `x` puts one away, out of the list and the count, until it changes, such as its agent asking something new or finishing again; what is put away is kept in treetop's state directory, so it stays away after a restart.
