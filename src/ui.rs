@@ -3434,6 +3434,8 @@ fn draw_issues(frame: &mut Frame, app: &App, main: Rect, footer: Rect, screen: &
         Some(form) => title.push(Span::raw(format!("{form} "))),
         None => title.extend(screen.issue_title(&p)),
     }
+    // Both corners and a dash of border stay clear of it, as on every box.
+    let title = cut_title(title, usize::from(window.width).saturating_sub(3));
     let keys = if is_writing {
         Some(Mode::Insert)
     } else {
@@ -3764,6 +3766,35 @@ fn draw_top(frame: &mut Frame, app: &App, area: Rect) {
         left.push(Span::raw(" "));
     }
     frame.render_widget(Paragraph::new(Line::from(left)).style(t.bar), area);
+}
+
+/// `spans` cut to `room` columns with an ellipsis and a space, so a long
+/// title ends as every other does rather than running into its corner.
+fn cut_title(spans: Vec<Span<'static>>, room: usize) -> Vec<Span<'static>> {
+    if Line::from(spans.clone()).width() <= room {
+        return spans;
+    }
+    let keep = room.saturating_sub(2);
+    let mut used = 0;
+    let mut out = Vec::new();
+    for span in spans {
+        let mut text = String::new();
+        for c in span.content.chars() {
+            let w = Span::raw(c.encode_utf8(&mut [0; 4]).to_string()).width();
+            if used + w > keep {
+                break;
+            }
+            text.push(c);
+            used += w;
+        }
+        let is_cut = text.chars().count() < span.content.chars().count();
+        out.push(Span::styled(text, span.style));
+        if is_cut {
+            break;
+        }
+    }
+    out.push(Span::raw("… "));
+    out
 }
 
 /// The tab shown, of the top row's and of the window's: the cursor's grey
@@ -10586,6 +10617,27 @@ mod panels_tests {
         assert!(is_shown(&issues, "personal") && !is_shown(&issues, "work"));
         let shown = drawn_issues(&app, &issues, 120, 31);
         assert!(shown.contains("ANT-1 text"), "{shown}");
+    }
+
+    #[test]
+    fn a_long_issue_title_is_cut_inside_1s_title_and_never_into_its_corner() {
+        let mut app = panels();
+        app.is_issues = true;
+        let long = "A-very-long-title-that-runs-on-past-the-edge-of-the-window-into-its-corner";
+        let issues = sources_screen(
+            &app,
+            vec![std::sync::Arc::new(OneIssue {
+                name: "work",
+                prefix: long,
+            })],
+        );
+        let shown = drawn_issues(&app, &issues, 120, 31);
+        let row = shown
+            .lines()
+            .find(|l| l.contains("[2] Issues"))
+            .unwrap_or_else(|| panic!("{shown}"));
+        let window = &row[row.find("┌ [1]").unwrap_or_else(|| panic!("{row}"))..];
+        assert!(window.ends_with("… ─┐"), "{window}");
     }
 
     #[test]

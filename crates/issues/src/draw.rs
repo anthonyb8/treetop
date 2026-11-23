@@ -716,7 +716,7 @@ impl Screen {
             Span::styled(" search ", fg(p.muted)),
         ]);
         let hint_width = u16::try_from(hint.width()).unwrap_or(0);
-        let mut pieces: Vec<(String, Style)> = panel::describe(&self.filters, self.group)
+        let pieces: Vec<(String, Style)> = panel::describe(&self.filters, self.group)
             .into_iter()
             .enumerate()
             .map(|(at, piece)| {
@@ -728,23 +728,27 @@ impl Screen {
                 (piece, style)
             })
             .collect();
-        if let Some(search) = self.search_text() {
-            pieces.push((format!("“{search}”"), fg(p.special)));
-        }
+        let sep = "  ·  ";
+        let width = |text: &str| Span::raw(text).width();
+        let search = self.search_text().map(|search| format!("“{search}”"));
         // A narrow list drops the filters that do not fit whole, so none is
-        // cut mid-word and two spaces always part them from the hints.
+        // cut mid-word and two spaces always part them from the hints. The
+        // search narrows the list most, so it is kept over the filters
+        // before it, and cut itself only when nothing else is left to drop.
         let room = usize::from(area.width.saturating_sub(hint_width)).saturating_sub(2);
+        let search_width = search.as_deref().map_or(0, |s| width(sep) + width(s));
+        let filter_room = room.saturating_sub(search_width);
         let mut spans = vec![Span::raw(" ")];
         let mut used = 1;
         let last = pieces.len().saturating_sub(1);
         for (at, (piece, style)) in pieces.into_iter().enumerate() {
-            let sep = if at > 0 { "  ·  " } else { "" };
-            let width = Span::raw(sep).width() + Span::raw(piece.as_str()).width();
+            let piece_width = if at > 0 { width(sep) } else { 0 } + width(&piece);
             // Any piece but the last keeps room for the ellipsis after it.
             let ellipsis = if at == last { 0 } else { 2 };
-            if used + width + ellipsis > room {
-                if at > 0 && used + 2 <= room {
+            if at > 0 && used + piece_width + ellipsis > filter_room {
+                if used + 2 <= filter_room {
                     spans.push(Span::styled(" …", fg(p.muted)));
+                    used += 2;
                 }
                 break;
             }
@@ -752,7 +756,24 @@ impl Screen {
                 spans.push(Span::styled(sep, fg(p.border)));
             }
             spans.push(Span::styled(piece, style));
-            used += width;
+            used += piece_width;
+        }
+        if let Some(search) = search {
+            let left = room.saturating_sub(used + width(sep));
+            let search = if width(&search) <= left {
+                search
+            } else {
+                let mut cut: String = String::new();
+                for c in search.chars() {
+                    if width(&cut) + width(c.encode_utf8(&mut [0; 4])) + 1 > left {
+                        break;
+                    }
+                    cut.push(c);
+                }
+                format!("{cut}…")
+            };
+            spans.push(Span::styled(sep, fg(p.border)));
+            spans.push(Span::styled(search, fg(p.special)));
         }
         let [left, right] =
             Layout::horizontal([Constraint::Fill(1), Constraint::Length(hint_width)]).areas(area);

@@ -2826,6 +2826,18 @@ mod tests {
     }
 
     #[test]
+    fn a_narrow_list_keeps_the_search_on_its_filter_line_over_the_other_filters() {
+        let (mut screen, _) = on_panels(2);
+        screen.filters.query = Some("number 1".into());
+        let (list, _) = drawn_on_panels(&screen, &TreeFour);
+        let line = list[0].trim_end();
+        let (said, _) = line.split_once("f filters").expect(line);
+        assert!(said.contains("“number 1”"), "{line}");
+        assert!(said.starts_with(" my issues"), "{line}");
+        assert!(said.ends_with("  "), "{line}");
+    }
+
+    #[test]
     fn on_the_panels_the_list_keeps_a_column_of_air_each_side_as_its_filter_line_does() {
         let (screen, _) = on_panels(2);
         let (list, _) = drawn_on_panels(&screen, &TreeThree);
