@@ -1119,7 +1119,9 @@ fn a_planning_chat_opens_in_the_window_with_normal_and_insert() {
 /// [2] and the issue under the cursor whole in [1]; `1` gives [1] the keys
 /// and `2` gives them back, the other digits pick no view,
 /// and p still picks the issue up. ANB-123: [3] under [2] names the project
-/// of the issue in [1], and `3` gives it the keys. On a terminal too small
+/// of the issue in [1], and `3` gives it the keys. ANB-125: `?` shows
+/// treetop's help with an Issues group, and the key that closes it does
+/// nothing else. On a terminal too small
 /// for the panels it is the screen it was, its digits picking views.
 #[test]
 fn issues_on_the_panels_read_the_issue_beside_the_list_and_digits_move_the_keys() {
@@ -1193,6 +1195,23 @@ esac
         project(text).contains("┌ [3] Project · Inbox ")
             && project(text).contains("this source's plugin cannot read projects")
     });
+    // ANB-125: `?` lists treetop's keys with an Issues group, and the key
+    // that closes it does only that: j leaves the cursor where it was.
+    screen.press("?");
+    screen.wait_for("treetop's help with the Issues keys", |text| {
+        text.contains(" n e c   new, edit, comment")
+            && text.contains(" s l a P status, labels, who, project")
+            && text.contains(" f       filters, in place of views")
+    });
+    screen.press("j");
+    screen.wait_for("the help closed", |text| {
+        !text.contains("new, edit, comment")
+    });
+    let shown = screen.text();
+    assert!(
+        titles(&shown).contains("[1] ANB-90 Show the rail") && bar_is(" PANEL 2 ")(&shown),
+        "{shown}"
+    );
     screen.press("j");
     screen.wait_for("[1] on the next issue, in no project", |text| {
         titles(text).contains("[1] ANB-91 Keep the rail")

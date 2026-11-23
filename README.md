@@ -829,16 +829,19 @@ The line above the list says what it shows: whose issues, which status, and what
 `/` searches: the list narrows as you type, by id, title, label and assignee, and once typing rests Linear is searched too, by title or issue number, so older issues show; Enter keeps the search and Esc clears it.
 `f` opens the filters: assignee (anyone, you, nobody, or a teammate), status (open, all, or one), priority, creator (anyone, you, or a teammate), label, project, cycle, and grouping, each picked from the team's own with Enter, the list following at once; `x` clears one and `c` all of them.
 In a grouped list, `z` folds the group under the cursor to its heading and `z` or Enter on the heading opens it again, as Linear folds a status; `Z` folds every group, or opens them all.
-`m` switches between yours and everyone's, `r` reads the list and the team again, and `?` shows these keys.
+`m` switches between yours and everyone's, `r` reads the list and the team again, and `?` shows these keys; on the panels it shows treetop's keys, with an Issues group for these.
 
 `s` changes the issue's status, `l` its labels, `a` its assignee and `P` its project, each from a picker of the team's own states, labels, members and projects that narrows as you type; labels are marked and unmarked with Tab and applied together with Enter, and the assignee picker offers you first, then nobody, then everyone else.
+On the panels the picker opens over [1], with the list still beside it; the filters on `f` cover the whole screen.
 The change shows on the row at once and is sent behind it; if Linear refuses it, the row goes back to what it was and the bar says why.
 `x` marks the issue under the cursor and moves down, and `X` marks every issue shown, or unmarks them all.
 While issues are marked, `s`, `a` and `P` set the status, assignee or project of every one of them at once, sent to Linear as one batch; any it refuses go back as they were, the marks clear once it is sent, and Esc clears them without changing anything.
 `c` writes a comment on the issue: Markdown, Alt+Enter for a new line, Enter to post it under the issue's other comments; one Linear refuses opens again with its text, so nothing written is lost.
+On the panels the comment box sits at the bottom of [1], under the issue it is on, and the bar says Insert with its keys.
 
 `n` opens a form for a new issue, and `e` the same form on the issue under the cursor.
 It fills the screen: the title, the status, priority, labels, assignee and project, and the description in a box below.
+On the panels it takes [1] instead, titled with what it makes or edits, such as `New issue in ANB` or `Edit ANB-123`, its border in Insert's colour and its keys on treetop's bar, with [2] and [3] still beside it.
 Tab and Shift+Tab move between the fields; on a field set from a list, Enter or typing opens its picker.
 The description takes Markdown as it is typed, Enter for a new line, and Ctrl+E writes it in your editor (`$VISUAL`, else `$EDITOR`, else `vi`) instead.
 Ctrl+S saves: a new issue needs a title and starts in the team's first open state, assigned to you; an edit sends only what changed.

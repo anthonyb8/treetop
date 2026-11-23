@@ -51,6 +51,9 @@ pub enum Action {
     /// Put an agent on issue `id`, from [3], the program's project panel,
     /// which knows whether anything holds it up.
     PickFromProject(String),
+    /// Show the program's keys: on the panels its help lists the screen's
+    /// with its own.
+    Help,
 }
 
 /// What fills the screen: the list, with the issue under the cursor
@@ -1855,6 +1858,7 @@ impl Screen {
                 return Action::Ask(context);
             }
             KeyCode::Char('q') => return Action::Quit,
+            KeyCode::Char('?') if self.is_panels => return Action::Help,
             KeyCode::Char('?') => self.is_help = true,
             KeyCode::Char('s') => self.open_picker(picker::Kind::Status),
             KeyCode::Char('l') => self.open_picker(picker::Kind::Labels),
@@ -3343,6 +3347,31 @@ mod tests {
         assert!(drawn.contains("› Status"), "{drawn}");
         assert!(drawn.contains("Enter changes it"), "{drawn}");
         assert!(drawn.contains("Ctrl+S  save"), "{drawn}");
+    }
+
+    #[test]
+    fn off_the_panels_the_comment_box_says_its_keys_on_its_border_and_not_on_the_bar() {
+        let (mut screen, _) = screen_with_team();
+        screen.handle_key(key(KeyCode::Char('c')));
+        let drawn = drawn(&screen).join("\n");
+        assert!(drawn.contains(" Comment on END-1 "), "{drawn}");
+        assert!(
+            drawn.contains(" Enter sends  Alt+Enter new line  Esc cancels "),
+            "{drawn}"
+        );
+        assert_eq!(drawn.matches("Alt+Enter").count(), 1, "{drawn}");
+    }
+
+    #[test]
+    fn question_mark_on_the_panels_asks_for_the_programs_help_and_off_them_shows_its_own() {
+        let (mut screen, _) = on_panels(2);
+        assert_eq!(screen.handle_key(key(KeyCode::Char('?'))), Action::Help);
+        let drawn_here = drawn(&screen).join("\n");
+        assert!(!drawn_here.contains(" Keys "), "{drawn_here}");
+        screen.set_panels(false);
+        assert_eq!(screen.handle_key(key(KeyCode::Char('?'))), Action::None);
+        let drawn = drawn(&screen).join("\n");
+        assert!(drawn.contains(" Keys "), "{drawn}");
     }
 
     fn reading(fake: Fake) -> Screen {

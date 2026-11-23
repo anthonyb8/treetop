@@ -105,6 +105,13 @@ const VIEWER_KEYS: [(&str, &str); 3] = [
     ("o", "open it in the browser"),
 ];
 
+/// The bar's keys in the comment box.
+const COMPOSE_KEYS: [(&str, &str); 3] = [
+    ("Enter", "send"),
+    ("Alt+Enter", "new line"),
+    ("Esc", "cancel"),
+];
+
 /// The bar's keys in the form, by the field the cursor is in.
 fn form_keys(field: Field) -> &'static [(&'static str, &'static str)] {
     match field {
@@ -200,28 +207,6 @@ const HELP: [(&str, &str); 28] = [
     ),
     ("Tab", "back to the trees"),
     ("q", "quit"),
-];
-
-/// The help's rows that differ on the panels, by key: the digits move
-/// between [2], [1] and [3] there, and the views are off them.
-const PANELS_HELP: [(&str, &str, &str); 5] = [
-    ("Enter →", "Enter 1", "read it: [1] takes the keys"),
-    (
-        "← h Esc",
-        "← h Esc",
-        "back along the links opened, then to the list",
-    ),
-    (
-        "J K PgDn PgUp",
-        "J K PgDn PgUp",
-        "scroll [1] from the list, a line or a page",
-    ),
-    ("1 to 5", "2", "back to the list: [2] takes the keys"),
-    (
-        "6 to 9",
-        "3",
-        "the project: j k move, Enter shows it in [1], p picks it up",
-    ),
 ];
 
 /// What the bar says on the left: the keys for what is on screen, or a
@@ -367,11 +352,15 @@ impl Screen {
         if let Some(form) = &self.form {
             let [body, footer] =
                 Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
-            let team = self
-                .teams
-                .get(&self.source)
-                .map_or(String::new(), |t| t.key.clone());
-            draw_form(frame, body, form, &team, p, self.picker.is_none());
+            let block = Block::bordered()
+                .border_style(fg(p.accent))
+                .padding(Padding::new(2, 2, 1, 0))
+                .title(Span::styled(
+                    format!(" {} ", self.form_title().unwrap_or_default()),
+                    fg(p.accent).add_modifier(Modifier::BOLD),
+                ));
+            draw_form(frame, block.inner(body), form, p, self.picker.is_none());
+            frame.render_widget(block, body);
             self.draw_footer(frame, footer, p);
         } else if self.focus == Focus::Issue {
             let [issue, footer] =
@@ -392,27 +381,47 @@ impl Screen {
             self.draw_detail(frame, detail, p);
             self.draw_footer(frame, footer, p);
         }
-        self.draw_over(frame, area, p);
-    }
-
-    /// What is open over the screen, over the whole of `area`: the help,
-    /// the filters, a picker or the comment box.
-    pub fn draw_over(&self, frame: &mut Frame, area: Rect, p: &Palette) {
-        if self.is_help {
-            draw_help(frame, area, p, self.is_panels);
-        } else if let (Some(at), None) = (self.panel, &self.picker) {
-            self.draw_panel(frame, area, at, p);
-        } else if let Some(picker) = &self.picker {
-            draw_picker(frame, area, picker, p);
-        } else if let Some(compose) = &self.compose {
+        self.draw_over(frame, area, area, p);
+        if let Some(compose) = &self.compose {
             draw_compose(frame, area, compose, p);
         }
     }
 
-    /// The screen takes the whole of its area even on the panels: the form,
-    /// or an image filling it.
+    /// What is open over the screen: the help and the filters over the
+    /// whole of `area`, and a picker, with the filters' own over them too,
+    /// in the middle of `window`, [1] on the panels.
+    pub fn draw_over(&self, frame: &mut Frame, area: Rect, window: Rect, p: &Palette) {
+        if self.is_help {
+            draw_help(frame, area, p);
+        } else if let (Some(at), None) = (self.panel, &self.picker) {
+            self.draw_panel(frame, area, at, p);
+        } else if let Some(picker) = &self.picker {
+            let on = if self.panel.is_some() { area } else { window };
+            draw_picker(frame, on, picker, p);
+        }
+    }
+
+    /// The screen takes the whole of its area even on the panels: an image
+    /// filling it.
     pub fn is_full_screen(&self) -> bool {
-        self.form.is_some() || self.viewer.is_some()
+        self.viewer.is_some()
+    }
+
+    /// The form or the comment box is open, so what is typed goes there.
+    pub fn is_writing(&self) -> bool {
+        self.form.is_some() || self.compose.is_some()
+    }
+
+    /// The open form's title: the issue it edits, or the team a new one
+    /// goes to.
+    pub fn form_title(&self) -> Option<String> {
+        let form = self.form.as_ref()?;
+        let team = self.teams.get(&self.source).map(|t| t.key.as_str());
+        Some(match (form.id(), team) {
+            (Some(id), _) => format!("Edit {id}"),
+            (None, Some(team)) if !team.is_empty() => format!("New issue in {team}"),
+            (None, _) => "New issue".to_string(),
+        })
     }
 
     /// [2]'s body on the panels: the filter line, and the list in the
@@ -504,6 +513,8 @@ impl Screen {
         }
         Bar::Keys(match &self.form {
             Some(form) => form_keys(form.field),
+            // Off the panels the comment popup lists its keys on its own border.
+            None if self.compose.is_some() && self.is_panels => &COMPOSE_KEYS,
             None if self.focus == Focus::Issue && self.viewer.is_some() => &VIEWER_KEYS,
             None if self.focus == Focus::Issue && self.is_panels => &PANEL_ISSUE_KEYS,
             None if self.focus == Focus::Issue => &ISSUE_KEYS,
@@ -931,9 +942,26 @@ impl Screen {
 
     /// [1]'s body on the panels: the issue under the cursor, or one opened
     /// from its links, whole, its fields a row each with its work from
-    /// `host`.
+    /// `host`, the comment box under it while one is written; or the form,
+    /// while it is open.
     pub fn draw_issue(&self, frame: &mut Frame, inner: Rect, p: &Palette, host: &dyn Host) {
-        self.draw_text(frame, inner, p, Some(host));
+        if let Some(form) = &self.form {
+            // A row of air under [1]'s title, as the form has on a screen
+            // of its own, and over [1]'s bottom, so the description's box
+            // does not sit on it.
+            let body = Block::new().padding(Padding::vertical(1)).inner(inner);
+            return draw_form(frame, body, form, p, self.picker.is_none());
+        }
+        let Some(compose) = &self.compose else {
+            return self.draw_text(frame, inner, p, Some(host));
+        };
+        // The comment box docks under the issue it is on, which scrolls in
+        // what is left above it.
+        let height = compose_height(compose, inner.width).min(inner.height);
+        let [text, docked] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(height)]).areas(inner);
+        self.draw_text(frame, text, p, Some(host));
+        draw_compose_box(frame, docked, compose, p, false);
     }
 
     /// The issue shown, in `inner`: its title and fields, its links, its
@@ -1380,31 +1408,12 @@ fn link_line(link: &Link, is_here: bool, p: &Palette) -> Line<'static> {
     if is_here { line.style(p.cursor) } else { line }
 }
 
-/// The form over the whole of `area`: the title, the fields the pickers
-/// set, and the description below, the field the cursor is in marked.
-/// `has_cursor` puts the terminal's cursor in it, unless a picker is over it.
-fn draw_form(
-    frame: &mut Frame,
-    area: Rect,
-    form: &Form,
-    team: &str,
-    p: &Palette,
-    has_cursor: bool,
-) {
-    let heading = match form.id() {
-        Some(id) => format!(" Edit {id} "),
-        None if team.is_empty() => " New issue ".to_string(),
-        None => format!(" New issue in {team} "),
-    };
-    let block = Block::bordered()
-        .border_style(fg(p.accent))
-        .padding(Padding::new(2, 2, 1, 0))
-        .title(Span::styled(
-            heading,
-            fg(p.accent).add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+/// The form in `inner`, inside the border its caller draws, its own on a
+/// screen of its own or [1]'s on the panels: the title, the fields the
+/// pickers set, and the description below, the field the cursor is in
+/// marked. `has_cursor` puts the terminal's cursor in it, unless a picker
+/// is over it.
+fn draw_form(frame: &mut Frame, inner: Rect, form: &Form, p: &Palette, has_cursor: bool) {
     // The title, a gap, a row per picked field, a gap, the description's
     // heading, and its box below.
     let picked = FIELDS.len() - 2;
@@ -1723,11 +1732,24 @@ pub fn draw_picker(frame: &mut Frame, area: Rect, picker: &Picker, p: &Palette) 
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/// The comment box over the lower half: the text, wrapped, the end of a
-/// long one kept in view, and the keys.
+/// The comment box in the middle of `area`, on a screen of its own.
 fn draw_compose(frame: &mut Frame, area: Rect, compose: &Compose, p: &Palette) {
     let width = area.width.saturating_sub(8).min(100);
-    let inner_width = usize::from(width.saturating_sub(2)).max(1);
+    let height = compose_height(compose, width).min(area.height);
+    let popup = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    draw_compose_box(frame, popup, compose, p, true);
+}
+
+/// The comment's rows wrapped inside a box `width` wide, between its
+/// borders and a column of air each side, an empty line kept as a row.
+fn compose_rows(compose: &Compose, width: u16) -> Vec<String> {
+    let inner_width = usize::from(width.saturating_sub(4)).max(1);
     let mut rows: Vec<String> = Vec::new();
     for line in compose.text.split('\n') {
         let chars: Vec<char> = line.chars().collect();
@@ -1736,29 +1758,36 @@ fn draw_compose(frame: &mut Frame, area: Rect, compose: &Compose, p: &Palette) {
         }
         rows.extend(chars.chunks(inner_width).map(|c| c.iter().collect()));
     }
-    let shown = rows.len().clamp(6, 14);
-    let height = u16::try_from(shown + 2)
-        .unwrap_or(u16::MAX)
-        .min(area.height);
-    let popup = Rect::new(
-        area.x + (area.width - width) / 2,
-        area.y + (area.height - height) / 2,
-        width,
-        height,
-    );
-    let block = Block::bordered()
+    rows
+}
+
+/// How tall the comment box `width` wide is: as tall as the comment, from
+/// six rows to fourteen, and its border.
+fn compose_height(compose: &Compose, width: u16) -> u16 {
+    let shown = compose_rows(compose, width).len().clamp(6, 14);
+    u16::try_from(shown + 2).unwrap_or(u16::MAX)
+}
+
+/// The comment box in `area`: the text, wrapped, the end of a long one kept
+/// in view. `has_keys` says its keys along its bottom, where no bar under
+/// it says them.
+fn draw_compose_box(frame: &mut Frame, area: Rect, compose: &Compose, p: &Palette, has_keys: bool) {
+    let rows = compose_rows(compose, area.width);
+    let mut block = Block::bordered()
         .border_style(fg(p.accent))
+        .padding(Padding::horizontal(1))
         .title(Span::styled(
             format!(" Comment on {} ", compose.issue),
             fg(p.title).add_modifier(Modifier::BOLD),
-        ))
-        .title_bottom(Line::styled(
+        ));
+    if has_keys {
+        block = block.title_bottom(Line::styled(
             " Enter sends  Alt+Enter new line  Esc cancels ",
             fg(p.muted),
         ));
-    let inner = block.inner(popup);
-    frame.render_widget(Clear, popup);
-    frame.render_widget(block, popup);
+    }
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
     if compose.text.is_empty() {
         frame.render_widget(
             Paragraph::new("Markdown; mention people with @name")
@@ -1782,25 +1811,16 @@ fn draw_compose(frame: &mut Frame, area: Rect, compose: &Compose, p: &Palette) {
     ));
 }
 
-/// The keys, over the middle of `area`: on the panels, with their keys for
-/// the digits and the issue.
-fn draw_help(frame: &mut Frame, area: Rect, p: &Palette, is_panels: bool) {
-    let rows: Vec<(&str, &str)> = HELP
-        .iter()
-        .filter_map(
-            |&(key, does)| match PANELS_HELP.iter().find(|(own, ..)| *own == key) {
-                Some(&(_, key, does)) if is_panels => (!key.is_empty()).then_some((key, does)),
-                _ => Some((key, does)),
-            },
-        )
-        .collect();
-    let width = rows
+/// The keys, over the middle of `area`, on a screen of its own: on the
+/// panels the program lists them with its own.
+fn draw_help(frame: &mut Frame, area: Rect, p: &Palette) {
+    let width = HELP
         .iter()
         .map(|(_, does)| does.chars().count())
         .max()
         .unwrap_or(0)
         + 14;
-    let lines: Vec<Line> = rows
+    let lines: Vec<Line> = HELP
         .iter()
         .map(|(key, does)| {
             Line::from(vec![

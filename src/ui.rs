@@ -128,7 +128,7 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
 
 /// The same for the panels layout, whose keys differ: its panels, the
 /// workspaces and Plan in place of the table's windows and zoom.
-const PANELS_HELP: [(&str, &[(&str, &str)]); 8] = [
+const PANELS_HELP: [(&str, &[(&str, &str)]); 9] = [
     (
         "Agents",
         &[
@@ -157,6 +157,14 @@ const PANELS_HELP: [(&str, &[(&str, &str)]); 8] = [
             ("p", "pick an issue up"),
             ("1", "its chat"),
             ("2-4", "its panels"),
+        ],
+    ),
+    (
+        "Screens",
+        &[
+            ("Tab", "Plan, Issues"),
+            ("I", "tree's plan, issue"),
+            ("s c", "status, comment, in [3]"),
         ],
     ),
     (
@@ -205,11 +213,22 @@ const PANELS_HELP: [(&str, &[(&str, &str)]); 8] = [
         ],
     ),
     (
-        "Screens",
+        "Issues",
         &[
-            ("Tab", "Plan, Issues"),
-            ("I", "tree's plan, issue"),
-            ("s c", "status, comment, in [3]"),
+            ("Enter 1", "read it in [1]"),
+            ("Tab", "[1]'s links"),
+            ("J K", "scroll [1] from [2]"),
+            ("f", "filters, in place of views"),
+            ("/", "search"),
+            ("m", "mine, everyone's"),
+            ("[ ] w", "issue sources"),
+            ("z Z", "fold, fold all"),
+            ("x X", "mark, mark all"),
+            ("s l a P", "status, labels, who, project"),
+            ("n e c", "new, edit, comment"),
+            ("p", "pick it up"),
+            ("o", "open in browser"),
+            ("r", "read again"),
         ],
     ),
     (
@@ -231,7 +250,7 @@ const HELP_COLUMNS: [&[usize]; 3] = [&[1, 2, 2, 2], &[3, 4], &[7]];
 
 /// The same for PANELS_HELP, three of whose columns fit the smallest screen
 /// the panels do.
-const PANELS_HELP_COLUMNS: [&[usize]; 4] = [&[1, 2, 2, 3], &[2, 2, 4], &[4, 4], &[8]];
+const PANELS_HELP_COLUMNS: [&[usize]; 4] = [&[1, 3, 3, 2], &[3, 3, 3], &[4, 5], &[9]];
 
 /// Most useful first; Esc stays early so the way out is never the key a
 /// narrow bar drops.
@@ -450,6 +469,9 @@ pub fn draw(
         draw_phone(frame, phone);
     } else if let Some(menu) = &app.scratch_menu {
         draw_scratch_menu(frame, app, menu);
+    } else if app.is_issues && app.is_help {
+        // Asked for on the panels, whose Issues keys it lists with the rest.
+        draw_help(frame, &PANELS_HELP, &PANELS_HELP_COLUMNS);
     } else if app.is_issues {
         // The trees' own dialogs wait until the trees are back on screen.
     } else if let Some(review) = app.reviews.front() {
@@ -3380,14 +3402,17 @@ fn draw_plan(frame: &mut Frame, app: &App, main: Rect, chat: Option<&Chat>) {
 /// The Issues screen on the panels: [2] the list down the left, in the
 /// columns Plan's panels take, [1] the issue under the cursor whole on the
 /// right, and treetop's bar with the keys of the one that has them. The
-/// screen draws inside the boxes; what opens over it covers them all.
+/// screen draws inside the boxes. The form takes [1], in Insert as a new
+/// agent's does a tree's window, the comment box docks at its bottom, and
+/// a picker opens over it; the filters cover the whole screen.
 fn draw_issues(frame: &mut Frame, app: &App, main: Rect, footer: Rect, screen: &issues::Screen) {
     let p = palette();
     let [left, window] = panel_columns(app, main);
     // [2] keeps two thirds of the column whatever [3] shows, so its rows
     // stay put as the cursor moves between projects.
     let [list, project] = Layout::vertical([Constraint::Fill(2), Constraint::Fill(1)]).areas(left);
-    let has_keys = app.prompt.is_none();
+    let is_writing = screen.is_writing() && app.prompt.is_none();
+    let has_keys = app.prompt.is_none() && !is_writing;
     let on_issue = screen.is_reading();
     let on_project = screen.project_cursor().is_some();
     let title = issues_list_title(screen, &p, usize::from(list.width.saturating_sub(2)));
@@ -3403,14 +3428,23 @@ fn draw_issues(frame: &mut Frame, app: &App, main: Rect, footer: Rect, screen: &
         screen,
         (has_keys && on_project).then_some(Mode::Normal),
     );
+    let form = screen.form_title();
     let mut title = vec![Span::raw(" [1] ")];
-    title.extend(screen.issue_title(&p));
-    let block = window_block((has_keys && on_issue).then_some(Mode::Normal))
+    match &form {
+        Some(form) => title.push(Span::raw(format!("{form} "))),
+        None => title.extend(screen.issue_title(&p)),
+    }
+    let keys = if is_writing {
+        Some(Mode::Insert)
+    } else {
+        (has_keys && on_issue).then_some(Mode::Normal)
+    };
+    let block = window_block(keys)
         .padding(Padding::horizontal(1))
         .title(Line::from(title));
     screen.draw_issue(frame, block.inner(window), &p, app);
     // Its bottom says how far down the issue is, known once it is drawn.
-    let block = match screen.issue_scrolled(&p) {
+    let block = match screen.issue_scrolled(&p).filter(|_| form.is_none()) {
         Some(line) => block.title_bottom(line),
         None => block,
     };
@@ -3420,11 +3454,15 @@ fn draw_issues(frame: &mut Frame, app: &App, main: Rect, footer: Rect, screen: &
         (_, true) => 3,
         _ => 2,
     };
-    let badge = format!(" PANEL {panel} ");
+    let (badge, color) = if is_writing {
+        (Mode::Insert.label().to_string(), Mode::Insert.color())
+    } else {
+        (format!(" PANEL {panel} "), Mode::Table.color())
+    };
     let mode = badge.len();
     draw_bar(frame, app, footer, mode, |room| {
         let t = theme();
-        let mut spans = vec![Span::styled(badge, t.badge.bg(Mode::Table.color()))];
+        let mut spans = vec![Span::styled(badge, t.badge.bg(color))];
         match screen.bar() {
             issues::Bar::Keys(keys) => push_keys(&mut spans, keys, room),
             issues::Bar::Message(message) => {
@@ -3441,7 +3479,7 @@ fn draw_issues(frame: &mut Frame, app: &App, main: Rect, footer: Rect, screen: &
         }
         Line::from(spans)
     });
-    screen.draw_over(frame, main.union(footer), &p);
+    screen.draw_over(frame, main.union(footer), window, &p);
 }
 
 /// [2]'s title on the Issues screen in `width` columns: its name, a tab for
@@ -10580,6 +10618,224 @@ mod panels_tests {
                 "{width}x{height}: {bar}"
             );
         }
+    }
+
+    /// `TwoIssues` with a team, Todo and Doing, so they can be written to
+    /// as a Linear source's can.
+    struct Writable;
+
+    impl issues::Backend for Writable {
+        fn name(&self) -> &str {
+            "work"
+        }
+
+        fn list(&self, filters: &issues::Filters) -> Result<Vec<linear::Issue>, String> {
+            TwoIssues.list(filters)
+        }
+
+        fn detail(&self, id: &str) -> Result<linear::Detail, String> {
+            TwoIssues.detail(id)
+        }
+
+        fn team(&self) -> Result<Option<std::sync::Arc<linear::Team>>, String> {
+            let state = |name: &str| linear::State {
+                id: name.to_lowercase(),
+                name: name.into(),
+                kind: "unstarted".into(),
+                position: 0.0,
+            };
+            Ok(Some(std::sync::Arc::new(linear::Team {
+                id: "t".into(),
+                key: "END".into(),
+                name: "Endo".into(),
+                states: vec![state("Todo"), state("Doing")],
+                labels: Vec::new(),
+                members: Vec::new(),
+                projects: Vec::new(),
+                cycles: Vec::new(),
+                me: None,
+            })))
+        }
+    }
+
+    /// The Issues screen on the panels at 160 by 45 over `Writable`, END-1
+    /// read into [1].
+    fn writable_screen(app: &App) -> issues::Screen {
+        let mut screen = issues::Screen::new(vec![std::sync::Arc::new(Writable)], 0, Vec::new());
+        screen.set_panels(issues_on_panels(app, Rect::new(0, 0, 160, 45)));
+        for _ in 0..200 {
+            screen.poll();
+            if drawn_issues(app, &screen, 160, 45).contains("END-1 text") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        screen
+    }
+
+    /// Presses `c` on `screen` until what it opens is drawn: the team it
+    /// needs may still be on its way.
+    fn opened(app: &App, screen: &mut issues::Screen, c: char, is_open: impl Fn(&str) -> bool) {
+        for _ in 0..200 {
+            screen.handle_key(ratatui::crossterm::event::KeyEvent::from(
+                ratatui::crossterm::event::KeyCode::Char(c),
+            ));
+            if is_open(&drawn_issues(app, screen, 160, 45)) {
+                return;
+            }
+            screen.poll();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!(
+            "{c} opened nothing:\n{}",
+            drawn_issues(app, screen, 160, 45)
+        );
+    }
+
+    /// The row and the first and last columns of the box titled `title`.
+    fn box_of(shown: &str, title: &str) -> (usize, usize, usize) {
+        let (y, row) = shown
+            .lines()
+            .enumerate()
+            .find(|(_, l)| l.contains(&format!("┌{title}")))
+            .unwrap_or_else(|| panic!("no {title}:\n{shown}"));
+        let cells: Vec<char> = row.chars().collect();
+        let left = row[..row.find(&format!("┌{title}")).unwrap()]
+            .chars()
+            .count();
+        let right = (left..cells.len())
+            .find(|&x| cells[x] == '┐')
+            .unwrap_or_else(|| panic!("{title} has no corner: {row}"));
+        (y, left, right)
+    }
+
+    #[test]
+    fn on_the_panels_n_and_e_write_in_1_in_insert_with_2_still_beside_it() {
+        let mut app = panels();
+        app.is_issues = true;
+        let mut issues = writable_screen(&app);
+        let x = window_column(&drawn_issues(&app, &issues, 160, 45));
+        for (c, title) in [('n', " [1] New issue in END "), ('e', " [1] Edit END-1 ")] {
+            opened(&app, &mut issues, c, |shown| shown.contains(title));
+            let shown = drawn_issues(&app, &issues, 160, 45);
+            let (y, left, _) = box_of(&shown, title);
+            assert_eq!(left, x, "{c} in [1], where the issue was:\n{shown}");
+            let corner = drawn_buffer(&app, &issues, 160, 45)
+                [(u16::try_from(x).unwrap(), u16::try_from(y).unwrap())]
+                .fg;
+            assert_eq!(corner, Mode::Insert.color(), "{c}: [1] in Insert");
+            assert!(
+                shown.contains("[2] Issues") && shown.contains("END-2 title"),
+                "{shown}"
+            );
+            assert!(
+                shown.contains("Title") && shown.contains("Status"),
+                "{shown}"
+            );
+            let bar = shown.lines().last().unwrap();
+            assert!(
+                bar.starts_with(" INSERT ") && bar.contains("Ctrl+S save"),
+                "{c}: {bar}"
+            );
+            issues.handle_key(ratatui::crossterm::event::KeyEvent::from(
+                ratatui::crossterm::event::KeyCode::Esc,
+            ));
+            assert!(!issues.is_writing(), "{c}: Esc closes it unwritten in");
+        }
+    }
+
+    #[test]
+    fn on_the_panels_c_docks_the_comment_box_in_1_under_the_issue_its_keys_on_the_bar_once() {
+        let mut app = panels();
+        app.is_issues = true;
+        let mut issues = writable_screen(&app);
+        let x = window_column(&drawn_issues(&app, &issues, 160, 45));
+        opened(&app, &mut issues, 'c', |shown| {
+            shown.contains(" Comment on END-1 ")
+        });
+        issues.paste("ship it");
+        let shown = drawn_issues(&app, &issues, 160, 45);
+        let lines: Vec<Vec<char>> = shown.lines().map(|l| l.chars().collect()).collect();
+        let (top, left, right) = box_of(&shown, " Comment on END-1 ");
+        // Inside [1]'s border and its column of air either side.
+        let window_right = (x + 1..lines[top].len())
+            .find(|&at| lines[top][at] == '│')
+            .unwrap_or_else(|| panic!("{shown}"));
+        assert_eq!((left, right), (x + 2, window_right - 2), "{shown}");
+        // Under the issue, which stays above it, and down on [1]'s bottom.
+        let text = shown
+            .lines()
+            .position(|l| l.contains("END-1 text"))
+            .unwrap();
+        assert!(text < top, "{shown}");
+        let bottom = (top..lines.len())
+            .find(|&y| lines[y][left] == '└')
+            .unwrap_or_else(|| panic!("{shown}"));
+        assert_eq!(lines[bottom + 1][x], '└', "on [1]'s bottom:\n{shown}");
+        assert!(
+            shown.contains("ship it") && shown.contains("END-2 title"),
+            "{shown}"
+        );
+        let bar = shown.lines().last().unwrap();
+        assert!(
+            bar.starts_with(" INSERT ")
+                && bar.contains("Enter send")
+                && bar.contains("Alt+Enter new line")
+                && bar.contains("Esc cancel"),
+            "{bar}"
+        );
+        assert_eq!(shown.matches("Alt+Enter").count(), 1, "{shown}");
+    }
+
+    #[test]
+    fn on_the_panels_a_picker_opens_over_1_and_the_filters_over_the_whole_screen() {
+        let mut app = panels();
+        app.is_issues = true;
+        let mut issues = writable_screen(&app);
+        let shown = drawn_issues(&app, &issues, 160, 45);
+        let x = window_column(&shown);
+        // Each box's gaps either side within the screen, [1] from x on.
+        let gaps = |shown: &str, title: &str| {
+            let (_, left, right) = box_of(shown, title);
+            (left, 159 - right)
+        };
+        opened(&app, &mut issues, 's', |shown| {
+            shown.contains(" Status of END-1 ")
+        });
+        let shown = drawn_issues(&app, &issues, 160, 45);
+        let (left, right) = gaps(&shown, " Status of END-1 ");
+        assert!(left > x, "over [1]:\n{shown}");
+        assert!((left - x).abs_diff(right) <= 1, "centred on [1]:\n{shown}");
+        assert!(
+            shown.contains("[2] Issues") && shown.contains("END-2 title"),
+            "{shown}"
+        );
+        issues.handle_key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Esc,
+        ));
+        opened(&app, &mut issues, 'f', |shown| shown.contains(" Filters "));
+        let shown = drawn_issues(&app, &issues, 160, 45);
+        let (left, right) = gaps(&shown, " Filters ");
+        assert!(left.abs_diff(right) <= 1, "centred on the screen:\n{shown}");
+        // A filter's own picker too.
+        issues.handle_key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Enter,
+        ));
+        let shown = drawn_issues(&app, &issues, 160, 45);
+        let title = shown
+            .lines()
+            .find_map(|l| {
+                let at = l.find("┌ ")?;
+                let rest = &l[at + "┌".len()..];
+                (!rest.starts_with(" Filters ") && !rest.starts_with(" ["))
+                    .then(|| rest[..rest.find('─').unwrap_or(rest.len())].to_string())
+            })
+            .unwrap_or_else(|| panic!("no filter's picker:\n{shown}"));
+        let (left, right) = gaps(&shown, &title);
+        assert!(
+            left.abs_diff(right) <= 1,
+            "{title} centred on the screen:\n{shown}"
+        );
     }
 
     use crate::app::tests::in_project;

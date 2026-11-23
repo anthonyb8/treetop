@@ -700,7 +700,7 @@ fn run(
             is_issue_mouse = false;
         } else {
             let wants = if app.is_issues {
-                issues.as_ref().is_some_and(|s| s.wants_mouse())
+                !app.is_help && issues.as_ref().is_some_and(|s| s.wants_mouse())
             } else {
                 app.wants_mouse()
             };
@@ -1318,6 +1318,12 @@ fn run(
             if key.kind != KeyEventKind::Press {
                 continue;
             }
+            // treetop's help over the Issues panels closes on any key, as
+            // it does over its own.
+            if app.is_issues && app.is_help {
+                app.is_help = false;
+                continue;
+            }
             let on_issues = issues
                 .as_mut()
                 .filter(|_| app.is_issues && app.prompt.is_none());
@@ -1353,6 +1359,10 @@ fn run(
                         {
                             app.message = Some(format!("could not record the issue: {err}"));
                         }
+                        Outcome::Continue
+                    }
+                    issues::Action::Help => {
+                        app.is_help = true;
                         Outcome::Continue
                     }
                     issues::Action::Open(url) => {
