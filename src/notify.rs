@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
-use crate::inbox::{About, Entry, Kind, place_of};
+use crate::inbox::{About, Entry, place_of};
 
 /// How long something waits before the desktop is told again, once.
 const AGAIN: Duration = Duration::from_secs(30 * 60);
@@ -161,29 +161,25 @@ impl Desktop {
 }
 
 /// The notification's title and body: the tree, with its workspace when it
-/// is another, its ticket and branch, what it waits for, and the question
-/// for an ask, since this one stays on your own screen.
+/// is another, its ticket and branch, and what it waits for, never what the
+/// agent wrote, as the phone's pushes are.
 pub fn text(entry: &Entry, is_reminder: bool, now: SystemTime) -> (String, String) {
     let title = match &entry.title {
         Some(title) => format!("{} · {title}", place_of(entry)),
         None => place_of(entry),
     };
     let what = crate::ui::waits_for(entry.kind);
-    let mut body = if is_reminder {
+    if is_reminder {
         let waited = entry
             .at
             .and_then(|at| now.duration_since(at).ok())
             .unwrap_or_default();
-        format!("Still {what}, {}m", waited.as_secs() / 60)
+        (title, format!("Still {what}, {}m", waited.as_secs() / 60))
     } else {
         let mut what = what.to_string();
         what[..1].make_ascii_uppercase();
-        what
-    };
-    if entry.kind == Kind::NeedsYou && !entry.what.is_empty() {
-        body = format!("{body}: {}", entry.what);
+        (title, what)
     }
-    (title, body)
 }
 
 /// The bytes that show a notification of `title` and `body`: OSC 777,
@@ -215,6 +211,7 @@ fn is_passed(allow_passthrough: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inbox::Kind;
     use std::path::PathBuf;
 
     fn entry(tree: &str, kind: Kind, at: Option<SystemTime>) -> Entry {
@@ -367,22 +364,15 @@ mod tests {
     }
 
     #[test]
-    fn a_notification_names_the_tree_and_an_ask_its_question() {
+    fn a_notification_names_the_tree_and_what_it_waits_for_alone() {
         let now = SystemTime::now();
         let asks = entry("22", Kind::NeedsYou, Some(now - 31 * MIN));
         assert_eq!(
             text(&asks, false, now),
-            (
-                "22 · ANB-73 compose-history".into(),
-                "Needs you: Keep drafts per tree, or one for all?".into()
-            )
+            ("22 · ANB-73 compose-history".into(), "Needs you".into())
         );
-        assert_eq!(
-            text(&asks, true, now).1,
-            "Still needs you, 31m: Keep drafts per tree, or one for all?"
-        );
-        // Failed checks and a dead agent are told the same way, without
-        // the question, which is only an ask's.
+        assert_eq!(text(&asks, true, now).1, "Still needs you, 31m");
+        // Failed checks and a dead agent are told the same way.
         let failed = entry("7", Kind::Failed, None);
         assert_eq!(text(&failed, false, now).1, "Checks failed");
         let died = entry("9", Kind::Died, None);
