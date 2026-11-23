@@ -391,6 +391,17 @@ impl Screen {
             .or_else(|| self.details.get(id).map(|d| &d.issue))
     }
 
+    /// A page of what the list scrolls beside it, less a row kept in view:
+    /// [1] on the panels, the preview under the list off them.
+    fn preview_page(&self) -> i32 {
+        let height = if self.is_panels {
+            self.view_height.get()
+        } else {
+            self.preview_height.get()
+        };
+        i32::from(height.saturating_sub(1).max(1))
+    }
+
     /// The issue [1] shows is one opened from a link or [3] that is not read
     /// yet: `current()` is None only until it lands, not because nothing is
     /// under the cursor.
@@ -1537,14 +1548,8 @@ impl Screen {
             }
             KeyCode::Char('J') => self.scroll_preview(1),
             KeyCode::Char('K') => self.scroll_preview(-1),
-            KeyCode::PageDown => {
-                let page = i32::from(self.preview_height.get().saturating_sub(1).max(1));
-                self.scroll_preview(page);
-            }
-            KeyCode::PageUp => {
-                let page = i32::from(self.preview_height.get().saturating_sub(1).max(1));
-                self.scroll_preview(-page);
-            }
+            KeyCode::PageDown => self.scroll_preview(self.preview_page()),
+            KeyCode::PageUp => self.scroll_preview(-self.preview_page()),
             KeyCode::Char('z') => self.toggle_fold(),
             KeyCode::Char('Z') => self.toggle_all_folds(),
             KeyCode::Enter | KeyCode::Right if self.current().is_some() => self.read(),
@@ -2965,7 +2970,7 @@ mod tests {
 
     #[test]
     fn on_the_panels_j_k_and_the_wheel_over_1_scroll_it_while_2_keeps_the_keys() {
-        let (mut screen, _) = on_panels(40);
+        let (mut screen, _) = on_panels(80);
         // The row of [1] "line 10" is on: the issue scrolled up that many.
         let at = |screen: &Screen| {
             let (_, issue) = drawn_on_panels(screen, &TreeFour);
@@ -2992,6 +2997,17 @@ mod tests {
         screen.handle_mouse(wheel(MouseEventKind::ScrollDown, area.x + 2, area.y + 2));
         screen.handle_mouse(wheel(MouseEventKind::ScrollDown, area.x + 2, area.y + 2));
         assert_eq!(at(&screen), start - 6, "the wheel over [1] scrolls it");
+        // PageDown pages [1] by its own height, less a row kept in view.
+        let before = screen.scroll;
+        screen.handle_key(key(KeyCode::PageDown));
+        let page = screen.view_height.get() - 1;
+        assert!(
+            page > 1 && screen.max_scroll.get() > before + page,
+            "room to page"
+        );
+        assert_eq!(screen.scroll, before + page, "PageDown pages [1]");
+        screen.handle_key(key(KeyCode::PageUp));
+        assert_eq!(screen.scroll, before, "PageUp pages back");
         assert!(!screen.is_reading(), "[2] keeps the keys");
         assert_eq!(screen.current().unwrap().id, "END-1", "the cursor stays");
         screen.handle_mouse(wheel(MouseEventKind::ScrollDown, 3, 3));
