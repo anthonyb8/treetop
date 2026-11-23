@@ -459,8 +459,6 @@ fn run(
     let mut snapshots = snapshot::Clock::default();
     // `U` installing a newer release, off this thread.
     let mut updating: Option<mpsc::Receiver<Result<String, String>>> = None;
-    // The line tmux's status shows for what waits on you, as last set.
-    let mut shown_waiting: Option<Option<String>> = None;
     loop {
         while let Ok(update) = refresher.updates.try_recv() {
             is_stale = true;
@@ -1052,13 +1050,9 @@ fn run(
             }
             chat_sized = Some(sizes);
         }
-        if is_stale && let Some((is_new, line)) = app.watch_waiting() {
+        if is_stale && let Some(is_new) = app.watch_waiting() {
             if is_new {
                 ring()?;
-            }
-            if app.is_in_tmux && shown_waiting.as_ref() != Some(&line) {
-                tmux::show_waiting(line.as_deref());
-                shown_waiting = Some(line);
             }
             let now = SystemTime::now();
             let read: Vec<PathBuf> = app.away_live.keys().cloned().collect();
@@ -1635,11 +1629,6 @@ fn show(
         }
         away.trees
             .insert(checkout.clone(), std::mem::take(&mut app.trees));
-        // Leaving treetop takes what waits off tmux's status line; a switch
-        // shows the next workspace's at once.
-        if app.is_in_tmux && !matches!(exit, Ok(Exit::Switch(..))) {
-            tmux::show_waiting(None);
-        }
         match exit? {
             Exit::Quit => return Ok(None),
             Exit::Switch(next, tree) => {

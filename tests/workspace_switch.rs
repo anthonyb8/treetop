@@ -406,7 +406,7 @@ fn an_agent_asking_in_another_workspace_shows_within_seconds() {
     });
     // Its first read is done, its agent not yet asking.
     std::thread::sleep(Duration::from_secs(1));
-    assert!(!screen.text().contains("needs action"), "{}", screen.text());
+    assert!(!screen.text().contains("needs you"), "{}", screen.text());
 
     // An agent in there's tree 1 starts asking, by the open `agent.json`
     // convention any agent can follow.
@@ -425,7 +425,7 @@ fn an_agent_asking_in_another_workspace_shows_within_seconds() {
     .unwrap();
 
     let asked = Instant::now();
-    while !screen.text().contains("1 needs action") {
+    while !screen.text().contains("1 needs you") {
         assert!(
             asked.elapsed() < Duration::from_secs(5),
             "there's ask did not show within 5 s:\n{}",
@@ -448,11 +448,10 @@ fn with_no_layout_set_treetop_opens_on_numbered_panels_and_number_keys_move_the_
     } = two_workspaces("panels", "");
     screen.wait_for("the numbered panels and the window", |text| {
         [
-            "[1] Ship",
             "[2] Trees",
             "[3] Linear",
             "[4] Keel",
-            "[0] Tree 1 · here-work",
+            "[1] Tree 1 · here-work",
         ]
         .iter()
         .all(|title| text.contains(title))
@@ -465,6 +464,12 @@ fn with_no_layout_set_treetop_opens_on_numbered_panels_and_number_keys_move_the_
     screen.press("3");
     screen.wait_for("panel 3 with the keys", |text| {
         bar(text).starts_with(" PANEL 3 ")
+    });
+    // The window's tree has no agent, so its info tab has the keys.
+    screen.press("]");
+    screen.press("1");
+    screen.wait_for("the window with the keys", |text| {
+        bar(text).starts_with(" NORMAL ")
     });
     screen.press("2");
     screen.wait_for("panel 2 with the keys", |text| {
@@ -592,15 +597,16 @@ esac
     screen.wait_for("tree 1's issue", |text| {
         let rows = linear(text);
         rows.contains("[3] Linear · ANB-90 ")
-            && rows.contains("bug  Show the rail")
+            && rows.contains("Show the rail")
+            && rows.contains("· bug")
             && rows.contains("In Progress")
             && rows.contains("Inbox")
     });
     // Back and forth, each at once: no key but the cursor's.
-    for (tree, has) in [("2", "Keep the rail"), ("3", "no issue on this tree")] {
+    for (tree, has) in [("2", "Keep the rail"), ("3", "issue    none")] {
         screen.press("j");
         screen.wait_for(tree, |text| {
-            text.contains(&format!("[0] Tree {tree} ·")) && linear(text).contains(has)
+            text.contains(&format!("[1] Tree {tree} ·")) && linear(text).contains(has)
         });
     }
     screen.press("kk");
@@ -658,16 +664,17 @@ fn the_keel_panel_follows_the_cursor_from_tree_to_tree() {
     };
     screen.wait_for("tree 1's run", |text| {
         let rows = keel(text);
-        text.contains("[0] Tree 1 · here-work")
+        text.contains("[1] Tree 1 · here-work")
             && rows.contains("[4] Keel · tree 1 ")
-            && rows.contains("issue █████▓░░░░░░░░ 5 of 11 !1 flagged")
-            && rows.contains("✓ 4  Step number 4")
-            && rows.contains("▸ 5  Step number 5")
+            && rows.contains("playbook issue · step 5 of 11")
+            && rows.contains("state    1 decision flagged")
+            && rows.contains("✓ Step number 4")
+            && rows.contains("▸ Step number 5")
     });
     screen.press("j");
     screen.wait_for("tree 2, with none", |text| {
         let rows = keel(text);
-        rows.contains("[4] Keel · tree 2 ") && rows.contains("no keel run in this tree")
+        rows.contains("[4] Keel · tree 2 ") && rows.contains("run      none")
     });
     screen.press("k");
     screen.press("4");
@@ -696,11 +703,11 @@ fn w_lists_the_workspaces_and_enter_switches_to_the_one_picked() {
         add_tree(root, "there", "2", None);
     });
     screen.wait_for("here's project in the title", |text| {
-        text.contains("[2] Trees · here ─") && text.contains("[0] Tree 1 · here-work")
+        text.contains("[2] Trees · here ─") && text.contains("[1] Tree 1 · here-work")
     });
     // From a window in Normal, and Esc closes it.
     screen.press("]");
-    screen.press("0");
+    screen.press("1");
     screen.wait_for("the window with the keys", |text| {
         text.lines().last().unwrap_or("").starts_with(" NORMAL ")
     });
@@ -711,8 +718,8 @@ fn w_lists_the_workspaces_and_enter_switches_to_the_one_picked() {
     screen.press("\x1b");
     screen.wait_for("it closed", |text| !text.contains(" Workspaces "));
     // From another panel, whose keys are not what the next workspace opens on.
-    screen.press("1");
-    screen.wait_for("Ship with the keys", |text| text.contains("PANEL 1"));
+    screen.press("4");
+    screen.wait_for("Keel with the keys", |text| text.contains("PANEL 4"));
     screen.press("w");
     screen.wait_for("both again", |text| text.contains(" Workspaces "));
     screen.press("/the");
@@ -720,7 +727,7 @@ fn w_lists_the_workspaces_and_enter_switches_to_the_one_picked() {
     screen.press("\r");
     screen.wait_on("there");
     screen.wait_for("there's tree in the window", |text| {
-        text.contains("[2] Trees · there ─") && text.contains("[0] Tree 1 · there-work")
+        text.contains("[2] Trees · there ─") && text.contains("[1] Tree 1 · there-work")
     });
     screen.press("r");
     screen.wait_for("the box to return there's tree", |text| {
@@ -740,7 +747,7 @@ fn an_ask_in_another_workspace_is_listed_by_e_and_enter_goes_there() {
     } = two_workspaces("waiting", "layout = \"panels\"\n");
     screen.wait_on("here");
     screen.wait_for("here's tree in the window", |text| {
-        text.contains("[0] Tree 1 · here-work")
+        text.contains("[1] Tree 1 · here-work")
     });
     let asker = Asker(Command::new("sleep").arg("600").spawn().unwrap());
     let git_dir = Command::new("git")
@@ -758,7 +765,7 @@ fn an_ask_in_another_workspace_is_listed_by_e_and_enter_goes_there() {
     screen.wait_for("there's ask on the top row", |text| {
         text.lines().next().is_some_and(|top| {
             top.split_whitespace()
-                .eq(["Trees", "Plan", "Issues", "●", "1", "needs", "you", "e"])
+                .eq(["Trees", "Plan", "Issues", "●", "1", "needs", "you"])
         })
     });
     screen.press("e");
@@ -766,7 +773,7 @@ fn an_ask_in_another_workspace_is_listed_by_e_and_enter_goes_there() {
     screen.press("\r");
     screen.wait_on("there");
     screen.wait_for("there's tree in the window", |text| {
-        text.contains("[0] Tree 1 · there-work")
+        text.contains("[1] Tree 1 · there-work")
     });
     drop(asker);
     drop(screen);
@@ -794,7 +801,7 @@ fn n_on_the_plan_screen_starts_a_planning_chat_that_can_read_the_repository() {
     );
     screen.press("\t");
     screen.wait_for("the Plan screen", |text| {
-        text.contains("[1] Planning chats")
+        text.contains("[2] Planning chats")
             && text.lines().last().unwrap_or("").starts_with(" PLAN ")
     });
     screen.press("n");
@@ -811,7 +818,7 @@ fn n_on_the_plan_screen_starts_a_planning_chat_that_can_read_the_repository() {
         "{said}"
     );
     assert!(
-        screen.text().contains("[1] Planning chats"),
+        screen.text().contains("[2] Planning chats"),
         "still on Plan"
     );
     drop(screen);
@@ -887,7 +894,7 @@ esac
             text.contains("project treetop panels")
                 && text.contains("░░░░░░░░░░░░░░░░ 0 done · 0 going · 2")
                 && text.contains("⊘ ANB-90")
-                && text.contains("[3] Ready to pick up 1")
+                && text.contains("[4] Ready to pick up 1")
         },
     );
     let shown = screen.text();
@@ -938,12 +945,12 @@ esac
         "case \"$1\" in\n--bg) echo 'claude attach new20' ;;\n\
          agents) echo '[{\"id\":\"new20\"}]' ;;\n*) exit 1 ;;\nesac\n",
     );
-    screen.press("3");
+    screen.press("4");
     screen.press("p");
     screen.wait_for("the new tree in the window, on the Trees screen", |text| {
         text.contains("[2] Trees")
-            && !text.contains("[1] Planning chats")
-            && text.contains("[0] Tree 20 · anb-90 · ANB-90 from plan 1 (I)")
+            && !text.contains("[2] Planning chats")
+            && text.contains("[1] Tree 20 · anb-90 · ANB-90 from plan 1 (I)")
     });
     drop(screen);
     let _ = fs::remove_dir_all(&root);
@@ -1013,7 +1020,7 @@ fn an_agents_ask_shows_within_seconds_while_its_workspaces_prs_are_slow_to_read(
     let _ = fs::remove_dir_all(&root);
 }
 
-/// ANB-106: a planning chat opens in [0] as a tree's chat tab does, with
+/// ANB-106: a planning chat opens in [1] as a tree's chat tab does, with
 /// Normal and Insert, and leaving Plan leaves nothing of it on Trees.
 #[test]
 fn a_planning_chat_opens_in_the_window_with_normal_and_insert() {
@@ -1042,12 +1049,12 @@ fn a_planning_chat_opens_in_the_window_with_normal_and_insert() {
     screen.wait_for("the panels", |text| text.contains("[2] Trees"));
     screen.press("\t");
     screen.wait_for("the planning chats", |text| text.contains("plan 1"));
-    // Enter opens it in [0], in Normal: the panels stay, nothing floats.
+    // Enter opens it in [1], in Normal: the panels stay, nothing floats.
     screen.press("\r");
-    screen.wait_for("the chat in [0]", |text| {
+    screen.wait_for("the chat in [1]", |text| {
         text.contains("chat j1 is open")
-            && text.contains("┐┌ [0] plan 1 ─")
-            && text.contains("[2] Made from it")
+            && text.contains("┐┌ [1] plan 1 ─")
+            && text.contains("[3] Made from it")
             && !text.contains("back to treetop")
     });
     screen.wait_for("Normal", bar_is(" NORMAL "));
@@ -1062,10 +1069,10 @@ fn a_planning_chat_opens_in_the_window_with_normal_and_insert() {
     screen.wait_for("Normal again", bar_is(" NORMAL "));
     screen.press("\x1b");
     screen.wait_for("Plan's own keys", bar_is(" PLAN "));
-    // Another chat under the cursor is another chat in [0].
+    // Another chat under the cursor is another chat in [1].
     screen.press("j");
-    screen.wait_for("[0] on the other chat", |text| {
-        text.contains("┐┌ [0] plan 2 ─") && !text.contains("chat j1 is open")
+    screen.wait_for("[1] on the other chat", |text| {
+        text.contains("┐┌ [1] plan 2 ─") && !text.contains("chat j1 is open")
     });
     screen.press("i");
     screen.wait_for("its chat, in Insert", |text| {
@@ -1119,10 +1126,10 @@ fn n_on_plan_opens_the_chat_it_started_not_the_one_under_the_cursor() {
     screen.wait_for("the planning chats", |text| text.contains("plan 1"));
     // Down to the last of them, the oldest.
     screen.press("jj");
-    screen.wait_for("the last chat", |text| text.contains("┌ [0] plan 1 ─"));
+    screen.wait_for("the last chat", |text| text.contains("┌ [1] plan 1 ─"));
     screen.press("n");
     screen.wait_for("the new chat, ready to type to", |text| {
-        text.contains("┌ [0] plan 4 ─")
+        text.contains("┌ [1] plan 4 ─")
             && text.contains("chat new4 is open")
             && text.lines().last().unwrap_or("").starts_with(" INSERT ")
     });
@@ -1168,10 +1175,11 @@ fn add_tree(root: &Path, name: &str, number: &str, branch: Option<&str>) {
     );
 }
 
-/// ANB-104, ANB-105: `F` on [1] Ship acts on the PR under its cursor, and a
-/// failure that never reached its agent waits on you again.
+/// ANB-104, ANB-105: `F` on [2] Trees sends the failure of the PR of the tree
+/// under its cursor, which the bar offers, and a failure that never reached
+/// its agent waits on you again.
 #[test]
-fn a_failure_sent_from_ship_that_never_arrives_waits_again() {
+fn a_failure_sent_that_never_arrives_waits_again() {
     let Workspaces {
         root, mut screen, ..
     } = two_workspaces("unsent", "");
@@ -1211,10 +1219,12 @@ esac
     // Away and back reads the plugins.
     screen.switch_to("there");
     screen.switch_to("here");
-    screen.wait_for("the failed PR, on you and in Ship", |text| {
-        text.contains("1 needs you") && text.contains("#65 x e2e") && text.contains("F send it")
+    screen.wait_for("the failed PR, on you and in Trees", |text| {
+        text.contains("1 needs you")
+            && text.contains("ci failed")
+            && text.contains("PR #65 x e2e")
+            && text.contains("F send failure")
     });
-    screen.press("1");
     screen.press("F");
     screen.wait_for("the send failing", |text| {
         text.contains("not sent to fixer in 1")
@@ -1269,10 +1279,12 @@ esac
     // Away and back reads the plugins.
     screen.switch_to("there");
     screen.switch_to("here");
-    screen.wait_for("the failed PR, on you and in Ship", |text| {
-        text.contains("1 needs you") && text.contains("#65 x e2e") && text.contains("F send it")
+    screen.wait_for("the failed PR, on you and in Trees", |text| {
+        text.contains("1 needs you")
+            && text.contains("ci failed")
+            && text.contains("PR #65 x e2e")
+            && text.contains("F send failure")
     });
-    screen.press("1");
     screen.press("F");
     // A switch waits for the failure to be read; then it is being typed in.
     screen.wait_for("the failure read, and sent", |text| {
@@ -1280,7 +1292,6 @@ esac
             .map(|l| l.chars().take(50).collect::<String>())
             .any(|l| l.contains("idle") && l.contains("here-work"))
     });
-    screen.press("2");
     screen.switch_to("there");
     screen.wait_for("the failure on you again, and why, on the bar", |text| {
         text.contains("1 needs you")
@@ -1308,8 +1319,8 @@ fn a_message_on_the_bar_gives_way_to_the_keys_at_the_next_one() {
     // Tree 1 has no PR whose failure F could send.
     screen.press("F");
     screen.wait_for("why not", bar_has("nothing has failed on tree 1's PR"));
-    screen.press("1");
-    screen.wait_for("[1]'s keys", bar_has("F send failure"));
+    screen.press("4");
+    screen.wait_for("[4]'s keys", bar_has("j/k steps"));
     screen.press("\t");
     screen.wait_for("Plan", bar_has("new chat"));
     screen.press("D");
@@ -1362,11 +1373,11 @@ fn the_palettes_rename_is_of_the_tree_it_names_from_any_panel() {
         root, mut screen, ..
     } = two_workspaces("palette", "");
     screen.wait_for("tree 1 in the window", |text| {
-        text.contains("[0] Tree 1 · here-work")
+        text.contains("[1] Tree 1 · here-work")
     });
     let bar_is =
         |mode: String| move |text: &str| text.lines().last().unwrap_or("").starts_with(&mode);
-    for panel in ["4", "3", "1", "2"] {
+    for panel in ["4", "3", "2"] {
         screen.press(panel);
         screen.press("\x10");
         screen.wait_for("the palette", |text| {
@@ -1453,7 +1464,7 @@ fn the_lists_cursor_stays_on_what_it_was_on_as_another_resolves() {
     screen.press("\r");
     screen.wait_on("there");
     let number = picked.trim_start_matches("there ");
-    let title = format!("[0] Tree {number} ·");
+    let title = format!("[1] Tree {number} ·");
     screen.wait_for("the tree picked", |text| text.contains(&title));
     drop(askers);
     drop(screen);
@@ -1490,7 +1501,7 @@ fn the_key_after_going_to_another_workspaces_item_acts_on_its_tree() {
     screen.press("\r");
     screen.wait_on("there");
     screen.wait_for("the tree picked", |text| {
-        text.contains(&format!("[0] Tree {last} ·"))
+        text.contains(&format!("[1] Tree {last} ·"))
     });
     std::thread::sleep(Duration::from_secs(1));
     screen.press("x");
@@ -1537,8 +1548,8 @@ fn shift_w_reaches_everything_that_needs_you_across_workspaces() {
     }
     screen.wait_for("all four", |text| text.contains("4 need you"));
     let place = |text: &str| -> Option<String> {
-        let title = text.lines().find(|l| l.contains("[0] Tree "))?;
-        let at = title.find("[0] Tree ")?;
+        let title = text.lines().find(|l| l.contains("[1] Tree "))?;
+        let at = title.find("[1] Tree ")?;
         Some(title[at..].chars().take(40).collect())
     };
     let mut seen = std::collections::BTreeSet::new();
