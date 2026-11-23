@@ -2586,6 +2586,12 @@ impl App {
         };
     }
 
+    /// [3] on the Issues screen follows no project: no issue is under the
+    /// cursor, so it shows nothing for `3` or `p` to act on.
+    pub fn lose_project(&mut self) {
+        self.issues_project = IssuesProject::Unknown;
+    }
+
     /// The project [3] wants read: never read, or read PROJECT_READ ago
     /// and not on its way again.
     pub fn wanted_project(&mut self) -> Option<ProjectKey> {

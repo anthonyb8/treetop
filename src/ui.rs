@@ -215,7 +215,7 @@ const PANELS_HELP: [(&str, &[(&str, &str)]); 9] = [
     (
         "Issues",
         &[
-            ("Enter 1", "read it in [1]"),
+            ("1 2 3", "the issue, list, project"),
             ("Tab", "[1]'s links"),
             ("J K", "scroll [1] from [2]"),
             ("f", "filters, in place of views"),

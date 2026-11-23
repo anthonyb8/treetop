@@ -391,6 +391,13 @@ impl Screen {
             .or_else(|| self.details.get(id).map(|d| &d.issue))
     }
 
+    /// The issue [1] shows is one opened from a link or [3] that is not read
+    /// yet: `current()` is None only until it lands, not because nothing is
+    /// under the cursor.
+    pub fn is_issue_unread(&self) -> bool {
+        self.trail.last().is_some() && self.current().is_none()
+    }
+
     /// The detail of the issue on screen, if it has been read since the
     /// issue last changed.
     pub(crate) fn detail(&self) -> Option<&Detail> {

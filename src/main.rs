@@ -666,7 +666,10 @@ fn run(
                 is_stale |= screen.poll();
                 // [3] follows the issue in [1], its project read behind
                 // the screen so the cursor never waits on it.
-                app.follow_project(screen.source_name(), screen.current());
+                match screen.current() {
+                    None if !screen.is_issue_unread() => app.lose_project(),
+                    issue => app.follow_project(screen.source_name(), issue),
+                }
                 screen.set_project(app.project_ids());
                 if is_panels && let Some(key) = app.wanted_project() {
                     let done = issue_reads_done.clone();

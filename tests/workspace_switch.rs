@@ -1212,6 +1212,24 @@ esac
         titles(&shown).contains("[1] ANB-90 Show the rail") && bar_is(" PANEL 2 ")(&shown),
         "{shown}"
     );
+    // A search that keeps nothing leaves no issue under the cursor, and [3]
+    // goes with it rather than keep the last project for `p` to act on.
+    screen.press("/");
+    screen.press("qqzzxx\r");
+    screen.wait_for("no issue under the cursor and no project", |text| {
+        titles(text).contains("· 0 issues")
+            && text.contains("no issue under the cursor")
+            && text.contains("[3] Project")
+            && !project(text).contains("Inbox")
+    });
+    screen.press("/");
+    screen.press("\x1b");
+    screen.wait_for(
+        "the search cleared, [3] on ANB-90's project again",
+        |text| {
+            titles(text).contains("· 2 issues") && project(text).contains("┌ [3] Project · Inbox ")
+        },
+    );
     screen.press("j");
     screen.wait_for("[1] on the next issue, in no project", |text| {
         titles(text).contains("[1] ANB-91 Keep the rail")
