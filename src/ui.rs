@@ -3390,10 +3390,9 @@ fn draw_issues(frame: &mut Frame, app: &App, main: Rect, footer: Rect, screen: &
     let has_keys = app.prompt.is_none();
     let on_issue = screen.is_reading();
     let on_project = screen.project_cursor().is_some();
-    let mut title = vec![Span::raw(" [2] Issues ")];
-    title.extend(screen.list_title(&p));
-    let block = window_block((has_keys && !on_issue && !on_project).then_some(Mode::Normal))
-        .title(Line::from(title));
+    let title = issues_list_title(screen, &p, usize::from(list.width.saturating_sub(2)));
+    let block =
+        window_block((has_keys && !on_issue && !on_project).then_some(Mode::Normal)).title(title);
     let body = block.inner(list);
     frame.render_widget(block, list);
     screen.draw_list_panel(frame, body, &p, app);
@@ -3443,6 +3442,57 @@ fn draw_issues(frame: &mut Frame, app: &App, main: Rect, footer: Rect, screen: &
         Line::from(spans)
     });
     screen.draw_over(frame, main.union(footer), &p);
+}
+
+/// [2]'s title on the Issues screen in `width` columns: its name, a tab for
+/// each issue source with the one shown marked as the top row marks its
+/// screen, then what the list counts. The shown tab always stays, cut if it
+/// has to be; the other tabs cut at the first that does not fit, and the
+/// counts after them give up the last ones first, so nothing wraps or is
+/// cut mid-count.
+fn issues_list_title(screen: &issues::Screen, p: &issues::Palette, width: usize) -> Line<'static> {
+    let t = theme();
+    let head = " [2] Issues ";
+    // The tabs and the counts share what the name and the space between
+    // them leave.
+    let mut room = width.saturating_sub(Line::raw(head).width() + 1);
+    let mut spans = vec![Span::raw(head)];
+    let names: Vec<&str> = screen.source_names().collect();
+    if names.is_empty() {
+        let none = Span::styled(" no source ", fg(t.muted));
+        room = room.saturating_sub(none.width());
+        spans.push(none);
+    }
+    let tab = |name: &str| Line::raw(format!(" {name} ")).width();
+    let shown = screen.shown_source();
+    let shown_width = shown.map_or(0, |at| tab(names[at]).min(room));
+    room -= shown_width;
+    for (at, name) in names.iter().enumerate() {
+        if Some(at) == shown {
+            let name = fit(name, shown_width.saturating_sub(2));
+            spans.push(Span::styled(format!(" {name} "), shown_tab_style()));
+        } else if tab(name) <= room {
+            room -= tab(name);
+            spans.push(Span::styled(format!(" {name} "), fg(t.muted)));
+        } else {
+            // Cut where it stops fitting, not further along, so the tabs
+            // keep their order; a cut shorter than a letter says nothing.
+            if room >= 4 {
+                let name = fit(name, room - 2);
+                spans.push(Span::styled(format!(" {name} "), fg(t.muted)));
+            }
+            room = 0;
+        }
+    }
+    spans.push(Span::raw(" "));
+    for count in screen.list_title(p) {
+        if count.width() > room {
+            break;
+        }
+        room -= count.width();
+        spans.push(count);
+    }
+    Line::from(spans)
 }
 
 /// [3] Project on the Issues screen: the project of the issue in [1], named
@@ -10323,7 +10373,7 @@ mod panels_tests {
             .lines()
             .find(|l| l.contains("[2] Issues"))
             .unwrap_or_else(|| panic!("{shown}"));
-        assert!(title.contains("[2] Issues · work · 2 issues"), "{title}");
+        assert!(title.contains("[2] Issues  work  · 2 issues"), "{title}");
         assert!(title.contains("[1] END-1 END-1 title"), "{title}");
         assert_eq!(
             window_column(&shown),
@@ -10369,6 +10419,142 @@ mod panels_tests {
             bar.starts_with(" PANEL 1 ") && bar.contains("2 list"),
             "{bar}"
         );
+    }
+
+    /// A source called `name` listing one issue, `<prefix>-1`.
+    struct OneIssue {
+        name: &'static str,
+        prefix: &'static str,
+    }
+
+    impl issues::Backend for OneIssue {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn list(&self, _: &issues::Filters) -> Result<Vec<linear::Issue>, String> {
+            Ok(vec![linear::Issue {
+                id: format!("{}-1", self.prefix),
+                title: format!("{} title", self.prefix),
+                state: "Todo".into(),
+                updated_at: "2026-10-17T10:00:00Z".into(),
+                ..linear::Issue::default()
+            }])
+        }
+
+        fn detail(&self, id: &str) -> Result<linear::Detail, String> {
+            let mut issue = self.list(&issues::Filters::default())?.remove(0);
+            issue.description = Some(format!("{id} text"));
+            Ok(linear::Detail {
+                issue,
+                comments: Vec::new(),
+                links: Vec::new(),
+            })
+        }
+    }
+
+    /// The Issues screen on the panels at 120 by 31 over `sources`, once it
+    /// has read the first one's issue.
+    fn sources_screen(
+        app: &App,
+        sources: Vec<std::sync::Arc<dyn issues::Backend>>,
+    ) -> issues::Screen {
+        let mut screen = issues::Screen::new(sources, 0, Vec::new());
+        screen.set_panels(issues_on_panels(app, Rect::new(0, 0, 120, 31)));
+        settle_issues(app, &mut screen, "-1 text");
+        screen
+    }
+
+    /// Polls `screen` until `text` is drawn, as the main loop would.
+    fn settle_issues(app: &App, screen: &mut issues::Screen, text: &str) {
+        for _ in 0..200 {
+            screen.poll();
+            if drawn_issues(app, screen, 120, 31).contains(text) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// [2]'s title row at 120 by 31, as far as [2]'s corner, and that row
+    /// of cells.
+    fn list_title_row(app: &App, screen: &issues::Screen) -> (String, u16) {
+        let shown = drawn_issues(app, screen, 120, 31);
+        let (y, row) = shown
+            .lines()
+            .enumerate()
+            .find(|(_, l)| l.contains("[2] Issues"))
+            .unwrap_or_else(|| panic!("{shown}"));
+        let corner = row.find('┐').unwrap_or_else(|| panic!("{row}"));
+        (
+            row[..corner + '┐'.len_utf8()].to_string(),
+            u16::try_from(y).unwrap(),
+        )
+    }
+
+    #[test]
+    fn issue_sources_are_tabs_on_2_and_brackets_show_the_other_with_its_list() {
+        let mut app = panels();
+        app.is_issues = true;
+        let source = |name, prefix| -> std::sync::Arc<dyn issues::Backend> {
+            std::sync::Arc::new(OneIssue { name, prefix })
+        };
+        let mut issues =
+            sources_screen(&app, vec![source("work", "END"), source("personal", "ANT")]);
+        let (title, y) = list_title_row(&app, &issues);
+        assert!(
+            title.starts_with("┌ [2] Issues  work  personal  · 1 issue ─"),
+            "{title}"
+        );
+        // The shown tab in the cursor's grey, as the top row marks its
+        // screen; the other muted.
+        let is_shown = |issues: &issues::Screen, name: &str| {
+            let (title, _) = list_title_row(&app, issues);
+            let x = u16::try_from(title[..title.find(name).unwrap()].chars().count()).unwrap();
+            let cell = &drawn_buffer(&app, issues, 120, 31)[(x, y)];
+            match theme().cursor.bg {
+                Some(bg) => cell.bg == bg,
+                None => cell.modifier.contains(Modifier::REVERSED),
+            }
+        };
+        assert!(is_shown(&issues, "work") && !is_shown(&issues, "personal"));
+        // Which way each bracket steps is the crate's to prove; here the
+        // mark follows the source shown, with its list read into [1].
+        issues.handle_key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Char(']'),
+        ));
+        settle_issues(&app, &mut issues, "ANT-1 text");
+        assert!(is_shown(&issues, "personal") && !is_shown(&issues, "work"));
+        let shown = drawn_issues(&app, &issues, 120, 31);
+        assert!(shown.contains("ANT-1 text"), "{shown}");
+    }
+
+    #[test]
+    fn long_source_names_cut_inside_2s_title_and_never_past_its_corner() {
+        let mut app = panels();
+        app.is_issues = true;
+        let source = |name, prefix| -> std::sync::Arc<dyn issues::Backend> {
+            std::sync::Arc::new(OneIssue { name, prefix })
+        };
+        // The shown tab whole, and then: the other cut where room runs out;
+        // or the other whole and the count, which no longer fits, left out
+        // rather than cut.
+        for (shown, other, row) in [
+            (
+                "the-work-linear-workspace",
+                "the-personal-linear-workspace",
+                "┌ [2] Issues  the-work-linear-workspace  the…  ┐",
+            ),
+            (
+                "the-work-linear-ws",
+                "home",
+                "┌ [2] Issues  the-work-linear-ws  home  ───────┐",
+            ),
+        ] {
+            let issues = sources_screen(&app, vec![source(shown, "END"), source(other, "ANT")]);
+            let (title, _) = list_title_row(&app, &issues);
+            assert!(title.starts_with(row), "{title}");
+        }
     }
 
     #[test]

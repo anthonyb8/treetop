@@ -1165,7 +1165,7 @@ esac
     screen.wait_for("Issues on the panels, the first issue in [1]", |text| {
         let row = titles(text);
         text.starts_with("  Trees   Plan   Issues ")
-            && row.contains("┌ [2] Issues · tix · 2 issues ")
+            && row.contains("┌ [2] Issues  tix  · 2 issues ")
             && row.find("[1] ANB-90 Show the rail") > row.find("[2] Issues")
             && text.contains("Draw it as a rail.")
             && text.contains("labels    Bug")

@@ -276,6 +276,17 @@ impl Screen {
         self.backends.len()
     }
 
+    /// Every source's name, in the config's order.
+    pub fn source_names(&self) -> impl Iterator<Item = &str> {
+        self.backends.iter().map(|b| b.name())
+    }
+
+    /// Which of `source_names` the list shows; none while a repository
+    /// without a source of its own has not asked for one.
+    pub fn shown_source(&self) -> Option<usize> {
+        (!self.is_without_source && self.source < self.backends.len()).then_some(self.source)
+    }
+
     /// Shows `message` in the bar until the next key.
     pub fn say(&mut self, message: String) {
         self.message = Some(message);
@@ -1293,19 +1304,30 @@ impl Screen {
         }
     }
 
-    /// Shows the next source, listing it afresh.
+    /// Shows the next source, as `]` does, but says why when there is no
+    /// other, `w` being the key that has always switched.
     fn next_source(&mut self) {
+        if !self.step_source(1) {
+            self.message = Some("one issue source; add another [issues.<name>] to switch".into());
+        }
+    }
+
+    /// Shows the source `by` along from this one, round from the last to
+    /// the first, listing it afresh; false with no other source to show.
+    fn step_source(&mut self, by: isize) -> bool {
         if self.is_without_source && !self.backends.is_empty() {
             self.is_without_source = false;
             self.error = None;
             self.load();
-            return;
+            return true;
         }
         if self.backends.len() < 2 {
-            self.message = Some("one issue source; add another [issues.<name>] to switch".into());
-            return;
+            return false;
         }
-        self.source = (self.source + 1) % self.backends.len();
+        let count = self.backends.len().cast_signed();
+        self.source = (self.source.cast_signed() + by)
+            .rem_euclid(count)
+            .cast_unsigned();
         self.marked.clear();
         self.all.clear();
         self.issues.clear();
@@ -1314,6 +1336,7 @@ impl Screen {
         self.selected = 0;
         self.scroll = 0;
         self.load();
+        true
     }
 
     fn reload(&mut self) {
@@ -1536,6 +1559,13 @@ impl Screen {
             KeyCode::Char('r') => self.reload(),
             KeyCode::Char('n') => self.open_new(),
             KeyCode::Char('w') => self.next_source(),
+            // The tabs of what has the keys, as on Trees: here the sources.
+            KeyCode::Char(']') => {
+                self.step_source(1);
+            }
+            KeyCode::Char('[') => {
+                self.step_source(-1);
+            }
             _ => return self.on_issue(key),
         }
         Action::None
@@ -2134,6 +2164,8 @@ mod tests {
             "nothing is asked of work"
         );
         assert!(screen.issues.is_empty());
+        // No source's tab is marked shown while none is listed.
+        assert_eq!(screen.shown_source(), None);
         let drawn = drawn(&screen).join("\n");
         assert!(
             drawn.contains(" no issue source for this repository"),
@@ -2146,6 +2178,7 @@ mod tests {
         screen.handle_key(key(KeyCode::Char('w')));
         settle(&mut screen);
         assert_eq!(screen.issues.len(), 1);
+        assert_eq!(screen.shown_source(), Some(0));
     }
 
     #[test]
@@ -3600,5 +3633,72 @@ mod tests {
         settle(&mut screen);
         assert_eq!(screen.source_name(), "personal");
         assert_eq!(screen.current().unwrap().id, "ANT-7");
+    }
+
+    #[test]
+    fn brackets_step_back_and_on_through_the_sources_round_from_either_end() {
+        let source = |name: &str, id: &str| -> Arc<dyn Backend> {
+            Arc::new(Fake {
+                name: name.into(),
+                issues: vec![issue(id)],
+                ..Fake::default()
+            })
+        };
+        let sources = vec![
+            source("work", "END-1"),
+            source("personal", "ANT-7"),
+            source("club", "CLB-3"),
+        ];
+        let mut screen = Screen::new(sources, 0, Vec::new());
+        settle(&mut screen);
+        for (code, name, id) in [
+            ('[', "club", "CLB-3"),
+            ('[', "personal", "ANT-7"),
+            (']', "club", "CLB-3"),
+            (']', "work", "END-1"),
+        ] {
+            screen.handle_key(key(KeyCode::Char(code)));
+            settle(&mut screen);
+            assert_eq!(screen.source_name(), name, "{code}");
+            assert_eq!(screen.current().unwrap().id, id, "{code}");
+        }
+    }
+
+    #[test]
+    fn with_one_source_brackets_stay_silent_where_w_says_why() {
+        let (mut screen, _) = screen();
+        for code in ['[', ']'] {
+            screen.handle_key(key(KeyCode::Char(code)));
+            assert_eq!(screen.message, None, "{code}");
+            assert_eq!(screen.source_name(), "work");
+        }
+        screen.handle_key(key(KeyCode::Char('w')));
+        assert!(
+            screen
+                .message
+                .as_deref()
+                .unwrap()
+                .starts_with("one issue source")
+        );
+    }
+
+    #[test]
+    fn brackets_type_in_the_search_box() {
+        let work = Arc::new(Fake {
+            name: "work".into(),
+            issues: vec![issue("END-1")],
+            ..Fake::default()
+        });
+        let personal = Arc::new(Fake {
+            name: "personal".into(),
+            ..Fake::default()
+        });
+        let mut screen = Screen::new(vec![work, personal], 0, Vec::new());
+        settle(&mut screen);
+        screen.handle_key(key(KeyCode::Char('/')));
+        screen.handle_key(key(KeyCode::Char('[')));
+        screen.handle_key(key(KeyCode::Char(']')));
+        assert_eq!(screen.search.as_deref(), Some("[]"));
+        assert_eq!(screen.source_name(), "work");
     }
 }

@@ -181,7 +181,10 @@ const HELP: [(&str, &str); 28] = [
     ),
     ("6 to 9", "your own views, from [views] in the config"),
     ("m", "only yours, or everyone's"),
-    ("w", "the next issue source: work, personal"),
+    (
+        "[ ] w",
+        "the issue source before or after, work and personal; w the next",
+    ),
     ("o", "open it in the browser"),
     ("r", "read the list and the team again"),
     (
@@ -418,26 +421,17 @@ impl Screen {
         self.draw_list(frame, area, p, host, true);
     }
 
-    /// [2]'s title after its name: the source, how many issues it lists,
-    /// how many are marked, and whether it is reading them.
+    /// [2]'s title after its tabs of sources: how many issues it lists,
+    /// how many are marked, and whether it is reading them, each its own
+    /// span so a narrow title can give up the last.
     pub fn list_title(&self, p: &Palette) -> Vec<Span<'static>> {
         // Without a source of its own the filter line says so, and lists
         // nothing to count.
         if self.is_without_source {
             return Vec::new();
         }
-        let source = if self.source_count() > 1 {
-            format!(
-                "{} ({}/{})",
-                self.source_name(),
-                self.source + 1,
-                self.source_count()
-            )
-        } else {
-            self.source_name().to_string()
-        };
         let mut spans = vec![Span::styled(
-            format!("· {source} · {} ", issues_said(self.issues.len())),
+            format!("· {} ", issues_said(self.issues.len())),
             fg(p.muted),
         )];
         if !self.marked.is_empty() {

@@ -796,7 +796,8 @@ The Issues screen shows the repository's issues from its issue source in the con
 In the panels layout, from 120 by 31, it is drawn as Trees and Plan are: the list is [2] down the left, in the columns ID, PRI, TITLE and WORK under the filter line, and the issue under the cursor is [1] on the right, whole, a row each for its status, labels, project and work above its description and comments.
 Under [2], [3] Project shows the project of the issue in [1], named in its title: a bar of its issues done, going and to start, then each open one with its tree and agent as WORK says them, `ready`, `⊘` and the issue it waits on, or `not started`, the one in [1] marked.
 It is read in the background as the cursor moves, and read again after a minute; an issue in no project says "not in a project".
-[2]'s title names the source and how many issues it lists, and treetop's bar shows the keys of the panel that has them.
+[2]'s title has a tab for each issue source, the one shown in the cursor's grey, then how many issues it lists, and treetop's bar shows the keys of the panel that has them.
+From the list `[` and `]` show the issue source before or after, as they move between [1]'s tabs on Trees; with one source they do nothing.
 Everything loads in the background, and an issue's description and comments are kept once read, so moving the cursor never waits on the network.
 Each issue picked up in a tree shows it in the WORK column, with its agent's state, `4 · waiting` in the warning colour when the agent waits on you.
 Enter or `→` opens the issue under the cursor on the whole screen, to scroll with j/k, Space and PgUp, g and G, or the mouse wheel; Esc or `←` goes back to the list.
