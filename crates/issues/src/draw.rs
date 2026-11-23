@@ -488,6 +488,19 @@ impl Screen {
         if self.search.is_some() {
             return Bar::Keys(&[("Enter", "keep it"), ("Esc", "clear it"), ("↑ ↓", "move")]);
         }
+        // A picker on the panels takes every key, so the bar says its own;
+        // the screen of its own keeps them on the picker's border alone.
+        if let Some(picker) = self.picker.as_ref().filter(|_| self.is_panels) {
+            return Bar::Keys(match picker.kind {
+                crate::picker::Kind::Labels => &[
+                    ("type", "narrow"),
+                    ("Tab", "mark"),
+                    ("Enter", "apply"),
+                    ("Esc", "cancel"),
+                ],
+                _ => &[("type", "narrow"), ("Enter", "pick"), ("Esc", "cancel")],
+            });
+        }
         if self.panel.is_some() && self.picker.is_none() {
             return Bar::Keys(&[
                 ("Enter", "change"),
@@ -950,7 +963,9 @@ impl Screen {
         let mut trail: Vec<&str> = self
             .issues
             .get(self.selected)
-            .filter(|_| !self.is_from_outside && !self.is_from_project)
+            .filter(|_| {
+                !self.is_from_outside && !self.is_from_project && !self.is_folded(self.selected)
+            })
             .map(|i| i.id.as_str())
             .into_iter()
             .collect();

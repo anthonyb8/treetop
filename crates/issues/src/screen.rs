@@ -370,6 +370,8 @@ impl Screen {
     pub fn viewed_id(&self) -> Option<&str> {
         match self.trail.last() {
             Some(id) => Some(id),
+            // A folded group shows only its heading, as `current()` says.
+            None if self.is_folded(self.selected) => None,
             None => self.issues.get(self.selected).map(|i| i.id.as_str()),
         }
     }
@@ -2850,6 +2852,53 @@ mod tests {
         let row = row_of(&list, "END-1");
         assert!(row.contains("A very long title"), "{row}");
         assert!(row.contains("… 3 · no agent "), "{row}");
+    }
+
+    #[test]
+    fn on_the_panels_a_folded_group_names_no_issue_in_1s_title() {
+        let (mut screen, _) = on_panels(2);
+        let named = |screen: &Screen| -> String {
+            screen
+                .issue_title(&crate::Palette::default())
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+        assert!(named(&screen).contains("END-1"), "{}", named(&screen));
+        screen.handle_key(key(KeyCode::Char('z')));
+        assert!(
+            screen.is_folded(screen.selected),
+            "z folds the cursor's group"
+        );
+        assert!(!named(&screen).contains("END-"), "{}", named(&screen));
+    }
+
+    #[test]
+    fn on_the_panels_a_picker_puts_its_own_keys_on_the_bar() {
+        let fake = Arc::new(Fake {
+            name: "work".into(),
+            issues: vec![Issue {
+                state: "todo".into(),
+                state_id: Some("todo".into()),
+                ..issue("END-1")
+            }],
+            team: Some(team_of(&["todo", "doing"])),
+            ..Fake::default()
+        });
+        let mut screen = Screen::new(vec![fake], 0, Vec::new());
+        settle(&mut screen);
+        screen.set_panels(true);
+        screen.handle_key(key(KeyCode::Char('s')));
+        assert!(screen.picker.is_some(), "s opens the status picker");
+        let crate::Bar::Keys(keys) = screen.bar() else {
+            panic!("the bar says keys");
+        };
+        let said: Vec<&str> = keys.iter().map(|(key, _)| *key).collect();
+        assert!(said.contains(&"Enter") && said.contains(&"Esc"), "{said:?}");
+        assert!(
+            !said.contains(&"j/k"),
+            "the list's keys would type into it: {said:?}"
+        );
     }
 
     #[test]
