@@ -1,6 +1,7 @@
 //! Drawing the Issues screen: the list on top, the issue under the cursor
 //! below with its description and comments, and the bar at the bottom. An
-//! open issue takes the whole screen.
+//! open issue takes the whole screen. On the program's panels the list and
+//! the issue are drawn into the boxes it lays out, from the same pieces.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -18,12 +19,12 @@ use ratatui_image::{Resize, StatefulImage};
 use crate::Palette;
 use crate::compose::Compose;
 use crate::form::{FIELDS, Field, Form};
-use crate::host::Host;
+use crate::host::{Host, Work};
 use crate::markdown::{self, Piece};
 use crate::panel::{self, ROWS};
 use crate::picker::{Kind, Picker};
 use crate::picture::{self, Picture};
-use crate::screen::{Focus, Screen};
+use crate::screen::{Focus, Screen, issues_said};
 use crate::targets::Target;
 use crate::views::Group;
 
@@ -47,6 +48,47 @@ const MARKED_KEYS: [(&str, &str); 6] = [
     ("X", "all"),
 ];
 
+/// The bar's keys on the panels, with [2] the list's.
+const PANEL_LIST_KEYS: [(&str, &str); 11] = [
+    ("j/k", "move"),
+    ("Enter", "read it"),
+    ("p", "pick up"),
+    ("f", "filters"),
+    ("/", "search"),
+    ("s", "status"),
+    ("x", "mark"),
+    ("1", "issue"),
+    ("3", "project"),
+    ("Tab", "Trees"),
+    ("?", "help"),
+];
+
+/// The bar's keys on the panels, with [3] the project's.
+const PANEL_PROJECT_KEYS: [(&str, &str); 8] = [
+    ("j/k", "move"),
+    ("Enter", "show it"),
+    ("p", "pick up"),
+    ("1", "issue"),
+    ("2", "list"),
+    ("Esc", "back"),
+    ("Tab", "Trees"),
+    ("?", "help"),
+];
+
+/// The bar's keys on the panels, with [1] the issue's.
+const PANEL_ISSUE_KEYS: [(&str, &str); 10] = [
+    ("j/k", "scroll"),
+    ("Tab", "links"),
+    ("p", "pick up"),
+    ("c", "comment"),
+    ("e", "edit"),
+    ("o", "browser"),
+    ("Esc", "back"),
+    ("2", "list"),
+    ("3", "project"),
+    ("?", "help"),
+];
+
 /// The bar's keys inside an open issue.
 const ISSUE_KEYS: [(&str, &str); 5] = [
     ("Esc", "back"),
@@ -61,6 +103,13 @@ const VIEWER_KEYS: [(&str, &str); 3] = [
     ("Esc", "back"),
     ("← →", "other images"),
     ("o", "open it in the browser"),
+];
+
+/// The bar's keys in the comment box.
+const COMPOSE_KEYS: [(&str, &str); 3] = [
+    ("Enter", "send"),
+    ("Alt+Enter", "new line"),
+    ("Esc", "cancel"),
 ];
 
 /// The bar's keys in the form, by the field the cursor is in.
@@ -139,7 +188,10 @@ const HELP: [(&str, &str); 28] = [
     ),
     ("6 to 9", "your own views, from [views] in the config"),
     ("m", "only yours, or everyone's"),
-    ("w", "the next issue source: work, personal"),
+    (
+        "[ ] w",
+        "the issue source before or after, work and personal; w the next",
+    ),
     ("o", "open it in the browser"),
     ("r", "read the list and the team again"),
     (
@@ -156,6 +208,15 @@ const HELP: [(&str, &str); 28] = [
     ("Tab", "back to the trees"),
     ("q", "quit"),
 ];
+
+/// What the bar says on the left: the keys for what is on screen, or a
+/// message or error in their place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bar<'a> {
+    Keys(&'static [(&'static str, &'static str)]),
+    Message(&'a str),
+    Error(&'a str),
+}
 
 fn fg(color: ratatui::style::Color) -> Style {
     Style::new().fg(color)
@@ -196,35 +257,75 @@ fn seconds(iso: &str) -> Option<u64> {
     u64::try_from(days * 86_400 + h * 3_600 + min * 60 + s).ok()
 }
 
-fn priority(issue: &Issue, p: &Palette) -> Cell<'static> {
-    let (text, style) = match issue.priority {
-        1 => ("urgent", fg(p.danger).add_modifier(Modifier::BOLD)),
-        2 => ("high", fg(p.warning)),
-        3 => ("medium", fg(p.text)),
-        4 => ("low", fg(p.muted)),
-        _ => ("", fg(p.muted)),
+/// The issue's priority, in a word, or cut to four letters in the panels'
+/// narrow column.
+fn priority(issue: &Issue, p: &Palette, is_short: bool) -> Cell<'static> {
+    let text = match issue.priority {
+        1 if is_short => "urg",
+        3 if is_short => "med",
+        1..=4 => issue.priority_label(),
+        _ => "",
     };
-    Cell::from(text).style(style)
+    Cell::from(text).style(priority_style(issue, p))
 }
 
-/// Which tree is working on the issue, and its agent's state: `4 ·
-/// waiting` loud, a busy one green, the rest muted.
-fn work_cell(host: &dyn Host, id: &str, p: &Palette) -> Cell<'static> {
-    let Some(work) = host.work_on(id) else {
-        return Cell::from("");
-    };
-    if work.is_ready {
-        return Cell::from("ready").style(fg(p.success).add_modifier(Modifier::BOLD));
+/// An urgent issue loud, a high one in the warning colour, the rest quieter.
+fn priority_style(issue: &Issue, p: &Palette) -> Style {
+    match issue.priority {
+        1 => fg(p.danger).add_modifier(Modifier::BOLD),
+        2 => fg(p.warning),
+        3 => fg(p.text),
+        _ => fg(p.muted),
     }
-    let agent = work.agent.as_deref().unwrap_or("no agent");
-    let style = if work.needs_you {
+}
+
+/// Which tree is working on the issue, and its agent's state, as
+/// `work_span` says it.
+fn work_cell(host: &dyn Host, id: &str, p: &Palette) -> Cell<'static> {
+    host.work_on(id)
+        .map_or_else(|| Cell::from(""), |work| Cell::from(work_span(&work, p)))
+}
+
+/// The work on an issue as the WORK column says it, for the program's own
+/// panels to say it the same: `4 · waiting` loud, a busy one green, the
+/// rest muted, or `ready`.
+pub fn work_span(work: &Work, p: &Palette) -> Span<'static> {
+    let text = if work.is_ready {
+        "ready".to_string()
+    } else {
+        let agent = work.agent.as_deref().unwrap_or("no agent");
+        format!("{} · {agent}", work.tree)
+    };
+    Span::styled(text, work_style(work, p))
+}
+
+/// The work on an issue in words, for [1] on the panels: its tree and
+/// agent, whether it is ready, or that nobody has it yet.
+fn work_said(host: &dyn Host, id: &str, p: &Palette) -> Span<'static> {
+    let Some(work) = host.work_on(id) else {
+        return Span::styled("nobody yet: p picks it up", fg(p.muted));
+    };
+    let text = if work.is_ready {
+        "ready to pick up: nothing blocks it".to_string()
+    } else {
+        let agent = work.agent.as_deref().unwrap_or("none");
+        format!("tree {}, agent {agent}", work.tree)
+    };
+    Span::styled(text, work_style(&work, p))
+}
+
+/// What needs you loud, a busy agent or a ready issue green, the rest
+/// muted.
+fn work_style(work: &Work, p: &Palette) -> Style {
+    if work.is_ready {
+        fg(p.success).add_modifier(Modifier::BOLD)
+    } else if work.needs_you {
         fg(p.warning).add_modifier(Modifier::BOLD)
-    } else if agent == "busy" {
+    } else if work.agent.as_deref() == Some("busy") {
         fg(p.success)
     } else {
         fg(p.muted)
-    };
-    Cell::from(format!("{} · {agent}", work.tree)).style(style)
+    }
 }
 
 fn key_bar(keys: &[(&str, &str)], width: u16, p: &Palette) -> Vec<Span<'static>> {
@@ -251,11 +352,15 @@ impl Screen {
         if let Some(form) = &self.form {
             let [body, footer] =
                 Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
-            let team = self
-                .teams
-                .get(&self.source)
-                .map_or(String::new(), |t| t.key.clone());
-            draw_form(frame, body, form, &team, p, self.picker.is_none());
+            let block = Block::bordered()
+                .border_style(fg(p.accent))
+                .padding(Padding::new(2, 2, 1, 0))
+                .title(Span::styled(
+                    format!(" {} ", self.form_title().unwrap_or_default()),
+                    fg(p.accent).add_modifier(Modifier::BOLD),
+                ));
+            draw_form(frame, block.inner(body), form, p, self.picker.is_none());
+            frame.render_widget(block, body);
             self.draw_footer(frame, footer, p);
         } else if self.focus == Focus::Issue {
             let [issue, footer] =
@@ -272,22 +377,177 @@ impl Screen {
                 Constraint::Length(1),
             ])
             .areas(area);
-            self.draw_list(frame, list, p, host);
+            self.draw_list(frame, list, p, host, false);
             self.draw_detail(frame, detail, p);
             self.draw_footer(frame, footer, p);
         }
+        self.draw_over(frame, area, area, p);
+        if let Some(compose) = &self.compose {
+            draw_compose(frame, area, compose, p);
+        }
+    }
+
+    /// What is open over the screen: the help and the filters over the
+    /// whole of `area`, and a picker, with the filters' own over them too,
+    /// in the middle of `window`, [1] on the panels.
+    pub fn draw_over(&self, frame: &mut Frame, area: Rect, window: Rect, p: &Palette) {
         if self.is_help {
             draw_help(frame, area, p);
         } else if let (Some(at), None) = (self.panel, &self.picker) {
             self.draw_panel(frame, area, at, p);
         } else if let Some(picker) = &self.picker {
-            draw_picker(frame, area, picker, p);
-        } else if let Some(compose) = &self.compose {
-            draw_compose(frame, area, compose, p);
+            let on = if self.panel.is_some() { area } else { window };
+            draw_picker(frame, on, picker, p);
         }
     }
 
-    fn draw_list(&self, frame: &mut Frame, area: Rect, p: &Palette, host: &dyn Host) {
+    /// The screen takes the whole of its area even on the panels: an image
+    /// filling it.
+    pub fn is_full_screen(&self) -> bool {
+        self.viewer.is_some()
+    }
+
+    /// The form or the comment box is open, so what is typed goes there.
+    pub fn is_writing(&self) -> bool {
+        self.form.is_some() || self.compose.is_some()
+    }
+
+    /// The open form's title: the issue it edits, or the team a new one
+    /// goes to.
+    pub fn form_title(&self) -> Option<String> {
+        let form = self.form.as_ref()?;
+        let team = self.teams.get(&self.source).map(|t| t.key.as_str());
+        Some(match (form.id(), team) {
+            (Some(id), _) => format!("Edit {id}"),
+            (None, Some(team)) if !team.is_empty() => format!("New issue in {team}"),
+            (None, _) => "New issue".to_string(),
+        })
+    }
+
+    /// [2]'s body on the panels: the filter line, and the list in the
+    /// columns that fit beside [1].
+    pub fn draw_list_panel(&self, frame: &mut Frame, area: Rect, p: &Palette, host: &dyn Host) {
+        self.draw_list(frame, area, p, host, true);
+    }
+
+    /// [2]'s title after its tabs of sources: how many issues it lists,
+    /// how many are marked, and whether it is reading them, each its own
+    /// span so a narrow title can give up the last.
+    pub fn list_title(&self, p: &Palette) -> Vec<Span<'static>> {
+        // Without a source of its own the filter line says so, and lists
+        // nothing to count.
+        if self.is_without_source {
+            return Vec::new();
+        }
+        let mut spans = vec![Span::styled(
+            format!("· {} ", issues_said(self.issues.len())),
+            fg(p.muted),
+        )];
+        if !self.marked.is_empty() {
+            spans.push(Span::styled(
+                format!("· {} marked ", self.marked.len()),
+                fg(p.success).add_modifier(Modifier::BOLD),
+            ));
+        }
+        if self.is_loading {
+            spans.push(Span::styled("· loading... ", fg(p.info)));
+        }
+        spans
+    }
+
+    /// [1]'s title after its number: the issues opened to get here, the one
+    /// shown marked, and its title.
+    pub fn issue_title(&self, p: &Palette) -> Vec<Span<'static>> {
+        let mut spans = self.trail_spans(p);
+        if let Some(issue) = self.current() {
+            spans.push(Span::raw(format!(" {} ", issue.title)));
+        } else if !spans.is_empty() {
+            spans.push(Span::raw(" "));
+        }
+        spans
+    }
+
+    /// How far down the issue shown is, for the bottom of its box, once it
+    /// is longer than the box.
+    pub fn issue_scrolled(&self, p: &Palette) -> Option<Line<'static>> {
+        let max = self.max_scroll.get();
+        (max > 0 && self.current().is_some()).then(|| {
+            Line::styled(
+                format!(
+                    " {}% ",
+                    u32::from(self.scroll.min(max)) * 100 / u32::from(max)
+                ),
+                fg(p.muted),
+            )
+        })
+    }
+
+    /// The bar's left, by what is on screen: the keys, or the message or
+    /// error there is in their place.
+    pub fn bar(&self) -> Bar<'_> {
+        if self.search.is_some() {
+            return Bar::Keys(&[("Enter", "keep it"), ("Esc", "clear it"), ("↑ ↓", "move")]);
+        }
+        // A picker on the panels takes every key, so the bar says its own;
+        // the screen of its own keeps them on the picker's border alone.
+        if let Some(picker) = self.picker.as_ref().filter(|_| self.is_panels) {
+            return Bar::Keys(match picker.kind {
+                crate::picker::Kind::Labels => &[
+                    ("type", "narrow"),
+                    ("Tab", "mark"),
+                    ("Enter", "apply"),
+                    ("Esc", "cancel"),
+                ],
+                _ => &[("type", "narrow"), ("Enter", "pick"), ("Esc", "cancel")],
+            });
+        }
+        if self.panel.is_some() && self.picker.is_none() {
+            return Bar::Keys(&[
+                ("Enter", "change"),
+                ("x", "clear"),
+                ("c", "clear all"),
+                ("Esc", "close"),
+            ]);
+        }
+        if self.choosing.is_some() && self.message.is_none() {
+            return Bar::Keys(&[
+                ("Enter", "choose"),
+                ("/", "search"),
+                ("f", "filters"),
+                ("→", "read"),
+                ("Esc", "cancel"),
+            ]);
+        }
+        if let Some(message) = &self.message {
+            return Bar::Message(message);
+        }
+        if let (Some(err), false) = (&self.error, self.issues.is_empty()) {
+            return Bar::Error(err);
+        }
+        Bar::Keys(match &self.form {
+            Some(form) => form_keys(form.field),
+            // Off the panels the comment popup lists its keys on its own border.
+            None if self.compose.is_some() && self.is_panels => &COMPOSE_KEYS,
+            None if self.focus == Focus::Issue && self.viewer.is_some() => &VIEWER_KEYS,
+            None if self.focus == Focus::Issue && self.is_panels => &PANEL_ISSUE_KEYS,
+            None if self.focus == Focus::Issue => &ISSUE_KEYS,
+            None if self.focus == Focus::Project => &PANEL_PROJECT_KEYS,
+            None if !self.marked.is_empty() => &MARKED_KEYS,
+            None if self.is_panels => &PANEL_LIST_KEYS,
+            None => &KEYS,
+        })
+    }
+
+    /// The list, the filter line above it: every column on the screen of
+    /// its own, or, `is_compact`, the four that fit beside [1] on the panels.
+    fn draw_list(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        p: &Palette,
+        host: &dyn Host,
+        is_compact: bool,
+    ) {
         let [bar, area] =
             Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
         self.draw_bar(frame, bar, p);
@@ -308,22 +568,64 @@ impl Screen {
             return;
         }
         // Grouped by status, each heading already says it, so the column
-        // would only repeat it.
+        // would only repeat it; the compact list keeps ID, PRI, TITLE and
+        // WORK, the issue's other fields being in [1] beside it.
         let has_status = self.group != Group::Status;
-        let columns = |mut cells: Vec<Cell<'static>>| {
-            if !has_status && cells.len() > 1 {
-                cells.remove(1);
-            }
-            cells
+        let is_shown = |at: usize| match at {
+            _ if is_compact => matches!(at, 0 | 2 | 3 | 6),
+            1 => has_status,
+            _ => true,
         };
+        let columns = |cells: Vec<Cell<'static>>| -> Vec<Cell<'static>> {
+            cells
+                .into_iter()
+                .enumerate()
+                .filter(|(at, _)| is_shown(*at))
+                .map(|(_, cell)| cell)
+                .collect()
+        };
+        let priority_heading = if is_compact { "PRI" } else { "PRIORITY" };
         let header = Row::new(columns(
             [
-                "ID", "STATUS", "PRIORITY", "TITLE", "LABELS", "ASSIGNEE", "WORK",
+                "ID",
+                "STATUS",
+                priority_heading,
+                "TITLE",
+                "LABELS",
+                "ASSIGNEE",
+                "WORK",
             ]
             .map(Cell::from)
             .to_vec(),
         ))
         .style(p.header);
+        // The compact list gives the title what it can: an id of eight,
+        // `urg`, and `12 · waiting` are as wide as its columns go.
+        let id_width = match (is_compact, self.marked.is_empty()) {
+            (true, true) => 9,
+            (true, false) => 11,
+            (false, true) => 10,
+            (false, false) => 12,
+        };
+        // The compact list cuts a long title with an ellipsis, as [1]'s
+        // title is, rather than mid-word at WORK: its room is what the box
+        // leaves after a column of air each side, ID, PRI, WORK and the
+        // spaces between them.
+        let title_room =
+            usize::from(area.width).saturating_sub(2 + usize::from(id_width) + 4 + 12 + 3);
+        let title_cell = |title: &str| -> Cell<'static> {
+            if !is_compact || Span::raw(title).width() <= title_room {
+                return Cell::from(title.to_string());
+            }
+            let mut cut = String::new();
+            for c in title.chars() {
+                if Span::raw(format!("{cut}{c}")).width() + 1 > title_room {
+                    break;
+                }
+                cut.push(c);
+            }
+            Cell::from(format!("{}…", cut.trim_end()))
+        };
         // A grouped list puts a heading row above each group, so the cursor's
         // row on screen counts the headings above it.
         let mut rows: Vec<Row> = Vec::new();
@@ -370,30 +672,38 @@ impl Screen {
             rows.push(Row::new(columns(vec![
                 id,
                 Cell::from(issue.state.clone()).style(fg(p.info)),
-                priority(issue, p),
-                Cell::from(issue.title.clone()),
+                priority(issue, p, is_compact),
+                title_cell(&issue.title),
                 Cell::from(issue.labels.join(", ")).style(fg(p.special)),
                 Cell::from(issue.assignee.clone().unwrap_or_default()).style(fg(p.muted)),
                 work_cell(host, &issue.id, p),
             ])));
         }
-        let id_width = if self.marked.is_empty() { 10 } else { 12 };
-        let mut widths = vec![
+        let widths: Vec<Constraint> = [
             Constraint::Length(id_width),
             Constraint::Length(14),
-            Constraint::Length(8),
+            Constraint::Length(if is_compact { 4 } else { 8 }),
             Constraint::Fill(1),
             Constraint::Length(18),
             Constraint::Length(14),
-            Constraint::Length(14),
-        ];
-        if !has_status {
-            widths.remove(1);
-        }
+            Constraint::Length(if is_compact { 12 } else { 14 }),
+        ]
+        .into_iter()
+        .enumerate()
+        .filter(|(at, _)| is_shown(*at))
+        .map(|(_, width)| width)
+        .collect();
         let table = Table::new(rows, widths)
             .header(header)
             .row_highlight_style(p.cursor);
         let mut state = TableState::default().with_selected(Some(cursor_row));
+        // In [2]'s box the table keeps a column of air each side, as the
+        // filter line above it and the other panels' text do.
+        let area = if is_compact {
+            Block::new().padding(Padding::horizontal(1)).inner(area)
+        } else {
+            area
+        };
         frame.render_stateful_widget(table, area, &mut state);
     }
 
@@ -431,25 +741,6 @@ impl Screen {
             );
             return;
         }
-        let mut spans = vec![Span::raw(" ")];
-        for (at, piece) in panel::describe(&self.filters, self.group)
-            .into_iter()
-            .enumerate()
-        {
-            if at > 0 {
-                spans.push(Span::styled("  ·  ", fg(p.border)));
-            }
-            let style = if at == 0 {
-                fg(p.title).add_modifier(Modifier::BOLD)
-            } else {
-                fg(p.info)
-            };
-            spans.push(Span::styled(piece, style));
-        }
-        if let Some(search) = self.search_text() {
-            spans.push(Span::styled("  ·  ", fg(p.border)));
-            spans.push(Span::styled(format!("“{search}”"), fg(p.special)));
-        }
         let hint = Line::from(vec![
             Span::styled("f", fg(p.accent)),
             Span::styled(" filters  ", fg(p.muted)),
@@ -457,6 +748,65 @@ impl Screen {
             Span::styled(" search ", fg(p.muted)),
         ]);
         let hint_width = u16::try_from(hint.width()).unwrap_or(0);
+        let pieces: Vec<(String, Style)> = panel::describe(&self.filters, self.group)
+            .into_iter()
+            .enumerate()
+            .map(|(at, piece)| {
+                let style = if at == 0 {
+                    fg(p.title).add_modifier(Modifier::BOLD)
+                } else {
+                    fg(p.info)
+                };
+                (piece, style)
+            })
+            .collect();
+        let sep = "  ·  ";
+        let width = |text: &str| Span::raw(text).width();
+        let search = self.search_text().map(|search| format!("“{search}”"));
+        // A narrow list drops the filters that do not fit whole, so none is
+        // cut mid-word and two spaces always part them from the hints. The
+        // search narrows the list most, so it is kept over the filters
+        // before it, and cut itself only when nothing else is left to drop.
+        let room = usize::from(area.width.saturating_sub(hint_width)).saturating_sub(2);
+        let search_width = search.as_deref().map_or(0, |s| width(sep) + width(s));
+        let filter_room = room.saturating_sub(search_width);
+        let mut spans = vec![Span::raw(" ")];
+        let mut used = 1;
+        let last = pieces.len().saturating_sub(1);
+        for (at, (piece, style)) in pieces.into_iter().enumerate() {
+            let piece_width = if at > 0 { width(sep) } else { 0 } + width(&piece);
+            // Any piece but the last keeps room for the ellipsis after it.
+            let ellipsis = if at == last { 0 } else { 2 };
+            if at > 0 && used + piece_width + ellipsis > filter_room {
+                if used + 2 <= filter_room {
+                    spans.push(Span::styled(" …", fg(p.muted)));
+                    used += 2;
+                }
+                break;
+            }
+            if at > 0 {
+                spans.push(Span::styled(sep, fg(p.border)));
+            }
+            spans.push(Span::styled(piece, style));
+            used += piece_width;
+        }
+        if let Some(search) = search {
+            let left = room.saturating_sub(used + width(sep));
+            let search = if width(&search) <= left {
+                search
+            } else {
+                let mut cut: String = String::new();
+                for c in search.chars() {
+                    if width(&cut) + width(c.encode_utf8(&mut [0; 4])) + 1 > left {
+                        break;
+                    }
+                    cut.push(c);
+                }
+                format!("{cut}…")
+            };
+            spans.push(Span::styled(sep, fg(p.border)));
+            spans.push(Span::styled(search, fg(p.special)));
+        }
         let [left, right] =
             Layout::horizontal([Constraint::Fill(1), Constraint::Length(hint_width)]).areas(area);
         frame.render_widget(Paragraph::new(Line::from(spans)), left);
@@ -510,20 +860,11 @@ impl Screen {
             .border_style(fg(p.border))
             .padding(Padding::horizontal(1));
         let Some(issue) = self.current() else {
-            let folded = self
-                .group_of(self.selected)
-                .filter(|_| self.is_folded(self.selected));
-            match folded {
-                Some(group) => {
-                    let count = (0..self.issues.len())
-                        .filter(|at| self.group_of(*at).as_ref() == Some(&group))
-                        .count();
-                    let text = format!("{group}: {count} issue(s), folded; z or Enter opens it");
-                    frame.render_widget(
-                        Paragraph::new(Line::styled(text, fg(p.muted))).block(block),
-                        area,
-                    );
-                }
+            match self.folded_note() {
+                Some(text) => frame.render_widget(
+                    Paragraph::new(Line::styled(text, fg(p.muted))).block(block),
+                    area,
+                ),
                 None => frame.render_widget(block, area),
             }
             return;
@@ -601,48 +942,115 @@ impl Screen {
         frame.render_widget(text.scroll((scroll, 0)), inner);
     }
 
-    /// The open issue over the whole of `area`: its title and fields, its
-    /// links, its description with its images, and its comments, scrolled.
-    fn draw_reading(&self, frame: &mut Frame, area: Rect, p: &Palette) {
-        // Where it was opened from, then each issue opened from a link; one
-        // opened from the trees starts the trail itself.
+    /// The heading of a folded group under the cursor, which stands for
+    /// its issues: how many it has, and how to open it.
+    fn folded_note(&self) -> Option<String> {
+        let group = self
+            .group_of(self.selected)
+            .filter(|_| self.is_folded(self.selected))?;
+        let count = (0..self.issues.len())
+            .filter(|at| self.group_of(*at).as_ref() == Some(&group))
+            .count();
+        Some(format!(
+            "{group}: {count} issue(s), folded; z or Enter opens it"
+        ))
+    }
+
+    /// The issues read to get to the one shown: where it was opened from,
+    /// then each issue opened from a link, the one shown last and marked;
+    /// one opened from the trees starts the trail itself.
+    fn trail_spans(&self, p: &Palette) -> Vec<Span<'static>> {
         let mut trail: Vec<&str> = self
             .issues
             .get(self.selected)
-            .filter(|_| !self.is_from_outside)
+            .filter(|_| {
+                !self.is_from_outside && !self.is_from_project && !self.is_folded(self.selected)
+            })
             .map(|i| i.id.as_str())
             .into_iter()
             .collect();
         trail.extend(self.trail.iter().map(String::as_str));
+        let last = trail.len().saturating_sub(1);
+        trail
+            .iter()
+            .enumerate()
+            .map(|(at, id)| {
+                if at == last {
+                    Span::styled(id.to_string(), fg(p.accent).add_modifier(Modifier::BOLD))
+                } else {
+                    Span::styled(format!("{id} › "), fg(p.muted))
+                }
+            })
+            .collect()
+    }
+
+    /// The open issue over the whole of `area`, in its own box.
+    fn draw_reading(&self, frame: &mut Frame, area: Rect, p: &Palette) {
         let mut title = vec![Span::raw(" ")];
-        for (at, id) in trail.iter().enumerate() {
-            if at + 1 == trail.len() {
-                title.push(Span::styled(*id, fg(p.accent).add_modifier(Modifier::BOLD)));
-            } else {
-                title.push(Span::styled(format!("{id} › "), fg(p.muted)));
-            }
-        }
+        title.extend(self.trail_spans(p));
         title.push(Span::raw(" "));
         let block = Block::bordered()
             .border_style(fg(p.accent))
             .padding(Padding::horizontal(1))
             .title(Line::from(title));
-        let inner = block.inner(area);
+        self.draw_text(frame, block.inner(area), p, None);
+        // Its bottom says how far down the text, once it is drawn, is.
+        let block = match self.issue_scrolled(p) {
+            Some(line) => block.title_bottom(line),
+            None => block,
+        };
+        frame.render_widget(block, area);
+    }
+
+    /// [1]'s body on the panels: the issue under the cursor, or one opened
+    /// from its links, whole, its fields a row each with its work from
+    /// `host`, the comment box under it while one is written; or the form,
+    /// while it is open.
+    pub fn draw_issue(&self, frame: &mut Frame, inner: Rect, p: &Palette, host: &dyn Host) {
+        if let Some(form) = &self.form {
+            // A row of air under [1]'s title, as the form has on a screen
+            // of its own, and over [1]'s bottom, so the description's box
+            // does not sit on it.
+            let body = Block::new().padding(Padding::vertical(1)).inner(inner);
+            return draw_form(frame, body, form, p, self.picker.is_none());
+        }
+        let Some(compose) = &self.compose else {
+            return self.draw_text(frame, inner, p, Some(host));
+        };
+        // The comment box docks under the issue it is on, which scrolls in
+        // what is left above it.
+        let height = compose_height(compose, inner.width).min(inner.height);
+        let [text, docked] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(height)]).areas(inner);
+        self.draw_text(frame, text, p, Some(host));
+        draw_compose_box(frame, docked, compose, p, false);
+    }
+
+    /// The issue shown, in `inner`: its title and fields, its links, its
+    /// description with its images, and its comments, scrolled. With a
+    /// `host` it is headed as [1] on the panels, whose box has its title.
+    fn draw_text(&self, frame: &mut Frame, inner: Rect, p: &Palette, host: Option<&dyn Host>) {
+        self.issue_area.set(inner);
         self.hits.borrow_mut().clear();
         self.placed.borrow_mut().clear();
         let Some(issue) = self.current() else {
-            frame.render_widget(block, area);
-            frame.render_widget(
-                Paragraph::new(format!(
-                    "reading {}...",
-                    self.viewed_id().unwrap_or_default()
-                ))
-                .style(fg(p.muted)),
-                inner,
-            );
+            self.max_scroll.set(0);
+            let text = if self.trail.is_empty()
+                && let Some(note) = self.folded_note()
+            {
+                note
+            } else if let Some(id) = self.viewed_id() {
+                format!("reading {id}...")
+            } else if self.is_loading {
+                // Until the list is read, [2] says it is being read.
+                String::new()
+            } else {
+                "no issue under the cursor".to_string()
+            };
+            frame.render_widget(Paragraph::new(text).style(fg(p.muted)), inner);
             return;
         };
-        let parts = self.reading_parts(issue, p);
+        let parts = self.reading_parts(issue, p, host);
         let heights: Vec<u16> = parts
             .iter()
             .map(|part| self.part_height(part, inner))
@@ -652,15 +1060,6 @@ impl Screen {
         self.max_scroll.set(max);
         self.view_height.set(inner.height);
         let scroll = self.scroll.min(max);
-        let block = if max > 0 {
-            block.title_bottom(Line::styled(
-                format!(" {}% ", u32::from(scroll) * 100 / u32::from(max)),
-                fg(p.muted),
-            ))
-        } else {
-            block
-        };
-        frame.render_widget(block, area);
         let mut offset: u16 = 0;
         for (part, height) in parts.iter().zip(heights) {
             if let Some(target) = part.target() {
@@ -680,16 +1079,24 @@ impl Screen {
         }
     }
 
-    /// The open issue as parts to lay out one under another.
-    fn reading_parts(&self, issue: &Issue, p: &Palette) -> Vec<Part> {
-        let mut parts = vec![Part::Text(vec![
-            Line::styled(
-                issue.title.clone(),
-                fg(p.title).add_modifier(Modifier::BOLD),
-            ),
-            fields(issue, p),
-            Line::default(),
-        ])];
+    /// The open issue as parts to lay out one under another, headed by its
+    /// title and fields, or with a `host` by a row for each field.
+    fn reading_parts(&self, issue: &Issue, p: &Palette, host: Option<&dyn Host>) -> Vec<Part> {
+        let mut parts = match host {
+            None => vec![Part::Text(vec![
+                Line::styled(
+                    issue.title.clone(),
+                    fg(p.title).add_modifier(Modifier::BOLD),
+                ),
+                fields(issue, p),
+                Line::default(),
+            ])],
+            Some(host) => vec![
+                Part::Text(field_rows(issue, host, p)),
+                Part::Rule,
+                Part::Text(vec![Line::default()]),
+            ],
+        };
         let Some(detail) = self.detail() else {
             parts.push(Part::Text(vec![Line::styled("reading...", fg(p.muted))]));
             return parts;
@@ -781,7 +1188,7 @@ impl Screen {
                 let text = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
                 u16::try_from(text.line_count(inner.width)).unwrap_or(u16::MAX)
             }
-            Part::Row(..) => 1,
+            Part::Row(..) | Part::Rule => 1,
             // The picture, then a line naming it.
             Part::Image { url, .. } => match self.pictures.get(url) {
                 Some(picture @ Picture::Ready { .. }) => {
@@ -817,6 +1224,10 @@ impl Screen {
                 frame.render_widget(Paragraph::new(line.clone()), shown);
                 self.hits.borrow_mut().push((shown, *target));
             }
+            Part::Rule => frame.render_widget(
+                Paragraph::new("─".repeat(usize::from(shown.width))).style(fg(p.border)),
+                shown,
+            ),
             Part::Image { target, url, alt } => {
                 self.hits.borrow_mut().push((shown, *target));
                 let rows = height - 1;
@@ -995,49 +1406,10 @@ impl Screen {
             .min(area.width);
         let [left_area, right_area] =
             Layout::horizontal([Constraint::Fill(1), Constraint::Length(right_width)]).areas(area);
-        let left = if self.search.is_some() {
-            Line::from(key_bar(
-                &[("Enter", "keep it"), ("Esc", "clear it"), ("↑ ↓", "move")],
-                left_area.width,
-                p,
-            ))
-        } else if self.panel.is_some() && self.picker.is_none() {
-            Line::from(key_bar(
-                &[
-                    ("Enter", "change"),
-                    ("x", "clear"),
-                    ("c", "clear all"),
-                    ("Esc", "close"),
-                ],
-                left_area.width,
-                p,
-            ))
-        } else if self.choosing.is_some() && self.message.is_none() {
-            Line::from(key_bar(
-                &[
-                    ("Enter", "choose"),
-                    ("/", "search"),
-                    ("f", "filters"),
-                    ("→", "read"),
-                    ("Esc", "cancel"),
-                ],
-                left_area.width,
-                p,
-            ))
-        } else if let Some(message) = &self.message {
-            Line::styled(format!(" {message}"), fg(p.warning))
-        } else if let (Some(err), false) = (&self.error, self.issues.is_empty()) {
-            Line::styled(format!(" {err}"), fg(p.danger))
-        } else if let Some(form) = &self.form {
-            Line::from(key_bar(form_keys(form.field), left_area.width, p))
-        } else if self.focus == Focus::Issue && self.viewer.is_some() {
-            Line::from(key_bar(&VIEWER_KEYS, left_area.width, p))
-        } else if self.focus == Focus::Issue {
-            Line::from(key_bar(&ISSUE_KEYS, left_area.width, p))
-        } else if !self.marked.is_empty() {
-            Line::from(key_bar(&MARKED_KEYS, left_area.width, p))
-        } else {
-            Line::from(key_bar(&KEYS, left_area.width, p))
+        let left = match self.bar() {
+            Bar::Keys(keys) => Line::from(key_bar(keys, left_area.width, p)),
+            Bar::Message(message) => Line::styled(format!(" {message}"), fg(p.warning)),
+            Bar::Error(err) => Line::styled(format!(" {err}"), fg(p.danger)),
         };
         frame.render_widget(Paragraph::new(left).style(p.bar), left_area);
         frame.render_widget(Paragraph::new(right).style(p.bar), right_area);
@@ -1050,6 +1422,8 @@ enum Part {
     Text(Vec<Line<'static>>),
     /// One line, not wrapped, that leads to target `.1`.
     Row(Line<'static>, usize),
+    /// A line across, under the fields.
+    Rule,
     Image {
         target: usize,
         url: String,
@@ -1060,7 +1434,7 @@ enum Part {
 impl Part {
     fn target(&self) -> Option<usize> {
         match self {
-            Part::Text(_) => None,
+            Part::Text(_) | Part::Rule => None,
             Part::Row(_, target) | Part::Image { target, .. } => Some(*target),
         }
     }
@@ -1096,31 +1470,12 @@ fn link_line(link: &Link, is_here: bool, p: &Palette) -> Line<'static> {
     if is_here { line.style(p.cursor) } else { line }
 }
 
-/// The form over the whole of `area`: the title, the fields the pickers
-/// set, and the description below, the field the cursor is in marked.
-/// `has_cursor` puts the terminal's cursor in it, unless a picker is over it.
-fn draw_form(
-    frame: &mut Frame,
-    area: Rect,
-    form: &Form,
-    team: &str,
-    p: &Palette,
-    has_cursor: bool,
-) {
-    let heading = match form.id() {
-        Some(id) => format!(" Edit {id} "),
-        None if team.is_empty() => " New issue ".to_string(),
-        None => format!(" New issue in {team} "),
-    };
-    let block = Block::bordered()
-        .border_style(fg(p.accent))
-        .padding(Padding::new(2, 2, 1, 0))
-        .title(Span::styled(
-            heading,
-            fg(p.accent).add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+/// The form in `inner`, inside the border its caller draws, its own on a
+/// screen of its own or [1]'s on the panels: the title, the fields the
+/// pickers set, and the description below, the field the cursor is in
+/// marked. `has_cursor` puts the terminal's cursor in it, unless a picker
+/// is over it.
+fn draw_form(frame: &mut Frame, inner: Rect, form: &Form, p: &Palette, has_cursor: bool) {
     // The title, a gap, a row per picked field, a gap, the description's
     // heading, and its box below.
     let picked = FIELDS.len() - 2;
@@ -1273,6 +1628,61 @@ fn draw_form(
     }
 }
 
+/// The issue's fields a row each, for [1] on the panels, each said even
+/// when it is not set: status, priority and assignee, labels, project and
+/// cycle, and who works on it.
+fn field_rows(issue: &Issue, host: &dyn Host, p: &Palette) -> Vec<Line<'static>> {
+    let label = |text: &str| Span::styled(format!("{text:<10}"), fg(p.muted));
+    let dot = || Span::styled("  ·  ", fg(p.border));
+    let or_none = |value: String, style: Style, none: &str| {
+        if value.is_empty() {
+            Span::styled(none.to_string(), fg(p.muted))
+        } else {
+            Span::styled(value, style)
+        }
+    };
+    let priority = Span::styled(
+        match issue.priority {
+            1..=4 => issue.priority_label(),
+            _ => "no priority",
+        },
+        priority_style(issue, p),
+    );
+    vec![
+        Line::from(vec![
+            label("status"),
+            Span::styled(issue.state.clone(), fg(p.info)),
+            dot(),
+            priority,
+            dot(),
+            or_none(
+                issue.assignee.clone().unwrap_or_default(),
+                fg(p.text),
+                "unassigned",
+            ),
+        ]),
+        Line::from(vec![
+            label("labels"),
+            or_none(issue.labels.join(", "), fg(p.special), "none"),
+        ]),
+        Line::from(vec![
+            label("project"),
+            or_none(
+                issue.project.clone().unwrap_or_default(),
+                fg(p.text),
+                "none",
+            ),
+            dot(),
+            or_none(
+                issue.cycle.clone().unwrap_or_default(),
+                fg(p.muted),
+                "no cycle",
+            ),
+        ]),
+        Line::from(vec![label("work"), work_said(host, &issue.id, p)]),
+    ]
+}
+
 /// The issue's fields on one line: status, priority, labels, assignee,
 /// project and cycle, each only when set.
 fn fields(issue: &Issue, p: &Palette) -> Line<'static> {
@@ -1384,11 +1794,24 @@ pub fn draw_picker(frame: &mut Frame, area: Rect, picker: &Picker, p: &Palette) 
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/// The comment box over the lower half: the text, wrapped, the end of a
-/// long one kept in view, and the keys.
+/// The comment box in the middle of `area`, on a screen of its own.
 fn draw_compose(frame: &mut Frame, area: Rect, compose: &Compose, p: &Palette) {
     let width = area.width.saturating_sub(8).min(100);
-    let inner_width = usize::from(width.saturating_sub(2)).max(1);
+    let height = compose_height(compose, width).min(area.height);
+    let popup = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    draw_compose_box(frame, popup, compose, p, true);
+}
+
+/// The comment's rows wrapped inside a box `width` wide, between its
+/// borders and a column of air each side, an empty line kept as a row.
+fn compose_rows(compose: &Compose, width: u16) -> Vec<String> {
+    let inner_width = usize::from(width.saturating_sub(4)).max(1);
     let mut rows: Vec<String> = Vec::new();
     for line in compose.text.split('\n') {
         let chars: Vec<char> = line.chars().collect();
@@ -1397,29 +1820,36 @@ fn draw_compose(frame: &mut Frame, area: Rect, compose: &Compose, p: &Palette) {
         }
         rows.extend(chars.chunks(inner_width).map(|c| c.iter().collect()));
     }
-    let shown = rows.len().clamp(6, 14);
-    let height = u16::try_from(shown + 2)
-        .unwrap_or(u16::MAX)
-        .min(area.height);
-    let popup = Rect::new(
-        area.x + (area.width - width) / 2,
-        area.y + (area.height - height) / 2,
-        width,
-        height,
-    );
-    let block = Block::bordered()
+    rows
+}
+
+/// How tall the comment box `width` wide is: as tall as the comment, from
+/// six rows to fourteen, and its border.
+fn compose_height(compose: &Compose, width: u16) -> u16 {
+    let shown = compose_rows(compose, width).len().clamp(6, 14);
+    u16::try_from(shown + 2).unwrap_or(u16::MAX)
+}
+
+/// The comment box in `area`: the text, wrapped, the end of a long one kept
+/// in view. `has_keys` says its keys along its bottom, where no bar under
+/// it says them.
+fn draw_compose_box(frame: &mut Frame, area: Rect, compose: &Compose, p: &Palette, has_keys: bool) {
+    let rows = compose_rows(compose, area.width);
+    let mut block = Block::bordered()
         .border_style(fg(p.accent))
+        .padding(Padding::horizontal(1))
         .title(Span::styled(
             format!(" Comment on {} ", compose.issue),
             fg(p.title).add_modifier(Modifier::BOLD),
-        ))
-        .title_bottom(Line::styled(
+        ));
+    if has_keys {
+        block = block.title_bottom(Line::styled(
             " Enter sends  Alt+Enter new line  Esc cancels ",
             fg(p.muted),
         ));
-    let inner = block.inner(popup);
-    frame.render_widget(Clear, popup);
-    frame.render_widget(block, popup);
+    }
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
     if compose.text.is_empty() {
         frame.render_widget(
             Paragraph::new("Markdown; mention people with @name")
@@ -1443,6 +1873,8 @@ fn draw_compose(frame: &mut Frame, area: Rect, compose: &Compose, p: &Palette) {
     ));
 }
 
+/// The keys, over the middle of `area`, on a screen of its own: on the
+/// panels the program lists them with its own.
 fn draw_help(frame: &mut Frame, area: Rect, p: &Palette) {
     let width = HELP
         .iter()

@@ -185,9 +185,12 @@ pub fn read(backend: &dyn Backend, ids: &[String]) -> Result<Vec<Planned>, Strin
     }
     let mut found = backend.standings(ids)?;
     found.sort_by_key(|s| ids.iter().position(|id| *id == s.id));
-    Ok(found
-        .into_iter()
-        .map(|s| Planned {
+    Ok(found.into_iter().map(Planned::from).collect())
+}
+
+impl From<linear::Standing> for Planned {
+    fn from(s: linear::Standing) -> Self {
+        Planned {
             stage: stage(s.kind.as_deref(), &s.state),
             blocked_by: s
                 .blocked_by
@@ -199,8 +202,31 @@ pub fn read(backend: &dyn Backend, ids: &[String]) -> Result<Vec<Planned>, Strin
             title: s.title,
             project: s.project,
             state: s.state,
-        })
-        .collect())
+        }
+    }
+}
+
+/// The project `id` as `backend` has it, and where each of its open
+/// issues stands, what blocks it included, in the project's order: open
+/// being neither done nor canceled.
+pub fn project(backend: &dyn Backend, id: &str) -> Result<ProjectRead, String> {
+    let project = backend.project(id)?;
+    let open: Vec<String> = project
+        .issues
+        .iter()
+        .filter(|i| is_open(stage(i.kind.as_deref(), &i.state)))
+        .map(|i| i.id.clone())
+        .collect();
+    let open = read(backend, &open)?;
+    Ok((project, open))
+}
+
+/// A project as read for the Issues screen's [3]: it, and its open issues.
+pub type ProjectRead = (linear::Project, Vec<Planned>);
+
+/// An issue at `stage` is still to be done: neither done nor canceled.
+pub fn is_open(stage: Stage) -> bool {
+    matches!(stage, Stage::NotStarted | Stage::Going)
 }
 
 /// The stage of a status: by its type, or, from a source that gives none,
@@ -326,6 +352,26 @@ mod tests {
             }
             Ok(found)
         }
+
+        /// p1, from ANB-4 down to ANB-1, as a project's
+        /// issues come without what blocks them.
+        fn project(&self, id: &str) -> Result<linear::Project, String> {
+            let mut issues = self.standings(&[
+                "ANB-1".into(),
+                "ANB-2".into(),
+                "ANB-3".into(),
+                "ANB-4".into(),
+            ])?;
+            for issue in &mut issues {
+                issue.blocked_by.clear();
+            }
+            Ok(linear::Project {
+                id: id.into(),
+                name: "treetop panels".into(),
+                issues,
+                ..linear::Project::default()
+            })
+        }
     }
 
     #[test]
@@ -368,6 +414,27 @@ mod tests {
             read(&fake, &[]),
             Ok(Vec::new()),
             "nothing made, nothing read"
+        );
+    }
+
+    /// ANB-123: [3] on Issues lists a project's open issues in its order,
+    /// with what blocks each, which a project's own read leaves out.
+    #[test]
+    fn a_project_is_read_with_where_each_open_issue_stands() {
+        let fake = Fake {
+            has_kinds: true,
+            is_down: false,
+        };
+        let (project, open) = project(&fake, "p1").unwrap();
+        assert_eq!(project.issues.len(), 4, "the bar counts them all");
+        let open: Vec<(&str, &[String])> = open
+            .iter()
+            .map(|p| (p.id.as_str(), p.blocked_by.as_slice()))
+            .collect();
+        assert_eq!(
+            open,
+            [("ANB-4", &["ANB-2".to_string()][..]), ("ANB-2", &[][..])],
+            "ANB-1 done and ANB-3 canceled are left out"
         );
     }
 

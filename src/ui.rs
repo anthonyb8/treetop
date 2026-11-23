@@ -128,7 +128,7 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
 
 /// The same for the panels layout, whose keys differ: its panels, the
 /// workspaces and Plan in place of the table's windows and zoom.
-const PANELS_HELP: [(&str, &[(&str, &str)]); 8] = [
+const PANELS_HELP: [(&str, &[(&str, &str)]); 9] = [
     (
         "Agents",
         &[
@@ -157,6 +157,14 @@ const PANELS_HELP: [(&str, &[(&str, &str)]); 8] = [
             ("p", "pick an issue up"),
             ("1", "its chat"),
             ("2-4", "its panels"),
+        ],
+    ),
+    (
+        "Screens",
+        &[
+            ("Tab", "Plan, Issues"),
+            ("I", "tree's plan, issue"),
+            ("s c", "status, comment, in [3]"),
         ],
     ),
     (
@@ -205,11 +213,22 @@ const PANELS_HELP: [(&str, &[(&str, &str)]); 8] = [
         ],
     ),
     (
-        "Screens",
+        "Issues",
         &[
-            ("Tab", "Plan, Issues"),
-            ("I", "tree's plan, issue"),
-            ("s c", "status, comment, in [3]"),
+            ("1 2 3", "the issue, list, project"),
+            ("Tab", "[1]'s links"),
+            ("J K", "scroll [1] from [2]"),
+            ("f", "filters, in place of views"),
+            ("/", "search"),
+            ("m", "mine, everyone's"),
+            ("[ ] w", "issue sources"),
+            ("z Z", "fold, fold all"),
+            ("x X", "mark, mark all"),
+            ("s l a P", "status, labels, who, project"),
+            ("n e c", "new, edit, comment"),
+            ("p", "pick it up"),
+            ("o", "open in browser"),
+            ("r", "read again"),
         ],
     ),
     (
@@ -231,7 +250,7 @@ const HELP_COLUMNS: [&[usize]; 3] = [&[1, 2, 2, 2], &[3, 4], &[7]];
 
 /// The same for PANELS_HELP, three of whose columns fit the smallest screen
 /// the panels do.
-const PANELS_HELP_COLUMNS: [&[usize]; 4] = [&[1, 2, 2, 3], &[2, 2, 4], &[4, 4], &[8]];
+const PANELS_HELP_COLUMNS: [&[usize]; 4] = [&[1, 3, 3, 2], &[3, 3, 3], &[4, 5], &[9]];
 
 /// Most useful first; Esc stays early so the way out is never the key a
 /// narrow bar drops.
@@ -286,8 +305,12 @@ pub fn draw(
     match issues.filter(|_| app.is_issues) {
         Some(screen) => {
             let rows = screen_rows(app, frame.area());
-            let area = rows.main.union(rows.footer);
-            screen.draw(frame, area, &palette(), app);
+            if rows.top.is_some() && !screen.is_full_screen() {
+                draw_issues(frame, app, rows.main, rows.footer, screen);
+            } else {
+                let area = rows.main.union(rows.footer);
+                screen.draw(frame, area, &palette(), app);
+            }
         }
         None if app.is_plan => {
             let rows = screen_rows(app, frame.area());
@@ -446,6 +469,9 @@ pub fn draw(
         draw_phone(frame, phone);
     } else if let Some(menu) = &app.scratch_menu {
         draw_scratch_menu(frame, app, menu);
+    } else if app.is_issues && app.is_help {
+        // Asked for on the panels, whose Issues keys it lists with the rest.
+        draw_help(frame, &PANELS_HELP, &PANELS_HELP_COLUMNS);
     } else if app.is_issues {
         // The trees' own dialogs wait until the trees are back on screen.
     } else if let Some(review) = app.reviews.front() {
@@ -1378,6 +1404,16 @@ fn draw_keel(frame: &mut Frame, app: &App, area: Rect, has_keys: bool) {
 
 /// A bar of `width` cells of issues done and under way, of `all`.
 fn issue_bar(done: usize, going: usize, all: usize, width: usize) -> Vec<Span<'static>> {
+    let mut bar = bar_cells(done, going, all, width);
+    bar.push(Span::styled(
+        format!(" {done} done · {going} going · {all}"),
+        fg(theme().muted),
+    ));
+    bar
+}
+
+/// `issue_bar`'s cells alone, without its words.
+fn bar_cells(done: usize, going: usize, all: usize, width: usize) -> Vec<Span<'static>> {
     let t = theme();
     let of = |n: usize| (width * n).checked_div(all).unwrap_or(0);
     let (full, half) = (of(done), of(going));
@@ -1385,7 +1421,6 @@ fn issue_bar(done: usize, going: usize, all: usize, width: usize) -> Vec<Span<'s
         Span::styled("█".repeat(full), fg(t.success)),
         Span::styled("▓".repeat(half), fg(t.warning)),
         Span::styled("░".repeat(width - full - half), fg(t.border)),
-        Span::styled(format!(" {done} done · {going} going · {all}"), fg(t.muted)),
     ]
 }
 
@@ -2462,7 +2497,6 @@ fn footer_left(app: &App, is_panels: bool, room: usize) -> Line<'static> {
         // A dialog's keys are its own: what has them under it would only
         // type into it.
         // Each hint whole, as many as fit, `?` listing the rest.
-        let mut used = Line::from(spans.clone()).width();
         let mut keys = panel_keys(app).to_vec();
         if !app.is_inserting() {
             keys.push(("?", "help"));
@@ -2485,22 +2519,30 @@ fn footer_left(app: &App, is_panels: bool, room: usize) -> Line<'static> {
         if let Some(key) = ship.filter(|_| is_one).and_then(|s| ship_key(s.stage)) {
             keys.insert(2, key);
         }
-        for (at, (key, does)) in keys.iter().enumerate() {
-            let width = Line::raw(format!("  {key} {does}")).width();
-            let is_last = at + 1 == keys.len();
-            if used + width + if is_last { 0 } else { 2 } > room {
-                spans.push(Span::styled(" …", fg(t.muted)));
-                break;
-            }
-            used += width;
-            spans.push(Span::styled(
-                format!("  {key}"),
-                fg(t.info).add_modifier(Modifier::BOLD),
-            ));
-            spans.push(Span::styled(format!(" {does}"), fg(t.muted)));
-        }
+        push_keys(&mut spans, &keys, room);
     }
     Line::from(spans)
+}
+
+/// Each of `keys` whole after `spans`, as many as fit in `room` columns,
+/// an ellipsis saying there are more.
+fn push_keys(spans: &mut Vec<Span<'static>>, keys: &[(&str, &str)], room: usize) {
+    let t = theme();
+    let mut used = Line::from(spans.clone()).width();
+    for (at, (key, does)) in keys.iter().enumerate() {
+        let width = Line::raw(format!("  {key} {does}")).width();
+        let is_last = at + 1 == keys.len();
+        if used + width + if is_last { 0 } else { 2 } > room {
+            spans.push(Span::styled(" …", fg(t.muted)));
+            break;
+        }
+        used += width;
+        spans.push(Span::styled(
+            format!("  {key}"),
+            fg(t.info).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(format!(" {does}"), fg(t.muted)));
+    }
 }
 
 /// The bar's badge: the mode, and in the panels layout the panel that has
@@ -2663,6 +2705,21 @@ fn panel_keys(app: &App) -> &'static [(&'static str, &'static str)] {
 /// The bottom bar: the mode and a message on the left, the summary on the
 /// right.
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect, is_panels: bool) {
+    let mode = badge(app, is_panels).len();
+    draw_bar(frame, app, area, mode, |room| {
+        footer_left(app, is_panels, room)
+    });
+}
+
+/// The bottom bar with `left` on the left, given the columns it has, its
+/// badge `mode` columns wide, and the summary on the right.
+fn draw_bar(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    mode: usize,
+    left: impl FnOnce(usize) -> Line<'static>,
+) {
     let t = theme();
     // The message keeps at least MESSAGE_ROOM columns; a full summary that
     // would squeeze it gives way to the compact one.
@@ -2674,14 +2731,14 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect, is_panels: bool) {
         full
     };
     // The mode stays whole however narrow the bar: the summary is cut first.
-    let mode = u16::try_from(badge(app, is_panels).len()).unwrap_or(u16::MAX);
+    let mode = u16::try_from(mode).unwrap_or(u16::MAX);
     let right_width = u16::try_from(right.width())
         .unwrap_or(u16::MAX)
         .min(area.width.saturating_sub(mode));
     let [left_area, right_area] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(right_width)]).areas(area);
     frame.render_widget(
-        Paragraph::new(footer_left(app, is_panels, usize::from(left_area.width))).style(t.bar),
+        Paragraph::new(left(usize::from(left_area.width))).style(t.bar),
         left_area,
     );
     frame.render_widget(Paragraph::new(right).style(t.bar), right_area);
@@ -3347,6 +3404,286 @@ fn draw_plan(frame: &mut Frame, app: &App, main: Rect, chat: Option<&Chat>) {
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
 }
 
+/// The Issues screen on the panels: [2] the list down the left, in the
+/// columns Plan's panels take, [1] the issue under the cursor whole on the
+/// right, and treetop's bar with the keys of the one that has them. The
+/// screen draws inside the boxes. The form takes [1], in Insert as a new
+/// agent's does a tree's window, the comment box docks at its bottom, and
+/// a picker opens over it; the filters cover the whole screen.
+fn draw_issues(frame: &mut Frame, app: &App, main: Rect, footer: Rect, screen: &issues::Screen) {
+    let p = palette();
+    let [left, window] = panel_columns(app, main);
+    // [2] keeps two thirds of the column whatever [3] shows, so its rows
+    // stay put as the cursor moves between projects.
+    let [list, project] = Layout::vertical([Constraint::Fill(2), Constraint::Fill(1)]).areas(left);
+    let is_writing = screen.is_writing() && app.prompt.is_none();
+    let has_keys = app.prompt.is_none() && !is_writing;
+    let on_issue = screen.is_reading();
+    let on_project = screen.project_cursor().is_some();
+    let title = issues_list_title(screen, &p, usize::from(list.width.saturating_sub(2)));
+    let block =
+        window_block((has_keys && !on_issue && !on_project).then_some(Mode::Normal)).title(title);
+    let body = block.inner(list);
+    frame.render_widget(block, list);
+    screen.draw_list_panel(frame, body, &p, app);
+    draw_project(
+        frame,
+        app,
+        project,
+        screen,
+        (has_keys && on_project).then_some(Mode::Normal),
+    );
+    let form = screen.form_title();
+    let mut title = vec![Span::raw(" [1] ")];
+    match &form {
+        Some(form) => title.push(Span::raw(format!("{form} "))),
+        None => title.extend(screen.issue_title(&p)),
+    }
+    // Both corners and a dash of border stay clear of it, as on every box.
+    let title = cut_title(title, usize::from(window.width).saturating_sub(3));
+    let keys = if is_writing {
+        Some(Mode::Insert)
+    } else {
+        (has_keys && on_issue).then_some(Mode::Normal)
+    };
+    let block = window_block(keys)
+        .padding(Padding::horizontal(1))
+        .title(Line::from(title));
+    screen.draw_issue(frame, block.inner(window), &p, app);
+    // Its bottom says how far down the issue is, known once it is drawn.
+    let block = match screen.issue_scrolled(&p).filter(|_| form.is_none()) {
+        Some(line) => block.title_bottom(line),
+        None => block,
+    };
+    frame.render_widget(block, window);
+    let panel = match (on_issue, on_project) {
+        (true, _) => 1,
+        (_, true) => 3,
+        _ => 2,
+    };
+    let (badge, color) = if is_writing {
+        (Mode::Insert.label().to_string(), Mode::Insert.color())
+    } else {
+        (format!(" PANEL {panel} "), Mode::Table.color())
+    };
+    let mode = badge.len();
+    draw_bar(frame, app, footer, mode, |room| {
+        let t = theme();
+        let mut spans = vec![Span::styled(badge, t.badge.bg(color))];
+        match screen.bar() {
+            issues::Bar::Keys(keys) => push_keys(&mut spans, keys, room),
+            issues::Bar::Message(message) => {
+                let room = room.saturating_sub(mode + 1);
+                spans.push(Span::styled(
+                    format!(" {}", fit(message, room)),
+                    fg(t.warning),
+                ));
+            }
+            issues::Bar::Error(err) => {
+                let room = room.saturating_sub(mode + 1);
+                spans.push(Span::styled(format!(" {}", fit(err, room)), fg(t.danger)));
+            }
+        }
+        Line::from(spans)
+    });
+    screen.draw_over(frame, main.union(footer), window, &p);
+}
+
+/// [2]'s title on the Issues screen in `width` columns: its name, a tab for
+/// each issue source with the one shown marked as the top row marks its
+/// screen, then what the list counts. The shown tab always stays, cut if it
+/// has to be; the other tabs cut at the first that does not fit, and the
+/// counts after them give up the last ones first, so nothing wraps or is
+/// cut mid-count.
+fn issues_list_title(screen: &issues::Screen, p: &issues::Palette, width: usize) -> Line<'static> {
+    let t = theme();
+    let head = " [2] Issues ";
+    // The tabs and the counts share what the name and the space between
+    // them leave.
+    let mut room = width.saturating_sub(Line::raw(head).width() + 1);
+    let mut spans = vec![Span::raw(head)];
+    let names: Vec<&str> = screen.source_names().collect();
+    if names.is_empty() {
+        let none = Span::styled(" no source ", fg(t.muted));
+        room = room.saturating_sub(none.width());
+        spans.push(none);
+    }
+    let tab = |name: &str| Line::raw(format!(" {name} ")).width();
+    let shown = screen.shown_source();
+    let shown_width = shown.map_or(0, |at| tab(names[at]).min(room));
+    room -= shown_width;
+    for (at, name) in names.iter().enumerate() {
+        if Some(at) == shown {
+            let name = fit(name, shown_width.saturating_sub(2));
+            // In the text's colour: the title's own is the border's, which
+            // is all but lost on the cursor's grey.
+            spans.push(Span::styled(
+                format!(" {name} "),
+                shown_tab_style().fg(t.text),
+            ));
+        } else if tab(name) <= room {
+            room -= tab(name);
+            spans.push(Span::styled(format!(" {name} "), fg(t.muted)));
+        } else {
+            // Cut where it stops fitting, not further along, so the tabs
+            // keep their order; a cut shorter than a letter says nothing.
+            if room >= 4 {
+                let name = fit(name, room - 2);
+                spans.push(Span::styled(format!(" {name} "), fg(t.muted)));
+            }
+            room = 0;
+        }
+    }
+    spans.push(Span::raw(" "));
+    for count in screen.list_title(p) {
+        if count.width() > room {
+            break;
+        }
+        room -= count.width();
+        spans.push(count);
+    }
+    Line::from(spans)
+}
+
+/// [3] Project on the Issues screen: the project of the issue in [1], named
+/// in its title, under a bar of its issues done, going and to start, then
+/// each open one with where it stands, as Plan's [3] has them: its tree and
+/// agent as [2]'s WORK says them, ready, waiting on another, or not
+/// started. [1]'s issue is marked, and the cursor drawn while [3] has the
+/// keys.
+fn draw_project(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    screen: &issues::Screen,
+    keys: Option<Mode>,
+) {
+    use crate::app::IssuesProject;
+    use crate::planned::Stage;
+    let t = theme();
+    let name = match &app.issues_project {
+        IssuesProject::Unknown => None,
+        IssuesProject::None => Some("none"),
+        IssuesProject::Named { name, .. } => Some(name.as_str()),
+    };
+    let mut title = vec![Span::raw(" [3] Project ")];
+    if let Some(name) = name {
+        title.push(Span::styled(format!("· {name} "), fg(t.muted)));
+    }
+    let block = window_block(keys).title(Line::from(title));
+    let body = block.inner(area);
+    frame.render_widget(block, area);
+    let say = |frame: &mut Frame, said: String, color: Color| {
+        frame.render_widget(
+            Paragraph::new(Line::styled(said, fg(color))).wrap(Wrap { trim: false }),
+            body,
+        );
+    };
+    let shown = match &app.issues_project {
+        IssuesProject::Unknown => return,
+        IssuesProject::None => return say(frame, " not in a project".into(), t.muted),
+        IssuesProject::Named { key: None, .. } => {
+            return say(
+                frame,
+                " this source's plugin cannot read projects".into(),
+                t.muted,
+            );
+        }
+        IssuesProject::Named { key: Some(_), .. } => match app.shown_project() {
+            Some(shown) => shown,
+            None => {
+                return match app.project_unread() {
+                    Some(why) => say(frame, format!(" {why}"), t.danger),
+                    None => say(frame, " reading…".into(), t.muted),
+                };
+            }
+        },
+    };
+    let (done, going, all) = TreeIssues::counts(shown.project);
+    let said = format!(
+        "  {done} done · {going} going · {} to start",
+        all - done - going
+    );
+    // The bar gives way before its words do, in a narrow column, with a
+    // space kept each side as on every other line.
+    let room = usize::from(body.width).saturating_sub(2 + Span::raw(said.as_str()).width());
+    let mut bar = vec![Span::raw(" ")];
+    bar.extend(bar_cells(done, going, all, room.min(16)));
+    bar.push(Span::styled(said, fg(t.muted)));
+    let mut head = vec![Line::from(bar)];
+    // What is old, above the rows so it is never scrolled off.
+    if let Some(why) = shown.error {
+        head.push(Line::styled(format!(" as last read: {why}"), fg(t.danger)));
+    }
+    if shown.open.is_empty() {
+        head.push(Line::styled(" nothing left open", fg(t.muted)));
+    }
+    let rows_at = u16::try_from(head.len()).unwrap_or(u16::MAX);
+    let [head_area, rows_area] =
+        Layout::vertical([Constraint::Length(rows_at), Constraint::Fill(1)]).areas(body);
+    frame.render_widget(Paragraph::new(head), head_area);
+    // Ids and titles padded to the longest that fit, so where each stands
+    // reads down one column, as on Plan's [3].
+    let id_width = widest(shown.open.iter().map(|i| i.id.as_str()));
+    const WIDEST_SAID: usize = 12;
+    let room = usize::from(body.width).saturating_sub(3 + id_width + 2 + 2 + WIDEST_SAID);
+    let title_width = widest(shown.open.iter().map(|i| i.title.as_str())).min(room);
+    let p = palette();
+    let here = screen.viewed_id();
+    let rows: Vec<ListItem> = shown
+        .open
+        .iter()
+        .map(|issue| {
+            let (mark, color) = planned_mark(app, issue);
+            let title = fit(&issue.title, title_width);
+            let pad = " ".repeat(title_width.saturating_sub(Span::raw(title.as_str()).width()));
+            let bold = |color: Color| fg(color).add_modifier(Modifier::BOLD);
+            let said = match issues::Host::work_on(app, &issue.id) {
+                Some(work) => issues::work_span(&work, &p),
+                None if app.picking.contains(&issue.id) => Span::styled("starting", bold(t.info)),
+                // Readiness is known once what blocks it is read.
+                None if shown.is_read && app.is_ready(issue) => {
+                    Span::styled("ready", bold(t.success))
+                }
+                None => match issue.blocked_by.first() {
+                    Some(by) if issue.stage == Stage::NotStarted => {
+                        Span::styled(format!("⊘ {by}"), bold(t.danger))
+                    }
+                    _ if issue.stage == Stage::Going => {
+                        Span::styled(issue.state.clone(), fg(t.muted))
+                    }
+                    _ => Span::styled("not started", fg(t.muted)),
+                },
+            };
+            let is_here = here == Some(issue.id.as_str());
+            ListItem::new(Line::from(vec![
+                Span::styled(format!(" {mark} "), bold(color)),
+                Span::styled(format!("{:<id_width$}  ", issue.id), fg(t.muted)),
+                Span::styled(
+                    format!("{title}{pad}  "),
+                    if is_here {
+                        Style::new().add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::new()
+                    },
+                ),
+                said,
+            ]))
+        })
+        .collect();
+    // Without the keys the cursor marks [1]'s issue, where [3] is on.
+    let cursor = screen
+        .project_cursor()
+        .or_else(|| shown.open.iter().position(|i| Some(i.id.as_str()) == here));
+    draw_list(frame, rows_area, rows, cursor);
+}
+
+/// The Issues screen is drawn on the panels on a screen of `size`, so its
+/// digits move between [2], [1] and [3].
+pub fn issues_on_panels(app: &App, size: Rect) -> bool {
+    screen_rows(app, size).top.is_some()
+}
+
 /// The panels layout is on `screen`: the config asks for it and it fits,
 /// for its keys and rows.
 pub fn has_panels(app: &App, screen: Rect) -> bool {
@@ -3435,6 +3772,35 @@ fn draw_top(frame: &mut Frame, app: &App, area: Rect) {
         left.push(Span::raw(" "));
     }
     frame.render_widget(Paragraph::new(Line::from(left)).style(t.bar), area);
+}
+
+/// `spans` cut to `room` columns with an ellipsis and a space, so a long
+/// title ends as every other does rather than running into its corner.
+fn cut_title(spans: Vec<Span<'static>>, room: usize) -> Vec<Span<'static>> {
+    if Line::from(spans.clone()).width() <= room {
+        return spans;
+    }
+    let keep = room.saturating_sub(2);
+    let mut used = 0;
+    let mut out = Vec::new();
+    for span in spans {
+        let mut text = String::new();
+        for c in span.content.chars() {
+            let w = Span::raw(c.encode_utf8(&mut [0; 4]).to_string()).width();
+            if used + w > keep {
+                break;
+            }
+            text.push(c);
+            used += w;
+        }
+        let is_cut = text.chars().count() < span.content.chars().count();
+        out.push(Span::styled(text, span.style));
+        if is_cut {
+            break;
+        }
+    }
+    out.push(Span::raw("… "));
+    out
 }
 
 /// The tab shown, of the top row's and of the window's: the cursor's grey
@@ -9989,6 +10355,769 @@ mod panels_tests {
         assert!(
             bar.starts_with(" NORMAL ") && bar.contains("i insert"),
             "{bar}"
+        );
+    }
+
+    /// A source listing END-1 and END-2, each read with a line of text.
+    struct TwoIssues;
+
+    impl issues::Backend for TwoIssues {
+        fn name(&self) -> &str {
+            "work"
+        }
+
+        fn list(&self, _: &issues::Filters) -> Result<Vec<linear::Issue>, String> {
+            Ok(["END-1", "END-2"]
+                .into_iter()
+                .map(|id| linear::Issue {
+                    id: id.into(),
+                    title: format!("{id} title"),
+                    state: "Todo".into(),
+                    updated_at: if id == "END-1" {
+                        "2026-10-17T11:00:00Z"
+                    } else {
+                        "2026-10-17T10:00:00Z"
+                    }
+                    .into(),
+                    ..linear::Issue::default()
+                })
+                .collect())
+        }
+
+        fn detail(&self, id: &str) -> Result<linear::Detail, String> {
+            let mut issue = self.list(&issues::Filters::default())?.remove(0);
+            id.clone_into(&mut issue.id);
+            issue.title = format!("{id} title");
+            issue.description = Some(format!("{id} text"));
+            Ok(linear::Detail {
+                issue,
+                comments: Vec::new(),
+                links: Vec::new(),
+            })
+        }
+    }
+
+    /// The Issues screen over `TwoIssues`, read, as the main loop has it on
+    /// a terminal of `width` by `height`.
+    fn issues_screen(app: &App, width: u16, height: u16) -> issues::Screen {
+        let mut screen = issues::Screen::new(vec![std::sync::Arc::new(TwoIssues)], 0, Vec::new());
+        screen.set_panels(issues_on_panels(app, Rect::new(0, 0, width, height)));
+        for _ in 0..200 {
+            screen.poll();
+            if screen.current().is_some()
+                && drawn_issues(app, &screen, width, height).contains("END-1 text")
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        screen
+    }
+
+    fn drawn_buffer(app: &App, screen: &issues::Screen, width: u16, height: u16) -> Buffer {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, app, None, None, Some(screen)))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn drawn_issues(app: &App, screen: &issues::Screen, width: u16, height: u16) -> String {
+        let buffer = drawn_buffer(app, screen, width, height);
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect()
+    }
+
+    /// The column of the first "┌ [1]" on screen.
+    fn window_column(shown: &str) -> usize {
+        shown
+            .lines()
+            .find_map(|l| l.find("┌ [1]").map(|at| l[..at].chars().count()))
+            .unwrap_or_else(|| panic!("no [1]:\n{shown}"))
+    }
+
+    #[test]
+    fn issues_on_the_panels_are_2_down_the_left_and_the_issue_in_1_in_plans_columns() {
+        let mut app = panels();
+        app.open_plan(Vec::new());
+        let plan = screen(&app, 160, 45).join("\n");
+        app.is_issues = true;
+        let mut issues = issues_screen(&app, 160, 45);
+        let shown = drawn_issues(&app, &issues, 160, 45);
+        assert!(shown.starts_with("  Trees   Plan   Issues "), "{shown}");
+        let title = shown
+            .lines()
+            .find(|l| l.contains("[2] Issues"))
+            .unwrap_or_else(|| panic!("{shown}"));
+        assert!(title.contains("[2] Issues  work  · 2 issues"), "{title}");
+        assert!(title.contains("[1] END-1 END-1 title"), "{title}");
+        assert_eq!(
+            window_column(&shown),
+            window_column(&plan),
+            "Plan's columns:\n{shown}"
+        );
+        assert!(shown.contains("END-1 text"), "{shown}");
+        let bar = shown.lines().last().unwrap();
+        assert!(
+            bar.starts_with(" PANEL 2 ") && bar.contains("1 issue"),
+            "{bar}"
+        );
+        // The green border follows the keys to [1], and the bar its keys:
+        // each box's corner, two columns before its number.
+        let row = shown
+            .lines()
+            .position(|l| l.contains("[2] Issues"))
+            .unwrap();
+        let corners: Vec<(&str, u16)> = ["[2]", "[1]"]
+            .into_iter()
+            .map(|number| {
+                let at = title[..title.find(number).unwrap()].chars().count();
+                (number, u16::try_from(at - 2).unwrap())
+            })
+            .collect();
+        let green = |issues: &issues::Screen| {
+            let buffer = drawn_buffer(&app, issues, 160, 45);
+            let row = u16::try_from(row).unwrap();
+            corners
+                .iter()
+                .filter(|(_, x)| buffer[(*x, row)].fg == Mode::Normal.color())
+                .map(|(number, _)| *number)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(green(&issues), ["[2]"]);
+        issues.handle_key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Enter,
+        ));
+        assert_eq!(green(&issues), ["[1]"]);
+        let shown = drawn_issues(&app, &issues, 160, 45);
+        let bar = shown.lines().last().unwrap();
+        assert!(
+            bar.starts_with(" PANEL 1 ") && bar.contains("2 list"),
+            "{bar}"
+        );
+    }
+
+    /// A source called `name` listing one issue, `<prefix>-1`.
+    struct OneIssue {
+        name: &'static str,
+        prefix: &'static str,
+    }
+
+    impl issues::Backend for OneIssue {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn list(&self, _: &issues::Filters) -> Result<Vec<linear::Issue>, String> {
+            Ok(vec![linear::Issue {
+                id: format!("{}-1", self.prefix),
+                title: format!("{} title", self.prefix),
+                state: "Todo".into(),
+                updated_at: "2026-10-17T10:00:00Z".into(),
+                ..linear::Issue::default()
+            }])
+        }
+
+        fn detail(&self, id: &str) -> Result<linear::Detail, String> {
+            let mut issue = self.list(&issues::Filters::default())?.remove(0);
+            issue.description = Some(format!("{id} text"));
+            Ok(linear::Detail {
+                issue,
+                comments: Vec::new(),
+                links: Vec::new(),
+            })
+        }
+    }
+
+    /// The Issues screen on the panels at 120 by 31 over `sources`, once it
+    /// has read the first one's issue.
+    fn sources_screen(
+        app: &App,
+        sources: Vec<std::sync::Arc<dyn issues::Backend>>,
+    ) -> issues::Screen {
+        let mut screen = issues::Screen::new(sources, 0, Vec::new());
+        screen.set_panels(issues_on_panels(app, Rect::new(0, 0, 120, 31)));
+        settle_issues(app, &mut screen, "-1 text");
+        screen
+    }
+
+    /// Polls `screen` until `text` is drawn, as the main loop would.
+    fn settle_issues(app: &App, screen: &mut issues::Screen, text: &str) {
+        for _ in 0..200 {
+            screen.poll();
+            if drawn_issues(app, screen, 120, 31).contains(text) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// [2]'s title row at 120 by 31, as far as [2]'s corner, and that row
+    /// of cells.
+    fn list_title_row(app: &App, screen: &issues::Screen) -> (String, u16) {
+        let shown = drawn_issues(app, screen, 120, 31);
+        let (y, row) = shown
+            .lines()
+            .enumerate()
+            .find(|(_, l)| l.contains("[2] Issues"))
+            .unwrap_or_else(|| panic!("{shown}"));
+        let corner = row.find('┐').unwrap_or_else(|| panic!("{row}"));
+        (
+            row[..corner + '┐'.len_utf8()].to_string(),
+            u16::try_from(y).unwrap(),
+        )
+    }
+
+    #[test]
+    fn issue_sources_are_tabs_on_2_and_brackets_show_the_other_with_its_list() {
+        let mut app = panels();
+        app.is_issues = true;
+        let source = |name, prefix| -> std::sync::Arc<dyn issues::Backend> {
+            std::sync::Arc::new(OneIssue { name, prefix })
+        };
+        let mut issues =
+            sources_screen(&app, vec![source("work", "END"), source("personal", "ANT")]);
+        let (title, y) = list_title_row(&app, &issues);
+        assert!(
+            title.starts_with("┌ [2] Issues  work  personal  · 1 issue ─"),
+            "{title}"
+        );
+        // The shown tab in the cursor's grey, as the top row marks its
+        // screen; the other muted.
+        let is_shown = |issues: &issues::Screen, name: &str| {
+            let (title, _) = list_title_row(&app, issues);
+            let x = u16::try_from(title[..title.find(name).unwrap()].chars().count()).unwrap();
+            let cell = &drawn_buffer(&app, issues, 120, 31)[(x, y)];
+            match theme().cursor.bg {
+                Some(bg) => cell.bg == bg,
+                None => cell.modifier.contains(Modifier::REVERSED),
+            }
+        };
+        assert!(is_shown(&issues, "work") && !is_shown(&issues, "personal"));
+        // The shown tab's words are the text's colour, never the border's
+        // that the rest of the title takes, so they read with or without
+        // the keys on [2].
+        let text_of = |issues: &issues::Screen, name: &str| {
+            let (title, _) = list_title_row(&app, issues);
+            let x = u16::try_from(title[..title.find(name).unwrap()].chars().count()).unwrap();
+            drawn_buffer(&app, issues, 120, 31)[(x, y)].fg
+        };
+        assert_eq!(text_of(&issues, "work"), theme().text, "with the keys");
+        issues.handle_key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Char('1'),
+        ));
+        assert_eq!(text_of(&issues, "work"), theme().text, "without the keys");
+        issues.handle_key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Char('2'),
+        ));
+        // Which way each bracket steps is the crate's to prove; here the
+        // mark follows the source shown, with its list read into [1].
+        issues.handle_key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Char(']'),
+        ));
+        settle_issues(&app, &mut issues, "ANT-1 text");
+        assert!(is_shown(&issues, "personal") && !is_shown(&issues, "work"));
+        let shown = drawn_issues(&app, &issues, 120, 31);
+        assert!(shown.contains("ANT-1 text"), "{shown}");
+    }
+
+    #[test]
+    fn a_long_issue_title_is_cut_inside_1s_title_and_never_into_its_corner() {
+        let mut app = panels();
+        app.is_issues = true;
+        let long = "A-very-long-title-that-runs-on-past-the-edge-of-the-window-into-its-corner";
+        let issues = sources_screen(
+            &app,
+            vec![std::sync::Arc::new(OneIssue {
+                name: "work",
+                prefix: long,
+            })],
+        );
+        let shown = drawn_issues(&app, &issues, 120, 31);
+        let row = shown
+            .lines()
+            .find(|l| l.contains("[2] Issues"))
+            .unwrap_or_else(|| panic!("{shown}"));
+        let window = &row[row.find("┌ [1]").unwrap_or_else(|| panic!("{row}"))..];
+        assert!(window.ends_with("… ─┐"), "{window}");
+    }
+
+    #[test]
+    fn long_source_names_cut_inside_2s_title_and_never_past_its_corner() {
+        let mut app = panels();
+        app.is_issues = true;
+        let source = |name, prefix| -> std::sync::Arc<dyn issues::Backend> {
+            std::sync::Arc::new(OneIssue { name, prefix })
+        };
+        // The shown tab whole, and then: the other cut where room runs out;
+        // or the other whole and the count, which no longer fits, left out
+        // rather than cut.
+        for (shown, other, row) in [
+            (
+                "the-work-linear-workspace",
+                "the-personal-linear-workspace",
+                "┌ [2] Issues  the-work-linear-workspace  the…  ┐",
+            ),
+            (
+                "the-work-linear-ws",
+                "home",
+                "┌ [2] Issues  the-work-linear-ws  home  ───────┐",
+            ),
+        ] {
+            let issues = sources_screen(&app, vec![source(shown, "END"), source(other, "ANT")]);
+            let (title, _) = list_title_row(&app, &issues);
+            assert!(title.starts_with(row), "{title}");
+        }
+    }
+
+    #[test]
+    fn issues_too_small_for_the_panels_or_in_the_table_layout_are_the_screen_of_their_own() {
+        let mut table = panels();
+        table.look = Look::Table;
+        for (app, width, height) in [(panels(), 100, 30), (panels(), 119, 45), (table, 160, 45)] {
+            let mut app = app;
+            app.is_issues = true;
+            let issues = issues_screen(&app, width, height);
+            let shown = drawn_issues(&app, &issues, width, height);
+            assert!(
+                !shown.contains("[2] Issues") && !shown.contains("[1]"),
+                "{width}x{height}:\n{shown}"
+            );
+            assert!(
+                !shown.starts_with("  Trees   Plan "),
+                "{width}x{height}:\n{shown}"
+            );
+            let bar = shown.lines().last().unwrap();
+            assert!(
+                !bar.contains("PANEL") && bar.contains("z  fold"),
+                "{width}x{height}: {bar}"
+            );
+        }
+    }
+
+    /// `TwoIssues` with a team, Todo and Doing, so they can be written to
+    /// as a Linear source's can.
+    struct Writable;
+
+    impl issues::Backend for Writable {
+        fn name(&self) -> &str {
+            "work"
+        }
+
+        fn list(&self, filters: &issues::Filters) -> Result<Vec<linear::Issue>, String> {
+            TwoIssues.list(filters)
+        }
+
+        fn detail(&self, id: &str) -> Result<linear::Detail, String> {
+            TwoIssues.detail(id)
+        }
+
+        fn team(&self) -> Result<Option<std::sync::Arc<linear::Team>>, String> {
+            let state = |name: &str| linear::State {
+                id: name.to_lowercase(),
+                name: name.into(),
+                kind: "unstarted".into(),
+                position: 0.0,
+            };
+            Ok(Some(std::sync::Arc::new(linear::Team {
+                id: "t".into(),
+                key: "END".into(),
+                name: "Endo".into(),
+                states: vec![state("Todo"), state("Doing")],
+                labels: Vec::new(),
+                members: Vec::new(),
+                projects: Vec::new(),
+                cycles: Vec::new(),
+                me: None,
+            })))
+        }
+    }
+
+    /// The Issues screen on the panels at 160 by 45 over `Writable`, END-1
+    /// read into [1].
+    fn writable_screen(app: &App) -> issues::Screen {
+        let mut screen = issues::Screen::new(vec![std::sync::Arc::new(Writable)], 0, Vec::new());
+        screen.set_panels(issues_on_panels(app, Rect::new(0, 0, 160, 45)));
+        for _ in 0..200 {
+            screen.poll();
+            if drawn_issues(app, &screen, 160, 45).contains("END-1 text") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        screen
+    }
+
+    /// Presses `c` on `screen` until what it opens is drawn: the team it
+    /// needs may still be on its way.
+    fn opened(app: &App, screen: &mut issues::Screen, c: char, is_open: impl Fn(&str) -> bool) {
+        for _ in 0..200 {
+            screen.handle_key(ratatui::crossterm::event::KeyEvent::from(
+                ratatui::crossterm::event::KeyCode::Char(c),
+            ));
+            if is_open(&drawn_issues(app, screen, 160, 45)) {
+                return;
+            }
+            screen.poll();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!(
+            "{c} opened nothing:\n{}",
+            drawn_issues(app, screen, 160, 45)
+        );
+    }
+
+    /// The row and the first and last columns of the box titled `title`.
+    fn box_of(shown: &str, title: &str) -> (usize, usize, usize) {
+        let (y, row) = shown
+            .lines()
+            .enumerate()
+            .find(|(_, l)| l.contains(&format!("┌{title}")))
+            .unwrap_or_else(|| panic!("no {title}:\n{shown}"));
+        let cells: Vec<char> = row.chars().collect();
+        let left = row[..row.find(&format!("┌{title}")).unwrap()]
+            .chars()
+            .count();
+        let right = (left..cells.len())
+            .find(|&x| cells[x] == '┐')
+            .unwrap_or_else(|| panic!("{title} has no corner: {row}"));
+        (y, left, right)
+    }
+
+    #[test]
+    fn on_the_panels_n_and_e_write_in_1_in_insert_with_2_still_beside_it() {
+        let mut app = panels();
+        app.is_issues = true;
+        let mut issues = writable_screen(&app);
+        let x = window_column(&drawn_issues(&app, &issues, 160, 45));
+        for (c, title) in [('n', " [1] New issue in END "), ('e', " [1] Edit END-1 ")] {
+            opened(&app, &mut issues, c, |shown| shown.contains(title));
+            let shown = drawn_issues(&app, &issues, 160, 45);
+            let (y, left, _) = box_of(&shown, title);
+            assert_eq!(left, x, "{c} in [1], where the issue was:\n{shown}");
+            let corner = drawn_buffer(&app, &issues, 160, 45)
+                [(u16::try_from(x).unwrap(), u16::try_from(y).unwrap())]
+                .fg;
+            assert_eq!(corner, Mode::Insert.color(), "{c}: [1] in Insert");
+            assert!(
+                shown.contains("[2] Issues") && shown.contains("END-2 title"),
+                "{shown}"
+            );
+            assert!(
+                shown.contains("Title") && shown.contains("Status"),
+                "{shown}"
+            );
+            let bar = shown.lines().last().unwrap();
+            assert!(
+                bar.starts_with(" INSERT ") && bar.contains("Ctrl+S save"),
+                "{c}: {bar}"
+            );
+            issues.handle_key(ratatui::crossterm::event::KeyEvent::from(
+                ratatui::crossterm::event::KeyCode::Esc,
+            ));
+            assert!(!issues.is_writing(), "{c}: Esc closes it unwritten in");
+        }
+    }
+
+    #[test]
+    fn on_the_panels_c_docks_the_comment_box_in_1_under_the_issue_its_keys_on_the_bar_once() {
+        let mut app = panels();
+        app.is_issues = true;
+        let mut issues = writable_screen(&app);
+        let x = window_column(&drawn_issues(&app, &issues, 160, 45));
+        opened(&app, &mut issues, 'c', |shown| {
+            shown.contains(" Comment on END-1 ")
+        });
+        issues.paste("ship it");
+        let shown = drawn_issues(&app, &issues, 160, 45);
+        let lines: Vec<Vec<char>> = shown.lines().map(|l| l.chars().collect()).collect();
+        let (top, left, right) = box_of(&shown, " Comment on END-1 ");
+        // Inside [1]'s border and its column of air either side.
+        let window_right = (x + 1..lines[top].len())
+            .find(|&at| lines[top][at] == '│')
+            .unwrap_or_else(|| panic!("{shown}"));
+        assert_eq!((left, right), (x + 2, window_right - 2), "{shown}");
+        // Under the issue, which stays above it, and down on [1]'s bottom.
+        let text = shown
+            .lines()
+            .position(|l| l.contains("END-1 text"))
+            .unwrap();
+        assert!(text < top, "{shown}");
+        let bottom = (top..lines.len())
+            .find(|&y| lines[y][left] == '└')
+            .unwrap_or_else(|| panic!("{shown}"));
+        assert_eq!(lines[bottom + 1][x], '└', "on [1]'s bottom:\n{shown}");
+        assert!(
+            shown.contains("ship it") && shown.contains("END-2 title"),
+            "{shown}"
+        );
+        let bar = shown.lines().last().unwrap();
+        assert!(
+            bar.starts_with(" INSERT ")
+                && bar.contains("Enter send")
+                && bar.contains("Alt+Enter new line")
+                && bar.contains("Esc cancel"),
+            "{bar}"
+        );
+        assert_eq!(shown.matches("Alt+Enter").count(), 1, "{shown}");
+    }
+
+    #[test]
+    fn on_the_panels_a_picker_opens_over_1_and_the_filters_over_the_whole_screen() {
+        let mut app = panels();
+        app.is_issues = true;
+        let mut issues = writable_screen(&app);
+        let shown = drawn_issues(&app, &issues, 160, 45);
+        let x = window_column(&shown);
+        // Each box's gaps either side within the screen, [1] from x on.
+        let gaps = |shown: &str, title: &str| {
+            let (_, left, right) = box_of(shown, title);
+            (left, 159 - right)
+        };
+        opened(&app, &mut issues, 's', |shown| {
+            shown.contains(" Status of END-1 ")
+        });
+        let shown = drawn_issues(&app, &issues, 160, 45);
+        let (left, right) = gaps(&shown, " Status of END-1 ");
+        assert!(left > x, "over [1]:\n{shown}");
+        assert!((left - x).abs_diff(right) <= 1, "centred on [1]:\n{shown}");
+        assert!(
+            shown.contains("[2] Issues") && shown.contains("END-2 title"),
+            "{shown}"
+        );
+        issues.handle_key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Esc,
+        ));
+        opened(&app, &mut issues, 'f', |shown| shown.contains(" Filters "));
+        let shown = drawn_issues(&app, &issues, 160, 45);
+        let (left, right) = gaps(&shown, " Filters ");
+        assert!(left.abs_diff(right) <= 1, "centred on the screen:\n{shown}");
+        // A filter's own picker too.
+        issues.handle_key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Enter,
+        ));
+        let shown = drawn_issues(&app, &issues, 160, 45);
+        let title = shown
+            .lines()
+            .find_map(|l| {
+                let at = l.find("┌ ")?;
+                let rest = &l[at + "┌".len()..];
+                (!rest.starts_with(" Filters ") && !rest.starts_with(" ["))
+                    .then(|| rest[..rest.find('─').unwrap_or(rest.len())].to_string())
+            })
+            .unwrap_or_else(|| panic!("no filter's picker:\n{shown}"));
+        let (left, right) = gaps(&shown, &title);
+        assert!(
+            left.abs_diff(right) <= 1,
+            "{title} centred on the screen:\n{shown}"
+        );
+    }
+
+    use crate::app::tests::in_project;
+
+    /// Project p1 as read for [3]: ANB-41 (in tree 4), END-1 ready, END-2
+    /// under way, END-3 waiting on END-2, END-4 done and END-5 canceled.
+    fn p1_read() -> crate::planned::ProjectRead {
+        use crate::planned::Planned;
+        let standing = |id: &str, kind: &str, state: &str| linear::Standing {
+            id: id.into(),
+            title: format!("{id} title"),
+            project: Some("project p1".into()),
+            state: state.into(),
+            kind: Some(kind.into()),
+            blocked_by: Vec::new(),
+        };
+        let issues = vec![
+            standing("ANB-41", "backlog", "Backlog"),
+            standing("END-1", "backlog", "Backlog"),
+            standing("END-2", "started", "In Progress"),
+            standing("END-3", "backlog", "Backlog"),
+            standing("END-4", "completed", "Done"),
+            standing("END-5", "canceled", "Canceled"),
+        ];
+        let open = issues
+            .iter()
+            .filter(|s| !matches!(s.kind.as_deref(), Some("completed" | "canceled")))
+            .map(|s| Planned {
+                blocked_by: if s.id == "END-3" {
+                    vec!["END-2".into()]
+                } else {
+                    Vec::new()
+                },
+                ..Planned::from(s.clone())
+            })
+            .collect();
+        let project = linear::Project {
+            id: "p1".into(),
+            name: "project p1".into(),
+            issues,
+            ..linear::Project::default()
+        };
+        (project, open)
+    }
+
+    /// [3]'s rows on Issues at 160 by 45, its title row first.
+    fn project_rows(app: &App, issues: &issues::Screen) -> Vec<String> {
+        let shown: Vec<String> = drawn_issues(app, issues, 160, 45)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let at = shown
+            .iter()
+            .position(|l| l.contains("[3] Project"))
+            .unwrap_or_else(|| panic!("no [3]:\n{}", shown.join("\n")));
+        let width = shown[at].chars().position(|c| c == '┐').unwrap() + 1;
+        shown[at..]
+            .iter()
+            .take_while(|l| !l.starts_with('└'))
+            .map(|l| l.chars().take(width).collect())
+            .collect()
+    }
+
+    /// ANB-123: [3] names the project of [1]'s issue, shows its bar and
+    /// each open issue where it stands, [1]'s marked; `3` gives it the keys.
+    #[test]
+    fn the_project_panel_shows_the_project_of_1s_issue_and_where_each_open_one_stands() {
+        let mut app = panels();
+        app.is_issues = true;
+        let mut issues = issues_screen(&app, 160, 45);
+        app.follow_project("work", Some(&in_project("END-1", "p1")));
+        let key = app.wanted_project().unwrap();
+        app.apply_project_read(key, Ok(p1_read()));
+        issues.set_project(app.project_ids());
+        let rows = project_rows(&app, &issues);
+        let all = rows.join("\n");
+        assert!(rows[0].contains("┌ [3] Project · project p1 "), "{all}");
+        // 1 of 5 done, 1 going, END-5 canceled and left out: 3, 3 and 10.
+        assert!(
+            rows[1].contains("███▓▓▓░░░░░░░░░░  1 done · 1 going · 3 to start"),
+            "{all}"
+        );
+        // In the narrowest column the bar gives way, and its words keep a
+        // space before the border as every other line does.
+        let narrow = drawn_issues(&app, &issues, 120, 31);
+        let line = narrow.lines().find(|l| l.contains("done · ")).unwrap();
+        assert!(line.contains("3 to start │"), "{line}");
+        let row = |id: &str| rows.iter().position(|l| l.contains(id));
+        let said = |id: &str| {
+            row(id).map_or(String::new(), |at| {
+                rows[at].trim_end_matches(['│', ' ']).to_string()
+            })
+        };
+        assert!(said("ANB-41").contains("4 · "), "{all}");
+        assert!(said("END-1").trim_end().ends_with("ready"), "{all}");
+        assert!(said("END-2").trim_end().ends_with("In Progress"), "{all}");
+        assert!(said("END-3").trim_end().ends_with("⊘ END-2"), "{all}");
+        assert!(row("END-4").is_none() && row("END-5").is_none(), "{all}");
+        // [1]'s issue, END-1, is the one marked.
+        let buffer = drawn_buffer(&app, &issues, 160, 45);
+        let top = drawn_issues(&app, &issues, 160, 45)
+            .lines()
+            .position(|l| l.contains("[3] Project"))
+            .unwrap();
+        let marked: Vec<String> = rows
+            .iter()
+            .enumerate()
+            .filter(|(at, _)| {
+                let y = u16::try_from(top + at).unwrap();
+                let cell = &buffer[(4, y)];
+                theme()
+                    .cursor
+                    .bg
+                    .map_or(cell.modifier.contains(Modifier::REVERSED), |bg| {
+                        cell.bg == bg
+                    })
+            })
+            .map(|(_, l)| l.split_whitespace().nth(2).unwrap_or("").to_string())
+            .collect();
+        assert_eq!(marked, ["END-1"], "{all}");
+        // `3` moves the keys, and the green border, from [2] to [3], and
+        // puts [3]'s keys on the bar.
+        let y = u16::try_from(top).unwrap();
+        let list_y = drawn_issues(&app, &issues, 160, 45)
+            .lines()
+            .position(|l| l.contains("[2] Issues"))
+            .map(|at| u16::try_from(at).unwrap())
+            .unwrap();
+        let green = Mode::Normal.color();
+        assert_eq!(buffer[(0, list_y)].fg, green, "[2] is green");
+        assert_ne!(buffer[(0, y)].fg, green, "[3] is not");
+        issues.handle_key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Char('3'),
+        ));
+        let buffer = drawn_buffer(&app, &issues, 160, 45);
+        assert_eq!(buffer[(0, y)].fg, green, "[3] is green");
+        assert_ne!(buffer[(0, list_y)].fg, green, "[2] is not");
+        let shown = drawn_issues(&app, &issues, 160, 45);
+        let bar = shown.lines().last().unwrap();
+        assert!(
+            bar.starts_with(" PANEL 3 ") && bar.contains("show it"),
+            "{bar}"
+        );
+    }
+
+    /// ANB-123: [3] says what it cannot show: no project, a source that
+    /// cannot read them, one being read, one that failed; and another
+    /// project's issue changes it at once, before that project is read.
+    #[test]
+    fn the_project_panel_says_reading_none_and_why_and_follows_the_cursor_at_once() {
+        let mut app = panels();
+        app.is_issues = true;
+        let issues = issues_screen(&app, 160, 45);
+        let body = |app: &App| project_rows(app, &issues)[1..].join("\n");
+        let title = |app: &App| project_rows(app, &issues)[0].clone();
+        assert_eq!(body(&app).trim_matches(['│', ' ', '\n']), "", "nothing yet");
+        app.follow_project("work", Some(&linear::Issue::default()));
+        assert!(
+            title(&app).contains("[3] Project · none "),
+            "{}",
+            title(&app)
+        );
+        assert!(body(&app).contains("not in a project"), "{}", body(&app));
+        let plugged = linear::Issue {
+            project: Some("Inbox".into()),
+            ..linear::Issue::default()
+        };
+        app.follow_project("tix", Some(&plugged));
+        assert!(title(&app).contains("· Inbox "), "{}", title(&app));
+        assert!(
+            body(&app).contains("this source's plugin cannot read projects"),
+            "{}",
+            body(&app)
+        );
+        app.follow_project("work", Some(&in_project("END-1", "p1")));
+        let p1 = app.wanted_project().unwrap();
+        assert!(body(&app).contains("reading…"), "{}", body(&app));
+        app.apply_project_read(p1.clone(), Ok(p1_read()));
+        assert!(body(&app).contains("END-3"), "{}", body(&app));
+        // Another project's issue changes [3] at once, reading that project.
+        app.follow_project("work", Some(&in_project("END-2", "p2")));
+        assert!(title(&app).contains("· project p2 "), "{}", title(&app));
+        assert!(body(&app).contains("reading…"), "{}", body(&app));
+        let p2 = app.wanted_project().unwrap();
+        app.apply_project_read(p2, Err("work: unavailable".into()));
+        let failed = body(&app);
+        assert!(
+            failed.contains("work: unavailable") && !failed.contains("reading…"),
+            "{failed}"
+        );
+        // A read of [1]'s issue still on its way keeps [3] where it was.
+        app.follow_project("work", None);
+        assert!(title(&app).contains("· project p2 "), "{}", title(&app));
+        // A failed read again keeps what was read, saying it is old.
+        app.follow_project("work", Some(&in_project("END-1", "p1")));
+        app.apply_project_read(p1, Err("work: unavailable".into()));
+        let old = body(&app);
+        assert!(
+            old.contains("as last read: work: unavailable") && old.contains("END-3"),
+            "{old}"
         );
     }
 

@@ -793,19 +793,29 @@ CodeRabbit's comments are read from the markers it leaves in them; one it writes
 treetop has three screens, Trees, Plan and Issues; Tab goes through them in that order and from Issues back to Trees, and `treetop issues` opens straight onto Issues.
 Plan is described under [Use](#use); the table layout has none, so there Tab goes between Trees and Issues alone.
 The Issues screen shows the repository's issues from its issue source in the config (see [Config](#config)): the list on top, your own open issues first, the most recently updated at the top, and below it the issue under the cursor with its fields, its description rendered from Markdown, and its comments.
+In the panels layout, from 120 by 31, it is drawn as Trees and Plan are: the list is [2] down the left, in the columns ID, PRI, TITLE and WORK under the filter line, and the issue under the cursor is [1] on the right, whole, a row each for its status, labels, project and work above its description and comments.
+Under [2], [3] Project shows the project of the issue in [1], named in its title: a bar of its issues done, going and to start, then each open one with its tree and agent as WORK says them, `ready`, `⊘` and the issue it waits on, or `not started`, the one in [1] marked.
+It is read in the background as the cursor moves, and read again after a minute; an issue in no project says "not in a project".
+[2]'s title has a tab for each issue source, the one shown in the cursor's grey, then how many issues it lists, and treetop's bar shows the keys of the panel that has them.
+From the list `[` and `]` show the issue source before or after, as they move between [1]'s tabs on Trees; with one source they do nothing.
 Everything loads in the background, and an issue's description and comments are kept once read, so moving the cursor never waits on the network.
 Each issue picked up in a tree shows it in the WORK column, with its agent's state, `4 · waiting` in the warning colour when the agent waits on you.
 Enter or `→` opens the issue under the cursor on the whole screen, to scroll with j/k, Space and PgUp, g and G, or the mouse wheel; Esc or `←` goes back to the list.
+On the panels Enter or `1` gives [1] the keys instead, its border turning green, and Esc or `2` gives them back to [2].
+`3` gives [3] the keys: j and k move through its issues, Enter shows the one under its cursor in [1], whether or not [2] lists it, and Esc in [1] comes back to [3].
+`p` in [3] picks the issue up into a fresh tree as Plan does, and one waiting on another says which.
 The keys that change an issue work the same from the list and from inside it.
 An open issue lists the issues it is linked to: its parent, its sub-issues, the ones it blocks or is blocked by, related ones and duplicates, and the issues of its team its text mentions.
 Tab moves between those links and the issue's images, and Enter or a click opens the one marked: an issue opens in its place, and Esc goes back along the issues opened, then to the list.
 Images show in the text, read with the source's key, in the terminal's own graphics where it has them (Kitty, Ghostty, WezTerm, iTerm2, through tmux with `allow-passthrough on`) and in coloured blocks anywhere else.
 An image opened fills the screen; `←` and `→` go to the issue's other images, and `o` opens it in the browser.
 The preview below the list scrolls with the mouse wheel over it, `J` and `K` a line, and `PgDn` and `PgUp` a page, so an issue can be read without opening it; the wheel over the list moves through the issues.
+On the panels the same keys and the wheel over [1] scroll [1] while [2] keeps the keys.
 On the Issues screen treetop takes the mouse, so selecting text there takes Shift as you drag.
 `w` switches to the next issue source, so a work and a personal workspace are one key apart, and `o` opens the issue in the browser.
 
-Number keys switch between views: `1` your open issues and `2` everyone's, both grouped by status as Linear groups them, `3` grouped by project, `4` grouped by status in the team's workflow order, and `5` the current cycle.
+Number keys switch between views in the table layout and on a screen too small for the panels; on the panels they move between [2], [1] and [3], `4` to `9` do nothing, and the filters on `f` do what the views did.
+The views are: `1` your open issues and `2` everyone's, both grouped by status as Linear groups them, `3` grouped by project, `4` grouped by status in the team's workflow order, and `5` the current cycle.
 Views of your own go on `6` to `9`, in name order, from `[views]` in the config, each a line of filters: `mine`, and `assignee:`, `creator:` (a name, or `me`), `priority:` (`urgent`, `high`, `medium`, `low` or `none`), `label:`, `state:` (a status, or `any`), `project:` and `cycle:` (`current` or a number), a value with spaces in double quotes, other words searched for, and `group:project` or `group:status`:
 
 ```toml
@@ -819,16 +829,19 @@ The line above the list says what it shows: whose issues, which status, and what
 `/` searches: the list narrows as you type, by id, title, label and assignee, and once typing rests Linear is searched too, by title or issue number, so older issues show; Enter keeps the search and Esc clears it.
 `f` opens the filters: assignee (anyone, you, nobody, or a teammate), status (open, all, or one), priority, creator (anyone, you, or a teammate), label, project, cycle, and grouping, each picked from the team's own with Enter, the list following at once; `x` clears one and `c` all of them.
 In a grouped list, `z` folds the group under the cursor to its heading and `z` or Enter on the heading opens it again, as Linear folds a status; `Z` folds every group, or opens them all.
-`m` switches between yours and everyone's, `r` reads the list and the team again, and `?` shows these keys.
+`m` switches between yours and everyone's, `r` reads the list and the team again, and `?` shows these keys; on the panels it shows treetop's keys, with an Issues group for these.
 
 `s` changes the issue's status, `l` its labels, `a` its assignee and `P` its project, each from a picker of the team's own states, labels, members and projects that narrows as you type; labels are marked and unmarked with Tab and applied together with Enter, and the assignee picker offers you first, then nobody, then everyone else.
+On the panels the picker opens over [1], with the list still beside it; the filters on `f` cover the whole screen.
 The change shows on the row at once and is sent behind it; if Linear refuses it, the row goes back to what it was and the bar says why.
 `x` marks the issue under the cursor and moves down, and `X` marks every issue shown, or unmarks them all.
 While issues are marked, `s`, `a` and `P` set the status, assignee or project of every one of them at once, sent to Linear as one batch; any it refuses go back as they were, the marks clear once it is sent, and Esc clears them without changing anything.
 `c` writes a comment on the issue: Markdown, Alt+Enter for a new line, Enter to post it under the issue's other comments; one Linear refuses opens again with its text, so nothing written is lost.
+On the panels the comment box sits at the bottom of [1], under the issue it is on, and the bar says Insert with its keys.
 
 `n` opens a form for a new issue, and `e` the same form on the issue under the cursor.
 It fills the screen: the title, the status, priority, labels, assignee and project, and the description in a box below.
+On the panels it takes [1] instead, titled with what it makes or edits, such as `New issue in ANB` or `Edit ANB-123`, its border in Insert's colour and its keys on treetop's bar, with [2] and [3] still beside it.
 Tab and Shift+Tab move between the fields; on a field set from a list, Enter or typing opens its picker.
 The description takes Markdown as it is typed, Enter for a new line, and Ctrl+E writes it in your editor (`$VISUAL`, else `$EDITOR`, else `vi`) instead.
 Ctrl+S saves: a new issue needs a title and starts in the team's first open state, assigned to you; an edit sends only what changed.

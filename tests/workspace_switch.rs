@@ -6,7 +6,7 @@
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -171,6 +171,26 @@ impl Screen {
             );
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// Makes the terminal `cols` by `rows`, as a user dragging its window
+    /// does: treetop hears of it as SIGWINCH.
+    fn resize(&mut self, cols: u16, rows: u16) {
+        let size = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        self.parser
+            .lock()
+            .unwrap()
+            .screen_mut()
+            .set_size(rows, cols);
+        // SAFETY: TIOCSWINSZ reads the winsize it is given on a descriptor
+        // this owns.
+        let set = unsafe { libc::ioctl(self.input.as_raw_fd(), libc::TIOCSWINSZ, &size) };
+        assert_eq!(set, 0, "TIOCSWINSZ");
     }
 
     /// Goes to the workspace `to`, the other of the two, as `w` then Enter does.
@@ -1090,6 +1110,178 @@ fn a_planning_chat_opens_in_the_window_with_normal_and_insert() {
     screen.press("\t");
     screen.wait_for("Trees, the planning chat gone", |text| {
         text.contains("[2] Trees") && !text.contains("chat j2 is open") && bar_is(" PANEL 2 ")(text)
+    });
+    drop(screen);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// ANB-122: on the panels Issues is drawn as Trees and Plan are, the list in
+/// [2] and the issue under the cursor whole in [1]; `1` gives [1] the keys
+/// and `2` gives them back, the other digits pick no view,
+/// and p still picks the issue up. ANB-123: [3] under [2] names the project
+/// of the issue in [1], and `3` gives it the keys. ANB-125: `?` shows
+/// treetop's help with an Issues group, and the key that closes it does
+/// nothing else. On a terminal too small
+/// for the panels it is the screen it was, its digits picking views.
+#[test]
+fn issues_on_the_panels_read_the_issue_beside_the_list_and_digits_move_the_keys() {
+    let Workspaces {
+        root, mut screen, ..
+    } = two_workspaces_with("issues-panels", "", |root| {
+        let plugins = root.join("config/treetop/plugins");
+        fs::create_dir_all(&plugins).unwrap();
+        write_script(
+            &plugins.join("tix"),
+            r#"read -r request
+case "$request" in
+*'"describe"'*) echo '{"ok":true,"result":{"protocol":1,"name":"tix","kind":"tickets","ops":["list","get"]}}' ;;
+*'"ANB-90"'*) echo '{"ok":true,"result":{"id":"ANB-90","title":"Show the rail","state":"Todo","project":"Inbox","labels":["Bug"],"description":"Draw it as a rail."}}' ;;
+*'"ANB-91"'*) echo '{"ok":true,"result":{"id":"ANB-91","title":"Keep the rail","state":"Todo","description":"Keep it drawn."}}' ;;
+*) echo '{"ok":true,"result":{"tickets":[{"id":"ANB-90","title":"Show the rail","state":"Todo","project":"Inbox","labels":["Bug"]},{"id":"ANB-91","title":"Keep the rail","state":"Todo"}]}}' ;;
+esac
+"#,
+        );
+        let here = root.join("here").canonicalize().unwrap();
+        fs::write(
+            root.join("config/treetop/config.toml"),
+            format!(
+                "[issues.tix]\nplugin = \"tix\"\nteam = \"ANB\"\n[repos.\"{}\"]\nissues = \"tix\"\n",
+                here.display()
+            ),
+        )
+        .unwrap();
+    });
+    let bar_is =
+        |mode: &'static str| move |text: &str| text.lines().last().unwrap_or("").starts_with(mode);
+    // The row [2]'s and [1]'s titles share.
+    let titles = |text: &str| -> String {
+        text.lines()
+            .find(|l| l.contains("[2] Issues"))
+            .unwrap_or("")
+            .to_string()
+    };
+    screen.wait_for("the panels", |text| text.contains("[2] Trees"));
+    screen.press("\t");
+    screen.wait_for("Plan", |text| text.contains("[2] Planning chats"));
+    screen.press("\t");
+    screen.wait_for("Issues on the panels, the first issue in [1]", |text| {
+        let row = titles(text);
+        text.starts_with("  Trees   Plan   Issues ")
+            && row.contains("┌ [2] Issues  tix  · 2 issues ")
+            && row.find("[1] ANB-90 Show the rail") > row.find("[2] Issues")
+            && text.contains("Draw it as a rail.")
+            && text.contains("labels    Bug")
+            && text.contains("project   Inbox")
+            && bar_is(" PANEL 2 ")(text)
+    });
+    let list = screen.text();
+    assert!(
+        list.lines().any(|l| l.contains("ID")
+            && l.contains("PRI")
+            && l.contains("TITLE")
+            && l.contains("WORK")),
+        "{list}"
+    );
+    // [3] under [2] names the issue's project; a plugin has no project ids,
+    // so it says it cannot read the project rather than reading forever.
+    let project = |text: &str| -> String {
+        text.lines()
+            .skip_while(|l| !l.contains("[3] Project"))
+            .take(2)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    screen.wait_for("[3] on ANB-90's project", |text| {
+        project(text).contains("┌ [3] Project · Inbox ")
+            && project(text).contains("this source's plugin cannot read projects")
+    });
+    // ANB-125: `?` lists treetop's keys with an Issues group, and the key
+    // that closes it does only that: j leaves the cursor where it was.
+    screen.press("?");
+    screen.wait_for("treetop's help with the Issues keys", |text| {
+        text.contains(" n e c   new, edit, comment")
+            && text.contains(" s l a P status, labels, who, project")
+            && text.contains(" f       filters, in place of views")
+    });
+    screen.press("j");
+    screen.wait_for("the help closed", |text| {
+        !text.contains("new, edit, comment")
+    });
+    let shown = screen.text();
+    assert!(
+        titles(&shown).contains("[1] ANB-90 Show the rail") && bar_is(" PANEL 2 ")(&shown),
+        "{shown}"
+    );
+    // A search that keeps nothing leaves no issue under the cursor, and [3]
+    // goes with it rather than keep the last project for `p` to act on.
+    screen.press("/");
+    screen.press("qqzzxx\r");
+    screen.wait_for("no issue under the cursor and no project", |text| {
+        titles(text).contains("· 0 issues")
+            && text.contains("no issue under the cursor")
+            && text.contains("[3] Project")
+            && !project(text).contains("Inbox")
+    });
+    screen.press("/");
+    screen.press("\x1b");
+    screen.wait_for(
+        "the search cleared, [3] on ANB-90's project again",
+        |text| {
+            titles(text).contains("· 2 issues") && project(text).contains("┌ [3] Project · Inbox ")
+        },
+    );
+    screen.press("j");
+    screen.wait_for("[1] on the next issue, in no project", |text| {
+        titles(text).contains("[1] ANB-91 Keep the rail")
+            && text.contains("Keep it drawn.")
+            && project(text).contains("┌ [3] Project · none ")
+            && project(text).contains("not in a project")
+    });
+    // `3` gives [3] the keys and its own on the bar; Esc gives them back.
+    screen.press("3");
+    screen.wait_for("[3] with the keys", |text| {
+        bar_is(" PANEL 3 ")(text) && text.lines().last().unwrap_or("").contains("show it")
+    });
+    screen.press("\x1b");
+    screen.wait_for("[2] with the keys from [3]", bar_is(" PANEL 2 "));
+    // The digits past 3 pick no view on the panels.
+    screen.press("4");
+    let shown = screen.text();
+    assert!(
+        titles(&shown).contains("[1] ANB-91 Keep the rail")
+            && bar_is(" PANEL 2 ")(&shown)
+            && !shown.contains("by project"),
+        "{shown}"
+    );
+    // Enter and Esc doing the same are the crate's own tests'.
+    screen.press("1");
+    screen.wait_for("[1] with the keys", |text| {
+        bar_is(" PANEL 1 ")(text) && text.lines().last().unwrap_or("").contains("2 list")
+    });
+    screen.press("2");
+    screen.wait_for("[2] with the keys again", bar_is(" PANEL 2 "));
+    // Too small for the panels it is the screen of its own, and its digits
+    // pick views again.
+    screen.resize(100, 30);
+    screen.wait_for("Issues on its own", |text| {
+        !text.contains("[2] Issues") && text.lines().last().unwrap_or("").contains("mine")
+    });
+    screen.press("3");
+    screen.wait_for("the view by project", |text| {
+        text.lines().last().unwrap_or("").contains("by project")
+    });
+    screen.resize(200, 50);
+    screen.wait_for("the panels again", |text| {
+        titles(text).contains("[2] Issues")
+    });
+    // p still picks the issue under the cursor up, on Trees: the stand-in
+    // treehouse leases no tree, so the bar says so once it has tried.
+    screen.press("p");
+    screen.wait_for("ANB-90 being picked up on Trees", |text| {
+        let bar = text.lines().last().unwrap_or("");
+        text.contains("[2] Trees")
+            && (bar.contains("picking up ANB-90 in a new tree")
+                || bar.contains("start of tree new failed: lease"))
     });
     drop(screen);
     let _ = fs::remove_dir_all(&root);

@@ -616,6 +616,51 @@ pub struct Watch {
 /// A read of what a planning chat made, or why it could not be.
 pub type MadeRead = Result<Vec<crate::planned::Planned>, String>;
 
+/// How long a project [3] on the Issues screen shows is kept before it is
+/// read again.
+const PROJECT_READ: Duration = Duration::from_secs(60);
+
+/// A project, by the issue source it is read from and its id.
+pub type ProjectKey = (String, String);
+
+/// The project [3] on the Issues screen follows: that of the issue [1]
+/// shows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum IssuesProject {
+    /// [1] has shown no issue yet.
+    #[default]
+    Unknown,
+    /// The issue is in no project.
+    None,
+    /// By name, and by key where its source can read projects.
+    Named {
+        name: String,
+        key: Option<ProjectKey>,
+    },
+}
+
+/// A project as [3] last read it, why its last read failed, and when it
+/// was asked for.
+#[derive(Debug, Clone)]
+pub struct ProjectKept {
+    read: Option<crate::planned::ProjectRead>,
+    error: Option<String>,
+    asked_at: Instant,
+    is_reading: bool,
+}
+
+/// [3]'s project as best known, for drawing it.
+pub struct ShownProject<'a> {
+    pub project: &'a linear::Project,
+    /// Its open issues, in its order.
+    pub open: Vec<crate::planned::Planned>,
+    /// What blocks each of them is known: read for [3], not only for a
+    /// tree's issue.
+    pub is_read: bool,
+    /// Why the last read failed, the project being as read before.
+    pub error: Option<&'a str>,
+}
+
 /// Where a planning chat stands, for the Plan screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanState {
@@ -948,6 +993,10 @@ pub struct App {
     /// The issue `p` on Plan picked up, whose tree the cursor goes to once
     /// it is listed, and the tree the cursor was on.
     pub picked: Option<(String, Option<PathBuf>)>,
+    /// The project [3] on the Issues screen follows, and each it has
+    /// shown, as last read; the trees' issues stay in `tree_issues`.
+    pub issues_project: IssuesProject,
+    projects: HashMap<ProjectKey, ProjectKept>,
 }
 
 /// How long a started agent may take to show up before treetop stops
@@ -2490,20 +2539,171 @@ impl App {
             );
             return Outcome::Continue;
         };
-        if self.tree_of_ticket(&issue.id).is_none() && !self.is_ready(&issue) {
-            self.message = Some(match issue.blocked_by.first() {
-                Some(by) => format!("{} waits on {by}; pick that up first", issue.id),
-                None => format!("{} is {}", issue.id, issue.state.to_lowercase()),
-            });
+        if let Some(why) = self.unpickable(&issue) {
+            self.message = Some(why);
             return Outcome::Continue;
         }
         self.leave_plan_window();
         self.is_plan = false;
-        if self.tree_of_ticket(&issue.id).is_none() {
-            let at = self.current().map(|t| t.path.clone());
-            self.picked = Some((issue.id.clone(), at));
+        self.pick_and_land(issue.id, source)
+    }
+
+    /// Why a planned issue cannot be picked up: what it waits on, or its
+    /// status; None when it is ready, or in a tree, which picking goes to.
+    fn unpickable(&self, issue: &crate::planned::Planned) -> Option<String> {
+        if self.tree_of_ticket(&issue.id).is_some() || self.is_ready(issue) {
+            return None;
         }
-        self.pick(issue.id, source)
+        Some(match issue.blocked_by.first() {
+            Some(by) => format!("{} waits on {by}; pick that up first", issue.id),
+            None => format!("{} is {}", issue.id, issue.state.to_lowercase()),
+        })
+    }
+
+    /// Picks issue `id` of `source` up, the cursor going to its new tree
+    /// once it is listed.
+    fn pick_and_land(&mut self, id: String, source: String) -> Outcome {
+        if self.tree_of_ticket(&id).is_none() {
+            let at = self.current().map(|t| t.path.clone());
+            self.picked = Some((id.clone(), at));
+        }
+        self.pick(id, source)
+    }
+
+    /// [3] on the Issues screen follows `issue`, the one [1] shows, of
+    /// issue source `source`; while [1]'s issue is not read yet it stays
+    /// on the project it was on.
+    pub fn follow_project(&mut self, source: &str, issue: Option<&linear::Issue>) {
+        let Some(issue) = issue else {
+            return;
+        };
+        self.issues_project = match &issue.project {
+            None => IssuesProject::None,
+            Some(name) => IssuesProject::Named {
+                name: name.clone(),
+                key: issue.project_id.clone().map(|id| (source.to_string(), id)),
+            },
+        };
+    }
+
+    /// [3] on the Issues screen follows no project: no issue is under the
+    /// cursor, so it shows nothing for `3` or `p` to act on.
+    pub fn lose_project(&mut self) {
+        self.issues_project = IssuesProject::Unknown;
+    }
+
+    /// The project [3] wants read: never read, or read PROJECT_READ ago
+    /// and not on its way again.
+    pub fn wanted_project(&mut self) -> Option<ProjectKey> {
+        let IssuesProject::Named { key: Some(key), .. } = &self.issues_project else {
+            return None;
+        };
+        let is_due = self
+            .projects
+            .get(key)
+            .is_none_or(|kept| !kept.is_reading && kept.asked_at.elapsed() >= PROJECT_READ);
+        if !is_due {
+            return None;
+        }
+        let key = key.clone();
+        let asked = ProjectKept {
+            read: None,
+            error: None,
+            asked_at: Instant::now(),
+            is_reading: true,
+        };
+        let kept = self.projects.entry(key.clone()).or_insert(asked);
+        kept.asked_at = Instant::now();
+        kept.is_reading = true;
+        Some(key)
+    }
+
+    /// What a read of project `key` for [3] found; a failed one keeps what
+    /// was read before, with why it is old.
+    pub fn apply_project_read(
+        &mut self,
+        key: ProjectKey,
+        read: Result<crate::planned::ProjectRead, String>,
+    ) {
+        let Some(kept) = self.projects.get_mut(&key) else {
+            return;
+        };
+        kept.is_reading = false;
+        match read {
+            Ok(read) => {
+                kept.read = Some(read);
+                kept.error = None;
+            }
+            Err(why) => kept.error = Some(why),
+        }
+    }
+
+    /// [3]'s project as best known: as a tree's issue in it last read it,
+    /// which counts changes made here, else as read for [3]; with its open
+    /// issues, what blocks each as read for [3]. None until either has it.
+    pub fn shown_project(&self) -> Option<ShownProject<'_>> {
+        let IssuesProject::Named { key: Some(key), .. } = &self.issues_project else {
+            return None;
+        };
+        let kept = self.projects.get(key);
+        let read = kept.and_then(|k| k.read.as_ref());
+        let project = self
+            .tree_issues
+            .project_by_id(&key.1)
+            .or(read.map(|(project, _)| project))?;
+        let open = project
+            .issues
+            .iter()
+            .map(|standing| crate::planned::Planned::from(standing.clone()))
+            .filter(|issue| crate::planned::is_open(issue.stage))
+            .map(|mut issue| {
+                if let Some(planned) =
+                    read.and_then(|(_, open)| open.iter().find(|p| p.id == issue.id))
+                {
+                    issue.blocked_by.clone_from(&planned.blocked_by);
+                }
+                issue
+            })
+            .collect();
+        Some(ShownProject {
+            project,
+            open,
+            is_read: read.is_some(),
+            error: kept.and_then(|k| k.error.as_deref()),
+        })
+    }
+
+    /// Why [3]'s project is not shown: its last read failed, or None while
+    /// it is read.
+    pub fn project_unread(&self) -> Option<&str> {
+        let IssuesProject::Named { key: Some(key), .. } = &self.issues_project else {
+            return None;
+        };
+        self.projects.get(key)?.error.as_deref()
+    }
+
+    /// [3]'s rows, by issue id, for the Issues screen to move its cursor
+    /// through.
+    pub fn project_ids(&self) -> Vec<String> {
+        self.shown_project()
+            .map(|shown| shown.open.into_iter().map(|i| i.id).collect())
+            .unwrap_or_default()
+    }
+
+    /// `p` in [3] on the Issues screen: picks issue `id` of `source` up as
+    /// `p` on Plan does, or says why not, for the Issues screen's bar.
+    pub fn pick_from_project(&mut self, id: &str, source: String) -> Result<Outcome, String> {
+        // A tree's copy of the project carries no blockers, so only [3]'s
+        // own read can say an issue is free to pick up.
+        let issue = self
+            .shown_project()
+            .filter(|shown| shown.is_read)
+            .and_then(|shown| shown.open.into_iter().find(|i| i.id == id))
+            .ok_or_else(|| format!("{id} is not read yet"))?;
+        if let Some(why) = self.unpickable(&issue) {
+            return Err(why);
+        }
+        Ok(self.pick_and_land(issue.id, source))
     }
 
     /// The tree of the issue Plan picked up, once it is listed, gets the
@@ -6951,6 +7151,167 @@ pub(crate) mod tests {
             !app.is_plan,
             "it goes to the Trees screen, where the tree lands"
         );
+    }
+
+    /// An issue of the Issues screen in project `project`, by its id.
+    pub(crate) fn in_project(id: &str, project: &str) -> linear::Issue {
+        linear::Issue {
+            id: id.into(),
+            project: Some(format!("project {project}")),
+            project_id: Some(project.into()),
+            ..linear::Issue::default()
+        }
+    }
+
+    /// Project `id` as a read of it for [3] has it: `issues`, each by id
+    /// and status type, and those open as `planned` read them.
+    fn project_read(
+        id: &str,
+        issues: &[(&str, &str)],
+        open: Vec<crate::planned::Planned>,
+    ) -> crate::planned::ProjectRead {
+        let issues = issues
+            .iter()
+            .map(|(id, kind)| linear::Standing {
+                id: (*id).into(),
+                title: format!("{id}'s title"),
+                project: None,
+                state: (*kind).into(),
+                kind: Some((*kind).into()),
+                blocked_by: Vec::new(),
+            })
+            .collect();
+        let project = linear::Project {
+            id: id.into(),
+            name: format!("project {id}"),
+            issues,
+            ..linear::Project::default()
+        };
+        (project, open)
+    }
+
+    /// ANB-123: `p` in [3] on Issues refuses an issue waiting on another as
+    /// `p` on Plan does, and picks a ready one up into a fresh tree.
+    #[test]
+    fn p_in_the_project_panel_picks_a_ready_issue_up_and_says_what_a_held_up_one_waits_on() {
+        use crate::planned::Stage;
+        let mut app = with_made();
+        app.is_plan = false;
+        app.is_issues = true;
+        app.follow_project("work", Some(&in_project("ANB-90", "p1")));
+        let key = app.wanted_project().expect("[3] wants p1 read");
+        assert_eq!(
+            app.pick_from_project("ANB-90", "work".into()),
+            Err("ANB-90 is not read yet".into())
+        );
+        app.apply_project_read(
+            key,
+            Ok(project_read(
+                "p1",
+                &[
+                    ("ANB-90", "backlog"),
+                    ("ANB-91", "backlog"),
+                    ("ANB-92", "completed"),
+                ],
+                vec![
+                    planned("ANB-90", Stage::NotStarted, &[]),
+                    planned("ANB-91", Stage::NotStarted, &["ANB-90"]),
+                ],
+            )),
+        );
+        assert_eq!(
+            app.pick_from_project("ANB-91", "work".into()),
+            Err("ANB-91 waits on ANB-90; pick that up first".into())
+        );
+        let Ok(Outcome::Queue(jobs)) = app.pick_from_project("ANB-90", "work".into()) else {
+            panic!("p picks ANB-90 up");
+        };
+        assert_eq!(jobs[0].kind, Kind::Start);
+        let launch = jobs[0].launch.as_ref().unwrap();
+        assert!(launch.is_new_tree);
+        let ticket = launch.ticket.as_ref().unwrap();
+        assert_eq!(
+            (ticket.id.as_str(), ticket.source.as_deref()),
+            ("ANB-90", Some("work"))
+        );
+        assert_eq!(
+            app.picked.as_ref().map(|(id, _)| id.as_str()),
+            Some("ANB-90"),
+            "the cursor goes to its tree once it lands"
+        );
+    }
+
+    /// ANB-123: a tree's read of the project carries no blockers, so until
+    /// [3]'s own read lands `p` must not take an issue it shows for ready.
+    #[test]
+    fn p_in_the_project_panel_waits_for_its_own_read_even_when_a_tree_knows_the_project() {
+        let mut app = with_made();
+        app.is_plan = false;
+        app.is_issues = true;
+        app.tree_issues.apply(crate::tree_issues::Read {
+            asked: std::time::Instant::now(),
+            sources: vec![crate::tree_issues::SourceRead {
+                source: None,
+                ids: Vec::new(),
+                issues: Ok(Vec::new()),
+                team: Ok(None),
+                projects: HashMap::from([(
+                    "p".to_string(),
+                    Ok(crate::tree_issues::tests::project()),
+                )]),
+            }],
+        });
+        app.follow_project("work", Some(&in_project("ANB-42", "p")));
+        assert!(
+            app.shown_project().is_some_and(|shown| !shown.is_read),
+            "[3] shows the tree's copy while its own read is out"
+        );
+        assert_eq!(
+            app.pick_from_project("ANB-42", "work".into()),
+            Err("ANB-42 is not read yet".into())
+        );
+    }
+
+    /// ANB-123: [3] reads the project of [1]'s issue once, again a minute on
+    /// and not before, never twice at once, and a new project at once.
+    #[test]
+    fn the_project_panel_reads_a_project_once_a_minute_and_a_new_one_at_once() {
+        let mut app = with_made();
+        let p1: ProjectKey = ("work".into(), "p1".into());
+        assert_eq!(app.wanted_project(), None, "no issue shown yet");
+        app.follow_project("work", Some(&in_project("ANB-90", "p1")));
+        assert_eq!(app.wanted_project(), Some(p1.clone()));
+        assert_eq!(app.wanted_project(), None, "asked just now");
+        app.apply_project_read(p1.clone(), Ok(project_read("p1", &[], Vec::new())));
+        assert_eq!(app.wanted_project(), None, "read just now");
+        // Another project's issue is read at once, and back on p1 it is kept.
+        app.follow_project("work", Some(&in_project("ANB-50", "p2")));
+        assert_eq!(app.wanted_project(), Some(("work".into(), "p2".into())));
+        app.follow_project("work", Some(&in_project("ANB-91", "p1")));
+        assert_eq!(app.wanted_project(), None, "p1 is still fresh");
+        let asked = app.projects.get_mut(&p1).unwrap();
+        asked.asked_at = Instant::now()
+            .checked_sub(PROJECT_READ - Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(app.wanted_project(), None, "a second short of a minute");
+        let asked = app.projects.get_mut(&p1).unwrap();
+        asked.asked_at = Instant::now().checked_sub(PROJECT_READ).unwrap();
+        assert_eq!(app.wanted_project(), Some(p1.clone()), "a minute on");
+        // That read still on its way is not asked for again, however long
+        // it takes.
+        let asked = app.projects.get_mut(&p1).unwrap();
+        asked.asked_at = Instant::now().checked_sub(PROJECT_READ).unwrap();
+        assert_eq!(app.wanted_project(), None, "not while it is read");
+        // An issue in no project, or from a plugin that has no project ids,
+        // reads nothing.
+        app.follow_project("work", Some(&linear::Issue::default()));
+        assert_eq!(app.wanted_project(), None);
+        let plugged = linear::Issue {
+            project: Some("Inbox".into()),
+            ..linear::Issue::default()
+        };
+        app.follow_project("tix", Some(&plugged));
+        assert_eq!(app.wanted_project(), None);
     }
 
     #[test]
