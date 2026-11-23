@@ -483,8 +483,8 @@ fn mark_of(kind: Kind) -> (&'static str, Color) {
 }
 
 /// The notifications, under the count at the top right: what needs action,
-/// then what is done, each with its tree, ticket, age and what it is about
-/// in full, the one under the cursor highlighted for Enter.
+/// then what is done, each a row of its tree, ticket, what it needs and its
+/// age, the one under the cursor highlighted for Enter.
 fn draw_notes(frame: &mut Frame, app: &App) {
     let t = theme();
     let screen = frame.area();
@@ -515,28 +515,33 @@ fn draw_notes(frame: &mut Frame, app: &App) {
             let start = lines.len();
             let (mark, colour) = mark_of(entry.kind);
             let place = inbox::place_of(entry).replace(':', " ");
-            let age = entry.at.map(reports::age).unwrap_or_default();
+            // A PR's failure has no time, and no space for one.
+            let age = entry.at.map(|at| format!("  {}", reports::age(at)));
+            let age = age.unwrap_or_default();
             let head = format!("{mark} {place}");
+            // What it needs, as [2] Trees' STATUS says it; what the agent
+            // wrote is in its chat.
+            let action = match entry.kind {
+                Kind::Done => "done",
+                Kind::Merged => "merged",
+                kind => asks_for(kind),
+            };
+            let tail = format!("{action}{age}");
             let title = entry.title.clone().unwrap_or_default();
-            let room = inner_width.saturating_sub(head.chars().count() + age.len() + 2);
+            let width = |text: &str| Line::raw(text).width();
+            let room = inner_width.saturating_sub(width(&head) + width(&tail) + 2);
             let title = fit(&title, room);
-            let pad = inner_width
-                .saturating_sub(head.chars().count() + 1 + title.chars().count() + age.len());
+            let pad = inner_width.saturating_sub(width(&head) + 1 + width(&title) + width(&tail));
             let style = if item == at { t.cursor } else { Style::new() };
             lines.push(
                 Line::from(vec![
                     Span::styled(head, fg(colour).add_modifier(Modifier::BOLD)),
                     Span::raw(format!(" {title}{}", " ".repeat(pad))),
+                    Span::styled(action, fg(colour)),
                     Span::styled(age, fg(t.muted)),
                 ])
                 .style(style),
             );
-            for row in wrap_spans(vec![Span::raw(format!("  {}", entry.what))], inner_width, 2) {
-                let pad = inner_width.saturating_sub(row.width());
-                let mut row = row;
-                row.spans.push(Span::raw(" ".repeat(pad)));
-                lines.push(row.style(style));
-            }
             if item == at {
                 cursor = (start, lines.len());
             }
@@ -7982,7 +7987,7 @@ mod count_tests {
     }
 
     #[test]
-    fn the_notifications_list_needs_action_then_done_with_each_in_full() {
+    fn the_notifications_list_needs_action_then_done_each_on_one_row() {
         let mut app = app();
         let mut reports = app.reports.clone();
         reports[0] = crate::inbox::tests::report(
@@ -8015,13 +8020,16 @@ mod count_tests {
         assert!(at("● 4 ANB-41 inbox-rail") < at("✗ 7 fix-login"));
         assert!(at("✗ 7 fix-login") < at("DONE"));
         assert!(at("DONE") < at("✓ 2 help-columns"));
-        assert!(shown[at("✓ 2 help-columns") + 1].contains("Done: opened PR #31"));
-        // Each with its ticket and how long it has waited: tree 4 asked 120s ago.
+        // Each with its ticket, what it needs and how long it has waited:
+        // tree 4 asked 120s ago. What the agent wrote is in its chat.
         let four = &shown[at("● 4 ANB-41 inbox-rail")];
-        assert!(four.contains(" 2m │"), "{four}");
-        // The question in full, wrapped, not cut.
-        assert!(text.contains("Where should the inbox sit"), "{text}");
-        assert!(text.contains("the rest of the layout."), "{text}");
+        assert!(four.contains(" asks you  2m │"), "{four}");
+        assert!(shown[at("✗ 9 port-menu")].contains(" agent died "));
+        assert!(shown[at("✗ 7 fix-login")].contains(" checks failed │"));
+        assert!(shown[at("✓ 2 help-columns")].contains(" done "));
+        assert!(!text.contains("Where should the inbox sit"), "{text}");
+        assert!(!text.contains("Done: opened PR #31"), "{text}");
+        assert_eq!(at("● 4 ANB-41 inbox-rail") + 1, at("✗ 7 fix-login"));
         assert!(
             text.contains("Enter l  open  x  not now  Esc h  close"),
             "{text}"
